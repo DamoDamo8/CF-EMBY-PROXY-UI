@@ -4,6 +4,11 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
+import {
+  ADMIN_RUNTIME_ENHANCEMENT_SCRIPT,
+  ADMIN_RUNTIME_ENHANCEMENT_STYLE
+} from './admin-runtime-enhancements.mjs';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..', '..');
@@ -15,20 +20,6 @@ const ADMIN_BOOTSTRAP_PLACEHOLDER = '__ADMIN_BOOTSTRAP_JSON__';
 const ADMIN_INIT_HEALTH_BANNER_PLACEHOLDER = '__INIT_HEALTH_BANNER__';
 const ADMIN_APP_ROOT_PLACEHOLDER = '__ADMIN_APP_ROOT__';
 const ADMIN_APP_ROOT_HTML = '<div id="app" v-cloak></div>';
-const ADMIN_RUNTIME_ENHANCEMENT_STYLE = `<style data-admin-runtime-enhancements="1">
-:root{--ui-control-radius-px:var(--ui-radius-px,10px)}
-#app-shell input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
-#app-shell select,
-#app-shell textarea,
-#app-shell label:has(> input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"])),
-#app-shell label:has(> select),
-#app-shell label:has(> textarea){border-radius:var(--ui-control-radius-px) !important}
-#app-shell i[data-lucide]{display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
-#app-shell svg.lucide{display:block;flex-shrink:0;stroke:currentColor}
-</style>`;
-const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancements="1">
-(()=>{if(window.__ADMIN_RUNTIME_ENHANCEMENTS_READY__)return;window.__ADMIN_RUNTIME_ENHANCEMENTS_READY__=!0;const enqueue="function"==typeof window.requestAnimationFrame?window.requestAnimationFrame.bind(window):callback=>window.setTimeout(callback,16);let frameId=0;function canRenderIcons(){return!!window.lucide&&"function"==typeof window.lucide.createIcons}function renderIcons(root=document.body){if(!canRenderIcons())return!1;try{return root&&root.nodeType===Node.ELEMENT_NODE?window.lucide.createIcons({root}):window.lucide.createIcons({}),!0}catch(error){return console.error("admin runtime lucide refresh failed",error),!1}}function scheduleIconRefresh(root=document.body){frameId||(frameId=enqueue(()=>{frameId=0,renderIcons(root)}))}function containsLucidePlaceholder(node){if(!node)return!1;if(node.matches?.("i[data-lucide]"))return!0;return!!node.querySelector?.("i[data-lucide]")}if("loading"===document.readyState?document.addEventListener("DOMContentLoaded",()=>scheduleIconRefresh(document.body),{once:!0}):scheduleIconRefresh(document.body),window.addEventListener("load",()=>scheduleIconRefresh(document.body),{once:!0}),"function"==typeof MutationObserver){const observer=new MutationObserver(records=>{for(const record of records){for(const node of record.addedNodes)if(node&&node.nodeType===Node.ELEMENT_NODE&&containsLucidePlaceholder(node))return void scheduleIconRefresh(document.body)}});"loading"===document.readyState?document.addEventListener("DOMContentLoaded",()=>{document.documentElement&&observer.observe(document.documentElement,{childList:!0,subtree:!0})},{once:!0}):document.documentElement&&observer.observe(document.documentElement,{childList:!0,subtree:!0})}})();
-</script>`;
 
 const PRIMARY_VIEWS = Object.freeze([
   'dashboard',
@@ -72,7 +63,8 @@ function buildFallbackBootstrap(adminPath = '/admin') {
     contract: {
       truthSources: {
         primaryUi: 'frontend/',
-        templateHtml: 'frontend/index.html',
+        templateHtml: 'frontend/admin-runtime.template.html',
+        runtimeEnhancements: 'frontend/scripts/admin-runtime-enhancements.mjs',
         contractDoc: 'worker.md'
       },
       bootstrapActions: {
@@ -131,19 +123,27 @@ function materializeFrontendIndex(templateHtml = '') {
     throw new Error('frontend/index.html 缺少 #app 根节点');
   }
 
-  return injectAdminRuntimeEnhancements(output);
+  return composeAdminRuntimeEnhancements(output);
 }
 
-function injectAdminRuntimeEnhancements(outputHtml = '') {
+function composeAdminRuntimeEnhancements(outputHtml = '') {
   const output = String(outputHtml || '');
   if (!output.includes('</head>')) {
-    throw new Error('frontend/index.html 缺少 </head>，无法注入 runtime enhancements');
+    throw new Error('frontend/index.html 缺少 </head>，无法组合 runtime enhancements');
+  }
+  if (output.includes('data-admin-runtime-enhancements="1"')) {
+    throw new Error('admin runtime template 不得内嵌重复的 runtime enhancements');
   }
 
-  return output.replace(
+  const composed = output.replace(
     '</head>',
     `${ADMIN_RUNTIME_ENHANCEMENT_STYLE}${ADMIN_RUNTIME_ENHANCEMENT_SCRIPT}</head>`
   );
+  const enhancementMarkerCount = composed.match(/data-admin-runtime-enhancements="1"/g)?.length || 0;
+  if (enhancementMarkerCount !== 2) {
+    throw new Error(`frontend/index.html runtime enhancements 数量异常：${enhancementMarkerCount}`);
+  }
+  return composed;
 }
 
 async function readText(filePath) {
@@ -155,8 +155,10 @@ async function main() {
   const nextIndexHtml = materializeFrontendIndex(sourceHtml);
   const metadata = {
     source: 'frontend/admin-runtime.template.html',
+    enhancements: 'frontend/scripts/admin-runtime-enhancements.mjs',
     target: 'frontend/index.html',
     sourceSha256: sha256(sourceHtml),
+    enhancementsSha256: sha256(`${ADMIN_RUNTIME_ENHANCEMENT_STYLE}${ADMIN_RUNTIME_ENHANCEMENT_SCRIPT}`),
     targetSha256: sha256(nextIndexHtml),
     generatedAt: new Date().toISOString()
   };
@@ -164,7 +166,7 @@ async function main() {
   if (process.argv.includes('--check')) {
     const currentHtml = await readText(targetHtmlPath).catch(() => '');
     if (currentHtml !== nextIndexHtml) {
-      console.error('[sync:admin-runtime] frontend/index.html 与 frontend/admin-runtime.template.html 不同步。');
+      console.error('[sync:admin-runtime] frontend/index.html 与模板及 runtime enhancements 不同步。');
       process.exit(1);
     }
     console.log(`[sync:admin-runtime] 已确认 frontend/index.html 同步完成 (${metadata.targetSha256})`);
@@ -173,7 +175,7 @@ async function main() {
 
   await writeFile(targetHtmlPath, nextIndexHtml, 'utf8');
   await writeFile(targetMetaPath, `${JSON.stringify(metadata, null, 2)}\n`, 'utf8');
-  console.log(`[sync:admin-runtime] 已同步 frontend/index.html <- frontend/admin-runtime.template.html (${metadata.targetSha256})`);
+  console.log(`[sync:admin-runtime] 已组合 frontend/index.html <- admin runtime template + enhancements (${metadata.targetSha256})`);
 }
 
 await main();

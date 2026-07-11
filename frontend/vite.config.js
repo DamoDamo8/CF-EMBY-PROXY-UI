@@ -41,6 +41,61 @@ function normalizeProxyTarget(rawValue = '') {
   return value || 'http://127.0.0.1:8787';
 }
 
+function readRequestProtocol(request) {
+  const forwardedProto = String(request?.headers?.['x-forwarded-proto'] || '')
+    .split(',')[0]
+    .trim()
+    .toLowerCase();
+  if (forwardedProto === 'https') return 'https';
+  return request?.socket?.encrypted ? 'https' : 'http';
+}
+
+function rewriteDevProxyLocation(locationHeader = '', target = '', request) {
+  const location = String(locationHeader || '').trim();
+  const requestHost = String(request?.headers?.host || '').trim();
+  if (!location || !requestHost) return location;
+
+  try {
+    const targetUrl = new URL(target);
+    const nextUrl = new URL(location, targetUrl);
+    if (nextUrl.origin !== targetUrl.origin) return location;
+    nextUrl.protocol = `${readRequestProtocol(request)}:`;
+    nextUrl.host = requestHost;
+    return nextUrl.toString();
+  } catch {
+    return location;
+  }
+}
+
+function rewriteDevProxySetCookieHeaders(setCookieHeader, request) {
+  if (readRequestProtocol(request) === 'https' || !setCookieHeader) return setCookieHeader;
+  const cookies = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+  return cookies.map((cookie) => String(cookie || '').replace(/;\s*Secure/gi, ''));
+}
+
+function createDevProxyRule(target) {
+  return {
+    target,
+    changeOrigin: true,
+    secure: false,
+    ws: false,
+    autoRewrite: true,
+    configure(proxy) {
+      proxy.on('proxyRes', (proxyRes, request) => {
+        const nextLocation = rewriteDevProxyLocation(proxyRes.headers.location, target, request);
+        if (nextLocation) {
+          proxyRes.headers.location = nextLocation;
+        }
+
+        const nextSetCookie = rewriteDevProxySetCookieHeaders(proxyRes.headers['set-cookie'], request);
+        if (nextSetCookie) {
+          proxyRes.headers['set-cookie'] = nextSetCookie;
+        }
+      });
+    }
+  };
+}
+
 function resolveVendorImportMap(env) {
   const dependencies = packageJson.dependencies || {};
   const vueVersion = normalizeSemver(dependencies.vue);
@@ -106,18 +161,8 @@ function createDevProxy(env) {
   const target = normalizeProxyTarget(env.VITE_DEV_PROXY_TARGET || env.VITE_API_BASE_URL);
 
   return {
-    [adminPath]: {
-      target,
-      changeOrigin: true,
-      secure: false,
-      ws: false
-    },
-    [`${adminPath}/`]: {
-      target,
-      changeOrigin: true,
-      secure: false,
-      ws: false
-    }
+    [adminPath]: createDevProxyRule(target),
+    [`${adminPath}/`]: createDevProxyRule(target)
   };
 }
 

@@ -11,4 +11,6 @@ npm-debug.log*
 bundled/
 package-lock.json
 prompts/
-/docs/
+banker/
+.admin-ui.from-*.html
+frontend/.admin-runtime-sync.json

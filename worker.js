@@ -36,6 +36,7 @@ const AUTH_DEFAULTS = Object.freeze({
 
 const CACHE_DEFAULTS = Object.freeze({
   CacheTTL: 60000,
+  NodeMissCacheTtlMs: 1000,
   CryptoKeyCacheTTL: 86400,
   CryptoKeyCacheMax: 100,
   NodeCacheMax: 5000,
@@ -230,7 +231,14 @@ const GLOBAL_CACHE_STATE = {
   NodesIndexCache: null,
   PlaybackInfoResponseCache: new Map(),
   PlaybackProgressRelay: new Map(),
-  CfRuntimeInFlight: new Map(),
+  SingleFlightTasks: new Map(),
+  RuntimeConfigCacheGeneration: 0,
+  NodesRevisionCacheGeneration: 0,
+  NodeCacheResetGeneration: 0,
+  NodeCacheGenerationNonce: 0,
+  NodeCacheGenerationEvictionEpoch: 0,
+  NodeCacheGenerations: new Map(),
+  AdminRemoteShellCacheMutationChains: new Map(),
   LogsReadinessProbeCache: new WeakMap()
 };
 
@@ -254,6 +262,7 @@ const GLOBAL_RUNTIME_STATE = {
   LogClearEpochMs: 0,
   LogLastFlushAt: 0,
   OpsStatusWriteChain: Promise.resolve(),
+  NodeIndexMutationChain: Promise.resolve(),
   InitCheckWarnedFingerprints: new Set()
 };
 
@@ -278,13 +287,11 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version, X-MediaBrowser-Authorization, X-MediaBrowser-Token"
 };
 
-const EMBY_WEB_BYPASS_COOKIE_NAME = "emby_web_bypass";
-const EMBY_WEB_BYPASS_COOKIE_MAX_AGE_SEC = 86400;
-const EMBY_WEB_BYPASS_QUERY_PARAM = "backup";
 const LEGACY_PROXY_CONTEXT_COOKIE_NAME = "legacy_proxy_ctx";
 const LEGACY_PROXY_CONTEXT_COOKIE_VERSION = 1;
 const LEGACY_PROXY_CONTEXT_COOKIE_MAX_AGE_SEC = 86400;
-const INTERNAL_PROXY_COOKIE_NAMES = [LEGACY_PROXY_CONTEXT_COOKIE_NAME, EMBY_WEB_BYPASS_COOKIE_NAME];
+// Keep stripping the retired Web bypass cookie so it never reaches Emby.
+const INTERNAL_PROXY_COOKIE_NAMES = [LEGACY_PROXY_CONTEXT_COOKIE_NAME, "emby_web_bypass"];
 const LEGACY_PROXY_CONTEXT_FALLBACK_ROOTS = new Set([
   "users",
   "items",
@@ -292,8 +299,7 @@ const LEGACY_PROXY_CONTEXT_FALLBACK_ROOTS = new Set([
   "audio",
   "livetv",
   "sessions",
-  "system",
-  "web"
+  "system"
 ]);
 
 function mergeVaryHeader(headers, value) {
@@ -508,24 +514,128 @@ function getCloudflareQuotaPeriodContext(planClass = "free", now = new Date()) {
   };
 }
 
-function buildCloudflareRuntimeInFlightKey(parts = []) {
-  return (Array.isArray(parts) ? parts : [parts]).map(item => String(item || "").trim()).filter(Boolean).join(":");
+function buildSingleFlightKey(parts = []) {
+  return (Array.isArray(parts) ? parts : [parts]).map(item => String(item ?? "").trim()).filter(Boolean).join(":");
 }
 
-async function runCloudflareRuntimeDeduped(key, loader) {
+async function runSingleFlight(key, loader) {
   const dedupeKey = String(key || "").trim();
-  if (!dedupeKey || typeof loader !== "function") return await loader();
-  const existingTask = GLOBALS.CfRuntimeInFlight.get(dedupeKey);
+  if (!dedupeKey) return await loader();
+  const existingTask = GLOBALS.SingleFlightTasks.get(dedupeKey);
   if (existingTask) return await existingTask;
   const nextTask = Promise.resolve()
     .then(() => loader())
     .finally(() => {
-      if (GLOBALS.CfRuntimeInFlight.get(dedupeKey) === nextTask) {
-        GLOBALS.CfRuntimeInFlight.delete(dedupeKey);
+      if (GLOBALS.SingleFlightTasks.get(dedupeKey) === nextTask) {
+        GLOBALS.SingleFlightTasks.delete(dedupeKey);
       }
     });
-  GLOBALS.CfRuntimeInFlight.set(dedupeKey, nextTask);
+  GLOBALS.SingleFlightTasks.set(dedupeKey, nextTask);
   return await nextTask;
+}
+
+function invalidateRuntimeConfigCache() {
+  GLOBALS.RuntimeConfigCacheGeneration += 1;
+  GLOBALS.ConfigCache = null;
+}
+
+function getRuntimeConfigCacheNamespace(env) {
+  return String(
+    env?.__CONFIG_CACHE_NAMESPACE
+    || env?.__WORKER_CACHE_SCOPE
+    || (env?.ENI_KV ? "ENI_KV" : "")
+    || (env?.KV ? "KV" : "")
+    || (env?.EMBY_KV ? "EMBY_KV" : "")
+    || (env?.EMBY_PROXY ? "EMBY_PROXY" : "")
+    || "default"
+  );
+}
+
+function primeRuntimeConfigCache(env, config) {
+  GLOBALS.RuntimeConfigCacheGeneration += 1;
+  GLOBALS.ConfigCache = {
+    data: config,
+    exp: Date.now() + Config.Defaults.CacheTTL,
+    namespace: getRuntimeConfigCacheNamespace(env)
+  };
+}
+
+function invalidateNodesRevisionCache() {
+  GLOBALS.NodesRevisionCacheGeneration += 1;
+  GLOBALS.NodesRevisionCache = null;
+}
+
+function primeNodesRevisionCache(revision) {
+  GLOBALS.NodesRevisionCacheGeneration += 1;
+  GLOBALS.NodesRevisionCache = {
+    loaded: true,
+    revision: String(revision || "").trim(),
+    exp: Date.now() + Config.Defaults.NodesRevisionCacheTtlMs
+  };
+}
+
+function getNodeCacheToken(nodeName) {
+  const normalizedName = String(nodeName || "").trim().toLowerCase();
+  const nodeGeneration = normalizedName ? Number(GLOBALS.NodeCacheGenerations.get(normalizedName)) || 0 : 0;
+  const generationToken = nodeGeneration
+    ? `node:${nodeGeneration}`
+    : `missing:${GLOBALS.NodeCacheGenerationEvictionEpoch}`;
+  return `${GLOBALS.NodeCacheResetGeneration}:${generationToken}`;
+}
+
+function invalidateNodeCacheTokens(nodeNames = []) {
+  for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
+    const name = String(rawName || "").trim().toLowerCase();
+    if (!name) continue;
+    if (!GLOBALS.NodeCacheGenerations.has(name)
+      && GLOBALS.NodeCacheGenerations.size >= Config.Defaults.NodeCacheMax
+    ) {
+      GLOBALS.NodeCacheGenerationEvictionEpoch += 1;
+    }
+    const nextGeneration = ++GLOBALS.NodeCacheGenerationNonce;
+    setBoundedMapEntry(GLOBALS.NodeCacheGenerations, name, nextGeneration, Config.Defaults.NodeCacheMax);
+  }
+}
+
+function resetNodeCacheTokens() {
+  GLOBALS.NodeCacheResetGeneration += 1;
+  GLOBALS.NodeCacheGenerations.clear();
+}
+
+async function runNodeIndexMutation(mutation) {
+  const previousMutation = GLOBALS.NodeIndexMutationChain;
+  const mutationTask = previousMutation
+    .catch(() => null)
+    .then(async () => {
+      GLOBALS.NodesListCache = null;
+      GLOBALS.NodesIndexCache = null;
+      invalidateNodesRevisionCache();
+      try {
+        return await mutation();
+      } catch (error) {
+        GLOBALS.NodesListCache = null;
+        GLOBALS.NodesIndexCache = null;
+        invalidateNodesRevisionCache();
+        throw error;
+      }
+    });
+  GLOBALS.NodeIndexMutationChain = mutationTask.catch(() => null);
+  return await mutationTask;
+}
+
+async function runAdminRemoteShellCacheMutation(cacheKeyUrl, mutation) {
+  const mutationKey = String(cacheKeyUrl);
+  const previousMutation = GLOBALS.AdminRemoteShellCacheMutationChains.get(mutationKey) || Promise.resolve();
+  const nextMutation = previousMutation
+    .catch(() => null)
+    .then(() => mutation())
+    .finally(() => {
+      if (GLOBALS.AdminRemoteShellCacheMutationChains.get(mutationKey) === nextMutation) {
+        GLOBALS.AdminRemoteShellCacheMutationChains.delete(mutationKey);
+      }
+    });
+  GLOBALS.AdminRemoteShellCacheMutationChains.set(mutationKey, nextMutation);
+  return await nextMutation;
 }
 
 function trimCloudflareRuntimeErrorMessage(error, fallbackText = "cloudflare_runtime_error") {
@@ -1250,6 +1360,26 @@ function sanitizeProxyPath(path) {
   if (!raw.startsWith("/")) raw = "/" + raw;
   raw = raw.replace(/^\/+/, "/");
   return raw;
+}
+
+function isEmbyWebProxyPath(proxyPath = "") {
+  let decodedPath = sanitizeProxyPath(proxyPath);
+  while (true) {
+    const nextPath = decodedPath.replace(/%([0-9a-f]{2})/gi, (encodedByte, hex) => {
+      const byteValue = Number.parseInt(hex, 16);
+      return byteValue <= 0x7f ? String.fromCharCode(byteValue) : encodedByte;
+    });
+    if (nextPath === decodedPath) break;
+    decodedPath = nextPath;
+  }
+  const canonicalSegments = [];
+  for (const segment of decodedPath.replace(/\\/g, "/").toLowerCase().split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") canonicalSegments.pop();
+    else canonicalSegments.push(segment);
+  }
+  const canonicalPath = `/${canonicalSegments.join("/")}`;
+  return canonicalPath === "/web" || canonicalPath.startsWith("/web/");
 }
 
 function encodeBase64UrlUtf8(value = "") {
@@ -6880,44 +7010,48 @@ function classifyCloudflareAnalyticsError(message, options = {}) {
 async function getRuntimeConfig(env) {
   const kv = Auth.getKV(env);
   if (!kv) return {};
-  const now = nowMs();
-  const cacheNamespace = String(
-    env?.__CONFIG_CACHE_NAMESPACE
-    || env?.__WORKER_CACHE_SCOPE
-    || (env?.ENI_KV ? "ENI_KV" : "")
-    || (env?.KV ? "KV" : "")
-    || (env?.EMBY_KV ? "EMBY_KV" : "")
-    || (env?.EMBY_PROXY ? "EMBY_PROXY" : "")
-    || "default"
-  );
-  const cachedConfig = GLOBALS.ConfigCache && GLOBALS.ConfigCache.namespace === cacheNamespace
-    ? GLOBALS.ConfigCache.data
+  const cacheNamespace = getRuntimeConfigCacheNamespace(env);
+  const cachedConfig = GLOBALS.ConfigCache?.namespace === cacheNamespace
+    ? GLOBALS.ConfigCache
     : null;
-  if (GLOBALS.ConfigCache && GLOBALS.ConfigCache.exp > now && GLOBALS.ConfigCache.data && GLOBALS.ConfigCache.namespace === cacheNamespace) return GLOBALS.ConfigCache.data;
-  let config = cachedConfig && typeof cachedConfig === "object" ? cachedConfig : {};
-  try {
-    const rawConfig = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
-    const migrationState = migrateRuntimeConfigLegacyAliases(rawConfig);
-    config = sanitizeRuntimeConfig(migrationState.config);
-    if (migrationState.migrated === true) {
-      await withNonCriticalFallback(
-        kv.put(Database.CONFIG_KEY, JSON.stringify(config)),
-        "runtime_config.persist_migration",
-        { cacheNamespace, configKey: Database.CONFIG_KEY },
-        null
-      );
+  if (cachedConfig?.exp > nowMs() && cachedConfig.data) return cachedConfig.data;
+
+  const cacheGeneration = GLOBALS.RuntimeConfigCacheGeneration;
+  return await runSingleFlight(
+    buildSingleFlightKey(["runtime_config", cacheNamespace, cacheGeneration]),
+    async () => {
+      const activeCache = GLOBALS.ConfigCache?.namespace === cacheNamespace
+        ? GLOBALS.ConfigCache
+        : null;
+      if (activeCache?.exp > nowMs() && activeCache.data) return activeCache.data;
+
+      const staleConfig = activeCache?.data && typeof activeCache.data === "object"
+        ? activeCache.data
+        : (cachedConfig?.data && typeof cachedConfig.data === "object" ? cachedConfig.data : null);
+      let config = staleConfig || {};
+      try {
+        const rawConfig = await kv.get(Database.CONFIG_KEY, { type: "json" }) || {};
+        const migrationState = migrateRuntimeConfigLegacyAliases(rawConfig);
+        config = sanitizeRuntimeConfig(migrationState.config);
+      } catch (error) {
+        const hasCachedConfig = staleConfig && typeof staleConfig === "object";
+        logRuntimeFailure("runtime_config.load_failed", error, {
+          cacheNamespace,
+          configKey: Database.CONFIG_KEY,
+          usedCachedConfig: hasCachedConfig === true
+        });
+        config = hasCachedConfig ? staleConfig : sanitizeRuntimeConfig({});
+      }
+      if (GLOBALS.RuntimeConfigCacheGeneration === cacheGeneration) {
+        GLOBALS.ConfigCache = {
+          data: config,
+          exp: nowMs() + Config.Defaults.CacheTTL,
+          namespace: cacheNamespace
+        };
+      }
+      return config;
     }
-  } catch (error) {
-    const hasCachedConfig = cachedConfig && typeof cachedConfig === "object";
-    logRuntimeFailure("runtime_config.load_failed", error, {
-      cacheNamespace,
-      configKey: Database.CONFIG_KEY,
-      usedCachedConfig: hasCachedConfig === true
-    });
-    config = hasCachedConfig ? cachedConfig : sanitizeRuntimeConfig({});
-  }
-  GLOBALS.ConfigCache = { data: config, exp: now + 60000, namespace: cacheNamespace };
-  return config;
+  );
 }
 
 async function getRuntimeConfigStrict(env) {
@@ -7060,40 +7194,13 @@ function buildLegacyProxyContextClearCookie() {
   return `${LEGACY_PROXY_CONTEXT_COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT`;
 }
 
-function hasEmbyWebBypassCookie(cookieHeader = "") {
-  return String(parseCookieHeader(cookieHeader).get(EMBY_WEB_BYPASS_COOKIE_NAME) || "").trim() === "1";
-}
-
-function buildEmbyWebBypassSetCookie() {
-  return `${EMBY_WEB_BYPASS_COOKIE_NAME}=1; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${EMBY_WEB_BYPASS_COOKIE_MAX_AGE_SEC}`;
-}
-
-function buildWebAccessGuideResponse(requestUrl, requestMethod = "GET", dynamicCors = null) {
-  const currentUrl = requestUrl instanceof URL ? new URL(requestUrl.toString()) : new URL(String(requestUrl || ""));
-  const backupUrl = new URL(currentUrl.toString());
-  const homeUrl = new URL("/", currentUrl);
-  backupUrl.searchParams.set(EMBY_WEB_BYPASS_QUERY_PARAM, "1");
-  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Emby Web 备用模式</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:radial-gradient(circle at top,#1e293b 0,#0f172a 45%,#020617 100%);color:#e2e8f0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.panel{width:min(100%,440px);background:rgba(15,23,42,.88);border:1px solid rgba(148,163,184,.2);border-radius:24px;padding:32px;box-shadow:0 24px 80px rgba(15,23,42,.45)}h1{margin:0 0 14px;font-size:24px;line-height:1.3}p{margin:0 0 14px;color:#cbd5e1;line-height:1.7}.muted{font-size:13px;color:#94a3b8}.actions{display:flex;flex-direction:column;gap:12px;margin-top:28px}.btn{display:inline-flex;align-items:center;justify-content:center;width:100%;padding:12px 18px;border-radius:14px;text-decoration:none;font-weight:700;transition:transform .15s ease,filter .15s ease}.btn:hover{transform:translateY(-1px);filter:brightness(1.05)}.btn-primary{background:#22c55e;color:#052e16}.btn-secondary{border:1px solid rgba(148,163,184,.25);color:#e2e8f0;background:rgba(30,41,59,.55)}code{word-break:break-all;background:rgba(15,23,42,.92);padding:2px 6px;border-radius:8px;color:#93c5fd}@media (max-width:520px){body{padding:16px}.panel{padding:24px}}</style></head><body><main class="panel"><h1>Emby Web 默认处于 API 优先模式</h1><p>当前代理默认优先面向客户端 API 与媒体请求，Web 页面首次访问需要额外确认后才会放行。</p><p>点击下方按钮后，Worker 会为当前浏览器写入 24 小时的 Web 临时授权 Cookie，并立即返回原始页面。</p><p class="muted">当前地址：<code>${escapeHtml(currentUrl.toString())}</code></p><div class="actions"><a class="btn btn-primary" href="${escapeHtml(backupUrl.toString())}">启用 Web 备用模式（24 小时）</a><a class="btn btn-secondary" href="${escapeHtml(homeUrl.toString())}">返回站点首页</a></div></main></body></html>`;
+function buildEmbyWebProxyDisabledResponse(requestMethod = "GET", dynamicCors = null) {
   const headers = dynamicCors ? new Headers(dynamicCors) : new Headers();
-  headers.set("Content-Type", "text/html;charset=UTF-8");
+  headers.set("Content-Type", "text/plain; charset=utf-8");
   headers.set("Cache-Control", "no-store, max-age=0");
   applySecurityHeaders(headers);
   if (headers.get("Access-Control-Allow-Origin") !== "*") mergeVaryHeader(headers, "Origin");
-  return new Response(requestMethod === "HEAD" ? null : html, { status: 403, headers });
-}
-
-function buildEmbyWebBypassRedirectResponse(requestUrl, dynamicCors = null) {
-  const cleanUrl = requestUrl instanceof URL ? new URL(requestUrl.toString()) : new URL(String(requestUrl || ""));
-  while (cleanUrl.searchParams.has(EMBY_WEB_BYPASS_QUERY_PARAM)) {
-    cleanUrl.searchParams.delete(EMBY_WEB_BYPASS_QUERY_PARAM);
-  }
-  const headers = dynamicCors ? new Headers(dynamicCors) : new Headers();
-  headers.set("Location", cleanUrl.toString());
-  headers.set("Cache-Control", "no-store, max-age=0");
-  headers.append("Set-Cookie", buildEmbyWebBypassSetCookie());
-  applySecurityHeaders(headers);
-  if (headers.get("Access-Control-Allow-Origin") !== "*") mergeVaryHeader(headers, "Origin");
-  return new Response(null, { status: 302, headers });
+  return new Response(requestMethod === "HEAD" ? null : "Not Found", { status: 404, headers });
 }
 
 function jsonHeaders(extra = {}) {
@@ -9315,7 +9422,7 @@ const CacheManager = {
   async invalidateList(ctx) {
     GLOBALS.NodesListCache = null;
     GLOBALS.NodesIndexCache = null;
-    GLOBALS.NodesRevisionCache = null;
+    invalidateNodesRevisionCache();
   },
   maybeCleanup() {
     const now = nowMs();
@@ -10138,12 +10245,15 @@ const Database = {
     };
   },
   async ensureNodesIndexMeta(kv, options = {}) {
-    const index = Array.isArray(options.index) ? this.normalizeNodeIndex(options.index) : await this.getNodesIndex(kv);
+    if (!kv) return this.buildNodesIndexMeta([], []);
     let nodes = Array.isArray(options.nodes) ? this.normalizeNodeSummaryIndex(options.nodes).nodes : null;
     if (!nodes) {
       const summaryIndexNodes = await this.getNodesSummaryIndex(kv, { ctx: options.ctx });
       nodes = Array.isArray(summaryIndexNodes) ? summaryIndexNodes : [];
     }
+    const index = Array.isArray(options.index)
+      ? this.normalizeNodeIndex(options.index)
+      : this.normalizeNodeIndex(nodes.map(node => node?.name));
     const nextMeta = this.buildNodesIndexMeta(index, nodes, options);
     const currentMeta = await this.readRevisionMeta(kv, this.NODES_INDEX_META_KEY, {
       count: 0,
@@ -10158,26 +10268,43 @@ const Database = {
     ) {
       return currentMeta;
     }
-    return await this.writeRevisionMeta(kv, this.NODES_INDEX_META_KEY, nextMeta, options.ctx);
+    return await runNodeIndexMutation(async () => {
+      const currentNodes = await this.loadNodeSummariesForMutation(kv, { ctx: options.ctx });
+      const committed = await this.commitNodesSummaryIndexMutation(currentNodes, { kv, ctx: options.ctx });
+      return committed.meta;
+    });
   },
   async getNodesRevision(kv, options = {}) {
     if (!kv) return "";
     const now = nowMs();
-    if (options.forceFresh !== true && GLOBALS.NodesRevisionCache?.exp > now && String(GLOBALS.NodesRevisionCache.revision || "").trim()) {
+    if (options.forceFresh !== true && GLOBALS.NodesRevisionCache?.loaded === true && GLOBALS.NodesRevisionCache.exp > now) {
       return String(GLOBALS.NodesRevisionCache.revision || "").trim();
     }
-    let meta = null;
-    try {
-      meta = await kv.get(this.NODES_INDEX_META_KEY, { type: "json" });
-    } catch {
-      meta = null;
-    }
-    const revision = isPlainObject(meta) ? String(meta.revision || "").trim() : "";
-    GLOBALS.NodesRevisionCache = {
-      revision,
-      exp: now + Config.Defaults.NodesRevisionCacheTtlMs
-    };
-    return revision;
+    const cacheGeneration = GLOBALS.NodesRevisionCacheGeneration;
+    return await runSingleFlight(
+      buildSingleFlightKey(["nodes_revision", cacheGeneration]),
+      async () => {
+        const activeCache = GLOBALS.NodesRevisionCache;
+        if (options.forceFresh !== true && activeCache?.loaded === true && activeCache.exp > nowMs()) {
+          return String(activeCache.revision || "").trim();
+        }
+        let meta = null;
+        try {
+          meta = await kv.get(this.NODES_INDEX_META_KEY, { type: "json" });
+        } catch {
+          return "";
+        }
+        const revision = isPlainObject(meta) ? String(meta.revision || "").trim() : "";
+        if (GLOBALS.NodesRevisionCacheGeneration === cacheGeneration) {
+          GLOBALS.NodesRevisionCache = {
+            loaded: true,
+            revision,
+            exp: nowMs() + Config.Defaults.NodesRevisionCacheTtlMs
+          };
+        }
+        return revision;
+      }
+    );
   },
   getLogsRevisionFromStatus(logStatus = {}) {
     const revision = String(logStatus?.revision || "").trim();
@@ -10229,8 +10356,8 @@ const Database = {
         fullIndexHash: ""
       }),
       this.readRevisionMetaForRead(kv, this.CONFIG_SNAPSHOTS_META_KEY, { count: 0 }),
-      this.getOpsStatusSectionForRead({ kv, db }, "log"),
-      this.getOpsStatusSectionForRead({ kv, db }, "dnsIpPool")
+      this.getOpsStatusSection({ kv, db }, "log"),
+      this.getOpsStatusSection({ kv, db }, "dnsIpPool")
     ]);
     let configMeta = storedConfigMeta;
     if (!configMeta) {
@@ -11649,8 +11776,8 @@ const Database = {
       ? await this.getCfRuntimeCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true })
       : null;
     try {
-      const payload = await runCloudflareRuntimeDeduped(
-        buildCloudflareRuntimeInFlightKey(["cf_runtime", cacheGroup, cacheKey]),
+      const payload = await runSingleFlight(
+        buildSingleFlightKey(["cf_runtime", cacheGroup, cacheKey]),
         async () => {
           const nextPayload = await loader();
           if (db) {
@@ -12103,7 +12230,7 @@ const Database = {
     const kv = options?.kv || this.getKV(env);
     const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
     const forceRefresh = options?.forceRefresh === true;
-    const opsStatus = await this.getOpsStatusForRead({ kv, db });
+    const opsStatus = await this.getOpsStatus({ kv, db });
     let cloudflare = {
       kv: buildCloudflareRuntimeQuotaSkippedCard("KV", "Cloudflare 配额尚未加载", "等待运行状态接口返回 Cloudflare 配额数据。"),
       d1: buildCloudflareRuntimeQuotaSkippedCard("D1", "Cloudflare 配额尚未加载", "等待运行状态接口返回 Cloudflare 配额数据。")
@@ -12129,8 +12256,8 @@ const Database = {
     const initHealth = buildInitHealth(env);
     const forceRefresh = options?.forceRefresh === true;
     const generatedAtMs = Math.max(0, Number(options.nowMs) || nowMs());
-    const runtimeStatus = await runCloudflareRuntimeDeduped(
-      buildCloudflareRuntimeInFlightKey(["runtime_status", forceRefresh ? "force" : "default"]),
+    const runtimeStatus = await runSingleFlight(
+      buildSingleFlightKey(["runtime_status", forceRefresh ? "force" : "default"]),
       async () => this.buildDashboardRuntimeStatusPayload(env, { kv, db, config, forceRefresh })
     );
     return {
@@ -12175,8 +12302,8 @@ const Database = {
       : null;
 
     try {
-      const snapshot = await runCloudflareRuntimeDeduped(
-        buildCloudflareRuntimeInFlightKey(["dashboard_snapshot", cacheKey, forceRefresh ? "force" : "default"]),
+      const snapshot = await runSingleFlight(
+        buildSingleFlightKey(["dashboard_snapshot", cacheKey, forceRefresh ? "force" : "default"]),
         async () => {
           const [stats, runtimeStatus] = await Promise.all([
             this.buildDashboardStatsPayload(env, { ctx, kv, db, config, dayWindow, nowMs: nowTimestamp }),
@@ -12465,7 +12592,12 @@ const Database = {
     const status = root && typeof root === "object" ? { ...root } : {};
     let latestUpdatedAt = typeof status.updatedAt === "string" ? status.updatedAt : "";
     const sectionEntries = await Promise.all(this.getOpsStatusSectionEntries().map(async ([sectionName]) => {
-      const sectionValue = await this.getOpsStatusSectionFromStores(stores, sectionName);
+      const storedSection = await this.getOpsStatusPayloadFromDb(db, this.getOpsStatusDbScope(sectionName));
+      const rootSection = root && typeof root[sectionName] === "object" ? root[sectionName] : {};
+      const sectionValue = mergeStatusPatch(
+        storedSection && typeof storedSection === "object" ? storedSection : {},
+        rootSection
+      );
       return [sectionName, sectionValue];
     }));
     for (const [sectionName, sectionValue] of sectionEntries) {
@@ -12479,50 +12611,6 @@ const Database = {
   },
   async getOpsStatus(envOrStore) {
     return this.getOpsStatusFromStores(this.resolveOpsStatusStores(envOrStore));
-  },
-  async getOpsStatusRootForRead(stores) {
-    const db = stores?.db || null;
-    if (!db) return {};
-    const dbRoot = await this.getOpsStatusPayloadFromDb(db, this.getOpsStatusDbScope());
-    const root = dbRoot && typeof dbRoot === "object" ? dbRoot : {};
-    const shadowPatch = this.getOpsStatusShadowPatch(db);
-    return mergeStatusPatch(root, shadowPatch && typeof shadowPatch === "object" ? shadowPatch : {});
-  },
-  async getOpsStatusSectionForRead(stores, sectionName) {
-    const db = stores?.db || null;
-    if (!sectionName) return {};
-    if (!this.OPS_STATUS_SECTION_SCOPES[sectionName]) return {};
-    const loadSectionValue = async () => {
-      if (!db) return null;
-      const dbValue = await this.getOpsStatusPayloadFromDb(db, this.getOpsStatusDbScope(sectionName));
-      return dbValue && typeof dbValue === "object" ? dbValue : null;
-    };
-    const [root, sectionValue] = await Promise.all([
-      this.getOpsStatusRootForRead(stores),
-      loadSectionValue()
-    ]);
-    const rootSection = root && typeof root[sectionName] === "object" ? root[sectionName] : {};
-    return mergeStatusPatch(sectionValue && typeof sectionValue === "object" ? sectionValue : {}, rootSection);
-  },
-  async getOpsStatusForRead(envOrStore) {
-    const stores = this.resolveOpsStatusStores(envOrStore);
-    const db = stores?.db || null;
-    if (!db) return {};
-    const root = await this.getOpsStatusRootForRead(stores);
-    const status = root && typeof root === "object" ? { ...root } : {};
-    let latestUpdatedAt = typeof status.updatedAt === "string" ? status.updatedAt : "";
-    const sectionEntries = await Promise.all(this.getOpsStatusSectionEntries().map(async ([sectionName]) => {
-      const sectionValue = await this.getOpsStatusSectionForRead(stores, sectionName);
-      return [sectionName, sectionValue];
-    }));
-    for (const [sectionName, sectionValue] of sectionEntries) {
-      if (!sectionValue || typeof sectionValue !== "object") continue;
-      if (!Object.keys(sectionValue).length) continue;
-      status[sectionName] = mergeStatusPatch(status[sectionName], sectionValue);
-      if (typeof sectionValue.updatedAt === "string" && sectionValue.updatedAt > latestUpdatedAt) latestUpdatedAt = sectionValue.updatedAt;
-    }
-    if (latestUpdatedAt) status.updatedAt = latestUpdatedAt;
-    return status;
   },
   getLogClearEpochMsFromStatus(logStatus) {
     const epoch = Number(logStatus?.clearEpochMs);
@@ -12846,11 +12934,15 @@ const Database = {
       return GLOBALS.NodesListCache.data;
     }
     if (!kv) return null;
+    const cacheGeneration = GLOBALS.NodesRevisionCacheGeneration;
     let stored = null;
     try {
       stored = await kv.get(this.NODES_SUMMARY_INDEX_KEY, { type: "json" });
     } catch {
       return null;
+    }
+    if (GLOBALS.NodesRevisionCacheGeneration !== cacheGeneration) {
+      return Array.isArray(stored) ? this.normalizeNodeSummaryIndex(stored).nodes : null;
     }
     if (!Array.isArray(stored)) return null;
     const normalized = this.normalizeNodeSummaryIndex(stored);
@@ -12858,37 +12950,48 @@ const Database = {
       const rebuilt = await this.rebuildNodeIndexesFromKv(kv, { ctx: options.ctx });
       return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
     }
-    if (normalized.changed) {
-      return await this.persistNodesSummaryIndex(normalized.nodes, { kv, ctx: options.ctx });
-    }
-    return this.primeNodeSummaryCaches(normalized.nodes);
+    return GLOBALS.NodesRevisionCacheGeneration === cacheGeneration
+      ? this.primeNodeSummaryCaches(normalized.nodes)
+      : normalized.nodes;
   },
   async getNodesSummaryIndexStrict(kv, options = {}) {
     if (options.useCache !== false && GLOBALS.NodesListCache?.exp > nowMs() && Array.isArray(GLOBALS.NodesListCache.data)) {
       return GLOBALS.NodesListCache.data;
     }
     if (!kv) return null;
+    const cacheGeneration = GLOBALS.NodesRevisionCacheGeneration;
     const stored = await kvGetStrict(kv, this.NODES_SUMMARY_INDEX_KEY, { type: "json" });
+    if (GLOBALS.NodesRevisionCacheGeneration !== cacheGeneration) {
+      return Array.isArray(stored) ? this.normalizeNodeSummaryIndex(stored).nodes : [];
+    }
     if (!Array.isArray(stored)) {
       const rebuilt = await this.rebuildNodeIndexesFromKvStrict(kv, { ctx: options.ctx });
-      return Array.isArray(rebuilt?.summaries) ? this.primeNodeSummaryCaches(rebuilt.summaries) : [];
+      return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
     }
     const normalized = this.normalizeNodeSummaryIndex(stored);
     if (normalized.requiresRebuild === true) {
       const rebuilt = await this.rebuildNodeIndexesFromKvStrict(kv, { ctx: options.ctx });
-      return Array.isArray(rebuilt?.summaries) ? this.primeNodeSummaryCaches(rebuilt.summaries) : [];
+      return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
     }
-    return this.primeNodeSummaryCaches(normalized.nodes);
+    return GLOBALS.NodesRevisionCacheGeneration === cacheGeneration
+      ? this.primeNodeSummaryCaches(normalized.nodes)
+      : normalized.nodes;
   },
-  async persistNodesSummaryIndex(nodes, options = {}) {
-    const { kv, ctx, syncLegacyIndex = false } = options;
-    const normalized = this.normalizeNodeSummaryIndex(nodes);
-    const normalizedNodes = normalized.nodes;
-    if (!kv) {
-      const committedNodes = this.primeNodeSummaryCaches(normalizedNodes);
-      GLOBALS.NodesRevisionCache = null;
-      return committedNodes;
+  async loadNodeSummariesForMutation(kv, options = {}) {
+    const stored = await kv.get(this.NODES_SUMMARY_INDEX_KEY, { type: "json" });
+    if (Array.isArray(stored)) {
+      const normalized = this.normalizeNodeSummaryIndex(stored);
+      if (normalized.requiresRebuild !== true) return normalized.nodes;
     }
+    const nodes = await this.loadAllNodeEntitiesFromKvStrict(kv, { ctx: options.ctx });
+    return nodes
+      .map(node => this.buildNodeSummary(node?.name, node).summary)
+      .filter(Boolean);
+  },
+  // The caller owns NodeIndexMutationChain across every read that feeds this commit.
+  async commitNodesSummaryIndexMutation(nodes, options = {}) {
+    const { kv, ctx, syncLegacyIndex = false } = options;
+    const normalizedNodes = this.normalizeNodeSummaryIndex(nodes).nodes;
     const normalizedIndex = this.normalizeNodeIndex(normalizedNodes.map(node => node.name));
     const nextMeta = this.buildNodesIndexMeta(normalizedIndex, normalizedNodes);
     const currentMeta = await this.readRevisionMeta(kv, this.NODES_INDEX_META_KEY, {
@@ -12896,33 +12999,47 @@ const Database = {
       indexHash: "",
       fullIndexHash: ""
     });
-    const tasks = [];
+    const contentTasks = [];
     if (currentMeta.fullIndexHash !== nextMeta.fullIndexHash || !currentMeta.revision) {
-      tasks.push(kv.put(this.NODES_SUMMARY_INDEX_KEY, JSON.stringify(normalizedNodes)));
+      contentTasks.push(kv.put(this.NODES_SUMMARY_INDEX_KEY, JSON.stringify(normalizedNodes)));
     }
     if (syncLegacyIndex !== false && (currentMeta.indexHash !== nextMeta.indexHash || !currentMeta.revision)) {
-      tasks.push(kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex)));
+      contentTasks.push(kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex)));
     }
-    if (
+    const metaNeedsWrite = (
       currentMeta.indexHash !== nextMeta.indexHash
       || currentMeta.fullIndexHash !== nextMeta.fullIndexHash
       || Number(currentMeta.count) !== Number(nextMeta.count)
       || !currentMeta.revision
-    ) {
-      tasks.push(kv.put(this.NODES_INDEX_META_KEY, JSON.stringify(nextMeta)));
+    );
+    if (contentTasks.length > 0) {
+      const task = Promise.all(contentTasks);
+      if (ctx) ctx.waitUntil(task);
+      await task;
     }
-    if (tasks.length > 0) {
-      const task = Promise.all(tasks);
+    if (metaNeedsWrite) {
+      const task = kv.put(this.NODES_INDEX_META_KEY, JSON.stringify(nextMeta));
       if (ctx) ctx.waitUntil(task);
       await task;
     }
     const committedNodes = this.primeNodeSummaryCaches(normalizedNodes);
-    const committedRevision = String((tasks.length > 0 ? nextMeta.revision : currentMeta.revision || nextMeta.revision) || "").trim();
-    GLOBALS.NodesRevisionCache = {
-      revision: committedRevision,
-      exp: nowMs() + Config.Defaults.NodesRevisionCacheTtlMs
-    };
-    return committedNodes;
+    const committedMeta = metaNeedsWrite ? nextMeta : currentMeta;
+    primeNodesRevisionCache(committedMeta.revision);
+    return { summaries: committedNodes, meta: committedMeta };
+  },
+  async persistNodesSummaryIndex(nodes, options = {}) {
+    const { kv, ctx, syncLegacyIndex = false } = options;
+    const normalized = this.normalizeNodeSummaryIndex(nodes);
+    const normalizedNodes = normalized.nodes;
+    if (!kv) {
+      const committedNodes = this.primeNodeSummaryCaches(normalizedNodes);
+      invalidateNodesRevisionCache();
+      return committedNodes;
+    }
+    return await runNodeIndexMutation(async () => {
+      const committed = await this.commitNodesSummaryIndexMutation(normalizedNodes, { kv, ctx, syncLegacyIndex });
+      return committed.summaries;
+    });
   },
   async listNodeEntityKeys(kv) {
     const keys = await this.listKvKeys(kv, { prefix: this.PREFIX });
@@ -12973,26 +13090,31 @@ const Database = {
     if (!kv) {
       return { index: [], summaries: [], nodes: [] };
     }
-    const nodes = await this.loadAllNodeEntitiesFromKv(kv, { ctx });
-    const summaries = nodes
-      .map((node) => this.buildNodeSummary(node?.name, node).summary)
-      .filter(Boolean);
-    const persistedSummaries = await this.persistNodesSummaryIndex(summaries, { kv, ctx, syncLegacyIndex });
-    return {
-      index: this.normalizeNodeIndex(persistedSummaries.map(node => node?.name)),
-      summaries: persistedSummaries,
-      nodes
-    };
+    return await runNodeIndexMutation(async () => {
+      const nodes = await this.loadAllNodeEntitiesFromKvStrict(kv, { ctx });
+      const summaries = nodes
+        .map((node) => this.buildNodeSummary(node?.name, node).summary)
+        .filter(Boolean);
+      const committed = await this.commitNodesSummaryIndexMutation(summaries, { kv, ctx, syncLegacyIndex });
+      return {
+        index: this.normalizeNodeIndex(committed.summaries.map(node => node?.name)),
+        summaries: committed.summaries,
+        nodes
+      };
+    });
   },
   async rebuildNodeIndexesFromKvStrict(kv, options = {}) {
     if (!kv) {
       return { index: [], summaries: [], nodes: [] };
     }
+    const cacheGeneration = GLOBALS.NodesRevisionCacheGeneration;
     const nodes = await this.loadAllNodeEntitiesFromKvStrict(kv, options);
     const summaries = nodes
       .map((node) => this.buildNodeSummary(node?.name, node).summary)
       .filter(Boolean);
-    const normalizedSummaries = this.primeNodeSummaryCaches(summaries);
+    const normalizedSummaries = GLOBALS.NodesRevisionCacheGeneration === cacheGeneration
+      ? this.primeNodeSummaryCaches(summaries)
+      : summaries;
     return {
       index: this.normalizeNodeIndex(normalizedSummaries.map(node => node?.name)),
       summaries: normalizedSummaries,
@@ -13004,43 +13126,35 @@ const Database = {
     if (!kv) return null;
     const name = String(nodeName || "").toLowerCase().trim();
     if (!name) return null;
-    let currentNodes = await this.getNodesSummaryIndex(kv, { ctx });
     const normalizedNode = this.buildNodeSummary(name, nodeData).summary;
     if (!normalizedNode) return null;
-    if (!Array.isArray(currentNodes)) {
-      const rebuilt = await this.rebuildNodeIndexesFromKv(kv, { ctx });
-      const rebuiltNodes = Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
-      return rebuiltNodes.find(node => String(node?.name || "").toLowerCase().trim() === name) || normalizedNode;
-    }
-    let found = false;
-    const nextNodes = currentNodes.map(node => {
-      if (String(node?.name || "").toLowerCase().trim() !== name) return node;
-      found = true;
-      return this.areNodeSummariesEquivalent(node, normalizedNode) ? node : normalizedNode;
+    const cachedEntry = GLOBALS.NodesListCache?.exp > nowMs() && Array.isArray(GLOBALS.NodesListCache.data)
+      ? GLOBALS.NodesListCache.data.find(node => String(node?.name || "").toLowerCase().trim() === name)
+      : null;
+    if (cachedEntry && this.areNodeSummariesEquivalent(cachedEntry, normalizedNode)) return cachedEntry;
+    return await runNodeIndexMutation(async () => {
+      const currentNodes = await this.loadNodeSummariesForMutation(kv, { ctx });
+      let found = false;
+      const nextNodes = currentNodes.map(node => {
+        if (String(node?.name || "").toLowerCase().trim() !== name) return node;
+        found = true;
+        return this.areNodeSummariesEquivalent(node, normalizedNode) ? node : normalizedNode;
+      });
+      if (!found) nextNodes.push(normalizedNode);
+      const committed = await this.commitNodesSummaryIndexMutation(nextNodes, { kv, ctx });
+      return committed.summaries.find(node => String(node?.name || "").toLowerCase().trim() === name) || normalizedNode;
     });
-    if (!found) nextNodes.push(normalizedNode);
-    if (found) {
-      const currentEntry = currentNodes.find(node => String(node?.name || "").toLowerCase().trim() === name);
-      const nextEntry = nextNodes.find(node => String(node?.name || "").toLowerCase().trim() === name) || null;
-      if (currentEntry && nextEntry && this.areNodeSummariesEquivalent(currentEntry, nextEntry)) {
-        return currentEntry;
-      }
-    }
-    await this.persistNodesSummaryIndex(nextNodes, { kv, ctx });
-    return normalizedNode;
   },
   async removeNodeSummaryEntry(nodeName, options = {}) {
     const { kv, ctx } = options;
     if (!kv) return [];
     const name = String(nodeName || "").toLowerCase().trim();
-    let currentNodes = await this.getNodesSummaryIndex(kv, { ctx });
-    if (!Array.isArray(currentNodes)) {
-      const rebuilt = await this.rebuildNodeIndexesFromKv(kv, { ctx });
-      currentNodes = Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
-    }
-    const nextNodes = currentNodes.filter(node => String(node?.name || "").toLowerCase().trim() !== name);
-    await this.persistNodesSummaryIndex(nextNodes, { kv, ctx });
-    return nextNodes;
+    return await runNodeIndexMutation(async () => {
+      const currentNodes = await this.loadNodeSummariesForMutation(kv, { ctx });
+      const nextNodes = currentNodes.filter(node => String(node?.name || "").toLowerCase().trim() !== name);
+      const committed = await this.commitNodesSummaryIndexMutation(nextNodes, { kv, ctx });
+      return committed.summaries;
+    });
   },
   async getNodesIndex(kv) {
     if (GLOBALS.NodesIndexCache?.exp > nowMs() && Array.isArray(GLOBALS.NodesIndexCache.data)) {
@@ -13052,12 +13166,16 @@ const Database = {
       GLOBALS.NodesIndexCache = { data: cachedIndex, exp: nowMs() + 60000 };
       return [...cachedIndex];
     }
+    const cacheGeneration = GLOBALS.NodesRevisionCacheGeneration;
     const index = this.normalizeNodeIndex(await kv.get(this.NODES_INDEX_KEY, { type: "json" }) || []);
+    if (GLOBALS.NodesRevisionCacheGeneration !== cacheGeneration) return [...index];
     if (!index.length) {
       const rebuilt = await this.rebuildNodeIndexesFromKv(kv);
       return [...this.normalizeNodeIndex(rebuilt.index)];
     }
-    GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
+    if (GLOBALS.NodesRevisionCacheGeneration === cacheGeneration) {
+      GLOBALS.NodesIndexCache = { data: index, exp: nowMs() + 60000 };
+    }
     return [...index];
   },
   buildPlaybackRouteHotSignature(nodeName, nodeData = {}) {
@@ -13124,11 +13242,13 @@ const Database = {
     return entry;
   },
   async getVerifiedPlaybackRouteHotSnapshot(nodeName, env) {
+    const nodeCacheToken = getNodeCacheToken(nodeName);
     const snapshot = this.getPlaybackRouteHotSnapshot(nodeName);
     if (!snapshot) return null;
     const kv = this.getKV(env);
     if (!kv) return snapshot;
-    const currentNodesRevision = await this.getNodesRevision(kv, { forceFresh: true });
+    const currentNodesRevision = await this.getNodesRevision(kv);
+    if (getNodeCacheToken(nodeName) !== nodeCacheToken) return null;
     if (!snapshot.nodesRevision || !currentNodesRevision || snapshot.nodesRevision === currentNodesRevision) {
       return snapshot;
     }
@@ -13142,8 +13262,10 @@ const Database = {
     return snapshot;
   },
   async primePlaybackRouteHotSnapshot(nodeName, nodeData = {}, env) {
+    const nodeCacheToken = getNodeCacheToken(nodeName);
     const kv = this.getKV(env);
     const nodesRevision = kv ? await this.getNodesRevision(kv) : "";
+    if (getNodeCacheToken(nodeName) !== nodeCacheToken) return null;
     return this.setPlaybackRouteHotSnapshot(nodeName, nodeData, { nodesRevision });
   },
   invalidatePlaybackRouteHotCache(nodeNames = []) {
@@ -13167,13 +13289,14 @@ const Database = {
       GLOBALS.PlaybackRouteHotCache.delete(name);
     }
     if (normalizedNames.length > 0) {
+      invalidateNodeCacheTokens(normalizedNames);
       invalidatePlaybackInfoResponseCacheForNodes(normalizedNames);
       invalidatePlaybackProgressRelayForNodes(normalizedNames);
     }
     if (options.invalidateList) {
       GLOBALS.NodesListCache = null;
       GLOBALS.NodesIndexCache = null;
-      GLOBALS.NodesRevisionCache = null;
+      invalidateNodesRevisionCache();
     }
   },
   /**
@@ -13183,45 +13306,56 @@ const Database = {
   async persistNodesIndex(index, options = {}) {
     const { kv, ctx, invalidateList = false } = options;
     const normalizedIndex = this.normalizeNodeIndex(index);
-    GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
-    GLOBALS.NodesRevisionCache = null;
     if (invalidateList) GLOBALS.NodesListCache = null;
-    if (!kv) return normalizedIndex;
-    const currentMeta = await this.readRevisionMeta(kv, this.NODES_INDEX_META_KEY, {
-      count: 0,
-      indexHash: "",
-      fullIndexHash: ""
-    });
-    const nextIndexHash = hashStableText(serializeConfigValue(normalizedIndex));
-    const metaUpdatedAt = currentMeta.indexHash === nextIndexHash && currentMeta.revision
-      ? currentMeta.updatedAt
-      : new Date().toISOString();
-    const nextMeta = {
-      ...currentMeta,
-      updatedAt: metaUpdatedAt,
-      revision: currentMeta.indexHash === nextIndexHash && currentMeta.revision
-        ? currentMeta.revision
-        : buildRevisionValue(hashStableText(`${nextIndexHash}:${currentMeta.fullIndexHash || ""}:${normalizedIndex.length}`), metaUpdatedAt),
-      hash: currentMeta.hash || "",
-      count: normalizedIndex.length,
-      indexHash: nextIndexHash,
-      fullIndexHash: String(currentMeta.fullIndexHash || "")
-    };
-    const tasks = [];
-    if (currentMeta.indexHash !== nextIndexHash || !currentMeta.revision) {
-      tasks.push(kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex)));
-      tasks.push(kv.put(this.NODES_INDEX_META_KEY, JSON.stringify(nextMeta)));
+    if (!kv) {
+      GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
+      invalidateNodesRevisionCache();
+      return normalizedIndex;
     }
-    if (tasks.length > 0) {
-      const task = Promise.all(tasks);
-      if (ctx) ctx.waitUntil(task);
-      await task;
-      GLOBALS.NodesRevisionCache = {
-        revision: String(nextMeta.revision || "").trim(),
-        exp: nowMs() + Config.Defaults.NodesRevisionCacheTtlMs
+    return await runNodeIndexMutation(async () => {
+      const currentMeta = await this.readRevisionMeta(kv, this.NODES_INDEX_META_KEY, {
+        count: 0,
+        indexHash: "",
+        fullIndexHash: ""
+      });
+      const nextIndexHash = hashStableText(serializeConfigValue(normalizedIndex));
+      const metaUpdatedAt = currentMeta.indexHash === nextIndexHash && currentMeta.revision
+        ? currentMeta.updatedAt
+        : new Date().toISOString();
+      const nextMeta = {
+        ...currentMeta,
+        updatedAt: metaUpdatedAt,
+        revision: currentMeta.indexHash === nextIndexHash && currentMeta.revision
+          ? currentMeta.revision
+          : buildRevisionValue(hashStableText(`${nextIndexHash}:${currentMeta.fullIndexHash || ""}:${normalizedIndex.length}`), metaUpdatedAt),
+        hash: currentMeta.hash || "",
+        count: normalizedIndex.length,
+        indexHash: nextIndexHash,
+        fullIndexHash: String(currentMeta.fullIndexHash || "")
       };
-    }
-    return normalizedIndex;
+      const contentTasks = [];
+      if (currentMeta.indexHash !== nextIndexHash || !currentMeta.revision) {
+        contentTasks.push(kv.put(this.NODES_INDEX_KEY, JSON.stringify(normalizedIndex)));
+      }
+      const metaNeedsWrite = (
+        currentMeta.indexHash !== nextIndexHash
+        || Number(currentMeta.count) !== normalizedIndex.length
+        || !currentMeta.revision
+      );
+      if (contentTasks.length > 0) {
+        const task = Promise.all(contentTasks);
+        if (ctx) ctx.waitUntil(task);
+        await task;
+      }
+      if (metaNeedsWrite) {
+        const metaTask = kv.put(this.NODES_INDEX_META_KEY, JSON.stringify(nextMeta));
+        if (ctx) ctx.waitUntil(metaTask);
+        await metaTask;
+      }
+      GLOBALS.NodesIndexCache = { data: normalizedIndex, exp: nowMs() + 60000 };
+      primeNodesRevisionCache(nextMeta.revision);
+      return normalizedIndex;
+    });
   },
   getDnsRecordHistoryKey(zoneId, recordId) {
     const safeZoneId = encodeURIComponent(String(zoneId || "").trim() || "default");
@@ -14114,16 +14248,18 @@ const Database = {
     try {
       await this.applyKvMutationsWithRollback(kv, mutationPlan);
     } catch (error) {
-      GLOBALS.ConfigCache = null;
+      invalidateRuntimeConfigCache();
       GLOBALS.NodesListCache = null;
       GLOBALS.NodesIndexCache = null;
-      GLOBALS.NodesRevisionCache = null;
+      invalidateNodesRevisionCache();
+      resetNodeCacheTokens();
       GLOBALS.NodeCache.clear();
       GLOBALS.PlaybackRouteHotCache.clear();
       throw error;
     }
 
-    GLOBALS.ConfigCache = null;
+    invalidateRuntimeConfigCache();
+    resetNodeCacheTokens();
     GLOBALS.NodeCache.clear();
     GLOBALS.PlaybackRouteHotCache.clear();
     if (Array.isArray(plan?.nodesIndex) && plan.nodesIndex.length > 0) {
@@ -14589,7 +14725,7 @@ const Database = {
           });
       await this.applyKvMutationsWithRollback(kv, mutationPlan);
     }
-    GLOBALS.ConfigCache = null;
+    invalidateRuntimeConfigCache();
     return options.env ? await getRuntimeConfig(options.env) : fallbackConfig;
   },
   async restoreTidyKvMigrationSnapshot(snapshot, options = {}) {
@@ -14653,10 +14789,11 @@ const Database = {
     }
 
     await this.applyKvMutationsWithRollback(kv, mutationPlan);
-    GLOBALS.ConfigCache = null;
+    invalidateRuntimeConfigCache();
     GLOBALS.NodesListCache = null;
     GLOBALS.NodesIndexCache = null;
-    GLOBALS.NodesRevisionCache = null;
+    invalidateNodesRevisionCache();
+    resetNodeCacheTokens();
     GLOBALS.NodeCache.clear();
     GLOBALS.PlaybackRouteHotCache.clear();
     return env ? await getRuntimeConfig(env) : nextRuntimeConfig;
@@ -14707,8 +14844,9 @@ const Database = {
     }
     await this.recordConfigSnapshot(kv, prevConfig, nextConfig, snapshotMeta);
     await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
+    if (env) primeRuntimeConfigCache(env, nextConfig);
+    else invalidateRuntimeConfigCache();
     await this.ensureConfigMeta(kv, nextConfig, { ctx });
-    GLOBALS.ConfigCache = null;
     const deleteTasks = this.buildLegacyConfigCacheKeys(prevConfig, nextConfig).map(key => kv.delete(key));
     if (deleteTasks.length) {
       if (ctx) ctx.waitUntil(Promise.all(deleteTasks));
@@ -15639,66 +15777,99 @@ const Database = {
   async getNode(nodeName, env, ctx) {
     nodeName = String(nodeName).toLowerCase();
     const kv = this.getKV(env); if (!kv) return null;
+    const memoryCacheToken = getNodeCacheToken(nodeName);
     const mem = GLOBALS.NodeCache.get(nodeName);
     if (mem && mem.exp > Date.now()) {
-      const currentNodesRevision = await this.getNodesRevision(kv, { forceFresh: true });
+      const currentNodesRevision = await this.getNodesRevision(kv);
       const cachedNodesRevision = String(mem?.nodesRevision || "").trim();
-      if (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision) {
+      if (getNodeCacheToken(nodeName) === memoryCacheToken
+        && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)
+      ) {
         touchMapEntry(GLOBALS.NodeCache, nodeName);
         return mem.data;
       }
-      GLOBALS.NodeCache.delete(nodeName);
+      if (getNodeCacheToken(nodeName) === memoryCacheToken) GLOBALS.NodeCache.delete(nodeName);
     }
-    try {
-      const nodeData = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
-      if (!nodeData) {
-        const summaryNodes = await this.getNodesSummaryIndex(kv, { ctx });
-        if (Array.isArray(summaryNodes) && summaryNodes.some(node => String(node?.name || "").toLowerCase().trim() === nodeName)) {
-          const syncTask = this.rebuildNodeIndexesFromKv(kv, { ctx });
-          if (ctx) ctx.waitUntil(syncTask);
+    const nodeLoadToken = getNodeCacheToken(nodeName);
+    return await runSingleFlight(
+      buildSingleFlightKey(["proxy_node", nodeName, nodeLoadToken]),
+      async () => {
+        try {
+          const nodeData = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
+          if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
+          if (!nodeData) {
+            const summaryNodes = await this.getNodesSummaryIndex(kv, { ctx });
+            if (Array.isArray(summaryNodes)) {
+              const summaryContainsNode = summaryNodes.some(node => String(node?.name || "").toLowerCase().trim() === nodeName);
+              if (summaryContainsNode) {
+                const syncTask = this.rebuildNodeIndexesFromKv(kv, { ctx });
+                if (ctx) ctx.waitUntil(syncTask);
+                else await syncTask;
+              } else {
+                const currentNodesRevision = await this.getNodesRevision(kv);
+                if (getNodeCacheToken(nodeName) === nodeLoadToken) {
+                  setBoundedMapEntry(GLOBALS.NodeCache, nodeName, {
+                    data: null,
+                    exp: Date.now() + Config.Defaults.NodeMissCacheTtlMs,
+                    nodesRevision: currentNodesRevision
+                  }, Config.Defaults.NodeCacheMax);
+                }
+              }
+            }
+            return null;
+          }
+          const { data: normalized, changed } = this.normalizeNode(nodeName, nodeData);
+          if (changed) {
+            const task = kv.put(`${this.PREFIX}${nodeName}`, JSON.stringify(normalized));
+            if (ctx) ctx.waitUntil(task);
+            else await task;
+          }
+          const syncTask = this.upsertNodeSummaryEntry(nodeName, normalized, { kv, ctx });
+          let currentNodesRevision = await this.getNodesRevision(kv);
+          if (!currentNodesRevision) {
+            await syncTask;
+            currentNodesRevision = await this.getNodesRevision(kv);
+          } else if (ctx) ctx.waitUntil(syncTask);
           else await syncTask;
+          if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
+          setBoundedMapEntry(GLOBALS.NodeCache, nodeName, {
+            data: normalized,
+            exp: Date.now() + Config.Defaults.CacheTTL,
+            nodesRevision: currentNodesRevision
+          }, Config.Defaults.NodeCacheMax);
+          return normalized;
+        } catch {
+          return null;
         }
-        return null;
       }
-      const { data: normalized, changed } = this.normalizeNode(nodeName, nodeData);
-      if (changed) {
-        const task = kv.put(`${this.PREFIX}${nodeName}`, JSON.stringify(normalized));
-        if (ctx) ctx.waitUntil(task);
-        else await task;
-      }
-      const syncTask = this.upsertNodeSummaryEntry(nodeName, normalized, { kv, ctx });
-      let currentNodesRevision = await this.getNodesRevision(kv);
-      if (!currentNodesRevision) {
-        await syncTask;
-        currentNodesRevision = await this.getNodesRevision(kv, { forceFresh: true });
-      } else if (ctx) ctx.waitUntil(syncTask);
-      else await syncTask;
-      setBoundedMapEntry(GLOBALS.NodeCache, nodeName, {
-        data: normalized,
-        exp: Date.now() + Config.Defaults.CacheTTL,
-        nodesRevision: currentNodesRevision
-      }, Config.Defaults.NodeCacheMax);
-      return normalized;
-    } catch { return null; }
+    );
   },
   async getNodeForRead(nodeName, env) {
     nodeName = String(nodeName).toLowerCase();
     const kv = this.getKV(env); if (!kv) return null;
+    const memoryCacheToken = getNodeCacheToken(nodeName);
     const mem = GLOBALS.NodeCache.get(nodeName);
-    if (mem && mem.exp > Date.now()) {
-      const currentNodesRevision = await this.getNodesRevision(kv, { forceFresh: true });
+    if (mem?.data === null) {
+      GLOBALS.NodeCache.delete(nodeName);
+    } else if (mem && mem.exp > Date.now()) {
+      const currentNodesRevision = await this.getNodesRevision(kv);
       const cachedNodesRevision = String(mem?.nodesRevision || "").trim();
-      if (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision) {
+      if (getNodeCacheToken(nodeName) === memoryCacheToken
+        && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)
+      ) {
         touchMapEntry(GLOBALS.NodeCache, nodeName);
         return mem.data;
       }
-      GLOBALS.NodeCache.delete(nodeName);
+      if (getNodeCacheToken(nodeName) === memoryCacheToken) GLOBALS.NodeCache.delete(nodeName);
     }
+    const nodeLoadToken = getNodeCacheToken(nodeName);
     try {
       const nodeData = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
+      if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
       if (!nodeData) return null;
       const normalized = this.normalizeNode(nodeName, nodeData).data;
       const currentNodesRevision = await this.getNodesRevision(kv);
+      if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
       setBoundedMapEntry(GLOBALS.NodeCache, nodeName, {
         data: normalized,
         exp: Date.now() + Config.Defaults.CacheTTL,
@@ -17259,7 +17430,7 @@ const Database = {
         });
         const currentHostItems = [];
         const sharedPoolItems = Array.isArray(sharedPoolResult?.items) ? sharedPoolResult.items : [];
-        const dnsIpPoolStatus = await Database.getOpsStatusSectionForRead({ kv, db }, "dnsIpPool");
+        const dnsIpPoolStatus = await Database.getOpsStatusSection({ kv, db }, "dnsIpPool");
         const countryCounter = new Map();
         for (const item of sharedPoolItems) {
           const code = String(item?.countryCode || "").trim().toUpperCase();
@@ -17347,7 +17518,7 @@ const Database = {
 	          const [config, sourceList, dnsIpPoolStatus] = await Promise.all([
 	            getRuntimeConfigStrict(env),
             Database.getDnsIpPoolSourcesForRead({ kv, db }),
-            Database.getOpsStatusSectionForRead({ kv, db }, "dnsIpPool")
+            Database.getOpsStatusSection({ kv, db }, "dnsIpPool")
           ]);
 	          return jsonResponse({
 	            success: true,
@@ -18229,9 +18400,9 @@ const Proxy = {
     return headers;
   },
   classifyRequest(request, proxyPath, requestUrl, currentConfig, options = {}) {
+    const requestMethod = request.method;
     const rangeHeader = request.headers.get("Range");
     const ifRangeHeader = request.headers.get("If-Range");
-    const lowerProxyPath = sanitizeProxyPath(proxyPath).toLowerCase();
     const isImage = EMBY_IMAGE_PATH_REGEX.test(proxyPath) || IMAGE_FILE_EXTENSION_REGEX.test(proxyPath);
     const isStaticFile = STATIC_ASSET_EXTENSION_REGEX.test(proxyPath);
     const isSubtitle = SUBTITLE_EXTENSION_REGEX.test(proxyPath);
@@ -18245,16 +18416,8 @@ const Proxy = {
     const isPlaybackStartedRequest = isPlaybackSessionStartedPath(proxyPath);
     const isPlaybackSessionControlRequest = isPlaybackProgressRequest || isPlaybackStoppedRequest || isPlaybackStartedRequest;
     const looksLikeVideoRoute = STREAMING_MEDIA_EXTENSION_REGEX.test(proxyPath) || /\/videos\/[^/]+\/(stream|original|download|file)/i.test(proxyPath) || /\/items\/[^/]+\/download/i.test(proxyPath) || requestUrl.searchParams.get("Static") === "true" || requestUrl.searchParams.get("Download") === "true";
-    const isSafeMethod = request.method === "GET" || request.method === "HEAD";
+    const isSafeMethod = requestMethod === "GET" || requestMethod === "HEAD";
     const isBigStream = looksLikeVideoRoute && !isManifest && !isSegment && !isSubtitle && !isImage;
-    const isWebClientEntry = isSafeMethod
-      && lowerProxyPath.startsWith("/web")
-      && !lowerProxyPath.includes("/emby/ping")
-      && !lowerProxyPath.includes("/emby/system/info")
-      && !isWsUpgrade
-      && !isImage
-      && !isStaticFile
-      && !isSubtitle;
     const isPlaybackCriticalRequest = isPlaybackInfoRequest || isSmartStrmMedia || isBigStream || isManifest || isSegment;
     const isApiRequest = !isImage && !isStaticFile && !isSubtitle && !isManifest && !isSegment && !isSmartStrmMedia && !isBigStream && !isWsUpgrade;
     // 节点直连只放行厚重媒体字节流，避免前端静态资源与 API 被 307 误伤。
@@ -18273,8 +18436,8 @@ const Proxy = {
     const enablePrewarm = currentConfig.enablePrewarm !== false && !legacyEntryOffloadEnabled;
     const prewarmCacheTtl = clampIntegerConfig(currentConfig.prewarmCacheTtl, DEFAULT_PREWARM_CACHE_TTL_SEC, 0, 3600);
     const prewarmDepth = normalizePrewarmDepth(currentConfig.prewarmDepth);
-    const isMetadataCacheable = request.method === "GET" && !isWsUpgrade && !legacyEntryOffloadEnabled && (isImage || isSubtitle || isManifest);
-    const isCacheableAsset = request.method === "GET" && !isWsUpgrade && (isImage || isStaticFile || isSubtitle || isSegment || isManifest);
+    const isMetadataCacheable = requestMethod === "GET" && !isWsUpgrade && !legacyEntryOffloadEnabled && (isImage || isSubtitle || isManifest);
+    const isCacheableAsset = requestMethod === "GET" && !isWsUpgrade && (isImage || isStaticFile || isSubtitle || isSegment || isManifest);
     const canStripAuthOnProtocolFallback = isSafeMethod && !isApiRequest && (isSmartStrmMedia || isBigStream || isManifest || isSegment);
     return {
       rangeHeader,
@@ -18291,7 +18454,6 @@ const Proxy = {
       isWsUpgrade,
       looksLikeVideoRoute,
       isBigStream,
-      isWebClientEntry,
       isPlaybackCriticalRequest,
       isApiRequest,
       isPlaybackInfoRequest,
@@ -18558,8 +18720,7 @@ const Proxy = {
   },
   isFailoverEligible(execution, targetRecords = []) {
     if (execution?.hedgeFailoverEnabled !== true) return { eligible: false, reason: "disabled" };
-    const method = String(execution?.request?.method || "GET").toUpperCase();
-    if (method !== "GET" && method !== "HEAD") return { eligible: false, reason: "non_idempotent" };
+    if (execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") return { eligible: false, reason: "non_idempotent" };
     if (execution?.requestTraits?.isWsUpgrade === true) return { eligible: false, reason: "websocket" };
     if (execution?.playbackRelayTargetUrl instanceof URL) return { eligible: false, reason: "absolute_target" };
     if (countDistinctTargetRecordKeys(targetRecords) < 2) return { eligible: false, reason: "single_target" };
@@ -19523,7 +19684,7 @@ const Proxy = {
       execution.playbackInfoRewrite = "not_needed";
       return upstreamState;
     }
-    if (String(execution?.request?.method || "GET").toUpperCase() === "HEAD") {
+    if (execution.requestMethod === "HEAD") {
       execution.playbackInfoRewrite = "not_needed";
       return upstreamState;
     }
@@ -20115,12 +20276,12 @@ const Proxy = {
     // 主视频流直接透传，避免再由 Worker JS 显式泵流接管；
     // 仅分片流保留托管路径，用于 cancel/error 收口与日志标记。
     return execution.requestTraits.isSegment === true
-      && execution.request.method !== "HEAD"
+      && execution.requestMethod !== "HEAD"
       && upstreamState.response.status !== 101
       && !!upstreamState.response.body;
   },
   buildPassthroughProxyResponseBody(execution, upstreamState) {
-    const upstreamBody = execution.request.method === "HEAD" ? null : upstreamState.response.body;
+    const upstreamBody = execution.requestMethod === "HEAD" ? null : upstreamState.response.body;
     // 非托管透传路径不再监听客户端中断；返回响应前立即拆掉 request/fetch 侧关联。
     try { upstreamState.releaseFetchController?.(); } catch {}
     execution.requestLifecycle?.dispose?.();
@@ -20141,10 +20302,10 @@ const Proxy = {
         upstreamStatus: upstreamState.response.status
       })
     };
-    if (!upstreamBody || execution.request.method === "HEAD" || !requestLifecycle) {
+    if (!upstreamBody || execution.requestMethod === "HEAD" || !requestLifecycle) {
       try { upstreamState.releaseFetchController?.(); } catch {}
       requestLifecycle?.dispose?.();
-      return execution.request.method === "HEAD" ? null : upstreamBody;
+      return execution.requestMethod === "HEAD" ? null : upstreamBody;
     }
 
     // 用显式流泵接管 cancel/error，避免客户端断开后上游连接继续悬挂。
@@ -20560,7 +20721,7 @@ const Proxy = {
     Logger.record(execution.env, execution.ctx, {
       nodeName: execution.nodeName,
       requestPath: execution.proxyPath,
-      requestMethod: execution.request.method,
+      requestMethod: execution.requestMethod,
       responseTime: Date.now() - execution.startTime,
       clientIp: execution.clientIp || "unknown",
       inboundColo: execution.logInboundColo || "UNKNOWN",
@@ -20596,6 +20757,7 @@ const Proxy = {
   },
   async prepareExecutionContext(request, node, path, name, key, env, ctx, options = {}) {
     const startTime = Date.now();
+    const requestMethod = request.method;
     CacheManager.maybeCleanup();
     if (!node || !node.target) {
       return {
@@ -20603,11 +20765,13 @@ const Proxy = {
       };
     }
 
-    const currentConfig = await getRuntimeConfig(env);
+    const currentConfig = isPlainObject(options.runtimeConfig)
+      ? options.runtimeConfig
+      : await getRuntimeConfig(env);
     const rawRequestUrl = options.requestUrl || new URL(request.url);
     const requestHost = normalizeHostnameText(rawRequestUrl.hostname);
-    const configuredHost = normalizeHostnameText(resolveConfiguredHost(env));
-    const configuredLegacyHost = normalizeHostnameText(resolveConfiguredLegacyHost(env));
+    const configuredHost = resolveConfiguredHost(env);
+    const configuredLegacyHost = resolveConfiguredLegacyHost(env);
     const resolvedEntryMode = normalizeNodeEntryMode(options.entryMode || node?.entryMode);
     const routeKindOverride = String(options.routeKindOverride || "").trim();
     const isLegacyHostRequest = !!(
@@ -20648,12 +20812,21 @@ const Proxy = {
     const playbackAbsoluteFallbackRequested = rawRequestUrl.searchParams.has(PLAYBACK_ABSOLUTE_FALLBACK_QUERY_PARAM);
     const playbackAbsoluteFallbackEligible = playbackAbsoluteFallbackRequested
       && (!!playbackRelay || isPlaybackInfoMediaProxyPath(rawProxyPath));
-    const requestUrl = new URL(rawRequestUrl.toString());
+    let requestUrl = rawRequestUrl;
     const proxyPath = playbackRelay?.visibleProxyPath || rawProxyPath;
+    const playbackRelayTargetPath = playbackRelay?.targetUrl instanceof URL
+      ? playbackRelay.targetUrl.pathname
+      : "";
+    if (isEmbyWebProxyPath(proxyPath) || (playbackRelayTargetPath && isEmbyWebProxyPath(playbackRelayTargetPath))) {
+      return {
+        invalidResponse: buildEmbyWebProxyDisabledResponse(requestMethod, dynamicCors)
+      };
+    }
+    if (playbackRelay || playbackAbsoluteFallbackEligible) {
+      requestUrl = new URL(rawRequestUrl);
+    }
     if (playbackRelay) {
-      while (requestUrl.searchParams.has(PLAYBACK_RELAY_QUERY_PARAM)) {
-        requestUrl.searchParams.delete(PLAYBACK_RELAY_QUERY_PARAM);
-      }
+      requestUrl.searchParams.delete(PLAYBACK_RELAY_QUERY_PARAM);
       const visibleUrl = buildAbsoluteProxyUrl(rawRequestUrl, name, key, proxyPath, {
         linkVariant,
         entryMode: options.entryMode
@@ -20661,9 +20834,7 @@ const Proxy = {
       requestUrl.pathname = visibleUrl.pathname;
     }
     if (playbackAbsoluteFallbackEligible) {
-      while (requestUrl.searchParams.has(PLAYBACK_ABSOLUTE_FALLBACK_QUERY_PARAM)) {
-        requestUrl.searchParams.delete(PLAYBACK_ABSOLUTE_FALLBACK_QUERY_PARAM);
-      }
+      requestUrl.searchParams.delete(PLAYBACK_ABSOLUTE_FALLBACK_QUERY_PARAM);
     }
     const nodeDirectSource = isNodeVideoStreamDirectEnabled(node, currentConfig, name);
     const baseRequestTraits = this.classifyRequest(request, proxyPath, requestUrl, currentConfig, {
@@ -20693,7 +20864,7 @@ const Proxy = {
         legacyEntryOffloadReason: "",
         direct307Mode: false,
         enablePrewarm: currentConfig.enablePrewarm !== false,
-        isMetadataCacheable: request.method === "GET"
+        isMetadataCacheable: requestMethod === "GET"
           && baseRequestTraits.isWsUpgrade !== true
           && (baseRequestTraits.isImage === true || baseRequestTraits.isSubtitle === true || baseRequestTraits.isManifest === true)
       }
@@ -20721,7 +20892,8 @@ const Proxy = {
     const videoProgressForwardIntervalSec = clampIntegerConfig(currentConfig.videoProgressForwardIntervalSec, DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC, 0, 60);
     const effectiveRealClientIpMode = resolveEffectiveNodeRealClientIpMode(node, currentConfig);
     const effectiveMediaAuthMode = resolveEffectiveNodeMediaAuthMode(node, currentConfig);
-    const nodeDerivedCacheRevision = buildNodeDerivedCacheRevision(name, node);
+    const nodeDerivedCacheRevision = String(options.nodeCacheRevision || "").trim()
+      || buildNodeDerivedCacheRevision(name, node);
     const metadataCacheKey = (requestTraits.isMetadataCacheable && shouldWorkerCacheMetadataUrl(requestUrl))
       ? buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath, {
         search: requestUrl.search,
@@ -20749,6 +20921,7 @@ const Proxy = {
 
     return {
       request,
+      requestMethod,
       node,
       nodeName: name,
       nodeKey: key,
@@ -20872,7 +21045,7 @@ const Proxy = {
       execution.playbackInfoCacheKey = "";
       return "";
     }
-    const requestMethod = String(execution?.request?.method || "GET").trim().toUpperCase() || "GET";
+    const requestMethod = execution.requestMethod;
     const needsBodySignature = requestMethod !== "GET" && requestMethod !== "HEAD";
     if (needsBodySignature && transport?.preparedBodyMode !== "buffered") {
       execution.playbackInfoCacheState = "skip";
@@ -20906,7 +21079,7 @@ const Proxy = {
     if (!contentType.includes("json")) return false;
     let bodyText = "";
     try {
-      bodyText = execution?.request?.method === "HEAD" ? "" : await response.text();
+      bodyText = execution.requestMethod === "HEAD" ? "" : await response.text();
     } catch {
       return false;
     }
@@ -20952,7 +21125,7 @@ const Proxy = {
     execution.playbackInfoCacheState = "hit";
     execution.playbackInfoRewrite = String(cacheEntry?.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim();
     const cachedResponse = new Response(
-      execution.request.method === "HEAD" ? null : String(cacheEntry.bodyText || ""),
+      execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""),
       {
         status: Number(cacheEntry.status) || 200,
         statusText: String(cacheEntry.statusText || ""),
@@ -20989,7 +21162,7 @@ const Proxy = {
       }),
       outboundColo: ""
     });
-    return new Response(execution.request.method === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
+    return new Response(execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
       status: cachedResponse.status,
       statusText: cachedResponse.statusText,
       headers: modifiedHeaders
@@ -21011,7 +21184,7 @@ const Proxy = {
       body: {},
       parseError: false
     };
-    const requestMethod = String(execution?.request?.method || "GET").trim().toUpperCase();
+    const requestMethod = execution.requestMethod;
     if (requestMethod === "GET" || requestMethod === "HEAD") return result;
     if (transport?.preparedBodyMode === "stream") {
       result.parseError = true;
@@ -21293,7 +21466,7 @@ const Proxy = {
       execution.progressForwardMode = "pass_through";
       return null;
     }
-    if ((execution.request.method !== "GET" && execution.request.method !== "HEAD") && transport?.preparedBodyMode !== "buffered") {
+    if ((execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") && transport?.preparedBodyMode !== "buffered") {
       execution.progressForwardMode = "unbuffered_bypass";
       return null;
     }
@@ -21338,18 +21511,6 @@ const Proxy = {
     execution.progressForwardMode = "throttled_204";
     this.schedulePlaybackProgressRelayFlush(sessionKey, relayEntry);
     return this.buildPlaybackProgressThrottleResponse(execution);
-  },
-  maybeHandleWebClientGate(execution) {
-    if (execution?.requestTraits?.isWebClientEntry !== true) return null;
-    const requestUrl = execution?.requestUrl instanceof URL
-      ? execution.requestUrl
-      : new URL(String(execution?.request?.url || ""));
-    if (requestUrl.searchParams.get(EMBY_WEB_BYPASS_QUERY_PARAM) === "1") {
-      return buildEmbyWebBypassRedirectResponse(requestUrl, execution?.dynamicCors);
-    }
-    const cookieHeader = execution?.request?.headers?.get("Cookie") || "";
-    if (hasEmbyWebBypassCookie(cookieHeader)) return null;
-    return buildWebAccessGuideResponse(requestUrl, execution?.request?.method || "GET", execution?.dynamicCors);
   },
   async tryServeMetadataCache(execution) {
     if (!execution.metadataCache || !execution.metadataCacheKey) return null;
@@ -21400,7 +21561,7 @@ const Proxy = {
     }
   },
   async resolveEarlyResponse(execution) {
-    if (execution.request.method === "OPTIONS") {
+    if (execution.requestMethod === "OPTIONS") {
       return this.buildOptionsResponse(execution);
     }
 
@@ -21420,9 +21581,6 @@ const Proxy = {
       execution.finalOrigin
     );
     if (rateLimitResponse) return rateLimitResponse;
-
-    const webClientGateResponse = this.maybeHandleWebClientGate(execution);
-    if (webClientGateResponse) return webClientGateResponse;
 
     return await this.tryServeMetadataCache(execution);
   },
@@ -21482,6 +21640,36 @@ const Proxy = {
       releaseProbeFetchController();
       probeLifecycle.dispose();
       return null;
+    }
+    const redirectTargetBase = execution.playbackRelayTargetUrl instanceof URL
+      ? execution.playbackRelayTargetUrl
+      : activeTargetBase;
+    const redirectPathState = resolveProxyRelativePathFromUpstreamUrl(nextUrl, redirectTargetBase);
+    const redirectProxyPath = redirectPathState.proxyPath
+      || (nextUrl.origin === redirectTargetBase?.origin ? nextUrl.pathname : null);
+    if (redirectProxyPath && isEmbyWebProxyPath(redirectProxyPath)) {
+      const redirectTrace = this.createRedirectTrace(execution.requestUrl);
+      this.recordRedirectTraceHop(redirectTrace, probeResponse.status, nextUrl, {
+        isSameOriginRedirect: true,
+        traceAction: "blocked_web"
+      });
+      this.finalizeRedirectTrace(redirectTrace, {
+        terminalMode: "web_proxy_disabled",
+        finalStatus: 404,
+        finalHost: nextUrl.hostname || ""
+      });
+      execution.redirectTrace = redirectTrace;
+      execution.defaultOutboundColo = resolveResponseColoCode(probeResponse) || "";
+      try { probeResponse.body?.cancel?.(); } catch {}
+      releaseProbeFetchController();
+      probeLifecycle.dispose();
+      this.recordAccessLog(execution, this.buildDirectAccessLogPayload(
+        execution,
+        404,
+        execution.defaultOutboundColo,
+        { redirectTrace, decisionReason: "web_proxy_disabled" }
+      ));
+      return buildEmbyWebProxyDisabledResponse(execution.requestMethod, execution.dynamicCors);
     }
     const directRedirectUrl = this.buildClientVisibleRedirectUrl(
       nextUrl,
@@ -21544,7 +21732,7 @@ const Proxy = {
     );
     releaseProbeFetchController();
     probeLifecycle.dispose();
-    return new Response(execution.request.method === "HEAD" ? null : probeResponse.body, {
+    return new Response(execution.requestMethod === "HEAD" ? null : probeResponse.body, {
       status: probeResponse.status,
       statusText: probeResponse.statusText,
       headers: modifiedHeaders
@@ -21554,7 +21742,7 @@ const Proxy = {
     if (execution?.forceWorkerProxy === true) return null;
     const entryDecision = this.enforceStrictClientDirectAuthPolicy(execution, execution.entryRoutingDecision, transport, {
       redirectStatus: execution.entryRoutingDecision?.redirectStatus || 307,
-      redirectMethod: execution.request?.method || "GET"
+      redirectMethod: execution.requestMethod
     });
     execution.entryRoutingDecision = entryDecision;
     if (entryDecision?.phase !== "entry" || entryDecision?.action !== "DIRECT") return null;
@@ -21616,7 +21804,7 @@ const Proxy = {
     });
   },
   createBuildFetchOptions(execution, transport) {
-    const { request, requestTraits, protocolFallback } = execution;
+    const { request, requestMethod, requestTraits, protocolFallback } = execution;
     const { newHeaders, adminCustomHeaders, preparedBody, preparedBodyMode } = transport;
     const transportTemplate = transport?.transportTemplate || null;
     const baseHeaderEntries = Array.isArray(transportTemplate?.baseHeaderEntries)
@@ -21643,7 +21831,7 @@ const Proxy = {
       const headers = new Headers(baseHeaderEntries);
       const finalTargetUrl = targetUrl instanceof URL ? targetUrl : new URL(String(targetUrl));
       const targetOrigin = finalTargetUrl.origin;
-      const effectiveMethod = String(options.method || request.method || "GET").toUpperCase();
+      const effectiveMethod = options.method || requestMethod;
       const effectiveBodyMode = options.bodyMode || preparedBodyMode;
       const effectiveBody = options.body !== undefined ? options.body : preparedBody;
       const isExternalRedirect = options.isExternalRedirect === true;
@@ -21725,7 +21913,7 @@ const Proxy = {
       : resolveNodeVideoStreamPolicy(execution.node, execution.currentConfig);
     const redirectTrace = this.createRedirectTrace(execution.requestUrl);
     const segmentFastPathEnabled = shouldUseSegmentFastUpstreamBuilder(
-      execution.request?.method,
+      execution.requestMethod,
       execution.requestTraits,
       { playbackRelayTargetUrl: execution.playbackRelayTargetUrl }
     );
@@ -21737,7 +21925,7 @@ const Proxy = {
           absoluteUrl: execution.playbackRelayTargetUrl,
           buildFetchOptions,
           fetchOptions: {
-            method: String(execution.request.method || "GET").toUpperCase(),
+            method: execution.requestMethod,
             bodyMode: transport.preparedBodyMode,
             body: transport.preparedBody,
             isExternalRedirect: true
@@ -21779,7 +21967,7 @@ const Proxy = {
     let proxiedExternalRedirect = false;
     let directRedirectUrl = null;
     let redirectHop = 0;
-    let redirectMethod = String(execution.request.method || "GET").toUpperCase();
+    let redirectMethod = execution.requestMethod;
     let redirectBodyMode = transport.preparedBodyMode;
     let redirectBody = transport.preparedBody;
     execution.defaultOutboundColo = resolveResponseColoCode(response) || "";
@@ -21794,6 +21982,28 @@ const Proxy = {
           finalStatus: currentRedirectStatus,
           finalHost: finalUrl?.hostname || activeTargetBase?.hostname || ""
         });
+        break;
+      }
+
+      const redirectPathState = resolveProxyRelativePathFromUpstreamUrl(nextUrl, activeTargetBase);
+      const redirectProxyPath = redirectPathState.proxyPath
+        || (nextUrl.origin === activeTargetBase?.origin ? nextUrl.pathname : null);
+      if (redirectProxyPath && isEmbyWebProxyPath(redirectProxyPath)) {
+        this.recordRedirectTraceHop(redirectTrace, currentRedirectStatus, nextUrl, {
+          isSameOriginRedirect: true,
+          traceAction: "blocked_web"
+        });
+        this.finalizeRedirectTrace(redirectTrace, {
+          terminalMode: "web_proxy_disabled",
+          finalStatus: 404,
+          finalHost: nextUrl.hostname || ""
+        });
+        try { response.body?.cancel?.(); } catch {}
+        try { releaseFetchController?.(); } catch {}
+        response = buildEmbyWebProxyDisabledResponse(execution.requestMethod, execution.dynamicCors);
+        finalUrl = nextUrl;
+        releaseFetchController = null;
+        redirectHop += 1;
         break;
       }
 
@@ -21942,8 +22152,14 @@ const Proxy = {
     let finalUpstreamState = execution?.requestTraits?.isPlaybackInfoRequest === true
       ? await this.maybeRewritePlaybackInfoResponse(execution, upstreamState)
       : upstreamState;
+    const redirectTerminalMode = String(
+      finalUpstreamState.redirectTrace?.terminalMode
+      || execution?.redirectTrace?.terminalMode
+      || ""
+    );
     const shouldPlaybackFallbackRedirect = execution?.playbackAbsoluteFallbackEligible === true
       && !finalUpstreamState.directRedirectUrl
+      && redirectTerminalMode !== "web_proxy_disabled"
       && Number(finalUpstreamState.response.status) === 404;
     if (shouldPlaybackFallbackRedirect) execution.playbackFallback = "relative_307";
     const isDirectAccessLog = this.shouldLogDirectAccess(execution, {
@@ -22215,6 +22431,12 @@ const Proxy = {
     );
   },
   async handle(request, node, path, name, key, env, ctx, options = {}) {
+    if (isEmbyWebProxyPath(path)) {
+      const runtimeConfig = isPlainObject(options.runtimeConfig) ? options.runtimeConfig : {};
+      const finalOrigin = this.resolveCorsOrigin(runtimeConfig, request);
+      const dynamicCors = getCorsHeadersForResponse(env, request, finalOrigin);
+      return buildEmbyWebProxyDisabledResponse(request.method, dynamicCors);
+    }
     // Proxy.handle 阶段图（单文件内的执行主链）：
     // Phase A. 环境准备：配置、来源、CORS、客户端身份
     // Phase B. 前置裁决：OPTIONS / 防火墙 / 限流 / 目标源合法性
@@ -22603,22 +22825,26 @@ const ADMIN_BOOTSTRAP_PLACEHOLDER = "__ADMIN_BOOTSTRAP_JSON__";
 const ADMIN_INIT_HEALTH_BANNER_PLACEHOLDER = "__INIT_HEALTH_BANNER__";
 const ADMIN_APP_ROOT_PLACEHOLDER = "__ADMIN_APP_ROOT__";
 const ADMIN_APP_ROOT_HTML = "";
-const ADMIN_HTML_CACHE_CONTROL = "public, max-age=300, s-maxage=600";
 const ADMIN_HTML_CACHE_KEY_ORIGIN = "https://admin-shell-cache.invalid";
 const ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL = "public, max-age=0, must-revalidate";
 const ADMIN_REMOTE_SHELL_EDGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const ADMIN_REMOTE_SHELL_REVALIDATE_MS = 5 * 60 * 1000;
 const ADMIN_REMOTE_SHELL_MAX_BYTES = 2 * 1024 * 1024;
+// Bump when the cached remote-shell representation changes.
+const ADMIN_REMOTE_SHELL_TRANSFORM_REVISION = "bootstrap-tailwind-v1";
 const ADMIN_REMOTE_SHELL_CACHED_AT_HEADER = "X-Admin-Shell-Cached-At";
 const ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER = "X-Admin-Shell-Source-Etag";
 const ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER = "X-Admin-Shell-Source-Last-Modified";
 const ADMIN_REMOTE_SHELL_SOURCE_HASH_HEADER = "X-Admin-Shell-Source-Hash";
 const ADMIN_RELEASE_PROXY_PATH_SEGMENT = "__release";
 const ADMIN_RELEASE_VENDOR_PATH_SEGMENT = "vendor";
+const ADMIN_WARM_PATH_SEGMENT = "__warm";
 const ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN = "https://admin-release-vendor-cache.invalid";
 const ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN = "https://admin-release-vendor-manifest.invalid";
 const ADMIN_RELEASE_VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable";
+const ADMIN_RELEASE_VENDOR_MUTABLE_CACHE_CONTROL = "no-store, max-age=0";
 const ADMIN_RELEASE_VENDOR_MAX_BYTES = 8 * 1024 * 1024;
+const ADMIN_WARM_VENDOR_CONCURRENCY = 3;
 const ADMIN_RELEASE_VENDOR_CACHED_AT_HEADER = "X-Admin-Release-Vendor-Cached-At";
 const ADMIN_RELEASE_VENDOR_SOURCE_HASH_HEADER = "X-Admin-Release-Vendor-Source-Hash";
 const ADMIN_PRIMARY_VIEWS = Object.freeze([
@@ -22895,6 +23121,7 @@ function buildAdminRemoteShellErrorContent(bootstrap = {}, shellState = {}, init
   const loginPath = String(bootstrap.loginPath || "").trim();
   const remoteShellIndexUrl = String(statusOptions.remoteShellIndexUrl || shellState.remoteShellIndexUrl || "").trim();
   const reasonSummary = describeAdminRemoteShellFailureReason(statusOptions.reason || "");
+  const setupPath = `${adminPath}?setup=1`;
 
   return `<style>
     .admin-remote-error-shell{max-width:920px;margin:0 auto;padding:44px 20px 56px;color:#0f172a}
@@ -22944,6 +23171,7 @@ function buildAdminRemoteShellErrorContent(bootstrap = {}, shellState = {}, init
           <a href="${escapeHtml(adminPath)}" class="admin-remote-error-btn admin-remote-error-btn-primary">刷新 /admin</a>
           ${loginPath ? `<a href="${escapeHtml(loginPath)}" class="admin-remote-error-btn admin-remote-error-btn-secondary">打开登录页</a>` : ""}
           ${remoteShellIndexUrl ? `<a href="${escapeHtml(remoteShellIndexUrl)}" class="admin-remote-error-btn admin-remote-error-btn-secondary" target="_blank" rel="noopener noreferrer">打开远端 index.html</a>` : ""}
+          <a href="${escapeHtml(setupPath)}" class="admin-remote-error-btn admin-remote-error-btn-secondary">重新设置发布源</a>
         </div>
         <p class="admin-remote-error-note">如果这里继续报错，请优先检查 Release 的 index.html、Worker vendor 代理链路，以及当前发布源配置。</p>
       </div>
@@ -23010,7 +23238,7 @@ function buildAdminIndexSetupContent(bootstrap = {}, shellState = {}, initHealth
       <div class="admin-gate-hero">
         <div class="admin-gate-kicker">Index Source Required</div>
         <h1 class="admin-gate-title">先锁定 GitHub Release，再进入 /admin 壳层</h1>
-        <p class="admin-gate-desc">你已经通过登录验证，但当前还没有可用的 <code>INDEX_URL</code>。这里会固定使用 <code>${escapeHtml(FIXED_GITHUB_RELEASE_REPO)}</code>，并只允许你选择同时包含 <code>index.html</code> 与 <code>worker.js</code> 的已发布 Release Tag。</p>
+        <p class="admin-gate-desc">这里会固定使用 <code>${escapeHtml(FIXED_GITHUB_RELEASE_REPO)}</code>，并只允许你选择同时包含 <code>index.html</code> 与 <code>worker.js</code> 的已发布 Release Tag。无论是首次进入 /admin，还是需要重新切换当前发布源，都可以在这里重新锁定。</p>
         <p class="admin-gate-note">正式版本只认 Release Tag。这里会自动派生 Release 的 <code>INDEX_URL</code> 与 <code>WORKER_SOURCE_URL</code>，并把 <code>target_commitish</code> 回写到 <code>releaseBranch</code> 作为兼容镜像字段。</p>
       </div>
       <div class="admin-gate-body">
@@ -23331,17 +23559,18 @@ function requestHasMatchingEtag(request, currentEtag = "") {
   });
 }
 
-function buildAdminHtmlCacheKeyRequest(request, variantEtag = "") {
-  const requestUrl = request instanceof Request ? new URL(request.url) : new URL(String(request || ""), ADMIN_HTML_CACHE_KEY_ORIGIN);
-  const cacheUrl = new URL(requestUrl.pathname, ADMIN_HTML_CACHE_KEY_ORIGIN);
-  cacheUrl.searchParams.set("variant", String(variantEtag || ""));
-  return new Request(cacheUrl.toString(), { method: "GET" });
-}
-
-function buildAdminRemoteShellCacheKeyRequest(request, remoteShellIndexUrl = "") {
+function buildAdminRemoteShellLegacyCacheKeyRequest(request, remoteShellIndexUrl = "") {
   const requestUrl = request instanceof Request ? new URL(request.url) : new URL(String(request || ""), ADMIN_HTML_CACHE_KEY_ORIGIN);
   const cacheUrl = new URL(requestUrl.pathname, ADMIN_HTML_CACHE_KEY_ORIGIN);
   cacheUrl.searchParams.set("remote", hashStableText(String(remoteShellIndexUrl || "").trim()));
+  return new Request(cacheUrl.toString(), { method: "GET" });
+}
+
+function buildAdminRemoteShellCacheKeyRequest(request, remoteShellIndexUrl = "", bootstrap = {}) {
+  const legacyCacheKey = buildAdminRemoteShellLegacyCacheKeyRequest(request, remoteShellIndexUrl);
+  const cacheUrl = new URL(legacyCacheKey.url);
+  cacheUrl.searchParams.set("transform", ADMIN_REMOTE_SHELL_TRANSFORM_REVISION);
+  cacheUrl.searchParams.set("bootstrap", hashStableText(serializeConfigValue(isPlainObject(bootstrap) ? bootstrap : {})));
   return new Request(cacheUrl.toString(), { method: "GET" });
 }
 
@@ -23353,21 +23582,6 @@ function buildAdminHtmlResponseHeaders(etag = "", cacheControl = "no-store, max-
   applySecurityHeaders(headers);
   if (etag) headers.set("ETag", formatAdminHtmlEtag(etag));
   return headers;
-}
-
-function buildAdminNotModifiedResponse(etag = "", cacheControl = ADMIN_HTML_CACHE_CONTROL) {
-  const headers = buildAdminHtmlResponseHeaders(etag, cacheControl);
-  headers.delete("Content-Type");
-  return new Response(null, { status: 304, headers });
-}
-
-function buildAdminHeadResponseFrom(response) {
-  if (!response) return new Response(null, { status: 500 });
-  return new Response(null, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: new Headers(response.headers)
-  });
 }
 
 function normalizeAdminHttpDateHeader(value = "") {
@@ -23407,10 +23621,6 @@ function buildConditionalNotModifiedResponseFromStoredResponse(response, cacheCo
   return new Response(null, { status: 304, headers });
 }
 
-function buildAdminNotModifiedResponseFrom(response, cacheControl = ADMIN_HTML_CACHE_CONTROL) {
-  return buildConditionalNotModifiedResponseFromStoredResponse(response, cacheControl);
-}
-
 function buildAdminRemoteBootstrapMarkup(bootstrapJson = "{}") {
   return `${buildAdminRemoteBootstrapScriptMarkup(bootstrapJson)}${ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML}`;
 }
@@ -23418,9 +23628,143 @@ function buildAdminRemoteBootstrapMarkup(bootstrapJson = "{}") {
 const ADMIN_REMOTE_BOOTSTRAP_SCRIPT_REGEX = /<script(?=[^>]*\bid="admin-bootstrap")(?=[^>]*\btype="application\/json")[^>]*>[\s\S]*?<\/script>/i;
 const ADMIN_REMOTE_BOOTSTRAP_LOADER_REGEX = /<script(?=[^>]*\bid="admin-bootstrap-loader")[^>]*>[\s\S]*?<\/script>/i;
 const ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML = '<script id="admin-bootstrap-loader">try{window.__ADMIN_BOOTSTRAP__=JSON.parse(document.getElementById("admin-bootstrap")?.textContent||"{}")}catch(_){window.__ADMIN_BOOTSTRAP__=window.__ADMIN_BOOTSTRAP__||{},window.__ADMIN_UI_BOOT_ERROR__=window.__ADMIN_UI_BOOT_ERROR__||"admin bootstrap parse failed: "+(_?.message||String(_||"unknown_error"))}</script>';
+const ADMIN_REMOTE_TAILWIND_PRELUDE_HTML = '<script id="admin-tailwind-prelude">window.tailwind=window.tailwind||{};</script>';
+const ADMIN_HTML_SKIPPED_CONTENT_TAGS = new Set(["script", "style", "template", "textarea", "title", "noscript"]);
 
 function buildAdminRemoteBootstrapScriptMarkup(bootstrapJson = "{}") {
   return `<script id="admin-bootstrap" type="application/json">${String(bootstrapJson || "{}")}</script>`;
+}
+
+function isAdminHtmlSpace(character = "") {
+  return character === " " || character === "\t" || character === "\n" || character === "\f" || character === "\r";
+}
+
+function findAdminHtmlTagEnd(sourceHtml, startIndex) {
+  let quote = "";
+  for (let index = startIndex; index < sourceHtml.length; index += 1) {
+    const character = sourceHtml[index];
+    if (quote) {
+      if (character === quote) quote = "";
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ">") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function parseAdminHtmlOpeningTag(sourceHtml, tagStart) {
+  let cursor = tagStart + 1;
+  if (!/[A-Za-z]/.test(sourceHtml[cursor] || "")) return null;
+  const tagEnd = findAdminHtmlTagEnd(sourceHtml, cursor);
+  if (tagEnd < 0) return null;
+
+  const tagNameStart = cursor;
+  while (cursor < tagEnd && !isAdminHtmlSpace(sourceHtml[cursor]) && sourceHtml[cursor] !== "/") cursor += 1;
+  const tagName = sourceHtml.slice(tagNameStart, cursor).toLowerCase();
+  const attributes = new Map();
+
+  while (cursor < tagEnd) {
+    while (cursor < tagEnd && isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
+    if (cursor >= tagEnd) break;
+    if (sourceHtml[cursor] === "/") {
+      cursor += 1;
+      continue;
+    }
+
+    const attributeNameStart = cursor;
+    while (
+      cursor < tagEnd
+      && !isAdminHtmlSpace(sourceHtml[cursor])
+      && sourceHtml[cursor] !== "="
+      && sourceHtml[cursor] !== "/"
+    ) cursor += 1;
+    if (cursor === attributeNameStart) {
+      cursor += 1;
+      continue;
+    }
+
+    const attributeName = sourceHtml.slice(attributeNameStart, cursor).toLowerCase();
+    while (cursor < tagEnd && isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
+    let attributeValue = "";
+    let quoted = false;
+    if (sourceHtml[cursor] === "=") {
+      cursor += 1;
+      while (cursor < tagEnd && isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
+      const quote = sourceHtml[cursor];
+      if (quote === '"' || quote === "'") {
+        quoted = true;
+        cursor += 1;
+        const attributeValueStart = cursor;
+        while (cursor < tagEnd && sourceHtml[cursor] !== quote) cursor += 1;
+        attributeValue = sourceHtml.slice(attributeValueStart, cursor);
+        if (cursor < tagEnd) cursor += 1;
+      } else {
+        const attributeValueStart = cursor;
+        while (cursor < tagEnd && !isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
+        attributeValue = sourceHtml.slice(attributeValueStart, cursor);
+      }
+    }
+    if (!attributes.has(attributeName)) attributes.set(attributeName, { value: attributeValue, quoted });
+  }
+
+  return { tagName, attributes, start: tagStart, tagEnd };
+}
+
+function findAdminHtmlClosingTag(sourceHtml, lowerSourceHtml, tagName, contentStart) {
+  const closingPrefix = `</${tagName}`;
+  let searchStart = contentStart;
+  while (searchStart < sourceHtml.length) {
+    const closingStart = lowerSourceHtml.indexOf(closingPrefix, searchStart);
+    if (closingStart < 0) return null;
+    const boundary = sourceHtml[closingStart + closingPrefix.length] || "";
+    if (!boundary || isAdminHtmlSpace(boundary) || boundary === "/" || boundary === ">") {
+      const tagEnd = findAdminHtmlTagEnd(sourceHtml, closingStart + closingPrefix.length);
+      if (tagEnd >= 0) return { start: closingStart, tagEnd };
+      return null;
+    }
+    searchStart = closingStart + closingPrefix.length;
+  }
+  return null;
+}
+
+function* iterateAdminHtmlOpeningTags(html = "") {
+  const sourceHtml = String(html || "");
+  const lowerSourceHtml = sourceHtml.toLowerCase();
+  let cursor = 0;
+
+  while (cursor < sourceHtml.length) {
+    const tagStart = sourceHtml.indexOf("<", cursor);
+    if (tagStart < 0) return;
+    if (sourceHtml.startsWith("<!--", tagStart)) {
+      const commentEnd = sourceHtml.indexOf("-->", tagStart + 4);
+      cursor = commentEnd < 0 ? sourceHtml.length : commentEnd + 3;
+      continue;
+    }
+
+    const openingTag = parseAdminHtmlOpeningTag(sourceHtml, tagStart);
+    if (!openingTag) {
+      cursor = tagStart + 1;
+      continue;
+    }
+
+    const contentStart = openingTag.tagEnd + 1;
+    const closingTag = ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName)
+      ? findAdminHtmlClosingTag(sourceHtml, lowerSourceHtml, openingTag.tagName, contentStart)
+      : null;
+    const contentEnd = closingTag ? closingTag.start : contentStart;
+    cursor = closingTag ? closingTag.tagEnd + 1 : contentStart;
+    yield {
+      ...openingTag,
+      contentStart,
+      contentEnd: closingTag || !ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName)
+        ? contentEnd
+        : sourceHtml.length,
+      contentClosed: Boolean(closingTag) || !ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName)
+    };
+    if (ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName) && !closingTag) return;
+  }
 }
 
 function injectMarkupIntoHtmlDocument(html = "", markup = "") {
@@ -23439,8 +23783,23 @@ function injectMarkupIntoHtmlDocument(html = "", markup = "") {
   return `${injectedMarkup}${sourceHtml}`;
 }
 
-function applyAdminRemoteBootstrapMarkup(html = "", bootstrapJson = "{}") {
+function ensureAdminRemoteTailwindConfigGlobal(html = "") {
   const sourceHtml = String(html || "");
+  if (!sourceHtml) return sourceHtml;
+  let configScriptStart = -1;
+  for (const openingTag of iterateAdminHtmlOpeningTags(sourceHtml)) {
+    if (openingTag.tagName !== "script" || !openingTag.contentClosed) continue;
+    if (openingTag.attributes.get("id")?.value === "admin-tailwind-prelude") return sourceHtml;
+    if (configScriptStart >= 0 || openingTag.attributes.has("src")) continue;
+    const scriptBody = sourceHtml.slice(openingTag.contentStart, openingTag.contentEnd);
+    if (/\btailwind\s*\.\s*config\s*=/i.test(scriptBody)) configScriptStart = openingTag.start;
+  }
+  if (configScriptStart < 0) return sourceHtml;
+  return `${sourceHtml.slice(0, configScriptStart)}${ADMIN_REMOTE_TAILWIND_PRELUDE_HTML}${sourceHtml.slice(configScriptStart)}`;
+}
+
+function applyAdminRemoteBootstrapMarkup(html = "", bootstrapJson = "{}") {
+  const sourceHtml = ensureAdminRemoteTailwindConfigGlobal(String(html || ""));
   if (!sourceHtml) return sourceHtml;
 
   const bootstrapScriptMarkup = buildAdminRemoteBootstrapScriptMarkup(bootstrapJson);
@@ -23602,13 +23961,15 @@ function isMutableJsdelivrGithubAssetUrl(assetUrl = "") {
   } catch {
     return false;
   }
-  if (!/(^|\.)jsdelivr\.net$/i.test(parsedUrl.hostname)) return false;
+  const assetHostname = parsedUrl.hostname.replace(/\.+$/, "");
+  if (!/(^|\.)jsdelivr\.net$/i.test(assetHostname)) return false;
 
+  if (!/^\/gh\/[^/]+\/[^/]+\//i.test(parsedUrl.pathname)) return false;
   const matchedRef = parsedUrl.pathname.match(/^\/gh\/[^/]+\/[^@/]+@([^/]+)\//i);
-  if (!matchedRef) return false;
+  if (!matchedRef) return true;
 
   const ref = decodeURIComponent(String(matchedRef[1] || "").trim());
-  if (!ref) return false;
+  if (!ref) return true;
   if (/^[0-9a-f]{7,40}$/i.test(ref)) return false;
   if (/^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/i.test(ref)) return false;
   return true;
@@ -23637,22 +23998,35 @@ function getAdminRemoteShellAssetPolicyViolations(html = "", baseUrl = "") {
       violations.push(`浏览器直连 GitHub Release 资产不再允许：${assetUrl}`);
       continue;
     }
-    if (isMutableJsdelivrGithubAssetUrl(assetUrl)) {
-      violations.push(`jsDelivr gh 可变 ref 不再允许：${assetUrl}`);
-    }
   }
 
   return violations;
 }
 
 function hasAdminRemoteShellAppRoot(html = "") {
-  return /\bid=(['"])app\1/i.test(String(html || ""));
+  for (const openingTag of iterateAdminHtmlOpeningTags(html)) {
+    if (ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName)) continue;
+    const idAttribute = openingTag.attributes.get("id");
+    if (idAttribute?.quoted && idAttribute.value === "app") return true;
+  }
+  return false;
 }
 
 function hasAdminRemoteShellHtmlDocument(html = "") {
   const normalizedHtml = String(html || "").trim();
   if (!normalizedHtml) return false;
   return /<!doctype\s+html\b/i.test(normalizedHtml) || /<html\b/i.test(normalizedHtml);
+}
+
+function isAcceptedAdminHtmlDocumentContentType(contentType = "", htmlDocumentDetected = false) {
+  const normalizedContentType = String(contentType || "").trim().toLowerCase();
+  if (!normalizedContentType) return true;
+  if (normalizedContentType.includes("text/html") || normalizedContentType.includes("application/xhtml+xml")) {
+    return true;
+  }
+  if (!htmlDocumentDetected) return false;
+  return normalizedContentType.startsWith("text/plain")
+    || normalizedContentType.startsWith("application/octet-stream");
 }
 
 function buildAdminRemoteShellVariantEtag(options = {}) {
@@ -23673,9 +24047,8 @@ function buildAdminRemoteShellVariantEtag(options = {}) {
 
 function buildAdminRemoteShellStoredResponse(html = "", options = {}) {
   const headers = buildAdminHtmlResponseHeaders(options.variantEtag || "", ADMIN_REMOTE_SHELL_EDGE_CACHE_CONTROL);
-  const lastModified = normalizeAdminHttpDateHeader(options.lastModified || "");
-  if (lastModified) headers.set("Last-Modified", lastModified);
-  headers.set(ADMIN_REMOTE_SHELL_CACHED_AT_HEADER, String(nowMs()));
+  const cachedAt = Number.parseInt(String(options.cachedAt || ""), 10);
+  headers.set(ADMIN_REMOTE_SHELL_CACHED_AT_HEADER, String(Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : nowMs()));
   const originEtag = normalizeEtagToken(options.originEtag || "");
   if (originEtag) headers.set(ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER, originEtag);
   const originLastModified = normalizeAdminHttpDateHeader(options.originLastModified || "");
@@ -23685,6 +24058,29 @@ function buildAdminRemoteShellStoredResponse(html = "", options = {}) {
   return new Response(String(html || ""), {
     status: 200,
     headers
+  });
+}
+
+async function migrateLegacyAdminRemoteShellStoredResponse(response, remoteShellIndexUrl, bootstrap, initHealth) {
+  const sourceHtml = await response.text();
+  const normalizedHtml = applyAdminRemoteBootstrapMarkup(sourceHtml, serializeInlineJson(bootstrap));
+  const originEtag = response.headers.get(ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER) || "";
+  const originLastModified = normalizeAdminHttpDateHeader(response.headers.get(ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER) || "");
+  const lastModified = normalizeAdminHttpDateHeader(response.headers.get("Last-Modified") || "") || originLastModified;
+  return buildAdminRemoteShellStoredResponse(normalizedHtml, {
+    variantEtag: buildAdminRemoteShellVariantEtag({
+      html: normalizedHtml,
+      bootstrap,
+      initHealth,
+      sourceUrl: remoteShellIndexUrl,
+      originEtag,
+      originLastModified: originLastModified || lastModified
+    }),
+    lastModified,
+    originEtag,
+    originLastModified: originLastModified || lastModified,
+    sourceUrl: remoteShellIndexUrl,
+    cachedAt: getAdminRemoteShellCachedAt(response)
   });
 }
 
@@ -23751,29 +24147,9 @@ function isAcceptedAdminReleaseVendorContentType(contentType = "", assetKind = "
     || normalizedContentType.startsWith("application/octet-stream");
 }
 
-function buildAdminReleaseVendorStoredResponse(body, options = {}) {
-  const headers = new Headers({
-    "Cache-Control": ADMIN_RELEASE_VENDOR_CACHE_CONTROL
-  });
-  const contentType = String(options.contentType || "").trim();
-  const etag = normalizeEtagToken(options.etag || "");
-  const lastModified = normalizeAdminHttpDateHeader(options.lastModified || "");
-  const sourceUrl = String(options.sourceUrl || "").trim();
-  if (contentType) headers.set("Content-Type", contentType);
-  if (etag) headers.set("ETag", formatAdminHtmlEtag(etag));
-  if (lastModified) headers.set("Last-Modified", lastModified);
-  headers.set(ADMIN_RELEASE_VENDOR_CACHED_AT_HEADER, String(nowMs()));
-  if (sourceUrl) headers.set(ADMIN_RELEASE_VENDOR_SOURCE_HASH_HEADER, hashStableText(sourceUrl));
-  return new Response(body, {
-    status: 200,
-    headers
-  });
-}
-
 function buildAdminReleaseVendorClientResponse(response, requestMethod = "GET") {
-  if (!response) return new Response("Release vendor asset unavailable", { status: 502 });
-  const headers = new Headers(response.headers || {});
-  headers.set("Cache-Control", ADMIN_RELEASE_VENDOR_CACHE_CONTROL);
+  const headers = new Headers(response.headers);
+  headers.set("Cache-Control", String(response.headers.get("Cache-Control") || ADMIN_RELEASE_VENDOR_CACHE_CONTROL).trim() || ADMIN_RELEASE_VENDOR_CACHE_CONTROL);
   headers.delete(ADMIN_RELEASE_VENDOR_CACHED_AT_HEADER);
   headers.delete(ADMIN_RELEASE_VENDOR_SOURCE_HASH_HEADER);
   applySecurityHeaders(headers);
@@ -23819,11 +24195,8 @@ async function buildAdminReleaseVendorManifestFromSource(releaseTag = "", source
     throw new Error(`release index payload invalid: ${remoteHtmlSize} bytes`);
   }
   const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(remoteHtml);
-  if (contentType && !contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
-    const allowPlainTextHtmlDocument = contentType.startsWith("text/plain") && htmlDocumentDetected;
-    if (!allowPlainTextHtmlDocument) {
-      throw new Error(`release index content-type invalid: ${contentType}`);
-    }
+  if (!isAcceptedAdminHtmlDocumentContentType(contentType, htmlDocumentDetected)) {
+    throw new Error(`release index content-type invalid: ${contentType}`);
   }
   if (!htmlDocumentDetected) {
     throw new Error("release index payload invalid: html document expected");
@@ -23894,6 +24267,12 @@ function resolveAdminReleaseVendorRouteMatch(pathname = "", adminPath = "/admin"
   }
 }
 
+function isAdminWarmRoute(pathname = "", adminPath = "/admin") {
+  const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
+  const normalizedPathname = sanitizeProxyPath(pathname || "/").replace(/\/+$/, "") || "/";
+  return normalizedPathname.toLowerCase() === `${normalizedAdminPath}/${ADMIN_WARM_PATH_SEGMENT}`.toLowerCase();
+}
+
 function getAdminRemoteShellCachedAt(response) {
   const cachedAt = Number.parseInt(String(response?.headers?.get?.(ADMIN_REMOTE_SHELL_CACHED_AT_HEADER) || ""), 10);
   return Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : 0;
@@ -23918,12 +24297,14 @@ async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstra
   });
   if (remoteResponse.status === 304 && previousResponse) {
     const previousHtml = await previousResponse.text();
+    const variantEtag = normalizeEtagToken(previousResponse.headers.get("ETag") || "");
+    const lastModified = normalizeAdminHttpDateHeader(previousResponse.headers.get("Last-Modified") || "");
     return {
       storedResponse: buildAdminRemoteShellStoredResponse(previousHtml, {
-        variantEtag: normalizeEtagToken(previousResponse.headers.get("ETag") || ""),
-        lastModified: remoteResponse.headers.get("Last-Modified") || previousResponse.headers.get("Last-Modified") || "",
-        originEtag: remoteResponse.headers.get("ETag") || previousOriginEtag,
-        originLastModified: remoteResponse.headers.get("Last-Modified") || previousOriginLastModified,
+        variantEtag,
+        lastModified,
+        originEtag: previousOriginEtag,
+        originLastModified: previousOriginLastModified,
         sourceUrl: remoteShellIndexUrl
       }),
       vendorManifest: null
@@ -23945,11 +24326,8 @@ async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstra
     throw new Error(`remote admin shell payload invalid: ${remoteHtmlSize} bytes`);
   }
   const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(remoteHtml);
-  if (contentType && !contentType.includes("text/html") && !contentType.includes("application/xhtml+xml")) {
-    const allowPlainTextHtmlDocument = contentType.startsWith("text/plain") && htmlDocumentDetected;
-    if (!allowPlainTextHtmlDocument) {
-      throw new Error(`remote admin shell content-type invalid: ${contentType}`);
-    }
+  if (!isAcceptedAdminHtmlDocumentContentType(contentType, htmlDocumentDetected)) {
+    throw new Error(`remote admin shell content-type invalid: ${contentType}`);
   }
   if (!htmlDocumentDetected) {
     throw new Error("remote admin shell payload invalid: html document expected");
@@ -24017,7 +24395,45 @@ async function revalidateAdminRemoteShellCache(request, edgeCache, cacheKey, rem
   return storedResponse;
 }
 
-async function renderAdminIndexSetupPage(request, env, ctx, initHealth = buildInitHealth(env), config = {}) {
+async function loadAdminRemoteShellColdCache(edgeCache, cacheKey, remoteShellIndexUrl, bootstrap, initHealth, releaseOptions = {}) {
+  return runSingleFlight(
+    buildSingleFlightKey(["admin_remote_shell_cold_load", cacheKey.url]),
+    () => runAdminRemoteShellCacheMutation(cacheKey.url, async () => {
+      if (edgeCache && typeof edgeCache.match === "function") {
+        const cacheResponseBeforeFetch = await edgeCache.match(cacheKey);
+        if (cacheResponseBeforeFetch) {
+          return {
+            storedResponse: cacheResponseBeforeFetch,
+            vendorManifest: null,
+            loadedFromCache: true
+          };
+        }
+      }
+
+      const remoteShellPayload = await fetchAdminRemoteShellStoredResponse(
+        remoteShellIndexUrl,
+        bootstrap,
+        initHealth,
+        null,
+        releaseOptions
+      );
+      const storedResponse = remoteShellPayload?.storedResponse || null;
+      if (!storedResponse) return remoteShellPayload;
+      if (edgeCache && typeof edgeCache.put === "function") {
+        await edgeCache.put(cacheKey, storedResponse.clone());
+        if (remoteShellPayload?.vendorManifest?.entries?.length) {
+          await cacheAdminReleaseVendorManifest(edgeCache, remoteShellPayload.vendorManifest, null);
+        }
+      }
+      return {
+        ...remoteShellPayload,
+        loadedFromCache: false
+      };
+    })
+  );
+}
+
+async function renderAdminIndexSetupPage(request, env, ctx, initHealth = buildInitHealth(env), config = {}, setupReason = "index_url_not_configured") {
   const indexState = buildResolvedAdminIndexState(env, config);
   const shellState = buildAdminShellState(env, initHealth, config);
   const bootstrap = buildAdminBootstrapPayload(env, initHealth, config);
@@ -24034,15 +24450,20 @@ async function renderAdminIndexSetupPage(request, env, ctx, initHealth = buildIn
     routeState: "setup_gate",
     remoteCacheState: "bypassed",
     lastFetchStatus: "skipped",
-    reason: "index_url_not_configured",
+    reason: setupReason,
     requestPath
   }, ctx);
   const appRootHtml = buildAdminIndexSetupContent(bootstrap, shellState, initHealth, config, indexState);
   const html = renderAdminHtmlShell(bootstrapJson, initHealthBannerHtml, appRootHtml);
   return new Response(
-    request?.method === "HEAD" ? null : html,
+    request.method === "HEAD" ? null : html,
     { headers: buildAdminHtmlResponseHeaders("", "no-store, max-age=0") }
   );
+}
+
+function isAdminIndexSetupForced(request) {
+  const setupFlag = String(new URL(request.url).searchParams.get("setup") || "").trim().toLowerCase();
+  return setupFlag === "1" || setupFlag === "true";
 }
 
 async function renderAdminRemoteShellErrorPage(request, env, ctx, initHealth = buildInitHealth(env), statusOptions = {}, config = {}) {
@@ -24068,39 +24489,11 @@ async function renderAdminRemoteShellErrorPage(request, env, ctx, initHealth = b
   };
   const appRootHtml = buildAdminRemoteShellErrorContent(bootstrap, shellState, initHealth, errorStatusOptions);
   await patchAdminShellRuntimeStatus(env, errorStatusOptions, ctx);
-
-  const variantEtag = buildAdminHtmlVariantEtag(bootstrap, initHealth, appRootHtml);
-  if (requestHasMatchingEtag(request, variantEtag)) {
-    return buildAdminNotModifiedResponse(variantEtag, ADMIN_HTML_CACHE_CONTROL);
-  }
-
-  const cacheKey = buildAdminHtmlCacheKeyRequest(request, variantEtag);
-  const edgeCache = typeof caches === "undefined" ? null : caches.default;
-  if (edgeCache && typeof edgeCache.match === "function") {
-    const cachedResponse = await edgeCache.match(cacheKey);
-    if (cachedResponse) {
-      return request?.method === "HEAD"
-        ? buildAdminHeadResponseFrom(cachedResponse)
-        : cachedResponse;
-    }
-  }
-
   const html = renderAdminHtmlShell(bootstrapJson, initHealthBannerHtml, appRootHtml);
-  const headers = buildAdminHtmlResponseHeaders(variantEtag, ADMIN_HTML_CACHE_CONTROL);
-  const cacheableResponse = new Response(html, { headers });
-  if (edgeCache && typeof edgeCache.put === "function") {
-    const cacheWriteTask = withNonCriticalFallback(
-      edgeCache.put(cacheKey, cacheableResponse.clone()),
-      "admin.shell_cache_write",
-      { path: new URL(request.url).pathname, variantEtag },
-      null
-    );
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(cacheWriteTask);
-    else await cacheWriteTask;
-  }
-  return request?.method === "HEAD"
-    ? buildAdminHeadResponseFrom(cacheableResponse)
-    : cacheableResponse;
+  return new Response(
+    request.method === "HEAD" ? null : html,
+    { headers: buildAdminHtmlResponseHeaders("", "no-store, max-age=0") }
+  );
 }
 
 async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHealth(env), remoteShellIndexUrl = resolveAdminShellIndexUrl(env), config = {}) {
@@ -24108,96 +24501,157 @@ async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHe
   const shellState = buildAdminShellState(env, initHealth, config);
   const bootstrap = buildAdminBootstrapPayload(env, initHealth, config);
   const indexState = buildResolvedAdminIndexState(env, config);
-  const cacheKey = buildAdminRemoteShellCacheKeyRequest(request, remoteShellIndexUrl);
+  const cacheKey = buildAdminRemoteShellCacheKeyRequest(request, remoteShellIndexUrl, bootstrap);
+  const legacyCacheKey = buildAdminRemoteShellLegacyCacheKeyRequest(request, remoteShellIndexUrl);
   const requestPath = new URL(request.url).pathname;
 
   if (edgeCache && typeof edgeCache.match === "function") {
-    const cachedResponse = await edgeCache.match(cacheKey);
-    if (cachedResponse) {
-      const revalidateDue = shouldRevalidateAdminRemoteShell(cachedResponse);
-      if (revalidateDue) {
-        const revalidateTask = withNonCriticalFallback(
-          revalidateAdminRemoteShellCache(
-            request,
-            edgeCache,
-            cacheKey,
+    const remoteShellCacheState = await runSingleFlight(
+      buildSingleFlightKey(["admin_remote_shell_cache_read", cacheKey.url]),
+      async () => {
+        const currentCachedResponse = await edgeCache.match(cacheKey);
+        if (currentCachedResponse) {
+          return { storedResponse: currentCachedResponse, legacyCacheMigrated: false };
+        }
+
+        const legacyCachedResponse = await edgeCache.match(legacyCacheKey);
+        if (!legacyCachedResponse) return null;
+        const migratedResponse = await withNonCriticalFallback(
+          migrateLegacyAdminRemoteShellStoredResponse(
+            legacyCachedResponse,
             remoteShellIndexUrl,
             bootstrap,
-            initHealth,
-            cachedResponse.clone(),
-            {
-              releaseTag: indexState.releaseTag,
-              adminPath: bootstrap.adminPath
-            },
-            ctx
+            initHealth
           ),
-          "admin.remote_shell_revalidate",
+          "admin.remote_shell_legacy_cache_read",
           { path: requestPath, remoteShellIndexUrl },
           null
         );
-        if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(revalidateTask);
-        else void revalidateTask;
+        if (!migratedResponse) return null;
+        return await runAdminRemoteShellCacheMutation(cacheKey.url, async () => {
+          const cacheResponseBeforeMigration = await edgeCache.match(cacheKey);
+          if (cacheResponseBeforeMigration) {
+            return { storedResponse: cacheResponseBeforeMigration, legacyCacheMigrated: false };
+          }
+          if (typeof edgeCache.put === "function") {
+            await withNonCriticalFallback(
+              edgeCache.put(cacheKey, migratedResponse.clone()),
+              "admin.remote_shell_legacy_cache_migrate",
+              { path: requestPath, remoteShellIndexUrl },
+              null
+            );
+          }
+          return { storedResponse: migratedResponse, legacyCacheMigrated: true };
+        });
       }
-      await patchAdminShellRuntimeStatus(env, {
+    );
+    const cachedResponse = remoteShellCacheState === null
+      ? null
+      : remoteShellCacheState.storedResponse.clone();
+    const legacyCacheMigrated = remoteShellCacheState !== null
+      && remoteShellCacheState.legacyCacheMigrated;
+    if (cachedResponse) {
+      const revalidateDue = shouldRevalidateAdminRemoteShell(cachedResponse);
+      let revalidateTask = null;
+      if (revalidateDue) {
+        const revalidationSourceResponse = cachedResponse.clone();
+        revalidateTask = runSingleFlight(
+          buildSingleFlightKey(["admin_remote_shell_revalidate", cacheKey.url]),
+          async () => withNonCriticalFallback(
+            runAdminRemoteShellCacheMutation(
+              cacheKey.url,
+              () => revalidateAdminRemoteShellCache(
+                request,
+                edgeCache,
+                cacheKey,
+                remoteShellIndexUrl,
+                bootstrap,
+                initHealth,
+                revalidationSourceResponse,
+                {
+                  releaseTag: indexState.releaseTag,
+                  adminPath: bootstrap.adminPath
+                },
+                ctx
+              )
+            ),
+            "admin.remote_shell_revalidate",
+            { path: requestPath, remoteShellIndexUrl },
+            null
+          )
+        );
+      }
+      const statusPatchTask = patchAdminShellRuntimeStatus(env, {
         shellState,
         initHealth,
         indexState,
         remoteShellIndexUrl,
         mode: "remote",
-        sourceType: "remote_cache",
+        sourceType: legacyCacheMigrated ? "remote_legacy_cache" : "remote_cache",
         routeState: "remote_active",
-        remoteCacheState: revalidateDue ? "stale_hit" : "hit",
+        remoteCacheState: legacyCacheMigrated
+          ? (revalidateDue ? "legacy_stale_hit" : "legacy_hit")
+          : (revalidateDue ? "stale_hit" : "hit"),
         revalidateDue,
         lastFetchStatus: "cached",
-        reason: revalidateDue ? "served_cached_remote_shell_and_scheduled_revalidate" : "served_cached_remote_shell",
+        reason: legacyCacheMigrated
+          ? (revalidateDue ? "migrated_legacy_remote_shell_and_scheduled_revalidate" : "migrated_legacy_remote_shell")
+          : (revalidateDue ? "served_cached_remote_shell_and_scheduled_revalidate" : "served_cached_remote_shell"),
         requestPath
-      }, ctx);
+      }, null);
+      const backgroundTask = revalidateTask
+        ? Promise.all([revalidateTask, statusPatchTask])
+        : statusPatchTask;
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(backgroundTask);
+      else void backgroundTask;
       if (requestMatchesAdminHtmlResponse(request, cachedResponse)) {
-        return buildAdminNotModifiedResponseFrom(cachedResponse, ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL);
+        return buildConditionalNotModifiedResponseFromStoredResponse(cachedResponse, ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL);
       }
-      return buildAdminRemoteShellClientResponse(cachedResponse, request?.method);
+      return buildAdminRemoteShellClientResponse(cachedResponse, request.method);
     }
   }
 
-  const remoteShellPayload = await fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstrap, initHealth, null, {
-    releaseTag: indexState.releaseTag,
-    adminPath: bootstrap.adminPath
-  });
+  const sharedRemoteShellPayload = await loadAdminRemoteShellColdCache(
+    edgeCache,
+    cacheKey,
+    remoteShellIndexUrl,
+    bootstrap,
+    initHealth,
+    {
+      releaseTag: indexState.releaseTag,
+      adminPath: bootstrap.adminPath
+    }
+  );
+  const remoteShellPayload = sharedRemoteShellPayload?.storedResponse
+    ? { ...sharedRemoteShellPayload, storedResponse: sharedRemoteShellPayload.storedResponse.clone() }
+    : sharedRemoteShellPayload;
   const storedResponse = remoteShellPayload?.storedResponse || null;
   if (!storedResponse) {
     throw new Error("remote admin shell payload missing");
   }
-  await patchAdminShellRuntimeStatus(env, {
+  const coldStatusPatchTask = runSingleFlight(
+    buildSingleFlightKey(["admin_remote_shell_cold_status", cacheKey.url]),
+    () => patchAdminShellRuntimeStatus(env, {
     shellState,
     initHealth,
     indexState,
     remoteShellIndexUrl,
     mode: "remote",
-    sourceType: "remote_fetch",
+    sourceType: sharedRemoteShellPayload?.loadedFromCache ? "remote_cache" : "remote_fetch",
     routeState: "remote_active",
-    remoteCacheState: "miss",
-    lastFetchStatus: "fetched",
-    reason: "fetched_remote_shell_index",
+    remoteCacheState: sharedRemoteShellPayload?.loadedFromCache ? "filled_while_waiting" : "miss",
+    lastFetchStatus: sharedRemoteShellPayload?.loadedFromCache ? "cached" : "fetched",
+    reason: sharedRemoteShellPayload?.loadedFromCache ? "served_cache_filled_while_waiting" : "fetched_remote_shell_index",
     requestPath
-  }, ctx);
-  if (edgeCache && typeof edgeCache.put === "function") {
-    const cacheWriteTask = withNonCriticalFallback(
-      edgeCache.put(cacheKey, storedResponse.clone()),
-      "admin.remote_shell_cache_write",
-      { path: requestPath, remoteShellIndexUrl },
-      null
-    );
-    if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(cacheWriteTask);
-    else await cacheWriteTask;
-    if (remoteShellPayload?.vendorManifest?.entries?.length) {
-      await cacheAdminReleaseVendorManifest(edgeCache, remoteShellPayload.vendorManifest, ctx);
-    }
-  }
+    }, null)
+  );
+  if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(coldStatusPatchTask);
+  else await coldStatusPatchTask;
 
   if (requestMatchesAdminHtmlResponse(request, storedResponse)) {
-    return buildAdminNotModifiedResponseFrom(storedResponse, ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL);
+    return buildConditionalNotModifiedResponseFromStoredResponse(storedResponse, ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL);
   }
-  return buildAdminRemoteShellClientResponse(storedResponse, request?.method);
+  return buildAdminRemoteShellClientResponse(storedResponse, request.method);
 }
 
 function buildAdminReleaseVendorErrorResponse(message = "Release vendor asset unavailable", status = 502) {
@@ -24228,14 +24682,18 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
     return buildAdminReleaseVendorErrorResponse("Release vendor asset not found", 404);
   }
 
+  const mutableVendorRef = isMutableJsdelivrGithubAssetUrl(manifestEntry.upstreamUrl);
+  const vendorCacheControl = mutableVendorRef
+    ? ADMIN_RELEASE_VENDOR_MUTABLE_CACHE_CONTROL
+    : ADMIN_RELEASE_VENDOR_CACHE_CONTROL;
   const cacheKey = buildAdminReleaseVendorAssetCacheKeyRequest(releaseTag, assetKey, manifestEntry.upstreamUrl);
-  if (edgeCache && typeof edgeCache.match === "function") {
+  if (!mutableVendorRef && edgeCache && typeof edgeCache.match === "function") {
     const cachedResponse = await edgeCache.match(cacheKey);
     if (cachedResponse) {
       if (requestMatchesAdminHtmlResponse(request, cachedResponse)) {
-        return buildConditionalNotModifiedResponseFromStoredResponse(cachedResponse, ADMIN_RELEASE_VENDOR_CACHE_CONTROL);
+        return buildConditionalNotModifiedResponseFromStoredResponse(cachedResponse, vendorCacheControl);
       }
-      return buildAdminReleaseVendorClientResponse(cachedResponse, request?.method);
+      return buildAdminReleaseVendorClientResponse(cachedResponse, request.method);
     }
   }
 
@@ -24288,13 +24746,19 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
     );
   }
 
-  const storedResponse = buildAdminReleaseVendorStoredResponse(responseBuffer, {
-    contentType,
-    etag: upstreamResponse.headers.get("ETag") || "",
-    lastModified: upstreamResponse.headers.get("Last-Modified") || "",
-    sourceUrl: manifestEntry.upstreamUrl
+  const storedHeaders = new Headers({ "Cache-Control": vendorCacheControl });
+  const etag = normalizeEtagToken(upstreamResponse.headers.get("ETag") || "");
+  const lastModified = normalizeAdminHttpDateHeader(upstreamResponse.headers.get("Last-Modified") || "");
+  if (contentType) storedHeaders.set("Content-Type", contentType);
+  if (etag) storedHeaders.set("ETag", formatAdminHtmlEtag(etag));
+  if (lastModified) storedHeaders.set("Last-Modified", lastModified);
+  storedHeaders.set(ADMIN_RELEASE_VENDOR_CACHED_AT_HEADER, String(nowMs()));
+  storedHeaders.set(ADMIN_RELEASE_VENDOR_SOURCE_HASH_HEADER, hashStableText(manifestEntry.upstreamUrl));
+  const storedResponse = new Response(responseBuffer, {
+    status: 200,
+    headers: storedHeaders
   });
-  if (edgeCache && typeof edgeCache.put === "function") {
+  if (!mutableVendorRef && edgeCache && typeof edgeCache.put === "function") {
     const cacheWriteTask = withNonCriticalFallback(
       edgeCache.put(cacheKey, storedResponse.clone()),
       "admin.release_vendor_cache_write",
@@ -24309,13 +24773,16 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
   }
 
   if (requestMatchesAdminHtmlResponse(request, storedResponse)) {
-    return buildConditionalNotModifiedResponseFromStoredResponse(storedResponse, ADMIN_RELEASE_VENDOR_CACHE_CONTROL);
+    return buildConditionalNotModifiedResponseFromStoredResponse(storedResponse, vendorCacheControl);
   }
-  return buildAdminReleaseVendorClientResponse(storedResponse, request?.method);
+  return buildAdminReleaseVendorClientResponse(storedResponse, request.method);
 }
 
 async function renderAdminPage(request, env, ctx, initHealth = buildInitHealth(env), config = null) {
   const runtimeConfig = isPlainObject(config) ? sanitizeRuntimeConfig(config) : sanitizeRuntimeConfig(await getRuntimeConfigStrict(env));
+  if (isAdminIndexSetupForced(request)) {
+    return renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig, "manual_setup_requested");
+  }
   const adminIndexState = buildResolvedAdminIndexState(env, runtimeConfig);
   if (!adminIndexState.indexUrl) {
     return renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig);
@@ -24342,7 +24809,103 @@ async function renderAdminPage(request, env, ctx, initHealth = buildInitHealth(e
       }, runtimeConfig);
     }
   }
-  return renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig);
+  return renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig, "index_url_not_configured");
+}
+
+async function warmAdminReleaseVendorEntries(entries = [], loadEntry) {
+  const normalizedEntries = Array.isArray(entries) ? entries : [];
+  if (typeof loadEntry !== "function" || normalizedEntries.length === 0) return [];
+  const responses = new Array(normalizedEntries.length);
+  let nextEntryIndex = 0;
+  const warmNextEntry = async () => {
+    while (nextEntryIndex < normalizedEntries.length) {
+      const entryIndex = nextEntryIndex;
+      nextEntryIndex += 1;
+      responses[entryIndex] = await loadEntry(normalizedEntries[entryIndex], entryIndex);
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(ADMIN_WARM_VENDOR_CONCURRENCY, normalizedEntries.length) },
+    () => warmNextEntry()
+  ));
+  return responses;
+}
+
+function buildAdminWarmSubrequest(url) {
+  return new Request(url, {
+    method: "HEAD",
+    headers: { "Accept": "*/*" },
+    cache: "no-store"
+  });
+}
+
+function isAdminWarmResponseSuccessful(response) {
+  return response?.ok === true || Number(response?.status) === 304;
+}
+
+async function renderAdminWarmResponse(request, env, initHealth = buildInitHealth(env), config = null) {
+  const runtimeConfig = isPlainObject(config) ? sanitizeRuntimeConfig(config) : sanitizeRuntimeConfig(await getRuntimeConfigStrict(env));
+  const indexState = buildResolvedAdminIndexState(env, runtimeConfig);
+  if (!indexState.indexUrl) {
+    return jsonError("ADMIN_INDEX_NOT_CONFIGURED", "管理台 Release index.html 尚未配置", 409);
+  }
+
+  const backgroundTasks = [];
+  const warmContext = {
+    waitUntil(task) {
+      backgroundTasks.push(Promise.resolve(task));
+    }
+  };
+  const adminPath = getAdminPath(env);
+  const shellRequestUrl = new URL(request.url);
+  shellRequestUrl.pathname = adminPath;
+  shellRequestUrl.search = "";
+  const shellResponse = await renderRemoteAdminPage(
+    buildAdminWarmSubrequest(shellRequestUrl),
+    env,
+    warmContext,
+    initHealth,
+    indexState.indexUrl,
+    runtimeConfig
+  );
+  await Promise.all(backgroundTasks.splice(0));
+
+  const edgeCache = typeof caches === "undefined" ? null : caches.default;
+  const manifest = await getOrCreateAdminReleaseVendorManifest(edgeCache, indexState.releaseTag, indexState.indexUrl, warmContext);
+  const immutableEntries = (Array.isArray(manifest?.entries) ? manifest.entries : [])
+    .filter(entry => entry?.assetKey && !isMutableJsdelivrGithubAssetUrl(entry.upstreamUrl));
+  const assetResponses = await warmAdminReleaseVendorEntries(immutableEntries, async (entry) => {
+    const assetPath = buildAdminReleaseVendorProxyPath(adminPath, indexState.releaseTag, entry.assetKey);
+    const assetUrl = new URL(request.url);
+    assetUrl.pathname = assetPath;
+    assetUrl.search = "";
+    return renderAdminReleaseVendorAsset(
+      buildAdminWarmSubrequest(assetUrl),
+      env,
+      warmContext,
+      { releaseTag: indexState.releaseTag, assetKey: entry.assetKey },
+      runtimeConfig
+    );
+  });
+  await Promise.all(backgroundTasks.splice(0));
+
+  const failedAssetCount = assetResponses.filter(response => !isAdminWarmResponseSuccessful(response)).length;
+  const shellWarmSucceeded = isAdminWarmResponseSuccessful(shellResponse);
+  const payload = JSON.stringify({
+    ok: shellWarmSucceeded && failedAssetCount === 0,
+    shellStatus: Number(shellResponse?.status) || 0,
+    warmedAssetCount: immutableEntries.length - failedAssetCount,
+    failedAssetCount
+  });
+  const headers = new Headers({
+    "Content-Type": "application/json;charset=UTF-8",
+    "Cache-Control": "no-store, max-age=0"
+  });
+  applySecurityHeaders(headers);
+  return new Response(request.method === "HEAD" ? null : payload, {
+    status: shellWarmSucceeded && failedAssetCount === 0 ? 200 : 502,
+    headers
+  });
 }
 
 function renderLandingPage(env, initHealth = buildInitHealth(env)) {
@@ -24620,14 +25183,13 @@ async function renderAdminLoginPage(request, env, initHealth = buildInitHealth(e
         });
         const payload = await response.json().catch(() => ({}));
         if (response.ok && payload && payload.ok === true) {
-          updateStatus("登录成功，正在预热管理台壳层...", "success");
-          try {
-            await fetch(ADMIN_LOGIN_RUNTIME.adminPath || "/admin", {
-              method: "HEAD",
-              credentials: "same-origin",
-              cache: "no-store"
-            });
-          } catch {}
+          updateStatus("登录成功，正在进入控制台...", "success");
+          void fetch((ADMIN_LOGIN_RUNTIME.adminPath || "/admin").replace(/\/+$/, "") + "/__warm", {
+            method: "HEAD",
+            credentials: "same-origin",
+            cache: "no-store",
+            keepalive: true
+          }).catch(() => null);
           window.location.assign(ADMIN_LOGIN_RUNTIME.adminPath || "/admin");
           return;
         }
@@ -24657,6 +25219,17 @@ function buildEdgeCorsResponse(dynamicCors, body, status = 200, options = {}) {
   return new Response(body, { status, headers });
 }
 
+function isPlaybackCriticalSegments(segments, startIndex) {
+  let segmentIndex = startIndex;
+  const firstSegment = safeDecodeSegment(segments[segmentIndex]);
+  let candidatePath = parseProxyLinkVariantSegment(firstSegment) === "main" ? "/" + firstSegment : "";
+  segmentIndex += 1;
+  for (; segmentIndex < segments.length; segmentIndex += 1) {
+    candidatePath += "/" + safeDecodeSegment(segments[segmentIndex]);
+  }
+  return isPlaybackCriticalProxyPath(candidatePath || "/");
+}
+
 const RuntimeEntry = {
   isLegacyAdminLoginRoute(routeContext) {
     return routeContext.adminPathLower === "/admin"
@@ -24672,9 +25245,12 @@ const RuntimeEntry = {
       || RuntimeEntry.isLegacyAdminLoginRoute(routeContext);
   },
 
+  buildRouteCorsResponse(request, env, body, status = 200) {
+    return buildEdgeCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
+  },
+
   buildFetchRouteContext(request, env) {
     const initHealth = warnInitHealthOnce(env);
-    const dynamicCors = getCorsHeadersForResponse(env, request);
     const requestUrl = new URL(request.url);
     const requestHost = normalizeHostnameText(requestUrl.hostname);
     const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
@@ -24688,10 +25264,8 @@ const RuntimeEntry = {
     const root = safeDecodeSegment(rootRaw).toLowerCase();
     return {
       initHealth,
-      dynamicCors,
       requestUrl,
       requestHost,
-      requestHostLower: requestHost.toLowerCase(),
       configuredHost: resolveConfiguredHost(env),
       configuredLegacyHost: resolveConfiguredLegacyHost(env),
       normalizedPathname,
@@ -24737,8 +25311,8 @@ const RuntimeEntry = {
     });
   },
 
-  buildLegacyProxyContextNotFoundResponse(routeContext) {
-    const response = buildEdgeCorsResponse(routeContext.dynamicCors, "Not Found", 404, { mergeOriginVary: true });
+  buildLegacyProxyContextNotFoundResponse(request, env) {
+    const response = this.buildRouteCorsResponse(request, env, "Not Found", 404);
     return this.appendSetCookieHeader(response, buildLegacyProxyContextClearCookie());
   },
 
@@ -24751,15 +25325,10 @@ const RuntimeEntry = {
 
   isPlaybackCriticalRouteContext(routeContext) {
     const segments = routeContext.segments;
-    const buildCandidatePath = (startIndex = 1) => {
-      const nextSegments = segments.slice(startIndex).map(item => safeDecodeSegment(item));
-      if (nextSegments.length && parseProxyLinkVariantSegment(nextSegments[0]) !== "main") nextSegments.shift();
-      return "/" + nextSegments.join("/");
-    };
     if (segments.length <= 1) return false;
-    if (isPlaybackCriticalProxyPath(buildCandidatePath(1))) return true;
+    if (isPlaybackCriticalSegments(segments, 1)) return true;
     if (segments.length <= 2) return false;
-    return isPlaybackCriticalProxyPath(buildCandidatePath(2));
+    return isPlaybackCriticalSegments(segments, 2);
   },
 
   async resolveProxyRouteContext(routeContext, env, ctx, request) {
@@ -24784,7 +25353,9 @@ const RuntimeEntry = {
     );
     const normalizedPathAfterRoot = pathNormalizationState?.normalizedPath || rawPathAfterRoot;
     const normalizedPathname = `/${routeContext.rootRaw}${normalizedPathAfterRoot === "/" ? "/" : normalizedPathAfterRoot}`;
-    const normalizedSegments = normalizedPathname.split("/").filter(Boolean);
+    const normalizedSegments = pathNormalizationState
+      ? normalizedPathname.split("/").filter(Boolean)
+      : routeContext.segments;
     let prefixLen = rootPrefixLen;
     if (secret) {
       const secretRaw = normalizedSegments[1] || "";
@@ -24834,8 +25405,7 @@ const RuntimeEntry = {
   async resolveHostPrefixProxyRouteContext(routeContext, env, ctx, request) {
     const hostPrefixMatch = routeContext?.hostPrefixMatch;
     if (!hostPrefixMatch?.prefix) return null;
-    const nodeName = String(hostPrefixMatch.prefix || "").trim().toLowerCase();
-    if (!nodeName) return null;
+    const nodeName = hostPrefixMatch.prefix;
     const playbackHotEligible = RuntimeEntry.isHostPrefixPlaybackCriticalRouteContext(routeContext);
     let playbackRouteHotSnapshot = playbackHotEligible ? await Database.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
     const targetHotCacheState = playbackHotEligible
@@ -24868,9 +25438,9 @@ const RuntimeEntry = {
   },
 
   isHostPrefixPathCompatHostRequest(routeContext) {
-    const requestHost = String(routeContext?.requestHostLower || "").trim().toLowerCase();
-    const configuredHost = String(routeContext?.configuredHost || "").trim().toLowerCase();
-    const configuredLegacyHost = String(routeContext?.configuredLegacyHost || "").trim().toLowerCase();
+    const requestHost = routeContext?.requestHost || "";
+    const configuredHost = routeContext?.configuredHost || "";
+    const configuredLegacyHost = routeContext?.configuredLegacyHost || "";
     if (!requestHost) return false;
     if (configuredHost && requestHost === configuredHost) return true;
     return !!(
@@ -24882,8 +25452,7 @@ const RuntimeEntry = {
 
   async resolveHostPrefixPathCompatRouteContext(routeContext, env, ctx, request, options = {}) {
     if (!this.isHostPrefixPathCompatHostRequest(routeContext) || !routeContext?.root) return null;
-    const nodeName = String(routeContext.root || "").trim().toLowerCase();
-    if (!nodeName) return null;
+    const nodeName = routeContext.root;
 
     const playbackHotEligible = RuntimeEntry.isPlaybackCriticalRouteContext(routeContext);
     let playbackRouteHotSnapshot = playbackHotEligible ? await Database.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
@@ -24950,12 +25519,12 @@ const RuntimeEntry = {
       requestHost: routeContext.requestHost
     });
     if (parsedContext?.ok !== true) {
-      return { response: this.buildLegacyProxyContextNotFoundResponse(routeContext) };
+      return { response: this.buildLegacyProxyContextNotFoundResponse(request, env) };
     }
 
     const nodeName = String(parsedContext.payload?.node || "").trim().toLowerCase();
     if (!nodeName) {
-      return { response: this.buildLegacyProxyContextNotFoundResponse(routeContext) };
+      return { response: this.buildLegacyProxyContextNotFoundResponse(request, env) };
     }
 
     const playbackHotEligible = isPlaybackCriticalProxyPath(routeContext.normalizedPathname);
@@ -24965,7 +25534,7 @@ const RuntimeEntry = {
       : "skip";
     const nodeData = playbackRouteHotSnapshot?.nodeData || await Database.getNode(nodeName, env, ctx);
     if (!nodeData) {
-      return { response: this.buildLegacyProxyContextNotFoundResponse(routeContext) };
+      return { response: this.buildLegacyProxyContextNotFoundResponse(request, env) };
     }
     const hostPrefixCompat = isHostPrefixEntryMode(nodeData?.entryMode);
     if (playbackHotEligible && !playbackRouteHotSnapshot) {
@@ -24990,28 +25559,28 @@ const RuntimeEntry = {
 
   async handleFetch(request, env, ctx) {
     const routeContext = RuntimeEntry.buildFetchRouteContext(request, env);
+    const { requestHost, configuredHost, configuredLegacyHost } = routeContext;
+    const requestMethod = request.method;
+    const isGetOrHead = requestMethod === "GET" || requestMethod === "HEAD";
 
-    if ((request.method === "GET" || request.method === "HEAD") && routeContext.pathnameLower === "/favicon.ico") {
-      return renderFaviconResponse(request.method);
+    if (isGetOrHead && routeContext.pathnameLower === "/favicon.ico") {
+      return renderFaviconResponse(requestMethod);
     }
 
     const runtimeConfig = await getRuntimeConfig(env);
     const isLegacyHostRequest = !!(
-      routeContext.configuredLegacyHost
-      && routeContext.configuredLegacyHost !== routeContext.configuredHost
-      && routeContext.requestHostLower
-      && routeContext.requestHostLower === routeContext.configuredLegacyHost
+      configuredLegacyHost
+      && configuredLegacyHost !== configuredHost
+      && requestHost === configuredLegacyHost
     );
-    const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!routeContext.configuredHost && !isLegacyHostRequest;
+    const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!configuredHost && !isLegacyHostRequest;
     routeContext.hostPrefixMatch = hostPrefixProxyActive
-      ? resolveHostPrefixMatch(routeContext.requestHost, routeContext.configuredHost)
+      ? resolveHostPrefixMatch(requestHost, configuredHost)
       : null;
     const isConfiguredHostSubdomain = !!(
       hostPrefixProxyActive
-      && routeContext.configuredHost
-      && routeContext.requestHostLower
-      && routeContext.requestHostLower !== routeContext.configuredHost
-      && routeContext.requestHostLower.endsWith(`.${routeContext.configuredHost}`)
+      && requestHost !== configuredHost
+      && requestHost.endsWith(`.${configuredHost}`)
     );
 
     if (routeContext.hostPrefixMatch) {
@@ -25025,28 +25594,37 @@ const RuntimeEntry = {
           cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords)
             ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords
             : null,
+          nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+          runtimeConfig,
           entryMode: hostPrefixRoute.entryMode
         });
       }
-      return buildEdgeCorsResponse(routeContext.dynamicCors, "Not Found", 404, { mergeOriginVary: true });
+      return RuntimeEntry.buildRouteCorsResponse(request, env, "Not Found", 404);
     }
 
     if (isConfiguredHostSubdomain) {
-      return buildEdgeCorsResponse(routeContext.dynamicCors, "Not Found", 404, { mergeOriginVary: true });
+      return RuntimeEntry.buildRouteCorsResponse(request, env, "Not Found", 404);
     }
 
-    if (request.method === "GET" && routeContext.normalizedPathname === "/") {
+    if (requestMethod === "GET" && routeContext.normalizedPathname === "/") {
       return renderLandingPage(env, routeContext.initHealth);
     }
 
-    const adminReleaseVendorRoute = (request.method === "GET" || request.method === "HEAD")
+    const adminReleaseVendorRoute = isGetOrHead
       ? resolveAdminReleaseVendorRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
       : null;
     if (adminReleaseVendorRoute) {
       return renderAdminReleaseVendorAsset(request, env, ctx, adminReleaseVendorRoute, runtimeConfig);
     }
 
-    if ((request.method === "GET" || request.method === "HEAD")
+    if (isGetOrHead && isAdminWarmRoute(routeContext.normalizedPathname, routeContext.adminPath)) {
+      if (!(await Auth.verifyRequest(request, env))) {
+        return buildRequestPathRedirectResponse(request, routeContext.adminLoginPath);
+      }
+      return renderAdminWarmResponse(request, env, routeContext.initHealth, runtimeConfig);
+    }
+
+    if (isGetOrHead
       && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower)
     ) {
       if (await Auth.verifyRequest(request, env)) {
@@ -25055,7 +25633,7 @@ const RuntimeEntry = {
       return renderAdminLoginPage(request, env, routeContext.initHealth);
     }
 
-    if ((request.method === "GET" || request.method === "HEAD")
+    if (isGetOrHead
       && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)
     ) {
       if (!(await Auth.verifyRequest(request, env))) {
@@ -25064,18 +25642,18 @@ const RuntimeEntry = {
       return renderAdminPage(request, env, ctx, routeContext.initHealth);
     }
 
-    if (request.method === "OPTIONS" && RuntimeEntry.isAdminPreflightRoute(routeContext)) {
-      return buildEdgeCorsResponse(routeContext.dynamicCors, null, 200, { mergeOriginVary: true });
+    if (requestMethod === "OPTIONS" && RuntimeEntry.isAdminPreflightRoute(routeContext)) {
+      return RuntimeEntry.buildRouteCorsResponse(request, env, null);
     }
 
-    if (request.method === "POST" && (
+    if (requestMethod === "POST" && (
       pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower)
       || RuntimeEntry.isLegacyAdminLoginRoute(routeContext)
     )) {
       return Auth.handleLogin(request, env);
     }
 
-    if (request.method === "POST" && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) {
+    if (requestMethod === "POST" && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) {
       if (!(await Auth.verifyRequest(request, env))) return jsonError("UNAUTHORIZED", "未授权", 401);
       try {
         return await normalizeJsonApiResponse(await Database.handleApi(request, env, ctx));
@@ -25087,7 +25665,7 @@ const RuntimeEntry = {
         });
         logRuntimeFailure("admin_api.unhandled_error", e, {
           path: routeContext.pathnameLower,
-          method: request.method,
+          method: requestMethod,
           responseCode: normalizedError.code,
           responseStatus: normalizedError.status
         }, "error");
@@ -25121,6 +25699,8 @@ const RuntimeEntry = {
           cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords)
             ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords
             : null,
+          nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+          runtimeConfig,
           entryMode: hostPrefixCompatRoute.entryMode,
           routeKindOverride: hostPrefixCompatRoute.routeKindOverride
         }
@@ -25128,7 +25708,7 @@ const RuntimeEntry = {
       return hostPrefixCompatRoute.attachLegacyProxyContext === true
         ? await RuntimeEntry.maybeAttachLegacyProxyContextResponse(
           hostPrefixCompatResponse,
-          routeContext.requestHost,
+          requestHost,
           hostPrefixCompatRoute.nodeName,
           env
         )
@@ -25146,10 +25726,12 @@ const RuntimeEntry = {
         cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords)
           ? proxyRoute.playbackRouteHotSnapshot.targetRecords
           : null,
+        nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+        runtimeConfig,
         entryMode: proxyRoute.entryMode
       });
       return isLegacyHostRequest
-        ? await RuntimeEntry.maybeAttachLegacyProxyContextResponse(proxyResponse, routeContext.requestHost, routeContext.root, env)
+        ? await RuntimeEntry.maybeAttachLegacyProxyContextResponse(proxyResponse, requestHost, routeContext.root, env)
         : proxyResponse;
     }
 
@@ -25172,20 +25754,22 @@ const RuntimeEntry = {
             cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords)
               ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords
               : null,
+            nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+            runtimeConfig,
             entryMode: legacyCookieRoute.entryMode,
             routeKindOverride: legacyCookieRoute.routeKindOverride
           }
         );
         return RuntimeEntry.maybeAttachLegacyProxyContextResponse(
           legacyCookieResponse,
-          routeContext.requestHost,
+          requestHost,
           legacyCookieRoute.nodeName,
           env
         );
       }
     }
 
-    return buildEdgeCorsResponse(routeContext.dynamicCors, "Not Found", 404, { mergeOriginVary: true });
+    return RuntimeEntry.buildRouteCorsResponse(request, env, "Not Found", 404);
   }
 };
 
@@ -25442,11 +26026,41 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     GLOBALS,
     Database,
     Proxy,
+    RuntimeEntry,
     createTargetRecord,
     isTargetRecord,
     buildUpstreamProxyUrl,
     buildFastSegmentUpstreamUrlText,
-    shouldUseSegmentFastUpstreamBuilder
+    shouldUseSegmentFastUpstreamBuilder,
+    isEmbyWebProxyPath,
+    runSingleFlight,
+    getRuntimeConfig,
+    invalidateRuntimeConfigCache,
+    invalidateNodesRevisionCache,
+    buildAdminRemoteShellErrorContent,
+    renderAdminRemoteShellErrorPage,
+    isAdminIndexSetupForced,
+    ensureAdminRemoteTailwindConfigGlobal,
+    applyAdminRemoteBootstrapMarkup,
+    buildAdminRemoteShellCacheKeyRequest,
+    buildAdminRemoteShellLegacyCacheKeyRequest,
+    buildAdminRemoteShellStoredResponse,
+    migrateLegacyAdminRemoteShellStoredResponse,
+    fetchAdminRemoteShellStoredResponse,
+    renderRemoteAdminPage,
+    renderAdminPage,
+    isAcceptedAdminHtmlDocumentContentType,
+    isAcceptedAdminReleaseVendorContentType,
+    isMutableJsdelivrGithubAssetUrl,
+    renderAdminReleaseVendorAsset,
+    isAdminWarmRoute,
+    renderAdminWarmResponse,
+    warmAdminReleaseVendorEntries,
+    buildAdminWarmSubrequest,
+    isAdminWarmResponseSuccessful,
+    ADMIN_REMOTE_SHELL_TRANSFORM_REVISION,
+    ADMIN_RELEASE_VENDOR_CACHE_CONTROL,
+    ADMIN_RELEASE_VENDOR_MUTABLE_CACHE_CONTROL
   });
 }
 
