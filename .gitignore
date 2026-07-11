@@ -11,3 +11,4 @@ npm-debug.log*
 bundled/
 package-lock.json
 prompts/
+/docs/
