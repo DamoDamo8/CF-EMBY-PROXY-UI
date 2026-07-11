@@ -70,6 +70,16 @@ cd frontend && npm run dev
 
 ## 验证
 
+### 统一检查入口
+
+`tests/` 保存自动化断言，`scripts/` 保存可执行工程工具。两者保持独立目录，通过以下只读入口统一执行常用提交前检查：
+
+```bash
+node scripts/check-project.mjs
+```
+
+该命令依次运行 Worker 语法检查、聚焦回归、管理台组合一致性、CDN 路径检查和 `git diff --check`。正式前端构建仍按下文单独执行，因为构建会改写 `frontend/dist/`。
+
 ### Worker
 
 修改 `worker.js` 后至少运行：

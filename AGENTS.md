@@ -37,6 +37,9 @@
 
 ## 强制校验
 
+- 跨 Worker、前端与发布边界的提交前只读检查可统一运行：
+  - `node scripts/check-project.mjs`
+
 - 修改 `worker.js` 后至少运行：
   - `node --check worker.js`
 - 涉及正式前端构建时必须运行：
