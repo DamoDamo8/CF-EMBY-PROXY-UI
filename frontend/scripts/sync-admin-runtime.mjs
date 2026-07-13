@@ -8,6 +8,7 @@ import {
   ADMIN_RUNTIME_ENHANCEMENT_SCRIPT,
   ADMIN_RUNTIME_ENHANCEMENT_STYLE
 } from './admin-runtime-enhancements.mjs';
+import { inspectRuntimeAssets } from './check-cdn-paths.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,6 +95,15 @@ function validateSourceTemplate(templateHtml = '') {
 
   if (!/<script(?=[^>]*\bid="admin-bootstrap-loader")[^>]*>/i.test(source)) {
     throw new Error('admin runtime template 缺少 admin-bootstrap-loader 脚本');
+  }
+
+  if (/(?:dnsAutoUpload|DNS_AUTO_UPLOAD)[A-Za-z_]*/.test(source)) {
+    throw new Error('admin runtime template 仍包含未受 Worker 支持的 dnsAutoUpload 配置');
+  }
+
+  const runtimeInspection = inspectRuntimeAssets(source);
+  if (runtimeInspection.inlineDynamicImports.length) {
+    throw new Error('admin runtime template 不得包含任何 inline 动态 import');
   }
 }
 

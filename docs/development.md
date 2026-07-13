@@ -68,6 +68,21 @@ cd frontend && npm run dev
 
 `npm run dev` 会先运行管理台同步脚本，再由 `frontend/scripts/dev-server.mjs` 启动 Vite 并输出 WSL/Windows 访问提示。
 
+## D1 schema 迁移
+
+- 正式 migration 位于根 `migrations/`，由 `wrangler.toml` 的 `migrations_dir` 与 `migrations_table` 管理。不要只修改 `worker.js` 的运行时兜底 DDL；schema 或索引契约变化必须同时新增 migration。
+- 当前 v5 migration 顺序固定为 `0001_d1_fresh_baseline.sql`（新库基础表）、`0002_d1_historical_compatibility.sql`（历史库兼容表）和 `0003_d1_schema_v5_indexes.sql`（索引收口）。先发布能够同时读取旧、新 schema 的 expand 代码，在预发执行 `initD1Schema` 并检查 `getD1SchemaStatus`，再应用远端 migration。基础 migration 不包含可重建的 `proxy_logs_fts`。
+- 历史库的未知列组合不得由静态 migration 猜测。运行时兼容初始化必须严格读取 `sqlite_master`/`PRAGMA table_info`，逐项补齐已知列后再创建依赖索引；PRAGMA 失败、半初始化结构或未知结构均 fail-closed。
+- 本地验证由用户在已配置 Wrangler 的环境中执行，代理不得自动安装依赖或直接应用远端 migration：
+
+```bash
+npx wrangler@latest d1 migrations list <DATABASE_NAME> --local
+npx wrangler@latest d1 migrations apply <DATABASE_NAME> --local
+npx wrangler@latest d1 execute <DATABASE_NAME> --local --command="SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name"
+```
+
+- 生产应用前先记录 D1 Time Travel bookmark，并检查远端 migration 列表；应用后复查表、索引、日志查询、DNS IP 工作区、scheduled 租约和 tidy。Wrangler migration 不提供 down 流程，普通回滚采用 forward-fix，灾难恢复使用 Time Travel。
+
 ## 验证
 
 ### 统一检查入口
@@ -78,7 +93,7 @@ cd frontend && npm run dev
 node scripts/check-project.mjs
 ```
 
-该命令依次运行 Worker 语法检查、聚焦回归、管理台组合一致性、CDN 路径检查和 `git diff --check`。正式前端构建仍按下文单独执行，因为构建会改写 `frontend/dist/`。
+该命令依次运行 Worker 语法检查、Worker 防御边界回归、配置/KV 安全回归、D1 migration SQLite fixture、前端增强 VM 回归、管理台组合一致性、CDN 路径检查和 `git diff --check`。正式前端构建仍按下文单独执行，因为构建会改写 `frontend/dist/`。
 
 ### Worker
 
@@ -88,22 +103,48 @@ node scripts/check-project.mjs
 node --check worker.js
 ```
 
-涉及管理台防御边界、远端壳缓存、isolate 内存缓存或 OpsStatus 读取收口时，还要运行聚焦回归：
+涉及管理台防御边界、全局设置、KV 整理、D1 schema、远端壳缓存、isolate 内存缓存或 OpsStatus 读取收口时，还要运行聚焦回归：
 
 ```bash
-node --test tests/worker-defensive-boundaries.test.mjs
+node --test tests/worker-defensive-boundaries.test.mjs tests/config-kv-safety.test.mjs tests/d1-migrations.test.mjs tests/frontend-runtime-enhancements.test.mjs
 git diff --check
 ```
 
 聚焦回归需要保持以下 I/O 边界：同代配置与节点 revision 并发刷新各只访问一次 KV；同节点、同失效代次的代理冷读取只访问一次节点实体，代理热节点和有效期内的短期负缓存不重复读取节点实体；一次完整 OpsStatus 聚合只读取一次 root 和每个 section 一次。并发节点摘要 upsert 必须合并而不丢项，索引重建必须串行覆盖实体加载与提交，旧 revision 候选不得覆盖当前 meta。节点 `/web` 子树必须在上游请求前固定拒绝，Playback relay、同节点重定向和 `__pb_abs` 回退不得绕过；同时不能误伤 `/websocket`、`/webhooks`、普通 API 或媒体路径。
 
+节点 metadata 自动化覆盖不同 Token、Cookie、用户和会话参数的 SHA-256 身份分区、目标预热 URL 的敏感 query 分区、原始凭据不进入缓存 URL、TTL/资源类别 revision 和条件请求 lookup。匿名/私有缓存头及真实 Cache API `206`/`304` 行为仍需浏览器或预发 smoke；metadata 上游必须保持 `cache: no-store`。
+
+域名前缀 CNAME 自动化覆盖三层目标优先级、主机名清洗、非法值拒绝、计划前向/回滚、全局 active plan 补偿、真实 CNAME 分步失败与 history 写失败的完整 host snapshot 恢复、手动单记录创建/更新的 history 失败补偿、DNS 失败后节点 KV 仍回滚，以及 rename 的部分 KV 写补偿。节点新建、清空覆盖、删除、批量导入和管理台回显仍需预发 smoke；DNS 断言必须确认记录名仍为 `<节点名>.<HOST>`，记录为 `ttl: 1`、`proxied: false`。
+
+D1 schema 自动化覆盖 fresh/旧日志 migration、完整必需列、主键/唯一键、同名错误索引、partial/expression 索引、畸形 FTS、v5 索引与正式查询、DNS 来源 batch、100 参数上限和稳定 IP `id`。D1 实例上的配额、Time Travel 和远端 migration apply 仍为人工发布检查。
+
+全局设置与备份自动化覆盖无 KV fail-closed、条件补偿与并发冲突、完整导入失败回滚、后发设置与节点保存串行、快照脱敏、settings/full 默认脱敏备份往返保留当前密钥，以及显式字段覆盖/清空。含密钥导出的浏览器确认交互和真实文件导入下载仍需管理台 smoke。
+
+KV tidy 自动化覆盖缺失/重复游标、签名篡改、过期与计划变化、配置/快照 revision 绑定、条件补偿冲突和最坏补偿配额。1000 页上限、所有 truth-source 读取失败点、每个 mutation 位置、与设置保存并发及结果分组 UI 对照仍需补充自动化；涉及这些边界的发布必须人工验证零写入失败语义。
+
+D1 migration fixture 当前使用 `node:sqlite` 实际执行三个 migration，覆盖新库、缺少兼容日志列的旧库、缺列、错误索引、错误主键/唯一键和畸形 FTS，不需要新增 npm 依赖。migration 表缺失/落后、PRAGMA 失败、逐 step 失败重试、同 binding 结构漂移及 FTS 创建失败仍需补充自动化；修改这些路径时以预发检查兜底。
+
+D1 管理动作的职责边界保持不变：`initLogsDb` 只补日志与小时统计，`initD1Schema` 不伪造 migration 记录，`initLogsFts` 失败不得返回 ready，显式状态检查必须复检实际结构。当前自动化只覆盖其中的初始化 single-flight 与 FTS 重建成功路径，其余在预发逐项验证。
+
+全局默认 CNAME 自动化已确认只同步继承节点、跳过节点级覆盖、全部 DNS 成功后才持久化，以及 active/已完成计划按逆序补偿。管理台字段显示、留空继承提示和访问链接仍由人工 UI smoke 确认。
+
 高风险 Worker 修改还应覆盖对应的本地或预发 smoke、鉴权、代理、KV/D1、缓存头和 scheduled 回归。
 
 ### 正式前端
 
+正式前端构建应在 Windows PowerShell 中运行，不在 WSL 内安装或更新依赖。在 Windows PowerShell 已定位到仓库根目录时执行：
+
+```powershell
+Set-Location frontend
+npm run build
+npm run build:cdn
+```
+
+必须从 WSL 发起时，在仓库根目录显式交给已安装的 Windows PowerShell；当前环境可使用 `powershell.exe`，安装 PowerShell 7 的环境可等价替换为 `pwsh.exe`：
+
 ```bash
-cd frontend && npm run build
-cd frontend && npm run build:cdn
+powershell.exe -NoProfile -Command "npm --prefix frontend run build"
+powershell.exe -NoProfile -Command "npm --prefix frontend run build:cdn"
 ```
 
 重点检查：
@@ -112,6 +153,8 @@ cd frontend && npm run build:cdn
 - `GET ADMIN_PATH` 只返回管理台壳和 Release `index.html`。
 - 已认证的 `GET/HEAD ADMIN_PATH?setup=1` 返回 `no-store` 设置恢复页，`HEAD` body 为空。
 - 浏览器侧依赖使用 `${ADMIN_PATH}/__release/<tag>/vendor/*` 同源路径。
+- `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch 都能被识别；无扩展脚本不能漏检，协议相对及尾点主机名禁止源不能绕过，正式 HTML 不含 importmap、任何 inline 动态 `import()` 或 `dnsAutoUpload*`。
+- `frontend/index.html` 与 `frontend/dist/index.html` 字节一致，证明同步输入已进入正式 Release 资产。
 - 上游引用符合不可变规则的 vendor 资源使用 `immutable`；可变或省略 jsDelivr GitHub ref 的资源使用 `no-store` 并跳过 Cache API。
 - HTML 保留 `ETag` 或 `Last-Modified` 协商缓存。
 - stale HTML 可在后台刷新。

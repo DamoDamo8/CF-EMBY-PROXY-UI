@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
 const frontendDirectory = path.join(repositoryRoot, 'frontend');
-const npmExecutable = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 const requiredChecks = [
   {
@@ -16,21 +15,27 @@ const requiredChecks = [
     cwd: repositoryRoot
   },
   {
-    name: 'Worker defensive boundaries',
+    name: 'Worker, KV safety, and D1 migrations',
     command: process.execPath,
-    args: ['--test', 'tests/worker-defensive-boundaries.test.mjs'],
+    args: [
+      '--test',
+      'tests/worker-defensive-boundaries.test.mjs',
+      'tests/config-kv-safety.test.mjs',
+      'tests/d1-migrations.test.mjs',
+      'tests/frontend-runtime-enhancements.test.mjs'
+    ],
     cwd: repositoryRoot
   },
   {
     name: 'Admin runtime composition',
-    command: npmExecutable,
-    args: ['run', 'check:admin-runtime'],
+    command: process.execPath,
+    args: ['./scripts/sync-admin-runtime.mjs', '--check'],
     cwd: frontendDirectory
   },
   {
     name: 'Release CDN paths',
-    command: npmExecutable,
-    args: ['run', 'check:cdn'],
+    command: process.execPath,
+    args: ['./scripts/check-cdn-paths.mjs'],
     cwd: frontendDirectory
   },
   {

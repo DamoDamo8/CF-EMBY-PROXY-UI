@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 await import("../worker.js");
@@ -12,6 +13,12 @@ const {
   Proxy,
   RuntimeEntry,
   isEmbyWebProxyPath,
+  buildWorkerMetadataCacheIdentityPartition,
+  buildWorkerMetadataPrewarmIdentityPartition,
+  buildWorkerMetadataCachePolicyRevision,
+  buildCanonicalWorkerMetadataCacheKey,
+  buildWorkerMetadataCacheLookupRequest,
+  hasWorkerMetadataPrivateIdentity,
   runSingleFlight,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
@@ -40,6 +47,12 @@ assert.ok(RuntimeEntry && typeof RuntimeEntry === "object", "missing Node test h
 const requiredFunctionHooks = {
   runSingleFlight,
   isEmbyWebProxyPath,
+  buildWorkerMetadataCacheIdentityPartition,
+  buildWorkerMetadataPrewarmIdentityPartition,
+  buildWorkerMetadataCachePolicyRevision,
+  buildCanonicalWorkerMetadataCacheKey,
+  buildWorkerMetadataCacheLookupRequest,
+  hasWorkerMetadataPrivateIdentity,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
   invalidateNodesRevisionCache,
@@ -98,6 +111,104 @@ async function withWorkerGlobals(overrides, callback) {
 
 function countOccurrences(value, fragment) {
   return String(value).split(fragment).length - 1;
+}
+
+function createInMemoryKvStore(initialValues = {}) {
+  const storedValues = new Map(
+    Object.entries(initialValues).map(([key, value]) => [
+      key,
+      typeof value === "string" ? value : JSON.stringify(value)
+    ])
+  );
+  const putKeys = [];
+  const deleteKeys = [];
+  const kv = {
+    async get(key, options = {}) {
+      const stored = storedValues.get(key);
+      if (stored === undefined) return null;
+      return options.type === "json" ? JSON.parse(stored) : stored;
+    },
+    async put(key, value) {
+      putKeys.push(key);
+      storedValues.set(key, String(value));
+    },
+    async delete(key) {
+      deleteKeys.push(key);
+      storedValues.delete(key);
+    },
+    async list(options = {}) {
+      const prefix = String(options.prefix || "");
+      return {
+        keys: [...storedValues.keys()]
+          .filter(key => key.startsWith(prefix))
+          .map(name => ({ name })),
+        list_complete: true
+      };
+    }
+  };
+  return { kv, storedValues, putKeys, deleteKeys };
+}
+
+function createCloudflareDnsFetch(initialRecords = [], options = {}) {
+  const records = new Map(initialRecords.map(record => [String(record.id), structuredClone(record)]));
+  let nextId = initialRecords.length + 1;
+  let mutationCount = 0;
+  const jsonResponse = payload => new Response(JSON.stringify(payload), {
+    headers: { "Content-Type": "application/json" }
+  });
+  const fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const method = String(init.method || "GET").toUpperCase();
+    if (method === "GET" && url.pathname.endsWith("/zones/zone-id")) {
+      return jsonResponse({ success: true, result: { id: "zone-id", name: "proxy.example" } });
+    }
+    if (!url.pathname.includes("/zones/zone-id/dns_records")) {
+      throw new Error(`unexpected Cloudflare request: ${method} ${url}`);
+    }
+    if (method === "GET") {
+      const recordPathMatch = /\/dns_records\/([^/]+)$/.exec(url.pathname);
+      if (recordPathMatch) {
+        const recordId = decodeURIComponent(recordPathMatch[1]);
+        return jsonResponse({ success: true, result: records.get(recordId) || null });
+      }
+      const name = String(url.searchParams.get("name") || "").toLowerCase();
+      const result = [...records.values()].filter(record => !name || String(record.name || "").toLowerCase() === name);
+      return jsonResponse({ success: true, result, result_info: { total_pages: 1 } });
+    }
+    mutationCount += 1;
+    if (mutationCount === Number(options.failMutationAt)) {
+      throw new Error(String(options.failureMessage || "dns_mutation_failed"));
+    }
+    const recordId = decodeURIComponent(url.pathname.split("/").at(-1) || "");
+    if (method === "DELETE") {
+      records.delete(recordId);
+      return jsonResponse({ success: true, result: { id: recordId } });
+    }
+    const body = JSON.parse(String(init.body || "{}"));
+    if (method === "PUT") {
+      records.set(recordId, { id: recordId, ...body });
+      return jsonResponse({ success: true, result: records.get(recordId) });
+    }
+    if (method === "POST") {
+      const id = `created-${nextId++}`;
+      records.set(id, { id, ...body });
+      return jsonResponse({ success: true, result: records.get(id) });
+    }
+    throw new Error(`unexpected Cloudflare request: ${method} ${url}`);
+  };
+  return { fetch, records };
+}
+
+function getComparableDnsRecords(records) {
+  return [...records.values()]
+    .map(record => ({
+      name: record.name,
+      type: record.type,
+      content: record.content,
+      ttl: record.ttl,
+      proxied: record.proxied === true
+    }))
+    .sort((left, right) => `${left.type}:${left.content}`.localeCompare(`${right.type}:${right.content}`));
 }
 
 test("remote shell error responses are no-store and never expose saved secrets", async () => {
@@ -786,6 +897,178 @@ test("admin warm subrequests are unconditional and treat cached 304 responses as
   assert.equal(isAdminWarmResponseSuccessful(new Response(null, { status: 502 })), false);
 });
 
+test("metadata cache keys partition identities without exposing credentials", async () => {
+  const anonymousRequest = new Request("https://worker.test/nodes/alpha/Images/Primary?tag=v1");
+  const firstIdentityRequest = new Request("https://worker.test/nodes/alpha/Images/Primary?api_key=secret-a&UserId=user-a&tag=v1", {
+    headers: {
+      "X-Emby-Token": "header-secret-a",
+      "Cookie": "auth_token=admin-cookie; emby_session=session-a"
+    }
+  });
+  const secondIdentityRequest = new Request("https://worker.test/nodes/alpha/Images/Primary?api_key=secret-b&UserId=user-b&tag=v1", {
+    headers: { "X-Emby-Token": "header-secret-b" }
+  });
+  const [anonymousPartition, firstPartition, secondPartition] = await Promise.all([
+    buildWorkerMetadataCacheIdentityPartition(anonymousRequest),
+    buildWorkerMetadataCacheIdentityPartition(firstIdentityRequest),
+    buildWorkerMetadataCacheIdentityPartition(secondIdentityRequest)
+  ]);
+
+  assert.match(anonymousPartition, /^[a-f0-9]{64}$/);
+  assert.notEqual(firstPartition, secondPartition);
+  assert.equal(hasWorkerMetadataPrivateIdentity(anonymousRequest), false);
+  assert.equal(hasWorkerMetadataPrivateIdentity(firstIdentityRequest), true);
+
+  const policyRevision = buildWorkerMetadataCachePolicyRevision("/Items/1/Images/Primary", {
+    imageCacheMaxAge: 3600,
+    prewarmCacheTtl: 120
+  });
+  const firstKey = buildCanonicalWorkerMetadataCacheKey(
+    new URL(firstIdentityRequest.url),
+    "alpha",
+    "node-key",
+    "/Items/1/Images/Primary",
+    {
+      search: new URL(firstIdentityRequest.url).search,
+      nodeCacheRevision: "node-r1",
+      entryMode: "kv_route",
+      identityPartition: firstPartition,
+      cachePolicyRevision: policyRevision
+    }
+  );
+  const secondKey = buildCanonicalWorkerMetadataCacheKey(
+    new URL(secondIdentityRequest.url),
+    "alpha",
+    "node-key",
+    "/Items/1/Images/Primary",
+    {
+      search: new URL(secondIdentityRequest.url).search,
+      nodeCacheRevision: "node-r1",
+      entryMode: "kv_route",
+      identityPartition: secondPartition,
+      cachePolicyRevision: policyRevision
+    }
+  );
+
+  assert.ok(firstKey instanceof Request);
+  assert.ok(secondKey instanceof Request);
+  assert.notEqual(firstKey.url, secondKey.url);
+  assert.doesNotMatch(firstKey.url, /secret-a|header-secret-a|session-a|user-a/);
+  assert.equal(buildCanonicalWorkerMetadataCacheKey(firstIdentityRequest.url, "alpha", "node-key", "/Items/1/Images/Primary"), null);
+});
+
+test("metadata prewarm partitions each target's sensitive query", async () => {
+  const sourceRequest = new Request("https://worker.test/alpha/Items", {
+    headers: {
+      "X-Emby-Token": "shared-header-secret",
+      "Cookie": "emby_session=shared-session"
+    }
+  });
+  const [firstPartition, secondPartition] = await Promise.all([
+    buildWorkerMetadataPrewarmIdentityPartition(
+      sourceRequest,
+      new URL("https://origin.test/Items/1/Images/Primary?api_key=target-secret-a&tag=v1")
+    ),
+    buildWorkerMetadataPrewarmIdentityPartition(
+      sourceRequest,
+      new URL("https://origin.test/Items/1/Images/Primary?api_key=target-secret-b&tag=v1")
+    )
+  ]);
+
+  assert.match(firstPartition, /^[a-f0-9]{64}$/);
+  assert.notEqual(firstPartition, secondPartition);
+  assert.doesNotMatch(firstPartition, /target-secret|shared-header-secret|shared-session/);
+});
+
+test("metadata cache policy revisions change with TTL and asset kind", () => {
+  const imageHour = buildWorkerMetadataCachePolicyRevision("/Items/1/Images/Primary", {
+    imageCacheMaxAge: 3600,
+    prewarmCacheTtl: 120
+  });
+  const imageDisabled = buildWorkerMetadataCachePolicyRevision("/Items/1/Images/Primary", {
+    imageCacheMaxAge: 0,
+    prewarmCacheTtl: 120
+  });
+  const manifest = buildWorkerMetadataCachePolicyRevision("/Videos/1/main.m3u8", {
+    imageCacheMaxAge: 3600,
+    prewarmCacheTtl: 120
+  });
+
+  assert.notEqual(imageHour, imageDisabled);
+  assert.notEqual(imageHour, manifest);
+});
+
+test("metadata cache lookups preserve supported request conditions and bypass If-Range", () => {
+  const cacheKey = new Request("https://worker-cache.test/item?identity=abc");
+  const sourceRequest = new Request("https://worker.test/item", {
+    headers: {
+      "Range": "bytes=10-19",
+      "If-None-Match": '"etag-v1"',
+      "If-Modified-Since": "Sun, 12 Jul 2026 00:00:00 GMT"
+    }
+  });
+  const lookupRequest = buildWorkerMetadataCacheLookupRequest(cacheKey, sourceRequest);
+
+  assert.ok(lookupRequest instanceof Request);
+  assert.equal(lookupRequest.url, cacheKey.url);
+  assert.equal(lookupRequest.headers.get("Range"), "bytes=10-19");
+  assert.equal(lookupRequest.headers.get("If-None-Match"), '"etag-v1"');
+  assert.equal(lookupRequest.headers.get("If-Modified-Since"), "Sun, 12 Jul 2026 00:00:00 GMT");
+  assert.equal(buildWorkerMetadataCacheLookupRequest(cacheKey, new Request("https://worker.test/item", {
+    headers: { "If-Range": '"etag-v1"', "Range": "bytes=10-19" }
+  })), null);
+});
+
+test("private metadata responses stay browser-private and upstream fetch bypasses shared cache", async () => {
+  const privateRequest = new Request("https://worker.test/Items/1/Images/Primary", {
+    headers: { "X-Emby-Token": "secret-token" }
+  });
+  const publicRequest = new Request("https://worker.test/Items/1/Images/Primary");
+  const requestTraits = {
+    isImage: true,
+    isStaticFile: false,
+    isSubtitle: false,
+    isManifest: false,
+    isMetadataCacheable: true,
+    isBigStream: false,
+    isSmartStrmMedia: false,
+    isSegment: false
+  };
+  const privateHeaders = Proxy.buildProxyResponseHeaders(
+    new Response("image"),
+    privateRequest,
+    {},
+    "*",
+    requestTraits,
+    { imageCacheMaxAge: 3600 }
+  );
+  const publicHeaders = Proxy.buildProxyResponseHeaders(
+    new Response("image"),
+    publicRequest,
+    {},
+    "*",
+    requestTraits,
+    { imageCacheMaxAge: 3600 }
+  );
+  assert.equal(privateHeaders.get("Cache-Control"), "private, max-age=3600");
+  assert.equal(publicHeaders.get("Cache-Control"), "public, max-age=3600");
+
+  const buildFetchOptions = Proxy.createBuildFetchOptions({
+    request: privateRequest,
+    requestMethod: "GET",
+    requestTraits,
+    protocolFallback: true
+  }, {
+    newHeaders: new Headers(privateRequest.headers),
+    adminCustomHeaders: new Set(),
+    preparedBody: null,
+    preparedBodyMode: "none"
+  });
+  const fetchOptions = await buildFetchOptions(new URL("https://origin.test/Items/1/Images/Primary"));
+  assert.equal(fetchOptions.cache, "no-store");
+  assert.equal(Object.hasOwn(fetchOptions, "cf"), false);
+});
+
 test("single-flight deduplicates equal keys while distinct keys run independently", async () => {
   GLOBALS.SingleFlightTasks.clear();
   const sharedGate = createDeferred();
@@ -1190,37 +1473,672 @@ test("runtime config invalidation prevents an older load from restoring stale ca
   invalidateRuntimeConfigCache();
 });
 
-test("runtime config writes prime the new value before metadata maintenance", async () => {
+test("runtime config writes roll back when metadata persistence fails", async () => {
   GLOBALS.SingleFlightTasks.clear();
   invalidateRuntimeConfigCache();
-  let configWriteCount = 0;
+  const storedValues = new Map([[Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 10 })]]);
+  let metadataFailurePending = true;
   const kv = {
-    async get(key) {
-      assert.equal(key, Database.CONFIG_KEY);
-      return { rateLimitRpm: 10 };
+    async get(key, options = {}) {
+      const value = storedValues.get(key);
+      if (value === undefined) return null;
+      return options.type === "json" ? JSON.parse(value) : value;
     },
-    async put(key) {
-      assert.equal(key, Database.CONFIG_KEY);
-      configWriteCount += 1;
+    async put(key, value) {
+      if (key === Database.CONFIG_META_KEY && metadataFailurePending) {
+        metadataFailurePending = false;
+        throw new Error("metadata maintenance failed");
+      }
+      storedValues.set(key, String(value));
+    },
+    async delete(key) {
+      storedValues.delete(key);
     }
   };
   const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "runtime-config-prime" };
   await getRuntimeConfig(env);
 
-  const database = Object.create(Database);
-  database.recordConfigSnapshot = async () => null;
-  database.ensureConfigMeta = async () => {
-    throw new Error("metadata maintenance failed");
-  };
   await assert.rejects(
-    database.persistRuntimeConfig({ rateLimitRpm: 20 }, { env, kv }),
+    Database.persistRuntimeConfig({ rateLimitRpm: 20 }, { env, kv }),
     /metadata maintenance failed/
   );
 
-  assert.equal(configWriteCount, 1);
-  assert.equal(GLOBALS.ConfigCache.data.rateLimitRpm, 20);
-  assert.equal(await getRuntimeConfig(env), GLOBALS.ConfigCache.data);
+  assert.equal(JSON.parse(storedValues.get(Database.CONFIG_KEY)).rateLimitRpm, 10);
+  assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_KEY), false);
+  assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_META_KEY), false);
   invalidateRuntimeConfigCache();
+  assert.equal((await getRuntimeConfig(env)).rateLimitRpm, 10);
+  invalidateRuntimeConfigCache();
+});
+
+test("host-prefix CNAME targets normalize at config and node boundaries", async () => {
+  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "host-prefix-normalize" };
+  const config = await Database.persistRuntimeConfig({
+    defaultHostPrefixCnameTarget: "  Global.Target.Example.  "
+  }, { env, kv });
+  assert.equal(config.defaultHostPrefixCnameTarget, "global.target.example");
+
+  const hostPrefixNode = Database.normalizeNode("alpha", {
+    target: "https://origin.test",
+    entryMode: "host_prefix",
+    hostPrefixCnameTarget: "  Node.Target.Example.  "
+  }).data;
+  assert.equal(hostPrefixNode.hostPrefixCnameTarget, "node.target.example");
+
+  const kvRouteNode = Database.normalizeNode("alpha", {
+    target: "https://origin.test",
+    entryMode: "kv_route",
+    hostPrefixCnameTarget: "node.target.example"
+  }).data;
+  assert.equal(kvRouteNode.hostPrefixCnameTarget, "");
+});
+
+test("invalid global host-prefix CNAME targets are rejected before persistence", async () => {
+  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "host-prefix-invalid" };
+  const invalidTargets = [
+    "https://target.example",
+    "target.example:443",
+    "target.example/path",
+    "*.target.example",
+    "target example",
+    "192.0.2.1"
+  ];
+
+  for (const defaultHostPrefixCnameTarget of invalidTargets) {
+    await assert.rejects(
+      Database.persistRuntimeConfig({ defaultHostPrefixCnameTarget }, { env, kv }),
+      error => error?.code === "HOST_PREFIX_CNAME_TARGET_INVALID"
+        && error?.details?.field === "defaultHostPrefixCnameTarget"
+    );
+  }
+});
+
+test("host-prefix CNAME target priority is node then global then HOST", () => {
+  const hostRoot = "proxy.example";
+  const inheritedNode = { target: "https://origin.test", entryMode: "host_prefix" };
+  const overriddenNode = {
+    ...inheritedNode,
+    hostPrefixCnameTarget: "node.target.example"
+  };
+
+  const nodeOverridePlan = Database.buildHostPrefixDnsSyncPlan(
+    "",
+    null,
+    "alpha",
+    overriddenNode,
+    hostRoot,
+    { nextConfig: { defaultHostPrefixCnameTarget: "global.target.example" } }
+  );
+  assert.equal(nodeOverridePlan.nextCnameTarget, "node.target.example");
+
+  const globalDefaultPlan = Database.buildHostPrefixDnsSyncPlan(
+    "",
+    null,
+    "alpha",
+    inheritedNode,
+    hostRoot,
+    { nextConfig: { defaultHostPrefixCnameTarget: "global.target.example" } }
+  );
+  assert.equal(globalDefaultPlan.nextCnameTarget, "global.target.example");
+
+  const hostFallbackPlan = Database.buildHostPrefixDnsSyncPlan(
+    "",
+    null,
+    "alpha",
+    inheritedNode,
+    hostRoot
+  );
+  assert.equal(hostFallbackPlan.nextCnameTarget, hostRoot);
+});
+
+test("host-prefix DNS plans carry forward and rollback CNAME targets", () => {
+  const node = { target: "https://origin.test", entryMode: "host_prefix" };
+  const plan = Database.buildHostPrefixDnsSyncPlan(
+    "alpha",
+    node,
+    "alpha",
+    node,
+    "proxy.example",
+    {
+      previousConfig: { defaultHostPrefixCnameTarget: "old.target.example" },
+      nextConfig: { defaultHostPrefixCnameTarget: "new.target.example" }
+    }
+  );
+
+  assert.equal(plan.previousDnsHost, "alpha.proxy.example");
+  assert.equal(plan.nextDnsHost, "alpha.proxy.example");
+  assert.equal(plan.previousCnameTarget, "old.target.example");
+  assert.equal(plan.nextCnameTarget, "new.target.example");
+  assert.deepEqual(plan.steps, [{
+    type: "upsert",
+    host: "alpha.proxy.example",
+    cnameTarget: "new.target.example"
+  }]);
+  assert.deepEqual(plan.rollbackSteps, [{
+    type: "upsert",
+    host: "alpha.proxy.example",
+    cnameTarget: "old.target.example"
+  }]);
+});
+
+test("node summaries retain host-prefix CNAME overrides without changing proxy cache revision", () => {
+  const baseNode = {
+    target: "https://origin.test",
+    entryMode: "host_prefix"
+  };
+  const firstSummary = Database.buildNodeSummary("alpha", {
+    ...baseNode,
+    hostPrefixCnameTarget: "First.Target.Example."
+  }).summary;
+  const secondSummary = Database.buildNodeSummary("alpha", {
+    ...baseNode,
+    hostPrefixCnameTarget: "second.target.example"
+  }).summary;
+
+  assert.equal(firstSummary.hostPrefixCnameTarget, "first.target.example");
+  assert.equal(secondSummary.hostPrefixCnameTarget, "second.target.example");
+  assert.equal(firstSummary.cacheRevision, secondSummary.cacheRevision);
+});
+
+test("global host-prefix CNAME changes sync only nodes that inherit the default", async () => {
+  const previousConfig = {
+    defaultHostPrefixCnameTarget: "old.target.example",
+    cfZoneId: "zone-id",
+    cfApiToken: "api-token"
+  };
+  const { kv, storedValues } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: previousConfig,
+    [`${Database.PREFIX}inherited`]: {
+      target: "https://inherited-origin.test",
+      entryMode: "host_prefix"
+    },
+    [`${Database.PREFIX}overridden`]: {
+      target: "https://overridden-origin.test",
+      entryMode: "host_prefix",
+      hostPrefixCnameTarget: "node.target.example"
+    },
+    [`${Database.PREFIX}path-node`]: {
+      target: "https://path-origin.test",
+      entryMode: "kv_route"
+    }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "cname-global-sync-success"
+  };
+  const dnsPlans = [];
+  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
+  Database.persistHostPrefixDnsSyncPlan = async (plan) => {
+    dnsPlans.push(structuredClone(plan));
+    return { changed: true };
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const savedConfig = await Database.persistRuntimeConfig({
+      ...previousConfig,
+      defaultHostPrefixCnameTarget: "new.target.example"
+    }, { env, kv });
+
+    assert.equal(savedConfig.defaultHostPrefixCnameTarget, "new.target.example");
+    assert.deepEqual(dnsPlans.map(plan => plan.steps), [[{
+      type: "upsert",
+      host: "inherited.proxy.example",
+      cnameTarget: "new.target.example"
+    }]]);
+    assert.equal(
+      JSON.parse(storedValues.get(Database.CONFIG_KEY)).defaultHostPrefixCnameTarget,
+      "new.target.example"
+    );
+  } finally {
+    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("global host-prefix CNAME sync rolls back earlier DNS updates before config persistence", async () => {
+  const previousConfig = {
+    defaultHostPrefixCnameTarget: "old.target.example",
+    cfZoneId: "zone-id",
+    cfApiToken: "api-token"
+  };
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: previousConfig,
+    [`${Database.PREFIX}alpha`]: {
+      target: "https://alpha-origin.test",
+      entryMode: "host_prefix"
+    },
+    [`${Database.PREFIX}beta`]: {
+      target: "https://beta-origin.test",
+      entryMode: "host_prefix"
+    }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "cname-global-sync-rollback"
+  };
+  const dnsSteps = [];
+  let forwardPlanCount = 0;
+  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
+  Database.persistHostPrefixDnsSyncPlan = async (plan) => {
+    const steps = structuredClone(plan.steps || []);
+    dnsSteps.push(steps);
+    if (steps[0]?.cnameTarget === "new.target.example") {
+      forwardPlanCount += 1;
+      if (forwardPlanCount === 2) throw new Error("beta_dns_update_failed");
+    }
+    return { changed: true };
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      Database.persistRuntimeConfig({
+        ...previousConfig,
+        defaultHostPrefixCnameTarget: "new.target.example"
+      }, { env, kv }),
+      error => error?.message === "beta_dns_update_failed"
+        && error?.details?.hostPrefixDnsSyncedCount === 1
+        && error?.details?.failedHostPrefixDnsHost === "beta.proxy.example"
+        && error?.details?.rollbackAttempted === true
+        && error?.details?.rollbackSucceeded === true
+    );
+
+    assert.deepEqual(dnsSteps, [
+      [{
+        type: "upsert",
+        host: "alpha.proxy.example",
+        cnameTarget: "new.target.example"
+      }],
+      [{
+        type: "upsert",
+        host: "beta.proxy.example",
+        cnameTarget: "new.target.example"
+      }],
+      [{
+        type: "upsert",
+        host: "beta.proxy.example",
+        cnameTarget: "old.target.example"
+      }],
+      [{
+        type: "upsert",
+        host: "alpha.proxy.example",
+        cnameTarget: "old.target.example"
+      }]
+    ]);
+    assert.equal(
+      JSON.parse(storedValues.get(Database.CONFIG_KEY)).defaultHostPrefixCnameTarget,
+      "old.target.example"
+    );
+    assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_KEY), false);
+    assert.equal(putKeys.includes(Database.CONFIG_KEY), false);
+    assert.equal(putKeys.includes(Database.CONFIG_SNAPSHOTS_KEY), false);
+  } finally {
+    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("CNAME sync restores the complete host snapshot after a partial delete failure", async () => {
+  const initialRecords = [
+    { id: "a-1", name: "alpha.proxy.example", type: "A", content: "192.0.2.10", ttl: 120, proxied: false },
+    { id: "aaaa-1", name: "alpha.proxy.example", type: "AAAA", content: "2001:db8::10", ttl: 300, proxied: false }
+  ];
+  const dns = createCloudflareDnsFetch(initialRecords, {
+    failMutationAt: 2,
+    failureMessage: "second_delete_failed"
+  });
+  const { kv } = createInMemoryKvStore();
+
+  await withWorkerGlobals({ fetch: dns.fetch }, async () => {
+    await assert.rejects(
+      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+        env: { HOST: "proxy.example" },
+        kv,
+        config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+        cnameTarget: "target.example"
+      }),
+      error => error?.message === "second_delete_failed"
+        && error?.details?.rollbackAttempted === true
+        && error?.details?.rollbackSucceeded === true
+    );
+  });
+
+  assert.deepEqual(getComparableDnsRecords(dns.records), getComparableDnsRecords(new Map(initialRecords.map(record => [record.id, record]))));
+});
+
+test("CNAME sync restores DNS when strict history persistence fails", async () => {
+  const initialRecords = [
+    { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
+  ];
+  const dns = createCloudflareDnsFetch(initialRecords);
+  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const { kv } = createInMemoryKvStore({
+    [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
+  });
+  const originalPut = kv.put;
+  kv.put = async (key, value) => {
+    if (key === historyKey) throw new Error("history_write_failed");
+    return await originalPut(key, value);
+  };
+
+  await withWorkerGlobals({ fetch: dns.fetch }, async () => {
+    await assert.rejects(
+      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+        env: { HOST: "proxy.example" },
+        kv,
+        config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+        cnameTarget: "new.target.example"
+      }),
+      error => error?.message === "history_write_failed"
+        && error?.details?.rollbackAttempted === true
+        && error?.details?.rollbackSucceeded === true
+    );
+  });
+
+  assert.deepEqual(getComparableDnsRecords(dns.records), getComparableDnsRecords(new Map(initialRecords.map(record => [record.id, record]))));
+});
+
+test("CNAME history mutation fails closed when the existing history cannot be read", async () => {
+  const initialRecords = [
+    { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
+  ];
+  const dns = createCloudflareDnsFetch(initialRecords);
+  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const { kv, putKeys } = createInMemoryKvStore();
+  const originalGet = kv.get;
+  kv.get = async (key, options) => {
+    if (key === historyKey) throw new Error("history_read_failed");
+    return await originalGet(key, options);
+  };
+
+  await withWorkerGlobals({ fetch: dns.fetch }, async () => {
+    await assert.rejects(
+      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+        env: { HOST: "proxy.example" },
+        kv,
+        config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+        cnameTarget: "new.target.example"
+      }),
+      error => error?.message === "history_read_failed"
+        && error?.details?.rollbackSucceeded === true
+    );
+  });
+
+  assert.equal(putKeys.includes(historyKey), false);
+  assert.deepEqual(getComparableDnsRecords(dns.records), getComparableDnsRecords(new Map(initialRecords.map(record => [record.id, record]))));
+});
+
+test("single-record DNS update restores the previous record when history persistence fails", async () => {
+  const initialRecords = [
+    { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
+  ];
+  const dns = createCloudflareDnsFetch(initialRecords);
+  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const { kv } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
+  });
+  const originalPut = kv.put;
+  kv.put = async (key, value) => {
+    if (key === historyKey) throw new Error("history_write_failed");
+    return await originalPut(key, value);
+  };
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "single-dns-update-history-rollback" };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+      recordId: "cname-1",
+      host: "alpha.proxy.example",
+      type: "CNAME",
+      content: "new.target.example"
+    }, {
+      env,
+      kv,
+      request: new Request("https://proxy.example/admin", {
+        headers: { "X-Admin-Confirm": "updateDnsRecord" }
+      })
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "CF_DNS_UPDATE_FAILED");
+    assert.equal(payload.error.details.reason, "history_write_failed");
+    assert.equal(payload.error.details.rollbackAttempted, true);
+    assert.equal(payload.error.details.rollbackSucceeded, true);
+    assert.equal(payload.error.details.rollbackError, "");
+    assert.deepEqual(getComparableDnsRecords(dns.records), getComparableDnsRecords(new Map(initialRecords.map(record => [record.id, record]))));
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("single-record DNS update reports a failed history compensation", async () => {
+  const initialRecords = [
+    { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
+  ];
+  const dns = createCloudflareDnsFetch(initialRecords, {
+    failMutationAt: 2,
+    failureMessage: "dns_rollback_failed"
+  });
+  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const { kv } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
+  });
+  const originalPut = kv.put;
+  kv.put = async (key, value) => {
+    if (key === historyKey) throw new Error("history_write_failed");
+    return await originalPut(key, value);
+  };
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "single-dns-update-history-rollback-failure" };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+      recordId: "cname-1",
+      host: "alpha.proxy.example",
+      type: "CNAME",
+      content: "new.target.example"
+    }, {
+      env,
+      kv,
+      request: new Request("https://proxy.example/admin", {
+        headers: { "X-Admin-Confirm": "updateDnsRecord" }
+      })
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.details.reason, "history_write_failed");
+    assert.equal(payload.error.details.rollbackAttempted, true);
+    assert.equal(payload.error.details.rollbackSucceeded, false);
+    assert.equal(payload.error.details.rollbackError, "dns_rollback_failed");
+    assert.equal(dns.records.get("cname-1").content, "new.target.example");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("single-record DNS create deletes the new record when history persistence fails", async () => {
+  const dns = createCloudflareDnsFetch([]);
+  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const { kv } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+  });
+  const originalPut = kv.put;
+  kv.put = async (key, value) => {
+    if (key === historyKey) throw new Error("history_write_failed");
+    return await originalPut(key, value);
+  };
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "single-dns-create-history-rollback" };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+      host: "alpha.proxy.example",
+      type: "CNAME",
+      content: "new.target.example"
+    }, {
+      env,
+      kv,
+      request: new Request("https://proxy.example/admin", {
+        headers: { "X-Admin-Confirm": "createDnsRecord" }
+      })
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.details.rollbackAttempted, true);
+    assert.equal(payload.error.details.rollbackSucceeded, true);
+    assert.equal(dns.records.size, 0);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("node rollback restores KV even when DNS compensation fails", async () => {
+  const { kv, storedValues } = createInMemoryKvStore({
+    [`${Database.PREFIX}alpha`]: { target: "https://new-origin.test", entryMode: "host_prefix" }
+  });
+  const mutation = {
+    previousName: "alpha",
+    previousNode: { target: "https://old-origin.test", entryMode: "host_prefix" },
+    nextName: "alpha",
+    nextNode: { target: "https://new-origin.test", entryMode: "host_prefix" },
+    nodeChanged: true,
+    dnsPlan: { changed: true, rollbackSteps: [{ type: "upsert", host: "alpha.proxy.example", cnameTarget: "old.target.example" }] }
+  };
+  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
+  Database.persistHostPrefixDnsSyncPlan = async () => {
+    throw new Error("dns_rollback_failed");
+  };
+  try {
+    await assert.rejects(
+      Database.rollbackPreparedNodeMutations([mutation], {
+        kv,
+        config: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+      }),
+      /dns:dns_rollback_failed/
+    );
+  } finally {
+    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+  }
+
+  assert.equal(JSON.parse(storedValues.get(`${Database.PREFIX}alpha`)).target, "https://old-origin.test");
+});
+
+test("active rename mutation rolls back a partial KV write", async () => {
+  const previousNode = { target: "https://old-origin.test", entryMode: "kv_route" };
+  const nextNode = { target: "https://new-origin.test", entryMode: "kv_route" };
+  const { kv, storedValues } = createInMemoryKvStore({
+    [`${Database.PREFIX}alpha`]: previousNode
+  });
+  const originalDelete = kv.delete;
+  let deleteFailurePending = true;
+  kv.delete = async key => {
+    if (key === `${Database.PREFIX}alpha` && deleteFailurePending) {
+      deleteFailurePending = false;
+      throw new Error("rename_delete_failed");
+    }
+    return await originalDelete(key);
+  };
+
+  await assert.rejects(
+    Database.applyPreparedNodeMutations([{
+      previousName: "alpha",
+      previousNode,
+      nextName: "beta",
+      nextNode,
+      nodeChanged: true,
+      dnsPlan: null
+    }], { kv }),
+    error => error?.message === "rename_delete_failed"
+      && error?.details?.rollbackAttempted === true
+      && error?.details?.rollbackSucceeded === true
+  );
+
+  assert.deepEqual(JSON.parse(storedValues.get(`${Database.PREFIX}alpha`)), previousNode);
+  assert.equal(storedValues.has(`${Database.PREFIX}beta`), false);
+});
+
+test("full import restores inherited host-prefix DNS after a node index rebuild failure", async () => {
+  const previousConfig = {
+    cfZoneId: "zone-id",
+    cfApiToken: "api-token",
+    defaultHostPrefixCnameTarget: "old.target.example"
+  };
+  const previousNode = {
+    target: "https://old-origin.test",
+    entryMode: "host_prefix"
+  };
+  const { kv, storedValues } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: previousConfig,
+    [`${Database.PREFIX}alpha`]: previousNode
+  });
+  const dns = createCloudflareDnsFetch([{
+    id: "cname-1",
+    name: "alpha.proxy.example",
+    type: "CNAME",
+    content: "old.target.example",
+    ttl: 1,
+    proxied: false
+  }]);
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "full-import-node-rebuild-rollback"
+  };
+  const originalRebuildNodeIndexesFromKv = Database.rebuildNodeIndexesFromKv;
+  let rebuildCount = 0;
+  Database.rebuildNodeIndexesFromKv = async (...args) => {
+    rebuildCount += 1;
+    if (rebuildCount === 1) throw new Error("node_index_rebuild_failed");
+    return await originalRebuildNodeIndexesFromKv.apply(Database, args);
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await withWorkerGlobals({ fetch: dns.fetch }, async () => {
+      await assert.rejects(
+        Database.ApiHandlers.importFull({
+          config: {
+            ...previousConfig,
+            defaultHostPrefixCnameTarget: "new.target.example"
+          },
+          nodes: [{
+            name: "alpha",
+            target: "https://new-origin.test",
+            entryMode: "kv_route"
+          }]
+        }, { env, ctx: null, kv }),
+        error => error?.message === "node_index_rebuild_failed"
+          && error?.details?.nodeRollbackError === ""
+          && error?.details?.configRollbackError === ""
+      );
+    });
+
+    const restoredConfig = JSON.parse(storedValues.get(Database.CONFIG_KEY));
+    const restoredNode = JSON.parse(storedValues.get(`${Database.PREFIX}alpha`));
+    assert.equal(restoredConfig.defaultHostPrefixCnameTarget, "old.target.example");
+    assert.equal(restoredNode.entryMode, "host_prefix");
+    assert.equal(restoredNode.target, "https://old-origin.test:443");
+    assert.deepEqual(getComparableDnsRecords(dns.records), [{
+      name: "alpha.proxy.example",
+      type: "CNAME",
+      content: "old.target.example",
+      ttl: 1,
+      proxied: false
+    }]);
+  } finally {
+    Database.rebuildNodeIndexesFromKv = originalRebuildNodeIndexesFromKv;
+    invalidateRuntimeConfigCache();
+  }
 });
 
 test("node revision refresh coalesces and hot node reads stay in memory", async () => {
@@ -1816,6 +2734,34 @@ test("proxy preparation clones request URLs only when playback parameters mutate
   assert.equal(relayUrl.searchParams.get("__pb_target"), relayTarget);
 });
 
+test("proxy metadata preparation rekeys identity and cache TTL", async () => {
+  const node = { target: "https://origin.test" };
+  const ctx = { waitUntil() {} };
+  const buildExecution = (token, cacheTtlImages) => Proxy.prepareExecutionContext(
+    new Request(`https://worker.test/alpha/Items/1/Images/Primary?api_key=${encodeURIComponent(token)}&tag=v1`),
+    node,
+    "/Items/1/Images/Primary",
+    "alpha",
+    "node-key",
+    {},
+    ctx,
+    { runtimeConfig: { rateLimitRpm: 0, cacheTtlImages } }
+  );
+
+  const [firstIdentity, secondIdentity, disabledCache] = await Promise.all([
+    buildExecution("secret-a", 30),
+    buildExecution("secret-b", 30),
+    buildExecution("secret-a", 0)
+  ]);
+
+  assert.ok(firstIdentity.metadataCacheKey instanceof Request);
+  assert.notEqual(firstIdentity.metadataCacheKey.url, secondIdentity.metadataCacheKey.url);
+  assert.notEqual(firstIdentity.metadataCacheKey.url, disabledCache.metadataCacheKey.url);
+  assert.doesNotMatch(firstIdentity.metadataCacheKey.url, /secret-a/);
+  assert.notEqual(firstIdentity.metadataCacheIdentityPartition, secondIdentity.metadataCacheIdentityPartition);
+  assert.notEqual(firstIdentity.metadataCachePolicyRevision, disabledCache.metadataCachePolicyRevision);
+});
+
 test("canonical OpsStatus read merges partition, root, shadow, and latest updatedAt", async () => {
   const db = { prepare() {} };
   const rootStatus = {
@@ -1980,7 +2926,8 @@ test("fresh remote shell keeps the external asset policy boundary", async () => 
       "/assets/app.js",
       "https://esm.sh/vue@3/dist/vue.runtime.esm-browser.js",
       "https://raw.githubusercontent.com/owner/repo/main/app.js",
-      "https://github.com/owner/repo/releases/download/v1.0.0/app.js"
+      "https://github.com/owner/repo/releases/download/v1.0.0/app.js",
+      "https://github.com/owner/repo/releases/download/v1.0.0/runtime"
     ];
     for (const forbiddenAssetUrl of forbiddenAssetUrls) {
       assetUrl = forbiddenAssetUrl;
@@ -1993,6 +2940,41 @@ test("fresh remote shell keeps the external asset policy boundary", async () => 
         /asset policy invalid/
       );
     }
+  });
+});
+
+test("remote shell rejects importmaps and rewrites semantic assets without extensions", async () => {
+  let html = '<!doctype html><html><head><script type="importmap">{"imports":{}}</script></head><body><div id="app"></div></body></html>';
+  await withWorkerGlobals({
+    fetch: async () => new Response(html, {
+      headers: { "Content-Type": "text/html; charset=utf-8" }
+    })
+  }, async () => {
+    await assert.rejects(
+      fetchAdminRemoteShellStoredResponse(
+        "https://example.test/index.html",
+        { adminPath: "/admin" },
+        { ok: true, missing: [] }
+      ),
+      /importmap/
+    );
+
+    html = `<!doctype html><html><head>
+      <script src='https://cdn.tailwindcss.com'></script>
+      <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.esm-browser.prod.js">
+      <link rel="preload" as="style" href="https://cdn.jsdelivr.net/npm/example@1.0.0/theme">
+    </head><body><div id="app"></div></body></html>`;
+    const payload = await fetchAdminRemoteShellStoredResponse(
+      "https://example.test/index.html",
+      { adminPath: "/admin" },
+      { ok: true, missing: [] },
+      null,
+      { adminPath: "/admin", releaseTag: "v1.0.0" }
+    );
+    const renderedHtml = await payload.storedResponse.text();
+    assert.equal(payload.vendorManifest.entries.length, 3);
+    assert.doesNotMatch(renderedHtml, /https:\/\/cdn\.tailwindcss\.com/);
+    assert.match(renderedHtml, /\/admin\/__release\/v1\.0\.0\/vendor\//);
   });
 });
 
@@ -2122,4 +3104,120 @@ test("immutable vendor assets use asset cache and immutable browser policy", asy
     "admin-release-vendor-cache.invalid"
   ]);
   assert.deepEqual(cacheWrites, ["admin-release-vendor-cache.invalid"]);
+});
+
+function createD1Recorder() {
+  const prepared = [];
+  const batches = [];
+  const schemaColumns = [
+    "id", "timestamp", "node_name", "request_path", "request_method", "status_code", "response_time", "client_ip",
+    "inbound_colo", "outbound_colo", "user_agent", "referer", "category", "error_detail", "detail_json", "created_at",
+    "inbound_ip", "outbound_ip", "ip", "ip_type", "source_kind", "source_label", "line_label", "remark", "updated_at",
+    "name", "url", "source_type", "domain", "preset_id", "builtin_id", "enabled", "sort_order", "ip_limit",
+    "last_fetch_at", "last_fetch_status", "last_fetch_count"
+  ];
+  const db = {
+    prepare(sql) {
+      const record = { sql: String(sql), bindings: [] };
+      prepared.push(record);
+      const statement = {
+        __record: record,
+        bind(...bindings) {
+          record.bindings = bindings;
+          return statement;
+        },
+        async run() {
+          return { success: true };
+        },
+        async all() {
+          if (/^PRAGMA table_info/i.test(record.sql.trim())) {
+            return { results: schemaColumns.map(name => ({ name })) };
+          }
+          return { results: [] };
+        },
+        async first() {
+          return null;
+        }
+      };
+      return statement;
+    },
+    async batch(statements) {
+      batches.push(statements.map(statement => statement.__record));
+      return statements.map(() => ({ success: true }));
+    }
+  };
+  return { db, prepared, batches };
+}
+
+test("D1 schema initialization is single-flight and migration indexes match runtime queries", async () => {
+  const logRecorder = createD1Recorder();
+  await Promise.all([
+    Database.ensureLogsBaseSchema(logRecorder.db),
+    Database.ensureLogsBaseSchema(logRecorder.db)
+  ]);
+  await Database.ensureLogsBaseSchema(logRecorder.db);
+  await Promise.all([
+    Database.ensureStatsHourlySchema(logRecorder.db),
+    Database.ensureStatsHourlySchema(logRecorder.db)
+  ]);
+
+  assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 2);
+  assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_stats_hourly \(/.test(record.sql)).length, 1);
+  assert.ok(logRecorder.prepared.some(record => /idx_proxy_logs_client_time/.test(record.sql)));
+
+  const dnsRecorder = createD1Recorder();
+  await Promise.all([
+    Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db),
+    Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db)
+  ]);
+  await Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
+
+  assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
+  assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_pool_items_updated_ip/.test(record.sql)));
+  assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_probe_cache_colo_ip_expires/.test(record.sql)));
+
+  const migrationSql = await readFile(new URL("../migrations/0003_d1_schema_v5_indexes.sql", import.meta.url), "utf8");
+  assert.match(migrationSql, /CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time/);
+  assert.match(migrationSql, /DROP INDEX IF EXISTS idx_proxy_logs_timestamp_id/);
+  assert.match(migrationSql, /DROP INDEX IF EXISTS idx_proxy_logs_category/);
+  assert.match(migrationSql, /DROP INDEX IF EXISTS idx_proxy_stats_hourly_date/);
+  assert.match(migrationSql, /DROP INDEX IF EXISTS idx_dns_ip_pool_items_ip_type/);
+  assert.match(migrationSql, /DROP INDEX IF EXISTS idx_sys_status_updated_at/);
+});
+
+test("D1 DNS writes keep stable ids and replace sources atomically", async () => {
+  const recorder = createD1Recorder();
+  await Database.upsertDnsIpPoolItems(recorder.db, [{
+    id: "item-v2",
+    ip: "203.0.113.10",
+    sourceKind: "manual",
+    sourceLabel: "manual"
+  }]);
+  const itemUpsertSql = recorder.prepared.find(record => /INSERT INTO dns_ip_pool_items/.test(record.sql))?.sql || "";
+  assert.doesNotMatch(itemUpsertSql, /id\s*=\s*excluded\.id/);
+
+  await Database.persistDnsIpPoolSources({ db: recorder.db }, [{
+    id: "source-1",
+    name: "Example source",
+    url: "https://example.test/ips.txt",
+    sourceType: "url",
+    sourceKind: "custom",
+    enabled: true,
+    sortOrder: 0,
+    ipLimit: 5
+  }]);
+  const sourceBatch = recorder.batches.at(-1);
+  assert.equal(sourceBatch.length, 2);
+  assert.match(sourceBatch[0].sql, /^DELETE FROM dns_ip_pool_sources$/);
+  assert.match(sourceBatch[1].sql, /^INSERT INTO dns_ip_pool_sources/);
+});
+
+test("D1 probe cache bulk reads stay within the 100 binding limit", async () => {
+  const recorder = createD1Recorder();
+  const ips = Array.from({ length: 99 }, (_, index) => `203.0.113.${index + 1}`);
+  await Database.getDnsIpProbeCacheEntries(recorder.db, ips, "SJC");
+  const bulkQueries = recorder.prepared.filter(record => /WHERE entry_colo = \? AND expires_at > \? AND ip IN/.test(record.sql));
+  assert.equal(bulkQueries.length, 2);
+  assert.ok(bulkQueries.every(record => record.bindings.length <= 100));
+  assert.equal(Math.max(...bulkQueries.map(record => record.bindings.length)), 100);
 });

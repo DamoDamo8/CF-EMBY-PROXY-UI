@@ -10,7 +10,7 @@
 /** @typedef {{ tgDailyReportEnabled?: boolean, tgDailyReportSummaryEnabled?: boolean, tgDailyReportKvEnabled?: boolean, tgDailyReportD1Enabled?: boolean, [key: string]: unknown }} DailyTelegramReportConfigLike */
 /** @typedef {{ updatedAt: string, hash: string, revision: string }} BaseRevisionMeta */
 /** @typedef {BaseRevisionMeta & { count?: number, indexHash?: string, fullIndexHash?: string }} ExtendedRevisionMeta */
-/** @typedef {RequestInit & { cf?: { cacheEverything: boolean, cacheTtl: number } }} WorkerRequestInit */
+/** @typedef {RequestInit} WorkerRequestInit */
 /** @typedef {Response & { webSocket?: unknown }} UpgradeableResponse */
 /** @typedef {Error & { code?: string, status?: number, details?: any }} AppError */
 /** @typedef {{ kv?: { namespaceTitle?: string }, d1?: { databaseName?: string } }} CloudflareQuotaResourceMeta */
@@ -88,6 +88,8 @@ const LOG_DEFAULTS = Object.freeze({
   TgAlertD1UsageEnabled: false,
   TgAlertD1UsageThresholdPercent: 80
 });
+
+const KV_TIDY_PLAN_TOKEN_TTL_MS = 10 * 60 * 1000;
 
 const SCHEDULE_DEFAULTS = Object.freeze({
   ScheduledLeaseMinMs: 30 * 1000,
@@ -263,10 +265,15 @@ const GLOBAL_RUNTIME_STATE = {
   LogLastFlushAt: 0,
   OpsStatusWriteChain: Promise.resolve(),
   NodeIndexMutationChain: Promise.resolve(),
+  KvDataMutationChain: Promise.resolve(),
+  KvTidyMutationChain: Promise.resolve(),
   InitCheckWarnedFingerprints: new Set()
 };
 
 const GLOBAL_DB_READY_STATE = {
+  LogsBaseDbReady: new WeakMap(),
+  StatsHourlyDbReady: new WeakMap(),
+  DnsIpWorkspaceDbReady: new WeakMap(),
   OpsStatusDbReady: new WeakMap(),
   OpsStatusShadowCache: new WeakMap(),
   ScheduledLeaseDbReady: new WeakMap(),
@@ -620,6 +627,24 @@ async function runNodeIndexMutation(mutation) {
       }
     });
   GLOBALS.NodeIndexMutationChain = mutationTask.catch(() => null);
+  return await mutationTask;
+}
+
+async function runKvDataMutation(mutation) {
+  const previousMutation = GLOBALS.KvDataMutationChain;
+  const mutationTask = previousMutation
+    .catch(() => null)
+    .then(() => mutation());
+  GLOBALS.KvDataMutationChain = mutationTask.catch(() => null);
+  return await mutationTask;
+}
+
+async function runKvTidyMutation(mutation) {
+  const previousMutation = GLOBALS.KvTidyMutationChain;
+  const mutationTask = previousMutation
+    .catch(() => null)
+    .then(() => runKvDataMutation(mutation));
+  GLOBALS.KvTidyMutationChain = mutationTask.catch(() => null);
   return await mutationTask;
 }
 
@@ -1509,6 +1534,16 @@ function getHostPrefixNodeValidationError(node = {}, env = null) {
       reason: legacyHostReservation.reason,
       legacyHost: legacyHostReservation.legacyHost,
       host: legacyHostReservation.host
+    };
+  }
+  const cnameTargetError = getHostPrefixCnameTargetValidationError(node?.hostPrefixCnameTarget);
+  if (cnameTargetError) {
+    return {
+      code: "HOST_PREFIX_CNAME_TARGET_INVALID",
+      message: cnameTargetError,
+      field: "hostPrefixCnameTarget",
+      value: String(node?.hostPrefixCnameTarget || "").trim(),
+      name
     };
   }
   return null;
@@ -2805,6 +2840,12 @@ const WORKER_CACHE_DROP_QUERY_PARAMS = new Set([
   "playsessionid",
   "sessionid"
 ]);
+const WORKER_METADATA_CACHE_REVISION = "identity-http-v2";
+const WORKER_METADATA_CONDITIONAL_HEADER_NAMES = Object.freeze([
+  "Range",
+  "If-None-Match",
+  "If-Modified-Since"
+]);
 const WORKER_METADATA_MANIFEST_ALLOWED_PATHS = [
   /^\/Videos\/[^/]+\/(?:main|master|stream)\.m3u8$/i,
   /^\/Videos\/[^/]+\/(?:manifest|main|master|stream)\.mpd$/i,
@@ -2844,6 +2885,79 @@ function normalizeWorkerCacheUrl(url) {
   normalizedUrl.search = "";
   for (const [key, value] of keptParams) normalizedUrl.searchParams.append(key, value);
   return normalizedUrl;
+}
+
+function collectWorkerMetadataCacheIdentity(request) {
+  const requestUrl = request instanceof Request ? new URL(request.url) : new URL(String(request || ""));
+  const queryEntries = [];
+  for (const [rawName, rawValue] of requestUrl.searchParams.entries()) {
+    const name = normalizeWorkerCacheParamName(rawName);
+    if (!WORKER_CACHE_DROP_QUERY_PARAMS.has(name)) continue;
+    queryEntries.push([name, String(rawValue)]);
+  }
+  queryEntries.sort((left, right) => {
+    const nameDiff = left[0].localeCompare(right[0]);
+    return nameDiff !== 0 ? nameDiff : left[1].localeCompare(right[1]);
+  });
+
+  const headers = request instanceof Request ? request.headers : new Headers();
+  const headerEntries = [];
+  for (const [rawName, rawValue] of headers.entries()) {
+    const name = String(rawName || "").trim().toLowerCase();
+    if (!name || (!MEDIA_REDIRECT_SAFE_HEADER_NAMES.has(name) && !isPotentialPrivateMediaAuthHeaderName(name))) continue;
+    headerEntries.push([name, String(rawValue)]);
+  }
+  const cookie = stripCookieHeaderNames(headers.get("Cookie") || "", ["auth_token", ...INTERNAL_PROXY_COOKIE_NAMES]);
+  if (cookie) headerEntries.push(["cookie", cookie]);
+  headerEntries.sort((left, right) => {
+    const nameDiff = left[0].localeCompare(right[0]);
+    return nameDiff !== 0 ? nameDiff : left[1].localeCompare(right[1]);
+  });
+  return { queryEntries, headerEntries };
+}
+
+function hasWorkerMetadataPrivateIdentity(request) {
+  const identity = collectWorkerMetadataCacheIdentity(request);
+  return identity.queryEntries.length > 0 || identity.headerEntries.length > 0;
+}
+
+async function buildWorkerMetadataCacheIdentityPartition(request) {
+  const identity = collectWorkerMetadataCacheIdentity(request);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(serializeConfigValue(identity))
+  );
+  return [...new Uint8Array(digest)]
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function buildWorkerMetadataPrewarmIdentityPartition(request, targetUrl) {
+  const targetRequest = new Request(
+    targetUrl instanceof URL ? targetUrl.toString() : String(targetUrl || ""),
+    { headers: request.headers }
+  );
+  return await buildWorkerMetadataCacheIdentityPartition(targetRequest);
+}
+
+function buildWorkerMetadataCachePolicyRevision(proxyPath = "", options = {}) {
+  const isManifest = STREAM_MANIFEST_EXTENSION_REGEX.test(String(proxyPath || ""));
+  const cacheKind = isManifest ? "manifest" : "asset";
+  const ttlSeconds = isManifest
+    ? Math.max(0, Number(options.prewarmCacheTtl) || 0)
+    : Math.max(0, Number(options.imageCacheMaxAge) || 0);
+  return hashStableText(`${WORKER_METADATA_CACHE_REVISION}:${cacheKind}:${ttlSeconds}`);
+}
+
+function buildWorkerMetadataCacheLookupRequest(cacheKey, sourceRequest) {
+  if (!(cacheKey instanceof Request) || !(sourceRequest instanceof Request)) return null;
+  if (sourceRequest.headers.has("If-Range")) return null;
+  const headers = new Headers();
+  for (const headerName of WORKER_METADATA_CONDITIONAL_HEADER_NAMES) {
+    const value = sourceRequest.headers.get(headerName);
+    if (value) headers.set(headerName, value);
+  }
+  return new Request(cacheKey.url, { method: "GET", headers });
 }
 
 function normalizeMetadataCachePath(pathname = "") {
@@ -2945,6 +3059,9 @@ function invalidatePlaybackProgressRelayForNodes(nodeNames = []) {
 
 function buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath = "/", options = {}) {
   try {
+    const identityPartition = String(options.identityPartition || "").trim();
+    const cachePolicyRevision = String(options.cachePolicyRevision || "").trim();
+    if (!identityPartition || !cachePolicyRevision) return null;
     const baseUrl = requestUrl instanceof URL ? new URL(requestUrl.toString()) : new URL(String(requestUrl || ""));
     const safeProxyPath = sanitizeProxyPath(proxyPath);
     const canonicalUrl = new URL(baseUrl.origin);
@@ -2955,6 +3072,9 @@ function buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath =
     canonicalUrl.search = String(options.search || "");
     const nodeCacheRevision = String(options.nodeCacheRevision || "").trim();
     if (nodeCacheRevision) canonicalUrl.searchParams.set("__proxyrev", nodeCacheRevision);
+    canonicalUrl.searchParams.set("__metadatarev", WORKER_METADATA_CACHE_REVISION);
+    canonicalUrl.searchParams.set("__identity", identityPartition);
+    canonicalUrl.searchParams.set("__policy", cachePolicyRevision);
     canonicalUrl.hash = "";
     return buildWorkerCacheKey(canonicalUrl);
   } catch {
@@ -4102,6 +4222,37 @@ function isValidDnsLabelForHostPrefix(value = "") {
   const text = String(value || "").trim().toLowerCase();
   if (!text || text.length > 63) return false;
   return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(text);
+}
+
+function normalizeHostPrefixCnameTarget(value = "") {
+  const text = String(value || "").trim().toLowerCase().replace(/\.+$/, "");
+  if (!text || text.length > 253) return "";
+  if (/\s|[:/@*]/.test(text) || isValidIpv4Address(text) || isValidIpv6Address(text)) return "";
+  const labels = text.split(".");
+  if (labels.some(label => !isValidDnsLabelForHostPrefix(label))) return "";
+  return text;
+}
+
+function getHostPrefixCnameTargetValidationError(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (normalizeHostPrefixCnameTarget(text)) return "";
+  return "CNAME 指向必须是合法主机名，不能包含协议、端口、路径、通配符、空格或 IP 地址";
+}
+
+function assertHostPrefixCnameTargetValid(value = "", field = "defaultHostPrefixCnameTarget") {
+  const message = getHostPrefixCnameTargetValidationError(value);
+  if (!message) return;
+  throw createStructuredConfigError("HOST_PREFIX_CNAME_TARGET_INVALID", message, 400, {
+    field,
+    value: String(value || "").trim()
+  });
+}
+
+function resolveHostPrefixCnameTarget(node = null, config = {}, hostRoot = "") {
+  return normalizeHostPrefixCnameTarget(node?.hostPrefixCnameTarget)
+    || normalizeHostPrefixCnameTarget(config?.defaultHostPrefixCnameTarget)
+    || normalizeHostnameText(hostRoot);
 }
 
 function resolveHostPrefixMatch(rawHostname = "", rawHost = "") {
@@ -6695,6 +6846,7 @@ function sanitizeRuntimeConfig(input = {}) {
   sanitized.prewarmDepth = normalizePrewarmDepth(sanitized.prewarmDepth);
   sanitized.hedgeProbePath = normalizeHedgeProbePath(sanitized.hedgeProbePath, DEFAULT_HEDGE_PROBE_PATH);
   sanitized.dnsDefaultFallbackCname = normalizeDnsFallbackCnameConfigValue(sanitized.dnsDefaultFallbackCname);
+  sanitized.defaultHostPrefixCnameTarget = normalizeHostPrefixCnameTarget(sanitized.defaultHostPrefixCnameTarget);
   sanitized.settingsExperienceMode = String(sanitized.settingsExperienceMode || '').trim().toLowerCase() === 'expert' ? 'expert' : 'novice';
   sanitized.cfQuotaPlanOverride = normalizeCloudflareQuotaPlanOverride(sanitized.cfQuotaPlanOverride);
   sanitized.logSearchMode = normalizeLogSearchMode(sanitized.logSearchMode);
@@ -6713,6 +6865,72 @@ function sanitizeRuntimeConfig(input = {}) {
   applyDailyTelegramReportKindCompat(sanitized, migratedRawConfig);
   delete sanitized.tgDailyReportTime;
   return sanitized;
+}
+
+const CONFIG_SECRET_FIELDS = ["cfApiToken", "tgBotToken"];
+
+function redactRuntimeConfigSecrets(input = {}) {
+  const config = sanitizeRuntimeConfig(input);
+  for (const field of CONFIG_SECRET_FIELDS) delete config[field];
+  return config;
+}
+
+function preserveRuntimeConfigSecrets(input = {}, currentConfig = {}) {
+  const nextConfig = sanitizeRuntimeConfig(input);
+  const current = sanitizeRuntimeConfig(currentConfig);
+  for (const field of CONFIG_SECRET_FIELDS) {
+    if (String(current[field] || "").trim()) nextConfig[field] = current[field];
+    else delete nextConfig[field];
+  }
+  return nextConfig;
+}
+
+function mergeMissingRuntimeConfigSecrets(input = {}, currentConfig = {}) {
+  const importedConfig = isPlainObject(input) ? { ...input } : {};
+  const current = sanitizeRuntimeConfig(currentConfig);
+  for (const field of CONFIG_SECRET_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(importedConfig, field)) continue;
+    if (String(current[field] || "").trim()) importedConfig[field] = current[field];
+  }
+  return importedConfig;
+}
+
+function redactConfigSnapshotSecrets(snapshot = {}) {
+  if (!isPlainObject(snapshot)) return snapshot;
+  const redacted = {
+    ...snapshot,
+    config: redactRuntimeConfigSecrets(snapshot.config || {})
+  };
+  if (isPlainObject(snapshot.rollbackPayload) && Array.isArray(snapshot.rollbackPayload.kvEntries)) {
+    redacted.rollbackPayload = {
+      ...snapshot.rollbackPayload,
+      kvEntries: snapshot.rollbackPayload.kvEntries.map(entry => {
+        if (!isPlainObject(entry) || entry.exists !== true) return entry;
+        const key = String(entry.key || "");
+        if (key === "sys:config_snapshots:v1") {
+          try {
+            const snapshots = JSON.parse(String(entry.value || "[]"));
+            return {
+              ...entry,
+              value: JSON.stringify(Array.isArray(snapshots) ? snapshots.map(item => redactConfigSnapshotSecrets(item)) : [])
+            };
+          } catch {
+            return { ...entry, value: JSON.stringify([]) };
+          }
+        }
+        if (key !== "sys:theme") return entry;
+        try {
+          return {
+            ...entry,
+            value: JSON.stringify(redactRuntimeConfigSecrets(JSON.parse(String(entry.value || "{}"))))
+          };
+        } catch {
+          return { ...entry, value: JSON.stringify({}) };
+        }
+      })
+    };
+  }
+  return redacted;
 }
 
 function normalizeDistinctConfigKeyList(values = []) {
@@ -7716,6 +7934,7 @@ const CONFIG_ALLOWED_FIELDS = [
   "dashboardShowKvD1Status",
   "sourceDirectNodes",
   "dnsDefaultFallbackCname",
+  "defaultHostPrefixCnameTarget",
   "pingTimeout",
   "pingCacheMinutes",
   "hedgeFailoverEnabled",
@@ -7815,7 +8034,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: {},
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "releaseRepo", "releaseBranch", "releaseTag", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "tgDailyReportTime"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "releaseRepo", "releaseBranch", "releaseTag", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "tgDailyReportTime"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -8349,55 +8568,76 @@ async function persistCloudflareDnsRecordsForHost({
       zoneRecordsUrl: `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(cfZoneId)}/dns_records`
     };
     const actions = createDnsPersistRecordActions(cfZoneId, cfApiToken, host, hostState.zoneRecordsUrl, hostState.baseRecord);
-
-    if (mode === "cname") {
-      const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
-      const currentAddressRecords = hostRecords.filter(record => record.type === "A" || record.type === "AAAA");
-      for (const record of currentAddressRecords) await actions.deleteRecord(record);
-      for (let index = 1; index < currentCnameRecords.length; index += 1) {
-        await actions.deleteRecord(currentCnameRecords[index]);
+    const hostSnapshot = hostRecords.map(record => normalizeEditableDnsRecord(record));
+    let dnsMutationAttempted = false;
+    const mutatingActions = {
+      ...actions,
+      async deleteRecord(record) {
+        dnsMutationAttempted = true;
+        return await actions.deleteRecord(record);
+      },
+      async updateRecord(record, nextType, nextContent) {
+        dnsMutationAttempted = true;
+        return await actions.updateRecord(record, nextType, nextContent);
+      },
+      async createRecord(nextType, nextContent, seedRecord) {
+        dnsMutationAttempted = true;
+        return await actions.createRecord(nextType, nextContent, seedRecord);
       }
-      const primaryCname = currentCnameRecords[0] || null;
-      const desiredCname = effectiveDesiredRecords[0];
-      const desiredTtl = Number(desiredCname?.ttl) || 1;
-      const desiredProxied = desiredCname?.proxied === true;
-      if (primaryCname) {
-        const hasContentChanged = String(primaryCname.content || "").trim() !== desiredCname.content;
-        const hasTtlChanged = Number(primaryCname.ttl) !== desiredTtl;
-        const hasProxiedChanged = (primaryCname.proxied === true) !== desiredProxied;
-        if (hasContentChanged || hasTtlChanged || hasProxiedChanged) {
-          await actions.updateRecord({
-            ...primaryCname,
+    };
+    let refreshedRecords = [];
+    let persistedHistory = null;
+    try {
+      if (mode === "cname") {
+        const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
+        const currentAddressRecords = hostRecords.filter(record => record.type === "A" || record.type === "AAAA");
+        for (const record of currentAddressRecords) await mutatingActions.deleteRecord(record);
+        for (let index = 1; index < currentCnameRecords.length; index += 1) {
+          await mutatingActions.deleteRecord(currentCnameRecords[index]);
+        }
+        const primaryCname = currentCnameRecords[0] || null;
+        const desiredCname = effectiveDesiredRecords[0];
+        const desiredTtl = Number(desiredCname?.ttl) || 1;
+        const desiredProxied = desiredCname?.proxied === true;
+        if (primaryCname) {
+          const hasContentChanged = String(primaryCname.content || "").trim() !== desiredCname.content;
+          const hasTtlChanged = Number(primaryCname.ttl) !== desiredTtl;
+          const hasProxiedChanged = (primaryCname.proxied === true) !== desiredProxied;
+          if (hasContentChanged || hasTtlChanged || hasProxiedChanged) {
+            await mutatingActions.updateRecord({
+              ...primaryCname,
+              ttl: desiredTtl,
+              proxied: desiredProxied
+            }, "CNAME", desiredCname.content);
+          }
+        } else {
+          await mutatingActions.createRecord("CNAME", desiredCname.content, {
+            ...hostState.baseRecord,
             ttl: desiredTtl,
             proxied: desiredProxied
-          }, "CNAME", desiredCname.content);
+          });
+        }
+        refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken, { nameExact: host });
+        if (!skipHistory) {
+          persistedHistory = await Database.recordDnsHostHistory(kv, cfZoneId, host, {
+            name: host,
+            type: "CNAME",
+            content: desiredCname.content,
+            actor: "admin",
+            source: "ui",
+            requestHost,
+            savedAt: new Date().toISOString()
+          });
         }
       } else {
-        await actions.createRecord("CNAME", desiredCname.content, {
-          ...hostState.baseRecord,
-          ttl: desiredTtl,
-          proxied: desiredProxied
-        });
-      }
-      if (!skipHistory) {
-        await Database.recordDnsHostHistory(kv, cfZoneId, host, {
-          name: host,
-          type: "CNAME",
-          content: desiredCname.content,
-          actor: "admin",
-          source: "ui",
-          requestHost,
-          savedAt: new Date().toISOString()
-        });
-      }
-    } else {
-      const hostSnapshot = hostRecords.map(record => normalizeEditableDnsRecord(record));
-      try {
         const currentCnameRecords = hostRecords.filter(record => record.type === "CNAME");
-        for (const record of currentCnameRecords) await actions.deleteRecord(record);
-        await syncDnsRecordsForType("A", effectiveDesiredRecords.filter(record => record.type === "A"), hostRecords.filter(record => record.type === "A"), syncSummaryByType.A, actions);
-        await syncDnsRecordsForType("AAAA", effectiveDesiredRecords.filter(record => record.type === "AAAA"), hostRecords.filter(record => record.type === "AAAA"), syncSummaryByType.AAAA, actions);
-      } catch (saveError) {
+        for (const record of currentCnameRecords) await mutatingActions.deleteRecord(record);
+        await syncDnsRecordsForType("A", effectiveDesiredRecords.filter(record => record.type === "A"), hostRecords.filter(record => record.type === "A"), syncSummaryByType.A, mutatingActions);
+        await syncDnsRecordsForType("AAAA", effectiveDesiredRecords.filter(record => record.type === "AAAA"), hostRecords.filter(record => record.type === "AAAA"), syncSummaryByType.AAAA, mutatingActions);
+        refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken, { nameExact: host });
+      }
+    } catch (saveError) {
+      if (dnsMutationAttempted) {
         rollbackAttempted = true;
         try {
           const latestHostRecords = await actions.listCurrentHostRecords();
@@ -8412,15 +8652,14 @@ async function persistCloudflareDnsRecordsForHost({
           rollbackSucceeded = false;
           rollbackError = String(restoreError?.message || restoreError || "unknown_rollback_error");
         }
-        throw saveError;
       }
+      throw saveError;
     }
 
-    const refreshedRecords = await listCloudflareDnsRecords(cfZoneId, cfApiToken, { nameExact: host });
     const refreshedEditableRecords = refreshedRecords.filter(record => isEditableDnsRecordType(record.type));
     const filteredRecords = refreshedEditableRecords.filter(record => normalizeHostnameText(record.name) === host);
     const history = includeHistory === true
-      ? await Database.getDnsHostHistory(kv, cfZoneId, host)
+      ? (persistedHistory || await Database.getDnsHostHistory(kv, cfZoneId, host))
       : [];
     const syncSummary = mode === "a"
       ? finalizeDnsRecordSyncSummary(mode, syncSummaryByType, {
@@ -9537,7 +9776,7 @@ const D1TidyPlanner = {
       dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
       dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
       sysStatusCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SYS_STATUS_TABLE}`),
-      ftsReady: await database.hasLogsFtsTable(db),
+      ftsReady: await database.isLogsFtsReady(db),
       d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db),
       kvDnsIpPoolSources: []
     };
@@ -9749,13 +9988,16 @@ const D1TidyExecutor = {
   async patchLogStatus(database, db, stores, executionPlan, summary, flags, options = {}) {
     const nowIso = new Date().toISOString();
     const mode = String(executionPlan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
-    const ftsReady = await database.hasLogsFtsTable(db);
+    const ftsReady = await database.isLogsFtsReady(db);
     const statsReady = await database.hasStatsHourlyTable(db);
+    const schemaStatus = await database.getD1SchemaStatus(db);
     const logPatch = {
       schemaReady: true,
       ftsReady,
       statsReady,
-      schemaVersion: 4,
+      schemaVersion: schemaStatus.schemaVersion,
+      runtimeCompatibilityVersion: database.D1_SCHEMA_VERSION,
+      migrationReady: schemaStatus.migrationReady === true,
       categoryEnabled: true,
       statsUtcOffsetMinutes: executionPlan.statsUtcOffsetMinutes || executionPlan.utcOffsetMinutes
     };
@@ -10131,6 +10373,13 @@ const Database = {
   DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
   DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
   DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
+  D1_SCHEMA_VERSION: 5,
+  D1_MIGRATIONS_TABLE: "d1_migrations",
+  D1_REQUIRED_MIGRATIONS: [
+    "0001_d1_fresh_baseline",
+    "0002_d1_historical_compatibility",
+    "0003_d1_schema_v5_indexes"
+  ],
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
   OPS_STATUS_SECTION_SCOPES: {
@@ -10402,6 +10651,25 @@ const Database = {
       return false;
     }
   },
+  async getLogsFtsReadiness(db) {
+    if (!db || !await this.hasLogsFtsTable(db)) {
+      return { tableReady: false, virtualTableReady: false, columnsReady: false, triggerReady: false, ready: false };
+    }
+    const columns = await this.getTableColumns(db, this.LOGS_FTS_TABLE);
+    const requiredColumns = ["node_name", "request_path", "user_agent", "error_detail", "detail_json"];
+    const columnsReady = requiredColumns.every(name => columns.has(name));
+    const [table, trigger] = await Promise.all([
+      db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").bind(this.LOGS_FTS_TABLE).first(),
+      db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger' AND name = ? LIMIT 1").bind(this.LOGS_FTS_INSERT_TRIGGER).first()
+    ]);
+    const virtualTableReady = /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(table?.sql || "").trim());
+    const triggerReady = String(trigger?.name || "") === this.LOGS_FTS_INSERT_TRIGGER
+      && String(trigger?.tbl_name || "") === this.LOGS_TABLE;
+    return { tableReady: true, virtualTableReady, columnsReady, triggerReady, ready: virtualTableReady && columnsReady && triggerReady };
+  },
+  async isLogsFtsReady(db) {
+    return (await this.getLogsFtsReadiness(db)).ready === true;
+  },
   async hasLogsBaseTable(db) {
     if (!db) return false;
     try {
@@ -10420,14 +10688,269 @@ const Database = {
       return false;
     }
   },
-  async getTableColumns(db, tableName) {
-    if (!db || !tableName) return new Set();
+  async getTableColumnDefinitions(db, tableName) {
+    if (!db || !tableName) return [];
     try {
       const rows = await db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all();
-      return new Set((rows?.results || []).map(row => String(row?.name || "").toLowerCase()).filter(Boolean));
-    } catch {
-      return new Set();
+      return (rows?.results || [])
+        .map(row => ({
+          name: String(row?.name || "").toLowerCase(),
+          type: String(row?.type || "").trim().toUpperCase(),
+          primaryKeyOrder: Math.max(0, Number(row?.pk) || 0)
+        }))
+        .filter(column => column.name);
+    } catch (cause) {
+      const error = new Error(`D1 schema inspection failed for ${tableName}`);
+      error.code = "D1_SCHEMA_INSPECTION_FAILED";
+      error.status = 503;
+      error.details = { tableName: String(tableName), cause: getErrorMessage(cause, "d1_pragma_failed") };
+      throw error;
     }
+  },
+  async getTableColumns(db, tableName) {
+    const definitions = await this.getTableColumnDefinitions(db, tableName);
+    return new Set(definitions.map(column => column.name));
+  },
+  async getIndexKeyColumns(db, indexName) {
+    if (!db || !indexName) return [];
+    try {
+      const rows = await db.prepare(`PRAGMA index_xinfo(${quoteSqlIdentifier(indexName)})`).all();
+      return (rows?.results || [])
+        .map(row => ({
+          order: Math.max(0, Number(row?.seqno) || 0),
+          name: String(row?.name || "").toLowerCase(),
+          key: row?.key === undefined || Number(row.key) === 1,
+          expression: Number(row?.cid) === -2 || !String(row?.name || "").trim()
+        }))
+        .filter(column => column.key)
+        .sort((left, right) => left.order - right.order)
+        .map(column => column.expression ? "<expression>" : column.name);
+    } catch (cause) {
+      const error = new Error(`D1 schema inspection failed for ${indexName}`);
+      error.code = "D1_SCHEMA_INSPECTION_FAILED";
+      error.status = 503;
+      error.details = { indexName: String(indexName), cause: getErrorMessage(cause, "d1_pragma_failed") };
+      throw error;
+    }
+  },
+  async getTableIndexDefinitions(db, tableName) {
+    if (!db || !tableName) return [];
+    try {
+      const rows = await db.prepare(`PRAGMA index_list(${quoteSqlIdentifier(tableName)})`).all();
+      return (rows?.results || []).map(row => ({
+        name: String(row?.name || ""),
+        unique: Number(row?.unique) === 1,
+        partial: Number(row?.partial) === 1
+      })).filter(index => index.name);
+    } catch (cause) {
+      const error = new Error(`D1 schema inspection failed for ${tableName}`);
+      error.code = "D1_SCHEMA_INSPECTION_FAILED";
+      error.status = 503;
+      error.details = { tableName: String(tableName), cause: getErrorMessage(cause, "d1_pragma_failed") };
+      throw error;
+    }
+  },
+  normalizeD1MigrationName(name = "") {
+    return String(name || "").trim().replace(/\.sql$/i, "");
+  },
+  async readD1AppliedMigrations(db, tableNames = null) {
+    const knownTables = tableNames instanceof Set
+      ? tableNames
+      : new Set((await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all())?.results?.map(row => String(row?.name || "")) || []);
+    if (!knownTables.has(this.D1_MIGRATIONS_TABLE)) {
+      return { tablePresent: false, tableValid: false, appliedMigrations: [] };
+    }
+    const columns = await this.getTableColumns(db, this.D1_MIGRATIONS_TABLE);
+    if (!columns.has("name")) {
+      return { tablePresent: true, tableValid: false, appliedMigrations: [] };
+    }
+    const rows = await db.prepare(`SELECT name FROM ${quoteSqlIdentifier(this.D1_MIGRATIONS_TABLE)} ORDER BY name ASC`).all();
+    return {
+      tablePresent: true,
+      tableValid: true,
+      appliedMigrations: [...new Set((rows?.results || [])
+        .map(row => this.normalizeD1MigrationName(row?.name))
+        .filter(Boolean))]
+    };
+  },
+  async getD1SchemaStatus(db) {
+    if (!db) {
+      return {
+        runtimeCompatibilityVersion: this.D1_SCHEMA_VERSION,
+        runtimeCompatibilityReady: false,
+        appliedMigrations: [],
+        latestRequiredMigration: this.D1_REQUIRED_MIGRATIONS.at(-1) || "",
+        migrationReady: false,
+        schemaVersion: null,
+        tables: {},
+        indexes: {},
+        ftsReady: false,
+        issues: ["db_not_configured"]
+      };
+    }
+    const [tableRows, indexRows] = await Promise.all([
+      db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+      db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all()
+    ]);
+    const tableNames = new Set((tableRows?.results || []).map(row => String(row?.name || "")).filter(Boolean));
+    const indexOwners = new Map((indexRows?.results || [])
+      .map(row => [String(row?.name || ""), String(row?.tbl_name || "")])
+      .filter(([name]) => name));
+    const requiredTables = [
+      this.SYS_STATUS_TABLE,
+      this.SCHEDULED_LOCKS_TABLE,
+      this.AUTH_FAILURES_TABLE,
+      this.CF_DASH_CACHE_TABLE,
+      this.CF_RUNTIME_CACHE_TABLE,
+      this.DNS_IP_POOL_ITEMS_TABLE,
+      this.DNS_IP_POOL_SOURCES_TABLE,
+      this.DNS_IP_POOL_FETCH_CACHE_TABLE,
+      this.DNS_IP_PROBE_CACHE_TABLE,
+      this.LOGS_TABLE,
+      this.STATS_HOURLY_TABLE
+    ];
+    const requiredIndexes = {
+      idx_sys_locks_expires_at: { table: this.SCHEDULED_LOCKS_TABLE, columns: ["expires_at"] },
+      idx_auth_failures_expires_at: { table: this.AUTH_FAILURES_TABLE, columns: ["expires_at"] },
+      idx_cf_dashboard_cache_expires_at: { table: this.CF_DASH_CACHE_TABLE, columns: ["expires_at"] },
+      idx_cf_runtime_cache_expires_at: { table: this.CF_RUNTIME_CACHE_TABLE, columns: ["expires_at"] },
+      idx_dns_ip_pool_items_updated_ip: { table: this.DNS_IP_POOL_ITEMS_TABLE, columns: ["updated_at", "ip"] },
+      idx_dns_ip_pool_sources_sort: { table: this.DNS_IP_POOL_SOURCES_TABLE, columns: ["sort_order", "updated_at"] },
+      idx_dns_ip_pool_fetch_cache_expires: { table: this.DNS_IP_POOL_FETCH_CACHE_TABLE, columns: ["expires_at"] },
+      idx_dns_ip_probe_cache_expire: { table: this.DNS_IP_PROBE_CACHE_TABLE, columns: ["expires_at"] },
+      idx_dns_ip_probe_cache_colo_ip_expires: { table: this.DNS_IP_PROBE_CACHE_TABLE, columns: ["entry_colo", "ip", "expires_at"] },
+      idx_proxy_logs_timestamp: { table: this.LOGS_TABLE, columns: ["timestamp"] },
+      idx_proxy_logs_client_time: { table: this.LOGS_TABLE, columns: ["client_ip", "timestamp"] },
+      idx_proxy_logs_status_time: { table: this.LOGS_TABLE, columns: ["status_code", "timestamp"] },
+      idx_proxy_logs_category_time: { table: this.LOGS_TABLE, columns: ["category", "timestamp"] }
+    };
+    const requiredColumns = {
+      [this.SYS_STATUS_TABLE]: ["scope", "payload", "updated_at"],
+      [this.SCHEDULED_LOCKS_TABLE]: ["scope", "token", "owner", "acquired_at", "renewed_at", "expires_at"],
+      [this.AUTH_FAILURES_TABLE]: ["ip", "fail_count", "expires_at", "updated_at"],
+      [this.CF_DASH_CACHE_TABLE]: ["cache_key", "zone_id", "bucket_date", "payload", "version", "cached_at", "expires_at", "updated_at"],
+      [this.CF_RUNTIME_CACHE_TABLE]: ["cache_key", "cache_group", "resource_id", "payload", "cached_at", "expires_at", "updated_at"],
+      [this.DNS_IP_POOL_ITEMS_TABLE]: ["id", "ip", "ip_type", "source_kind", "source_label", "line_label", "remark", "created_at", "updated_at"],
+      [this.DNS_IP_POOL_SOURCES_TABLE]: ["id", "name", "url", "source_type", "domain", "source_kind", "preset_id", "builtin_id", "enabled", "sort_order", "ip_limit", "last_fetch_at", "last_fetch_status", "last_fetch_count", "created_at", "updated_at"],
+      [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature", "items_json", "source_results_json", "imported_count", "enabled_source_count", "cached_at", "expires_at", "created_at", "updated_at"],
+      [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo", "probe_status", "latency_ms", "cf_ray", "colo_code", "city_name", "country_code", "country_name", "probed_at", "expires_at"],
+      [this.LOGS_TABLE]: ["id", "timestamp", "node_name", "request_path", "request_method", "status_code", "response_time", "client_ip", "inbound_colo", "outbound_colo", "user_agent", "referer", "category", "error_detail", "detail_json", "created_at", "inbound_ip", "outbound_ip"],
+      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"]
+    };
+    const requiredPrimaryKeys = {
+      [this.SYS_STATUS_TABLE]: ["scope"],
+      [this.SCHEDULED_LOCKS_TABLE]: ["scope"],
+      [this.AUTH_FAILURES_TABLE]: ["ip"],
+      [this.CF_DASH_CACHE_TABLE]: ["cache_key"],
+      [this.CF_RUNTIME_CACHE_TABLE]: ["cache_key"],
+      [this.DNS_IP_POOL_ITEMS_TABLE]: ["id"],
+      [this.DNS_IP_POOL_SOURCES_TABLE]: ["id"],
+      [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature"],
+      [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
+      [this.LOGS_TABLE]: ["id"],
+      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"]
+    };
+    const issues = [];
+    const tableStatus = Object.fromEntries(requiredTables.map(name => [name, tableNames.has(name)]));
+    for (const [name, ready] of Object.entries(tableStatus)) if (!ready) issues.push(`missing_table:${name}`);
+    const columnStatus = {};
+    const primaryKeyStatus = {};
+    for (const [tableName, columnNames] of Object.entries(requiredColumns)) {
+      const definitions = tableNames.has(tableName) ? await this.getTableColumnDefinitions(db, tableName) : [];
+      const columns = new Set(definitions.map(column => column.name));
+      columnStatus[tableName] = Object.fromEntries(columnNames.map(name => [name, columns.has(name)]));
+      if (tableNames.has(tableName)) {
+        for (const [name, ready] of Object.entries(columnStatus[tableName])) {
+          if (!ready) issues.push(`missing_column:${tableName}.${name}`);
+        }
+        const actualPrimaryKey = definitions
+          .filter(column => column.primaryKeyOrder > 0)
+          .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+          .map(column => column.name);
+        const expectedPrimaryKey = requiredPrimaryKeys[tableName] || [];
+        const idColumn = tableName === this.LOGS_TABLE
+          ? definitions.find(column => column.name === "id")
+          : null;
+        primaryKeyStatus[tableName] = serializeConfigValue(actualPrimaryKey) === serializeConfigValue(expectedPrimaryKey)
+          && (!idColumn || idColumn.type === "INTEGER");
+        if (!primaryKeyStatus[tableName]) issues.push(`invalid_primary_key:${tableName}`);
+      } else {
+        primaryKeyStatus[tableName] = false;
+      }
+    }
+    const indexStatus = {};
+    const tableIndexDefinitions = new Map();
+    for (const [indexName, definition] of Object.entries(requiredIndexes)) {
+      const owner = indexOwners.get(indexName);
+      if (!owner) {
+        indexStatus[indexName] = false;
+        issues.push(`missing_index:${indexName}`);
+        continue;
+      }
+      if (!tableIndexDefinitions.has(definition.table)) {
+        tableIndexDefinitions.set(definition.table, await this.getTableIndexDefinitions(db, definition.table));
+      }
+      const listedIndex = tableIndexDefinitions.get(definition.table)
+        .find(index => index.name === indexName);
+      const actualColumns = await this.getIndexKeyColumns(db, indexName);
+      indexStatus[indexName] = owner === definition.table
+        && listedIndex?.unique === false
+        && listedIndex?.partial === false
+        && serializeConfigValue(actualColumns) === serializeConfigValue(definition.columns);
+      if (!indexStatus[indexName]) issues.push(`invalid_index:${indexName}`);
+    }
+    let dnsIpUniqueReady = false;
+    if (tableNames.has(this.DNS_IP_POOL_ITEMS_TABLE)) {
+      const tableIndexes = await this.getTableIndexDefinitions(db, this.DNS_IP_POOL_ITEMS_TABLE);
+      for (const index of tableIndexes.filter(item => item.unique && !item.partial)) {
+        const columns = await this.getIndexKeyColumns(db, index.name);
+        if (serializeConfigValue(columns) === serializeConfigValue(["ip"])) {
+          dnsIpUniqueReady = true;
+          break;
+        }
+      }
+      if (!dnsIpUniqueReady) issues.push(`missing_unique_key:${this.DNS_IP_POOL_ITEMS_TABLE}.ip`);
+    }
+    const constraintStatus = {
+      primaryKeys: primaryKeyStatus,
+      uniqueKeys: { [`${this.DNS_IP_POOL_ITEMS_TABLE}.ip`]: dnsIpUniqueReady }
+    };
+    const fts = await this.getLogsFtsReadiness(db);
+    if (fts.tableReady && !fts.virtualTableReady) issues.push("fts_virtual_table_invalid");
+    if (fts.tableReady && !fts.columnsReady) issues.push("fts_columns_incomplete");
+    if (fts.tableReady && !fts.triggerReady) issues.push(`missing_trigger:${this.LOGS_FTS_INSERT_TRIGGER}`);
+    const migrationState = await this.readD1AppliedMigrations(db, tableNames);
+    const appliedMigrationSet = new Set(migrationState.appliedMigrations);
+    const missingMigrations = this.D1_REQUIRED_MIGRATIONS.filter(name => !appliedMigrationSet.has(name));
+    if (!migrationState.tablePresent) issues.push("migration_table_missing");
+    else if (!migrationState.tableValid) issues.push("migration_table_invalid");
+    for (const name of missingMigrations) issues.push(`missing_migration:${name}`);
+    const runtimeCompatibilityReady = Object.values(tableStatus).every(Boolean)
+      && Object.values(indexStatus).every(Boolean)
+      && Object.values(columnStatus).every(table => Object.values(table).every(Boolean))
+      && Object.values(primaryKeyStatus).every(Boolean)
+      && dnsIpUniqueReady;
+    const migrationReady = runtimeCompatibilityReady
+      && migrationState.tableValid
+      && missingMigrations.length === 0;
+    return {
+      runtimeCompatibilityVersion: this.D1_SCHEMA_VERSION,
+      runtimeCompatibilityReady,
+      appliedMigrations: migrationState.appliedMigrations,
+      latestRequiredMigration: this.D1_REQUIRED_MIGRATIONS.at(-1) || "",
+      missingMigrations,
+      migrationTablePresent: migrationState.tablePresent,
+      migrationTableValid: migrationState.tableValid,
+      migrationReady,
+      schemaVersion: migrationReady ? this.D1_SCHEMA_VERSION : null,
+      tables: tableStatus,
+      columns: columnStatus,
+      indexes: indexStatus,
+      constraints: constraintStatus,
+      ftsReady: fts.ready,
+      fts,
+      issues
+    };
   },
   async probeLogsReadiness(db, options = {}) {
     if (!db) {
@@ -10445,7 +10968,7 @@ const Database = {
     }
     const [schemaReady, ftsReady, statsReady] = await Promise.all([
       this.hasLogsBaseTable(db),
-      this.hasLogsFtsTable(db),
+      this.isLogsFtsReady(db),
       this.hasStatsHourlyTable(db)
     ]);
     const probed = {
@@ -10489,76 +11012,94 @@ const Database = {
   },
   async ensureLogsBaseSchema(db) {
     if (!db) return false;
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, inbound_colo TEXT, outbound_colo TEXT, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL, inbound_ip TEXT, outbound_ip TEXT)`).run();
-    let existingColumns = new Set();
+    let initTask = GLOBALS.LogsBaseDbReady.get(db);
+    if (!initTask) {
+      initTask = (async () => {
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, inbound_colo TEXT, outbound_colo TEXT, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL, inbound_ip TEXT, outbound_ip TEXT)`).run();
+        const existingColumns = await this.getTableColumns(db, this.LOGS_TABLE);
+        if (!existingColumns.has("inbound_colo")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN inbound_colo TEXT`).run();
+          existingColumns.add("inbound_colo");
+        }
+        if (!existingColumns.has("outbound_colo")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN outbound_colo TEXT`).run();
+          existingColumns.add("outbound_colo");
+        }
+        if (!existingColumns.has("inbound_ip")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN inbound_ip TEXT`).run();
+          existingColumns.add("inbound_ip");
+        }
+        if (!existingColumns.has("outbound_ip")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN outbound_ip TEXT`).run();
+          existingColumns.add("outbound_ip");
+        }
+        if (!existingColumns.has("category")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN category TEXT DEFAULT 'api'`).run();
+          existingColumns.add("category");
+        }
+        if (!existingColumns.has("error_detail")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN error_detail TEXT`).run();
+        }
+        if (!existingColumns.has("detail_json")) {
+          await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN detail_json TEXT`).run();
+          existingColumns.add("detail_json");
+        }
+        if (existingColumns.has("inbound_ip")) {
+          await db.prepare(`UPDATE ${this.LOGS_TABLE}
+            SET inbound_colo = COALESCE(NULLIF(inbound_colo, ''), NULLIF(inbound_ip, ''))
+            WHERE COALESCE(NULLIF(inbound_colo, ''), '') = ''
+              AND COALESCE(NULLIF(inbound_ip, ''), '') != ''`).run();
+        }
+        if (existingColumns.has("outbound_ip")) {
+          await db.prepare(`UPDATE ${this.LOGS_TABLE}
+            SET outbound_colo = COALESCE(NULLIF(outbound_colo, ''), NULLIF(outbound_ip, ''))
+            WHERE COALESCE(NULLIF(outbound_colo, ''), '') = ''
+              AND COALESCE(NULLIF(outbound_ip, ''), '') != ''`).run();
+        }
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON ${this.LOGS_TABLE} (timestamp)`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_time ON ${this.LOGS_TABLE} (client_ip, timestamp DESC)`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON ${this.LOGS_TABLE} (status_code, timestamp)`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time ON ${this.LOGS_TABLE} (category, timestamp)`).run();
+        GLOBALS.LogsReadinessProbeCache.delete(db);
+        return true;
+      })().catch(error => {
+        GLOBALS.LogsBaseDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.LogsBaseDbReady.set(db, initTask);
+    }
     try {
-      const schemaRows = await db.prepare(`PRAGMA table_info(${this.LOGS_TABLE})`).all();
-      existingColumns = new Set((schemaRows?.results || []).map(row => String(row?.name || "").toLowerCase()).filter(Boolean));
-    } catch {}
-    if (!existingColumns.has("inbound_colo")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN inbound_colo TEXT`).run();
-      existingColumns.add("inbound_colo");
+      return await initTask;
+    } finally {
+      if (GLOBALS.LogsBaseDbReady.get(db) === initTask) GLOBALS.LogsBaseDbReady.delete(db);
     }
-    if (!existingColumns.has("outbound_colo")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN outbound_colo TEXT`).run();
-      existingColumns.add("outbound_colo");
-    }
-    if (!existingColumns.has("inbound_ip")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN inbound_ip TEXT`).run();
-      existingColumns.add("inbound_ip");
-    }
-    if (!existingColumns.has("outbound_ip")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN outbound_ip TEXT`).run();
-      existingColumns.add("outbound_ip");
-    }
-    if (!existingColumns.has("category")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN category TEXT DEFAULT 'api'`).run();
-      existingColumns.add("category");
-    }
-    if (!existingColumns.has("error_detail")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN error_detail TEXT`).run();
-    }
-    if (!existingColumns.has("detail_json")) {
-      await db.prepare(`ALTER TABLE ${this.LOGS_TABLE} ADD COLUMN detail_json TEXT`).run();
-      existingColumns.add("detail_json");
-    }
-    if (existingColumns.has("inbound_ip")) {
-      await db.prepare(`UPDATE ${this.LOGS_TABLE}
-        SET inbound_colo = COALESCE(NULLIF(inbound_colo, ''), NULLIF(inbound_ip, ''))
-        WHERE COALESCE(NULLIF(inbound_colo, ''), '') = ''
-          AND COALESCE(NULLIF(inbound_ip, ''), '') != ''`).run();
-    }
-    if (existingColumns.has("outbound_ip")) {
-      await db.prepare(`UPDATE ${this.LOGS_TABLE}
-        SET outbound_colo = COALESCE(NULLIF(outbound_colo, ''), NULLIF(outbound_ip, ''))
-        WHERE COALESCE(NULLIF(outbound_colo, ''), '') = ''
-          AND COALESCE(NULLIF(outbound_ip, ''), '') != ''`).run();
-    }
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON ${this.LOGS_TABLE} (timestamp)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_ip ON ${this.LOGS_TABLE} (client_ip)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_inbound_colo ON ${this.LOGS_TABLE} (inbound_colo)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_outbound_colo ON ${this.LOGS_TABLE} (outbound_colo)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp_id ON ${this.LOGS_TABLE} (timestamp, id)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_node_time ON ${this.LOGS_TABLE} (node_name, timestamp)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category ON ${this.LOGS_TABLE} (category)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON ${this.LOGS_TABLE} (status_code, timestamp)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time ON ${this.LOGS_TABLE} (category, timestamp)`).run();
-    return true;
   },
   async ensureStatsHourlySchema(db) {
     if (!db) return false;
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.STATS_HOURLY_TABLE} (
-      bucket_date TEXT NOT NULL,
-      bucket_hour INTEGER NOT NULL,
-      request_count INTEGER NOT NULL DEFAULT 0,
-      play_count INTEGER NOT NULL DEFAULT 0,
-      playback_info_count INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL,
-      PRIMARY KEY (bucket_date, bucket_hour)
-    )`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_stats_hourly_date ON ${this.STATS_HOURLY_TABLE} (bucket_date, bucket_hour)`).run();
-    GLOBALS.LogsReadinessProbeCache.delete(db);
-    return true;
+    let initTask = GLOBALS.StatsHourlyDbReady.get(db);
+    if (!initTask) {
+      initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${this.STATS_HOURLY_TABLE} (
+        bucket_date TEXT NOT NULL,
+        bucket_hour INTEGER NOT NULL,
+        request_count INTEGER NOT NULL DEFAULT 0,
+        play_count INTEGER NOT NULL DEFAULT 0,
+        playback_info_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (bucket_date, bucket_hour)
+      )`).run().then(() => {
+        GLOBALS.LogsReadinessProbeCache.delete(db);
+        return true;
+      }).catch(error => {
+        GLOBALS.StatsHourlyDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.StatsHourlyDbReady.set(db, initTask);
+    }
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.StatsHourlyDbReady.get(db) === initTask) GLOBALS.StatsHourlyDbReady.delete(db);
+    }
   },
   normalizeD1SchemaProfile(profile = "") {
     const normalizedProfile = String(profile || "").trim().toLowerCase();
@@ -10566,6 +11107,23 @@ const Database = {
       return normalizedProfile;
     }
     return "logs-core";
+  },
+  invalidateD1SchemaReadiness(db, scope = "all") {
+    if (!db) return;
+    const normalizedScope = String(scope || "all").trim().toLowerCase();
+    if (normalizedScope === "all" || normalizedScope === "logs") {
+      GLOBALS.LogsBaseDbReady.delete(db);
+      GLOBALS.StatsHourlyDbReady.delete(db);
+      GLOBALS.LogsReadinessProbeCache.delete(db);
+    }
+    if (normalizedScope === "all") {
+      GLOBALS.DnsIpWorkspaceDbReady.delete(db);
+      GLOBALS.OpsStatusDbReady.delete(db);
+      GLOBALS.ScheduledLeaseDbReady.delete(db);
+      GLOBALS.AuthFailuresDbReady.delete(db);
+      GLOBALS.CfDashboardCacheDbReady.delete(db);
+      GLOBALS.CfRuntimeCacheDbReady.delete(db);
+    }
   },
   async bootstrapD1Schema(db, profile = "logs-core") {
     const resolvedProfile = this.normalizeD1SchemaProfile(profile);
@@ -10620,7 +11178,7 @@ const Database = {
       runtimeTablesReady: runtimeSteps.every(step => stepResults.some(item => item.name === step.name && item.ready === true)),
       schemaReady: await this.hasLogsBaseTable(db),
       statsReady: await this.hasStatsHourlyTable(db),
-      ftsReady: await this.hasLogsFtsTable(db),
+      ftsReady: await this.isLogsFtsReady(db),
       ftsResult,
       steps: stepResults
     };
@@ -10724,89 +11282,103 @@ const Database = {
   },
   async ensureDnsIpWorkspaceSchema(db) {
     if (!db) return false;
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_ITEMS_TABLE} (
-      id TEXT PRIMARY KEY,
-      ip TEXT NOT NULL UNIQUE,
-      ip_type TEXT NOT NULL,
-      source_kind TEXT NOT NULL,
-      source_label TEXT,
-      line_label TEXT NOT NULL DEFAULT '',
-      remark TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`).run();
-    const itemColumns = await this.getTableColumns(db, this.DNS_IP_POOL_ITEMS_TABLE);
-    if (!itemColumns.has("line_label")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_ITEMS_TABLE} ADD COLUMN line_label TEXT NOT NULL DEFAULT ''`).run();
+    let initTask = GLOBALS.DnsIpWorkspaceDbReady.get(db);
+    if (!initTask) {
+      initTask = (async () => {
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_ITEMS_TABLE} (
+          id TEXT PRIMARY KEY,
+          ip TEXT NOT NULL UNIQUE,
+          ip_type TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          source_label TEXT,
+          line_label TEXT NOT NULL DEFAULT '',
+          remark TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`).run();
+        const itemColumns = await this.getTableColumns(db, this.DNS_IP_POOL_ITEMS_TABLE);
+        if (!itemColumns.has("line_label")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_ITEMS_TABLE} ADD COLUMN line_label TEXT NOT NULL DEFAULT ''`).run();
+        }
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_updated_ip ON ${this.DNS_IP_POOL_ITEMS_TABLE} (updated_at DESC, ip ASC)`).run();
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_SOURCES_TABLE} (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          url TEXT NOT NULL,
+          source_type TEXT NOT NULL DEFAULT 'url',
+          domain TEXT,
+          source_kind TEXT NOT NULL DEFAULT 'custom',
+          preset_id TEXT NOT NULL DEFAULT '',
+          builtin_id TEXT NOT NULL DEFAULT '',
+          enabled INTEGER NOT NULL DEFAULT 1,
+          sort_order INTEGER NOT NULL DEFAULT 0,
+          ip_limit INTEGER NOT NULL DEFAULT 5,
+          last_fetch_at TEXT,
+          last_fetch_status TEXT,
+          last_fetch_count INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`).run();
+        const sourceColumns = await this.getTableColumns(db, this.DNS_IP_POOL_SOURCES_TABLE);
+        if (!sourceColumns.has("source_type")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_type TEXT NOT NULL DEFAULT 'url'`).run();
+        }
+        if (!sourceColumns.has("domain")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN domain TEXT`).run();
+        }
+        if (!sourceColumns.has("source_kind")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'custom'`).run();
+        }
+        if (!sourceColumns.has("preset_id")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN preset_id TEXT NOT NULL DEFAULT ''`).run();
+        }
+        if (!sourceColumns.has("builtin_id")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN builtin_id TEXT NOT NULL DEFAULT ''`).run();
+        }
+        if (!sourceColumns.has("ip_limit")) {
+          await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN ip_limit INTEGER NOT NULL DEFAULT 5`).run();
+        }
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_sources_sort ON ${this.DNS_IP_POOL_SOURCES_TABLE} (sort_order ASC, updated_at ASC)`).run();
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_FETCH_CACHE_TABLE} (
+          signature TEXT PRIMARY KEY,
+          items_json TEXT NOT NULL,
+          source_results_json TEXT NOT NULL,
+          imported_count INTEGER NOT NULL DEFAULT 0,
+          enabled_source_count INTEGER NOT NULL DEFAULT 0,
+          cached_at INTEGER NOT NULL,
+          expires_at INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_fetch_cache_expires ON ${this.DNS_IP_POOL_FETCH_CACHE_TABLE} (expires_at)`).run();
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_PROBE_CACHE_TABLE} (
+          ip TEXT NOT NULL,
+          entry_colo TEXT NOT NULL,
+          probe_status TEXT NOT NULL,
+          latency_ms INTEGER,
+          cf_ray TEXT,
+          colo_code TEXT,
+          city_name TEXT,
+          country_code TEXT,
+          country_name TEXT,
+          probed_at TEXT NOT NULL,
+          expires_at INTEGER NOT NULL,
+          PRIMARY KEY (ip, entry_colo)
+        )`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_probe_cache_expire ON ${this.DNS_IP_PROBE_CACHE_TABLE} (expires_at)`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_probe_cache_colo_ip_expires ON ${this.DNS_IP_PROBE_CACHE_TABLE} (entry_colo, ip, expires_at)`).run();
+        return true;
+      })().catch(error => {
+        GLOBALS.DnsIpWorkspaceDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.DnsIpWorkspaceDbReady.set(db, initTask);
     }
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_updated_at ON ${this.DNS_IP_POOL_ITEMS_TABLE} (updated_at DESC)`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_ip_type ON ${this.DNS_IP_POOL_ITEMS_TABLE} (ip_type)`).run();
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_SOURCES_TABLE} (
-      id TEXT PRIMARY KEY,
-      name TEXT NOT NULL,
-      url TEXT NOT NULL,
-      source_type TEXT NOT NULL DEFAULT 'url',
-      domain TEXT,
-      source_kind TEXT NOT NULL DEFAULT 'custom',
-      preset_id TEXT NOT NULL DEFAULT '',
-      builtin_id TEXT NOT NULL DEFAULT '',
-      enabled INTEGER NOT NULL DEFAULT 1,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      ip_limit INTEGER NOT NULL DEFAULT 5,
-      last_fetch_at TEXT,
-      last_fetch_status TEXT,
-      last_fetch_count INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`).run();
-    const sourceColumns = await this.getTableColumns(db, this.DNS_IP_POOL_SOURCES_TABLE);
-    if (!sourceColumns.has("source_type")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_type TEXT NOT NULL DEFAULT 'url'`).run();
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.DnsIpWorkspaceDbReady.get(db) === initTask) GLOBALS.DnsIpWorkspaceDbReady.delete(db);
     }
-    if (!sourceColumns.has("domain")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN domain TEXT`).run();
-    }
-    if (!sourceColumns.has("source_kind")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'custom'`).run();
-    }
-    if (!sourceColumns.has("preset_id")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN preset_id TEXT NOT NULL DEFAULT ''`).run();
-    }
-    if (!sourceColumns.has("builtin_id")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN builtin_id TEXT NOT NULL DEFAULT ''`).run();
-    }
-    if (!sourceColumns.has("ip_limit")) {
-      await db.prepare(`ALTER TABLE ${this.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN ip_limit INTEGER NOT NULL DEFAULT 5`).run();
-    }
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_sources_sort ON ${this.DNS_IP_POOL_SOURCES_TABLE} (sort_order ASC, updated_at ASC)`).run();
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_POOL_FETCH_CACHE_TABLE} (
-      signature TEXT PRIMARY KEY,
-      items_json TEXT NOT NULL,
-      source_results_json TEXT NOT NULL,
-      imported_count INTEGER NOT NULL DEFAULT 0,
-      enabled_source_count INTEGER NOT NULL DEFAULT 0,
-      cached_at INTEGER NOT NULL,
-      expires_at INTEGER NOT NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    )`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_fetch_cache_expires ON ${this.DNS_IP_POOL_FETCH_CACHE_TABLE} (expires_at)`).run();
-    await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.DNS_IP_PROBE_CACHE_TABLE} (
-      ip TEXT NOT NULL,
-      entry_colo TEXT NOT NULL,
-      probe_status TEXT NOT NULL,
-      latency_ms INTEGER,
-      cf_ray TEXT,
-      colo_code TEXT,
-      city_name TEXT,
-      country_code TEXT,
-      country_name TEXT,
-      probed_at TEXT NOT NULL,
-      expires_at INTEGER NOT NULL,
-      PRIMARY KEY (ip, entry_colo)
-    )`).run();
-    await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_probe_cache_expire ON ${this.DNS_IP_PROBE_CACHE_TABLE} (expires_at)`).run();
-    return true;
   },
   getDnsIpPoolRevisionFromStatus(status = {}) {
     const revision = String(status?.revision || "").trim();
@@ -10862,7 +11434,6 @@ const Database = {
       id, ip, ip_type, source_kind, source_label, line_label, remark, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(ip) DO UPDATE SET
-      id = excluded.id,
       ip_type = excluded.ip_type,
       source_kind = excluded.source_kind,
       source_label = excluded.source_label,
@@ -10925,9 +11496,8 @@ const Database = {
     const db = stores?.db || null;
     if (!db) throw new Error("D1 not configured");
     await this.ensureDnsIpWorkspaceSchema(db);
-    await db.prepare(`DELETE FROM ${this.DNS_IP_POOL_SOURCES_TABLE}`).run();
-    if (!normalizedSources.length) return [];
-    const statements = normalizedSources.map(source => db.prepare(`INSERT INTO ${this.DNS_IP_POOL_SOURCES_TABLE} (
+    const statements = [db.prepare(`DELETE FROM ${this.DNS_IP_POOL_SOURCES_TABLE}`)];
+    statements.push(...normalizedSources.map(source => db.prepare(`INSERT INTO ${this.DNS_IP_POOL_SOURCES_TABLE} (
       id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       source.id,
@@ -10946,7 +11516,7 @@ const Database = {
       source.lastFetchCount,
       source.createdAt,
       source.updatedAt
-    ));
+    )));
     await db.batch(statements);
     return normalizedSources;
   },
@@ -11076,8 +11646,8 @@ const Database = {
     const rows = [];
     const now = nowMs();
     try {
-      for (let index = 0; index < uniqueIps.length; index += 100) {
-        const chunk = uniqueIps.slice(index, index + 100);
+      for (let index = 0; index < uniqueIps.length; index += 98) {
+        const chunk = uniqueIps.slice(index, index + 98);
         if (!chunk.length) continue;
         const placeholders = chunk.map(() => "?").join(", ");
         const result = await db.prepare(`SELECT ip, entry_colo, probe_status, latency_ms, cf_ray, colo_code, city_name, country_code, country_name, probed_at, expires_at
@@ -11276,10 +11846,8 @@ const Database = {
     let recreated = false;
     let droppedTriggers = 0;
     if (!forceRecreate && await this.hasLogsFtsTable(db)) {
-      const existingColumns = await this.getTableColumns(db, this.LOGS_FTS_TABLE);
-      if (existingColumns.size > 0 && !existingColumns.has("detail_json")) {
-        forceRecreate = true;
-      }
+      const readiness = await this.getLogsFtsReadiness(db);
+      if (!readiness.virtualTableReady || !readiness.columnsReady) forceRecreate = true;
     }
     if (forceRecreate) {
       droppedTriggers = await this.dropLogsFtsSyncTriggers(db);
@@ -11393,7 +11961,6 @@ const Database = {
       initTask = (async () => {
         try {
           await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SYS_STATUS_TABLE} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`).run();
-          await db.prepare(`CREATE INDEX IF NOT EXISTS idx_sys_status_updated_at ON ${this.SYS_STATUS_TABLE} (updated_at DESC)`).run();
           return true;
         } catch (error) {
           console.warn("sys_status init failed", error);
@@ -11402,9 +11969,11 @@ const Database = {
       })();
       GLOBALS.OpsStatusDbReady.set(db, initTask);
     }
-    const ready = await initTask;
-    if (!ready) GLOBALS.OpsStatusDbReady.delete(db);
-    return ready;
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.OpsStatusDbReady.get(db) === initTask) GLOBALS.OpsStatusDbReady.delete(db);
+    }
   },
   async ensureAuthFailuresTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
@@ -11427,9 +11996,11 @@ const Database = {
       })();
       GLOBALS.AuthFailuresDbReady.set(db, initTask);
     }
-    const ready = await initTask;
-    if (!ready) GLOBALS.AuthFailuresDbReady.delete(db);
-    return ready;
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.AuthFailuresDbReady.get(db) === initTask) GLOBALS.AuthFailuresDbReady.delete(db);
+    }
   },
   async getAuthFailureEntry(db, ip = "") {
     const normalizedIp = String(ip || "").trim();
@@ -11509,7 +12080,6 @@ const Database = {
             updated_at INTEGER NOT NULL
           )`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_dashboard_cache_expires_at ON ${this.CF_DASH_CACHE_TABLE} (expires_at)`).run();
-          await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_dashboard_cache_zone_bucket ON ${this.CF_DASH_CACHE_TABLE} (zone_id, bucket_date)`).run();
           return true;
         } catch (error) {
           console.warn("cf_dashboard_cache init failed", error);
@@ -11518,9 +12088,11 @@ const Database = {
       })();
       GLOBALS.CfDashboardCacheDbReady.set(db, initTask);
     }
-    const ready = await initTask;
-    if (!ready) GLOBALS.CfDashboardCacheDbReady.delete(db);
-    return ready;
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.CfDashboardCacheDbReady.get(db) === initTask) GLOBALS.CfDashboardCacheDbReady.delete(db);
+    }
   },
   async getCfDashboardCacheEntry(db, cacheKey = "", options = {}) {
     const normalizedKey = String(cacheKey || "").trim();
@@ -11656,7 +12228,6 @@ const Database = {
             updated_at INTEGER NOT NULL
           )`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_runtime_cache_expires_at ON ${this.CF_RUNTIME_CACHE_TABLE} (expires_at)`).run();
-          await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_runtime_cache_group_resource ON ${this.CF_RUNTIME_CACHE_TABLE} (cache_group, resource_id)`).run();
           return true;
         } catch (error) {
           console.warn("cf_runtime_cache init failed", error);
@@ -11665,9 +12236,11 @@ const Database = {
       })();
       GLOBALS.CfRuntimeCacheDbReady.set(db, initTask);
     }
-    const ready = await initTask;
-    if (!ready) GLOBALS.CfRuntimeCacheDbReady.delete(db);
-    return ready;
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.CfRuntimeCacheDbReady.get(db) === initTask) GLOBALS.CfRuntimeCacheDbReady.delete(db);
+    }
   },
   async getCfRuntimeCacheEntry(db, cacheKey = "", options = {}) {
     const normalizedKey = String(cacheKey || "").trim();
@@ -12684,9 +13257,11 @@ const Database = {
       })();
       GLOBALS.ScheduledLeaseDbReady.set(db, initTask);
     }
-    const ready = await initTask;
-    if (!ready) GLOBALS.ScheduledLeaseDbReady.delete(db);
-    return ready;
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.ScheduledLeaseDbReady.get(db) === initTask) GLOBALS.ScheduledLeaseDbReady.delete(db);
+    }
   },
   normalizeScheduledLeaseLock(lock, backend = "") {
     if (!lock || typeof lock !== "object") return null;
@@ -12811,6 +13386,9 @@ const Database = {
       cacheRevision: buildNodeDerivedCacheRevision(name, rawNode),
       displayName: String(rawNode.displayName ?? ""),
       entryMode,
+      hostPrefixCnameTarget: entryMode === "host_prefix"
+        ? normalizeHostPrefixCnameTarget(rawNode.hostPrefixCnameTarget)
+        : "",
       secret: entryMode === "host_prefix" ? "" : String(rawNode.secret ?? ""),
       tag: String(rawNode.tag ?? ""),
       tagColor: String(rawNode.tagColor ?? ""),
@@ -13441,6 +14019,11 @@ const Database = {
       return [];
     }
   },
+  async getDnsRecordHistoryForMutation(kv, zoneId, recordId) {
+    if (!kv || !zoneId || !recordId) return [];
+    const stored = await kv.get(this.getDnsRecordHistoryKey(zoneId, recordId), { type: "json" });
+    return this.normalizeDnsRecordHistory(stored);
+  },
   async persistDnsRecordHistory(kv, zoneId, recordId, entries) {
     if (!kv || !zoneId || !recordId) return [];
     const normalizedHistory = this.normalizeDnsRecordHistory(entries);
@@ -13449,7 +14032,7 @@ const Database = {
   },
   async recordDnsRecordHistory(kv, zoneId, recordId, entry = {}) {
     if (!kv || !zoneId || !recordId) return [];
-    const currentHistory = await this.getDnsRecordHistory(kv, zoneId, recordId);
+    const currentHistory = await this.getDnsRecordHistoryForMutation(kv, zoneId, recordId);
     const normalizedEntry = this.normalizeDnsRecordHistoryEntry(entry);
     if (normalizedEntry.type !== "CNAME" || !normalizedEntry.content) return currentHistory;
     const existingSameValue = currentHistory.find(item => this.normalizeDnsHistoryValueKey(item?.type, item?.content) === this.normalizeDnsHistoryValueKey(normalizedEntry.type, normalizedEntry.content));
@@ -13506,6 +14089,8 @@ const Database = {
     const collected = [];
     let cursor = "";
     let guard = 0;
+    let completed = false;
+    const seenCursors = new Set();
     while (guard < 1000) {
       guard += 1;
       const page = cursor
@@ -13516,8 +14101,26 @@ const Database = {
         if (name) collected.push(name);
       }
       const nextCursor = typeof page?.cursor === "string" ? page.cursor : "";
-      if (page?.list_complete === true || !nextCursor) break;
+      if (page?.list_complete === true) {
+        completed = true;
+        break;
+      }
+      if (!nextCursor || nextCursor === cursor || seenCursors.has(nextCursor)) {
+        const error = new Error("KV key scan did not complete");
+        error.code = "KV_SCAN_INCOMPLETE";
+        error.status = 409;
+        error.details = { prefix, pageCount: guard, cursor: nextCursor, reason: !nextCursor ? "missing_cursor" : "repeated_cursor" };
+        throw error;
+      }
+      seenCursors.add(nextCursor);
       cursor = nextCursor;
+    }
+    if (!completed) {
+      const error = new Error("KV key scan exceeded the page safety limit");
+      error.code = "KV_SCAN_INCOMPLETE";
+      error.status = 409;
+      error.details = { prefix, pageCount: guard, cursor, reason: "page_limit" };
+      throw error;
     }
     return [...new Set(collected)];
   },
@@ -13527,6 +14130,8 @@ const Database = {
     const collected = [];
     let cursor = "";
     let guard = 0;
+    let completed = false;
+    const seenCursors = new Set();
     while (guard < 1000) {
       guard += 1;
       const page = await kvListStrict(kv, cursor ? { prefix, cursor } : { prefix });
@@ -13535,8 +14140,26 @@ const Database = {
         if (name) collected.push(name);
       }
       const nextCursor = typeof page?.cursor === "string" ? page.cursor : "";
-      if (page?.list_complete === true || !nextCursor) break;
+      if (page?.list_complete === true) {
+        completed = true;
+        break;
+      }
+      if (!nextCursor || nextCursor === cursor || seenCursors.has(nextCursor)) {
+        const error = new Error("KV key scan did not complete");
+        error.code = "KV_SCAN_INCOMPLETE";
+        error.status = 409;
+        error.details = { prefix, pageCount: guard, cursor: nextCursor, reason: !nextCursor ? "missing_cursor" : "repeated_cursor" };
+        throw error;
+      }
+      seenCursors.add(nextCursor);
       cursor = nextCursor;
+    }
+    if (!completed) {
+      const error = new Error("KV key scan exceeded the page safety limit");
+      error.code = "KV_SCAN_INCOMPLETE";
+      error.status = 409;
+      error.details = { prefix, pageCount: guard, cursor, reason: "page_limit" };
+      throw error;
     }
     return [...new Set(collected)];
   },
@@ -13545,8 +14168,12 @@ const Database = {
     let rawText = null;
     try {
       rawText = await kv.get(this.CONFIG_KEY);
-    } catch {
-      return { config: {}, rawConfig: {}, hadMalformedValue: true, source: "read_failed", rawText: null };
+    } catch (cause) {
+      const error = new Error("KV tidy could not read the runtime config");
+      error.code = "KV_TIDY_CONFIG_READ_FAILED";
+      error.status = 503;
+      error.details = { key: this.CONFIG_KEY, cause: getErrorMessage(cause, "kv_read_failed") };
+      throw error;
     }
     if (rawText === null || rawText === undefined || rawText === "") {
       return { config: {}, rawConfig: {}, hadMalformedValue: false, source: "missing", rawText: null };
@@ -13589,7 +14216,7 @@ const Database = {
   async applyKvMutationsWithRollback(kv, mutations = []) {
     if (!kv) return [];
     const normalizedMutations = [];
-    const rollbackEntries = [];
+    const rollbackEntries = new Map();
     const seenKeys = new Set();
 
     for (const mutation of Array.isArray(mutations) ? mutations : []) {
@@ -13605,28 +14232,53 @@ const Database = {
       });
       if (seenKeys.has(key)) continue;
       seenKeys.add(key);
-      rollbackEntries.push({ key, ...await this.readRawKvEntry(kv, key) });
+      rollbackEntries.set(key, { key, ...await this.readRawKvEntry(kv, key) });
     }
 
+    const appliedKeys = [];
+    const appliedExpectedEntries = new Map();
     try {
       for (const mutation of normalizedMutations) {
         if (mutation.type === "delete") await kv.delete(mutation.key);
         else await kv.put(mutation.key, mutation.value);
+        if (!appliedExpectedEntries.has(mutation.key)) appliedKeys.push(mutation.key);
+        appliedExpectedEntries.set(mutation.key, mutation.type === "delete"
+          ? { exists: false, value: null }
+          : { exists: true, value: mutation.value });
       }
       return normalizedMutations;
     } catch (error) {
       const rollbackFailures = [];
-      for (let i = rollbackEntries.length - 1; i >= 0; i -= 1) {
-        const entry = rollbackEntries[i];
+      const rollbackConflicts = [];
+      for (let i = appliedKeys.length - 1; i >= 0; i -= 1) {
+        const key = appliedKeys[i];
+        const entry = rollbackEntries.get(key);
+        const expected = appliedExpectedEntries.get(key);
+        if (!entry || !expected) continue;
         try {
+          const current = await this.readRawKvEntry(kv, key);
+          const currentMatchesExpected = current.exists === expected.exists
+            && (expected.exists !== true || current.value === expected.value);
+          if (!currentMatchesExpected) {
+            rollbackConflicts.push(key);
+            continue;
+          }
           if (entry.exists) await kv.put(entry.key, entry.value);
           else await kv.delete(entry.key);
         } catch (rollbackError) {
           rollbackFailures.push(`${entry.key}:${rollbackError?.message || String(rollbackError)}`);
         }
       }
-      if (rollbackFailures.length > 0) {
-        throw new Error(`${error?.message || String(error)}; rollback_failed=${rollbackFailures.join(",")}`);
+      if (rollbackFailures.length > 0 || rollbackConflicts.length > 0) {
+        const rollbackError = new Error(`${error?.message || String(error)}; rollback_incomplete`);
+        rollbackError.code = "KV_MUTATION_ROLLBACK_CONFLICT";
+        rollbackError.status = 409;
+        rollbackError.details = {
+          rollbackConflicts,
+          rollbackFailures,
+          originalError: getErrorMessage(error, "kv_mutation_failed")
+        };
+        throw rollbackError;
       }
       throw error;
     }
@@ -13642,12 +14294,7 @@ const Database = {
     };
   },
   async readStoredNodesSummaryState(kv) {
-    let rawStoredSummaryIndexText = "";
-    try {
-      rawStoredSummaryIndexText = String(await kv.get(this.NODES_SUMMARY_INDEX_KEY) || "");
-    } catch {
-      rawStoredSummaryIndexText = "";
-    }
+    const rawStoredSummaryIndexText = String(await kv.get(this.NODES_SUMMARY_INDEX_KEY) || "");
     let parsedStoredSummaryIndex = null;
     try {
       parsedStoredSummaryIndex = rawStoredSummaryIndexText ? JSON.parse(rawStoredSummaryIndexText) : null;
@@ -13772,13 +14419,24 @@ const Database = {
     const nodeRollbackEntries = [];
 
     for (const nodeName of nodeNames) {
+      const key = `${this.PREFIX}${nodeName}`;
       let rawNode = null;
       try {
-        rawNode = await kv.get(`${this.PREFIX}${nodeName}`, { type: "json" });
-      } catch {
-        rawNode = null;
+        rawNode = await kvGetStrict(kv, key, { type: "json" });
+      } catch (cause) {
+        const error = new Error(`KV tidy could not read node ${nodeName}`);
+        error.code = "KV_TIDY_NODE_READ_FAILED";
+        error.status = 503;
+        error.details = { key, nodeName, cause: getErrorMessage(cause, "kv_read_failed") };
+        throw error;
       }
-      if (!isPlainObject(rawNode)) continue;
+      if (!isPlainObject(rawNode)) {
+        const error = new Error(`KV tidy found an invalid node entity: ${nodeName}`);
+        error.code = "KV_TIDY_NODE_INVALID";
+        error.status = 409;
+        error.details = { key, nodeName };
+        throw error;
+      }
       const legacyNodeState = collectLegacyNodeState(rawNode);
       if (legacyNodeState.shouldAddToSourceDirectNodes) {
         sourceDirectNodesSelection = normalizeNodeNameList([...sourceDirectNodesSelection, nodeName]);
@@ -13791,7 +14449,7 @@ const Database = {
       const { data: normalizedNode, changed } = this.normalizeNode(nodeName, rawNode, { dropLegacyDirectRouting: true });
       fullEntityNodes.push({ name: nodeName, ...normalizedNode });
       if (!changed) continue;
-      nodeRollbackEntries.push({ key: `${this.PREFIX}${nodeName}`, ...await this.readRawKvEntry(kv, `${this.PREFIX}${nodeName}`) });
+      nodeRollbackEntries.push({ key, ...await this.readRawKvEntry(kv, key) });
       rewrittenNodeCount += 1;
       rewrittenNodes.push({ name: nodeName, data: normalizedNode });
     }
@@ -13821,11 +14479,11 @@ const Database = {
     const migratedConfigKeys = [];
     for (const snapshot of rawSnapshots) {
       if (snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) && snapshot.reason === "tidy_kv_data_pre_migration") {
-        rewrittenSnapshots.push(snapshot);
+        rewrittenSnapshots.push(redactConfigSnapshotSecrets(snapshot));
         continue;
       }
       const rewriteResult = rewriteConfigSnapshotToCurrentSchema(snapshot);
-      rewrittenSnapshots.push(rewriteResult.snapshot);
+      rewrittenSnapshots.push(redactConfigSnapshotSecrets(rewriteResult.snapshot));
       if (rewriteResult.rewritten) rewrittenSnapshotCount += 1;
       deletedLegacySnapshotFieldCount += Number(rewriteResult.deletedLegacyFieldCount) || 0;
       migratedConfigKeys.push(...(rewriteResult.migratedConfigKeys || []));
@@ -13865,6 +14523,103 @@ const Database = {
     }
     return noteParts;
   },
+  normalizeKvTidyMutationValueForHash(mutation = {}) {
+    const key = String(mutation?.key || "").trim();
+    const value = String(mutation?.value ?? "");
+    if (key !== this.CONFIG_SNAPSHOTS_KEY || !value) return value;
+    try {
+      const snapshots = JSON.parse(value);
+      if (!Array.isArray(snapshots)) return value;
+      return JSON.stringify(snapshots.map(snapshot => {
+        if (!isPlainObject(snapshot)) return snapshot;
+        const normalized = { ...snapshot };
+        delete normalized.id;
+        delete normalized.createdAt;
+        return normalized;
+      }));
+    } catch {
+      return value;
+    }
+  },
+  buildKvTidyPlanHash(plan = {}) {
+    const mutationPlan = (Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : []).map(mutation => ({
+      type: String(mutation?.type || "put").trim().toLowerCase() === "delete" ? "delete" : "put",
+      key: String(mutation?.key || "").trim(),
+      value: this.normalizeKvTidyMutationValueForHash(mutation)
+    }));
+    return hashStableText(serializeConfigValue({
+      scope: "kv",
+      scannedKeys: [...new Set(Array.isArray(plan?.scannedKeys) ? plan.scannedKeys : [])].sort(),
+      revisions: isPlainObject(plan?.revisions) ? plan.revisions : {},
+      mutationPlan,
+      rebuiltNodeSummaries: Array.isArray(plan?.rebuiltNodeSummaries) ? plan.rebuiltNodeSummaries : []
+    }));
+  },
+  async createKvTidyPlanToken(env, plan = {}, options = {}) {
+    const secret = String(env?.JWT_SECRET || "").trim();
+    if (!secret) {
+      const error = new Error("JWT_SECRET is required to sign the KV tidy plan");
+      error.code = "SERVER_MISCONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const issuedAt = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1000));
+    const expiresAt = issuedAt + Math.max(60, Math.floor(Number(options.ttlMs) || KV_TIDY_PLAN_TOKEN_TTL_MS) / 1000);
+    const payloadPart = encodeBase64UrlUtf8(JSON.stringify({
+      version: 1,
+      scope: "kv",
+      planHash: String(plan?.planHash || this.buildKvTidyPlanHash(plan)).trim(),
+      issuedAt,
+      expiresAt
+    }));
+    return `${payloadPart}.${await Auth.sign(secret, payloadPart)}`;
+  },
+  async verifyKvTidyPlanToken(env, token = "", options = {}) {
+    const secret = String(env?.JWT_SECRET || "").trim();
+    const rawToken = String(token || "").trim();
+    if (!secret) {
+      const error = new Error("JWT_SECRET is required to verify the KV tidy plan");
+      error.code = "SERVER_MISCONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const dotIndex = rawToken.indexOf(".");
+    if (dotIndex <= 0 || dotIndex === rawToken.length - 1) {
+      const error = new Error("KV tidy plan token is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    const payloadPart = rawToken.slice(0, dotIndex);
+    const signature = rawToken.slice(dotIndex + 1);
+    if (signature !== await Auth.sign(secret, payloadPart)) {
+      const error = new Error("KV tidy plan token signature is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    let payload = null;
+    try {
+      payload = JSON.parse(decodeBase64UrlUtf8(payloadPart));
+    } catch {
+      payload = null;
+    }
+    const nowSeconds = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1000));
+    if (!isPlainObject(payload) || payload.version !== 1 || payload.scope !== "kv" || !String(payload.planHash || "").trim()) {
+      const error = new Error("KV tidy plan token payload is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    if (Number(payload.expiresAt) <= nowSeconds) {
+      const error = new Error("KV tidy plan has expired");
+      error.code = "TIDY_PLAN_STALE";
+      error.status = 409;
+      error.details = { reason: "expired", expiresAt: Number(payload.expiresAt) || 0 };
+      throw error;
+    }
+    return payload;
+  },
   async resolveKvTidyQuotaBudget(env, mutationPlan = [], options = {}) {
     const kv = options.kv || this.getKV(env);
     const runtimeConfig = sanitizeRuntimeConfig(options.config || {});
@@ -13882,7 +14637,11 @@ const Database = {
       ? await this.captureRawKvEntries(kv, normalizedMutations.map(mutation => mutation.key))
       : [];
     const estimatedRollbackWriteCount = rollbackEntries.filter(entry => entry?.exists === true).length;
-    const estimatedWorstCaseWriteCount = estimatedPutCount + estimatedRollbackWriteCount;
+    const estimatedRollbackDeleteCount = rollbackEntries.filter(entry => entry?.exists !== true).length;
+    const estimatedWorstCaseWriteCount = estimatedPutCount
+      + estimatedDeleteCount
+      + estimatedRollbackWriteCount
+      + estimatedRollbackDeleteCount;
     const quotaBudget = {
       planClass: String(planProfile?.planClass || "free").trim().toLowerCase() === "paid" ? "paid" : "free",
       planLabel: String(planProfile?.planLabel || "").trim() || "FREE",
@@ -13891,6 +14650,7 @@ const Database = {
       estimatedPutCount,
       estimatedDeleteCount,
       estimatedRollbackWriteCount,
+      estimatedRollbackDeleteCount,
       estimatedWorstCaseWriteCount,
       blocked: estimatedWorstCaseWriteCount > writeLimit,
       reason: ""
@@ -13904,7 +14664,7 @@ const Database = {
     const kv = options.kv || this.getKV(env);
     if (!kv) throw new Error("KV not configured");
 
-    const allKeys = await this.listKvKeys(kv);
+    const allKeys = (await this.listKvKeysStrict(kv)).sort();
     const {
       rawStoredSummaryIndexText,
       storedSummaryIndexState,
@@ -13955,7 +14715,17 @@ const Database = {
       migratedConfigKeys.push("sourceDirectNodes");
     }
 
-    const rawSnapshots = await this.readStoredConfigSnapshots(kv);
+    const rawSnapshots = await this.readStoredConfigSnapshotsStrict(kv);
+    const [configMeta, snapshotsMeta] = await Promise.all([
+      this.readRevisionMetaForRead(kv, this.CONFIG_META_KEY),
+      this.readRevisionMetaForRead(kv, this.CONFIG_SNAPSHOTS_META_KEY, { count: 0 })
+    ]);
+    const revisions = {
+      configRevision: String(configMeta?.revision || ""),
+      configContentHash: hashStableText(serializeConfigValue(currentStoredConfig)),
+      snapshotsRevision: String(snapshotsMeta?.revision || ""),
+      snapshotsContentHash: hashStableText(serializeConfigValue(rawSnapshots))
+    };
     const {
       rewrittenSnapshots,
       rewrittenSnapshotCount,
@@ -14221,11 +14991,13 @@ const Database = {
       warnings.push(quotaBudget.reason);
     }
 
-    return {
+    const plan = {
       scope: "kv",
+      scannedKeys: allKeys,
       config: nextTidyConfig,
       nodesIndex: rebuiltNodeIndex,
       rebuiltNodeSummaries,
+      revisions,
       summary,
       quotaBudget,
       mutationPlan,
@@ -14239,6 +15011,8 @@ const Database = {
         warnings
       }
     };
+    plan.planHash = this.buildKvTidyPlanHash(plan);
+    return plan;
   },
   async applyKvTidyPlan(plan, options = {}) {
     const kv = options.kv || this.getKV(options.env);
@@ -14278,19 +15052,31 @@ const Database = {
     });
   },
   async tidyKvData(env, options = {}) {
-    const plan = options.plan || await this.buildKvTidyPlan(env, options);
-    if (plan?.quotaBudget?.blocked === true) {
-      const message = String(plan?.quotaBudget?.reason || "KV tidy write budget exceeded").trim() || "KV tidy write budget exceeded";
-      /** @type {AppError} */
-      const error = new Error(message);
-      error.code = "KV_TIDY_WRITE_LIMIT_EXCEEDED";
-      error.status = 409;
-      error.details = {
-        quotaBudget: plan.quotaBudget
-      };
-      throw error;
-    }
-    return await this.applyKvTidyPlan(plan, options);
+    return await runKvTidyMutation(async () => {
+      const tokenPayload = await this.verifyKvTidyPlanToken(env, options.planToken);
+      const plan = await this.buildKvTidyPlan(env, options);
+      if (String(plan.planHash || "") !== String(tokenPayload.planHash || "")) {
+        const error = new Error("KV tidy data changed after preview");
+        error.code = "TIDY_PLAN_STALE";
+        error.status = 409;
+        error.details = {
+          reason: "plan_changed",
+          previewPlanHash: String(tokenPayload.planHash || ""),
+          currentPlanHash: String(plan.planHash || "")
+        };
+        throw error;
+      }
+      if (plan?.quotaBudget?.blocked === true) {
+        const message = String(plan?.quotaBudget?.reason || "KV tidy write budget exceeded").trim() || "KV tidy write budget exceeded";
+        /** @type {AppError} */
+        const error = new Error(message);
+        error.code = "KV_TIDY_WRITE_LIMIT_EXCEEDED";
+        error.status = 409;
+        error.details = { quotaBudget: plan.quotaBudget };
+        throw error;
+      }
+      return await this.applyKvTidyPlan(plan, options);
+    });
   },
   async readD1Count(db, sql, bindParams = []) {
     if (!db || !sql) return 0;
@@ -14623,7 +15409,12 @@ const Database = {
   async readStoredConfigSnapshotsStrict(kv) {
     if (!kv) return [];
     const stored = await kvGetStrict(kv, this.CONFIG_SNAPSHOTS_KEY, { type: "json" });
-    return Array.isArray(stored) ? stored : [];
+    if (stored === null || stored === undefined) return [];
+    if (Array.isArray(stored)) return stored;
+    const error = new Error("Stored config snapshots are invalid");
+    error.code = "CONFIG_SNAPSHOTS_INVALID";
+    error.status = 409;
+    throw error;
   },
   async writeStoredConfigSnapshots(kv, snapshots = [], options = {}) {
     if (!kv) return [];
@@ -14636,7 +15427,7 @@ const Database = {
     const snapshotMeta = this.normalizeConfigSnapshotMeta(meta);
     const changedKeys = normalizeDistinctConfigKeyList(options.changedKeys || []);
     const extraFields = isPlainObject(options.extraFields) ? options.extraFields : {};
-    return {
+    return redactConfigSnapshotSecrets({
       id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       createdAt: new Date().toISOString(),
       reason: snapshotMeta.reason,
@@ -14646,9 +15437,9 @@ const Database = {
       note: snapshotMeta.note,
       changedKeys,
       changeCount: Number(options.changeCount) || changedKeys.length,
-      config: sanitizeRuntimeConfig(config),
+      config: redactRuntimeConfigSecrets(config),
       ...extraFields
-    };
+    });
   },
   async getConfigSnapshots(kv, options = {}) {
     if (!kv) return [];
@@ -14659,7 +15450,7 @@ const Database = {
     const includeConfig = options.withConfig === true;
     return (Array.isArray(rawSnapshots) ? rawSnapshots : [])
       .filter(item => item && typeof item === "object" && Array.isArray(item.changedKeys) && item.createdAt)
-      .map(item => includeConfig ? { ...item } : {
+      .map(item => includeConfig ? redactConfigSnapshotSecrets(item) : {
         id: item.id,
         createdAt: item.createdAt,
         reason: item.reason,
@@ -14677,7 +15468,7 @@ const Database = {
     return this.normalizeConfigSnapshotsForResponse(rawSnapshots, options);
   },
   async getConfigSnapshotById(kv, snapshotId) {
-    const snapshots = await this.getConfigSnapshots(kv, { withConfig: true });
+    const snapshots = await this.getConfigSnapshotsForRead(kv, { withConfig: true });
     return snapshots.find(item => item.id === snapshotId) || null;
   },
   async clearConfigSnapshots(kv) {
@@ -14692,8 +15483,8 @@ const Database = {
       };
     }
     const currentConfig = env
-      ? await getRuntimeConfig(env)
-      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+      ? await getRuntimeConfigStrict(env)
+      : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
     const rollbackKeys = [
       this.CONFIG_KEY,
       this.CONFIG_META_KEY,
@@ -14728,29 +15519,76 @@ const Database = {
     invalidateRuntimeConfigCache();
     return options.env ? await getRuntimeConfig(options.env) : fallbackConfig;
   },
+  async restoreCapturedRuntimeConfigAndDnsState(state = {}, options = {}) {
+    const previousConfig = sanitizeRuntimeConfig(state?.config || {});
+    let dnsRestoreError = null;
+    let kvRestoreError = null;
+    let restoredConfig = previousConfig;
+    try {
+      await this.commitRuntimeConfig(previousConfig, {
+        env: options.env,
+        kv: options.kv,
+        ctx: options.ctx,
+        snapshotMeta: {
+          reason: "rollback_config_dns",
+          section: "all",
+          source: "rollback",
+          actor: "system"
+        }
+      });
+    } catch (error) {
+      dnsRestoreError = error;
+    }
+    try {
+      restoredConfig = await this.restoreCapturedRuntimeConfigState(state, options);
+    } catch (error) {
+      kvRestoreError = error;
+    }
+    if (dnsRestoreError || kvRestoreError) {
+      const error = new Error([
+        dnsRestoreError ? `dns:${getErrorMessage(dnsRestoreError, "restore_failed")}` : "",
+        kvRestoreError ? `kv:${getErrorMessage(kvRestoreError, "restore_failed")}` : ""
+      ].filter(Boolean).join("; "));
+      error.code = "CONFIG_DNS_RESTORE_FAILED";
+      error.status = 500;
+      error.details = {
+        dnsRestoreError: dnsRestoreError ? getErrorMessage(dnsRestoreError, "restore_failed") : "",
+        kvRestoreError: kvRestoreError ? getErrorMessage(kvRestoreError, "restore_failed") : ""
+      };
+      throw error;
+    }
+    return restoredConfig;
+  },
   async restoreTidyKvMigrationSnapshot(snapshot, options = {}) {
     const { env, kv } = options;
-    if (!kv) return sanitizeRuntimeConfig(snapshot?.config || {});
+    if (!kv) return redactRuntimeConfigSecrets(snapshot?.config || {});
     const rollbackPayload = isPlainObject(snapshot?.rollbackPayload) ? snapshot.rollbackPayload : {};
     const rollbackEntries = Array.isArray(rollbackPayload.kvEntries) ? rollbackPayload.kvEntries : [];
-    if (!rollbackEntries.length) {
-      return sanitizeRuntimeConfig(snapshot?.config || {});
-    }
-
     const prevRuntimeConfig = env
-      ? await getRuntimeConfig(env)
-      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+      ? await getRuntimeConfigStrict(env)
+      : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
+    if (!rollbackEntries.length) {
+      return preserveRuntimeConfigSecrets(snapshot?.config || {}, prevRuntimeConfig);
+    }
 
     const rollbackConfigEntry = rollbackEntries.find((entry) => String(entry?.key || "") === this.CONFIG_KEY);
     let nextRuntimeConfig = sanitizeRuntimeConfig(snapshot?.config || {});
     if (rollbackConfigEntry?.exists && rollbackConfigEntry.value) {
       try {
-        nextRuntimeConfig = sanitizeRuntimeConfig(JSON.parse(String(rollbackConfigEntry.value)));
+        nextRuntimeConfig = preserveRuntimeConfigSecrets(JSON.parse(String(rollbackConfigEntry.value)), prevRuntimeConfig);
       } catch {}
     }
+    nextRuntimeConfig = preserveRuntimeConfigSecrets(nextRuntimeConfig, prevRuntimeConfig);
 
     const diffEntries = getConfigDiffEntries(prevRuntimeConfig, nextRuntimeConfig);
-    const currentSnapshots = await this.getConfigSnapshots(kv, { withConfig: true });
+    const rollbackSnapshotsEntry = rollbackEntries.find((entry) => String(entry?.key || "") === this.CONFIG_SNAPSHOTS_KEY);
+    let restoredSnapshots = await this.getConfigSnapshotsForRead(kv, { withConfig: true });
+    if (rollbackSnapshotsEntry?.exists === true) {
+      try {
+        const parsedSnapshots = JSON.parse(String(rollbackSnapshotsEntry.value || "[]"));
+        if (Array.isArray(parsedSnapshots)) restoredSnapshots = parsedSnapshots.map(item => redactConfigSnapshotSecrets(item));
+      } catch {}
+    }
     const nextSnapshots = diffEntries.length
       ? [{
           id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -14762,9 +15600,9 @@ const Database = {
           note: String(snapshot?.id || "").trim(),
           changedKeys: diffEntries.map(item => item.key),
           changeCount: diffEntries.length,
-          config: sanitizeRuntimeConfig(prevRuntimeConfig)
-        }, ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit)
-      : currentSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
+          config: redactRuntimeConfigSecrets(prevRuntimeConfig)
+        }, ...restoredSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit)
+      : restoredSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
 
     const mutationPlan = [{
       type: "put",
@@ -14778,7 +15616,11 @@ const Database = {
         mutationPlan.push({
           type: "put",
           key,
-          value: String(entry?.value ?? "")
+          value: key === this.CONFIG_KEY
+            ? JSON.stringify(nextRuntimeConfig)
+            : (key === this.CONFIG_SNAPSHOTS_KEY
+                ? JSON.stringify(nextSnapshots.map(item => redactConfigSnapshotSecrets(item)))
+                : String(entry?.value ?? ""))
         });
       } else {
         mutationPlan.push({ type: "delete", key, value: "" });
@@ -14814,7 +15656,7 @@ const Database = {
       note: snapshotMeta.note,
       changedKeys: diffEntries.map(item => item.key),
       changeCount: diffEntries.length,
-      config: sanitizeRuntimeConfig(prevConfig)
+      config: redactRuntimeConfigSecrets(prevConfig)
     };
     const nextSnapshots = [snapshot, ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit);
     await this.writeStoredConfigSnapshots(kv, nextSnapshots);
@@ -14825,40 +15667,145 @@ const Database = {
    * @param {PersistRuntimeConfigOptions} [options={}]
    */
   async persistRuntimeConfig(rawConfig, options = {}) {
+    return await runKvDataMutation(() => this.commitRuntimeConfig(rawConfig, options));
+  },
+  async prepareRuntimeConfigPersistence(rawConfig, options = {}) {
     const { env, kv, ctx, snapshotMeta } = options;
     if (!kv) {
-      const nextConfig = sanitizeRuntimeConfig(rawConfig);
-      assertReleaseSourceConfigValid(rawConfig);
-      assertHostPrefixProxyConfigReady(nextConfig, env);
-      return nextConfig;
+      const error = new Error("KV namespace is required to persist runtime config");
+      error.code = "KV_NOT_CONFIGURED";
+      error.status = 503;
+      throw error;
     }
+    assertHostPrefixCnameTargetValid(rawConfig?.defaultHostPrefixCnameTarget);
     const prevConfig = env
-      ? await getRuntimeConfig(env)
-      : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
+      ? await getRuntimeConfigStrict(env)
+      : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
     const nextConfig = sanitizeRuntimeConfig(rawConfig);
     assertReleaseSourceConfigValid(rawConfig);
     assertHostPrefixProxyConfigReady(nextConfig, env);
+    const configuredHost = resolveConfiguredHost(env);
+    const previousDefaultTarget = resolveHostPrefixCnameTarget(null, prevConfig, configuredHost);
+    const nextDefaultTarget = resolveHostPrefixCnameTarget(null, nextConfig, configuredHost);
+    const inheritedHostPrefixNodes = previousDefaultTarget !== nextDefaultTarget
+      ? (await this.loadAllNodeEntitiesFromKvStrict(kv, { ctx }))
+          .filter(node => isHostPrefixEntryMode(node?.entryMode) && !normalizeHostPrefixCnameTarget(node?.hostPrefixCnameTarget))
+      : [];
+    if (inheritedHostPrefixNodes.length > 0) assertHostPrefixDnsSyncReady(nextConfig, env);
+    const dnsPlans = inheritedHostPrefixNodes
+      .map(node => this.buildHostPrefixDnsSyncPlan(
+        node.name,
+        node,
+        node.name,
+        node,
+        configuredHost,
+        { previousConfig: prevConfig, nextConfig }
+      ))
+      .filter(plan => plan.changed === true);
+    return { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env };
+  },
+  async buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta = {}) {
+    const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
+    const currentSnapshots = (await this.readStoredConfigSnapshotsStrict(kv))
+      .map(snapshot => redactConfigSnapshotSecrets(snapshot));
+    const nextSnapshots = diffEntries.length > 0
+      ? [this.createSyntheticConfigSnapshot(prevConfig, snapshotMeta, {
+          changedKeys: diffEntries.map(item => item.key),
+          changeCount: diffEntries.length
+        }), ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit)
+      : currentSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
+    const configMeta = this.normalizeRevisionMeta(buildHashedMetaPayload(nextConfig));
+    const snapshotsMeta = this.normalizeRevisionMeta({
+      ...buildHashedMetaPayload(nextSnapshots),
+      count: nextSnapshots.length
+    }, { count: 0 });
+    const mutationPlan = [
+      { type: "put", key: this.CONFIG_SNAPSHOTS_KEY, value: JSON.stringify(nextSnapshots) },
+      { type: "put", key: this.CONFIG_SNAPSHOTS_META_KEY, value: JSON.stringify(snapshotsMeta) },
+      { type: "put", key: this.CONFIG_KEY, value: JSON.stringify(nextConfig) },
+      { type: "put", key: this.CONFIG_META_KEY, value: JSON.stringify(configMeta) }
+    ];
+    for (const key of this.buildLegacyConfigCacheKeys(prevConfig, nextConfig)) {
+      mutationPlan.push({ type: "delete", key, value: "" });
+    }
+    return mutationPlan;
+  },
+  async commitRuntimeConfig(rawConfig, options = {}) {
+    const prepared = await this.prepareRuntimeConfigPersistence(rawConfig, options);
+    const { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env } = prepared;
     if (serializeConfigValue(prevConfig) === serializeConfigValue(nextConfig)) {
       await this.ensureConfigMeta(kv, nextConfig, { ctx });
       return nextConfig;
     }
-    await this.recordConfigSnapshot(kv, prevConfig, nextConfig, snapshotMeta);
-    await kv.put(this.CONFIG_KEY, JSON.stringify(nextConfig));
-    if (env) primeRuntimeConfigCache(env, nextConfig);
-    else invalidateRuntimeConfigCache();
-    await this.ensureConfigMeta(kv, nextConfig, { ctx });
-    const deleteTasks = this.buildLegacyConfigCacheKeys(prevConfig, nextConfig).map(key => kv.delete(key));
-    if (deleteTasks.length) {
-      if (ctx) ctx.waitUntil(Promise.all(deleteTasks));
-      else await Promise.all(deleteTasks);
+    const appliedDnsPlans = [];
+    let activeDnsPlan = null;
+    let configMutationStarted = false;
+    try {
+      for (const plan of dnsPlans) {
+        activeDnsPlan = plan;
+        await this.persistHostPrefixDnsSyncPlan(plan, {
+          env,
+          kv,
+          ctx,
+          config: nextConfig,
+          requestHost: configuredHost
+        });
+        appliedDnsPlans.push(plan);
+        activeDnsPlan = null;
+      }
+      configMutationStarted = true;
+      const mutationPlan = await this.buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta);
+      await this.applyKvMutationsWithRollback(kv, mutationPlan);
+      if (env) primeRuntimeConfigCache(env, nextConfig);
+      else invalidateRuntimeConfigCache();
+      await this.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig, nextConfig });
+      return nextConfig;
+    } catch (error) {
+      const rollbackFailures = [];
+      const rollbackDnsPlans = activeDnsPlan
+        ? [...appliedDnsPlans, activeDnsPlan]
+        : appliedDnsPlans;
+      for (let index = rollbackDnsPlans.length - 1; index >= 0; index -= 1) {
+        try {
+          await this.persistHostPrefixDnsSyncPlan({
+            steps: rollbackDnsPlans[index].rollbackSteps
+          }, {
+            env,
+            kv,
+            ctx,
+            config: nextConfig,
+            requestHost: configuredHost,
+            skipHistory: true
+          });
+        } catch (rollbackError) {
+          rollbackFailures.push(getErrorMessage(rollbackError, "dns_rollback_failed"));
+        }
+      }
+      if (error && typeof error === "object") {
+        const configRollbackConflicts = Array.isArray(error?.details?.rollbackConflicts)
+          ? error.details.rollbackConflicts
+          : [];
+        const configRollbackFailures = Array.isArray(error?.details?.rollbackFailures)
+          ? error.details.rollbackFailures
+          : [];
+        error.details = {
+          ...(isPlainObject(error.details) ? error.details : {}),
+          hostPrefixDnsSyncAttempted: dnsPlans.length > 0,
+          hostPrefixDnsSyncedCount: appliedDnsPlans.length,
+          failedHostPrefixDnsHost: String(activeDnsPlan?.nextDnsHost || activeDnsPlan?.previousDnsHost || ""),
+          rollbackAttempted: rollbackDnsPlans.length > 0 || configMutationStarted,
+          rollbackSucceeded: rollbackFailures.length === 0 && configRollbackConflicts.length === 0 && configRollbackFailures.length === 0,
+          rollbackError: [...rollbackFailures, ...configRollbackFailures].join("; "),
+          rollbackConflicts: configRollbackConflicts
+        };
+      }
+      throw error;
     }
-    await this.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig, nextConfig });
-    return nextConfig;
   },
-  async syncSourceDirectNodesConfig(env, kv, ctx, options = {}) {
+  async commitSourceDirectNodesConfigWithinMutation(env, kv, ctx, options = {}) {
     if (!kv) return null;
     const currentConfig = env
-      ? await getRuntimeConfig(env)
+      ? await getRuntimeConfigStrict(env)
       : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
     const currentSelection = normalizeNodeNameList(currentConfig.sourceDirectNodes || []);
     const nextSelection = reconcileNamedNodeSelection(currentSelection, {
@@ -14867,7 +15814,7 @@ const Database = {
       allowedNames: options.allowedNames
     });
     if (serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection)) return currentConfig;
-    return this.persistRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
+    return this.commitRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
       env,
       kv,
       ctx,
@@ -14880,10 +15827,10 @@ const Database = {
       }
     });
   },
-  async syncSingleNodeMainVideoStreamShortcutShadow(env, kv, ctx, options = {}) {
+  async commitSingleNodeMainVideoStreamShortcutShadowWithinMutation(env, kv, ctx, options = {}) {
     if (!kv) return null;
     const currentConfig = env
-      ? await getRuntimeConfig(env)
+      ? await getRuntimeConfigStrict(env)
       : sanitizeRuntimeConfig(await kv.get(this.CONFIG_KEY, { type: "json" }) || {});
     const originalName = String(options.originalName || "").trim().toLowerCase();
     const nodeName = String(options.nodeName || "").trim().toLowerCase();
@@ -14898,7 +15845,7 @@ const Database = {
     if (nodeName && nextMode === "direct") nextSelection.push(nodeName);
     nextSelection = normalizeNodeNameList(nextSelection);
     if (serializeConfigValue(currentConfig.sourceDirectNodes || []) === serializeConfigValue(nextSelection)) return currentConfig;
-    return this.persistRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
+    return this.commitRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
       env,
       kv,
       ctx,
@@ -15375,6 +16322,11 @@ const Database = {
       n.secret = "";
       changed = true;
     }
+    const normalizedHostPrefixCnameTarget = normalizedEntryMode === "host_prefix"
+      ? normalizeHostPrefixCnameTarget(n.hostPrefixCnameTarget)
+      : "";
+    if (String(n.hostPrefixCnameTarget || "") !== normalizedHostPrefixCnameTarget) changed = true;
+    n.hostPrefixCnameTarget = normalizedHostPrefixCnameTarget;
     const normalizedPlaybackInfoMode = normalizeNodePlaybackInfoMode(n.playbackInfoMode);
     if (String(n.playbackInfoMode || "") !== normalizedPlaybackInfoMode) changed = true;
     n.playbackInfoMode = normalizedPlaybackInfoMode;
@@ -15419,7 +16371,7 @@ const Database = {
     n.headers = normalizedHeaders;
     delete n.videoThrottling;
     delete n.interceptMs;
-    if (n.schemaVersion !== 4) { n.schemaVersion = 4; changed = true; }
+    if (n.schemaVersion !== 5) { n.schemaVersion = 5; changed = true; }
     if (Object.prototype.hasOwnProperty.call(n, "createdAt")) { delete n.createdAt; changed = true; }
     if (Object.prototype.hasOwnProperty.call(n, "updatedAt")) { delete n.updatedAt; changed = true; }
     return { data: n, changed };
@@ -15486,6 +16438,9 @@ const Database = {
       entryMode: rawNode?.entryMode !== undefined
         ? normalizeNodeEntryMode(rawNode.entryMode)
         : normalizeNodeEntryMode(existingNode.entryMode),
+      hostPrefixCnameTarget: rawNode?.hostPrefixCnameTarget !== undefined
+        ? rawNode.hostPrefixCnameTarget
+        : existingNode.hostPrefixCnameTarget,
       secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
       tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
       remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
@@ -15503,7 +16458,7 @@ const Database = {
         ? normalizeNodeMainVideoStreamMode(rawMainVideoStreamMode)
         : readNodeMainVideoStreamMode(existingNode),
       headers: this.sanitizeHeaders(parsedHeaders),
-      schemaVersion: 4
+      schemaVersion: 5
     }).data;
     const normalizedExistingNode = this.normalizeNode(name, existingNode || {}).data;
     return nextNode;
@@ -15514,7 +16469,7 @@ const Database = {
     if (!normalizedHostRoot || !isValidDnsLabelForHostPrefix(normalizedName)) return "";
     return `${normalizedName}.${normalizedHostRoot}`;
   },
-  buildHostPrefixDnsSyncPlan(previousName = "", previousNode = null, nextName = "", nextNode = null, hostRoot = "") {
+  buildHostPrefixDnsSyncPlan(previousName = "", previousNode = null, nextName = "", nextNode = null, hostRoot = "", options = {}) {
     const normalizedHostRoot = normalizeHostnameText(hostRoot);
     const previousDnsHost = previousNode && isHostPrefixEntryMode(previousNode?.entryMode)
       ? this.buildHostPrefixDnsRecordHost(previousName, normalizedHostRoot)
@@ -15522,24 +16477,38 @@ const Database = {
     const nextDnsHost = nextNode && isHostPrefixEntryMode(nextNode?.entryMode)
       ? this.buildHostPrefixDnsRecordHost(nextName, normalizedHostRoot)
       : "";
+    const previousCnameTarget = previousDnsHost
+      ? resolveHostPrefixCnameTarget(previousNode, options.previousConfig || options.config || {}, normalizedHostRoot)
+      : "";
+    const nextCnameTarget = nextDnsHost
+      ? resolveHostPrefixCnameTarget(nextNode, options.nextConfig || options.config || {}, normalizedHostRoot)
+      : "";
     const steps = [];
     const rollbackSteps = [];
     if (previousDnsHost && previousDnsHost !== nextDnsHost) {
       steps.push({ type: "delete", host: previousDnsHost });
     }
-    if (nextDnsHost) {
-      steps.push({ type: "upsert", host: nextDnsHost });
+    if (nextDnsHost && (
+      options.forceUpsert === true
+      || nextDnsHost !== previousDnsHost
+      || nextCnameTarget !== previousCnameTarget
+    )) {
+      steps.push({ type: "upsert", host: nextDnsHost, cnameTarget: nextCnameTarget });
     }
     if (nextDnsHost && nextDnsHost !== previousDnsHost) {
       rollbackSteps.push({ type: "delete", host: nextDnsHost });
     }
     if (previousDnsHost && previousDnsHost !== nextDnsHost) {
-      rollbackSteps.push({ type: "upsert", host: previousDnsHost });
+      rollbackSteps.push({ type: "upsert", host: previousDnsHost, cnameTarget: previousCnameTarget });
+    } else if (previousDnsHost && nextCnameTarget !== previousCnameTarget) {
+      rollbackSteps.push({ type: "upsert", host: previousDnsHost, cnameTarget: previousCnameTarget });
     }
     return {
       hostRoot: normalizedHostRoot,
       previousDnsHost,
       nextDnsHost,
+      previousCnameTarget,
+      nextCnameTarget,
       steps,
       rollbackSteps,
       changed: steps.length > 0
@@ -15572,6 +16541,8 @@ const Database = {
     if (!host) return null;
     const config = options.config || await getRuntimeConfig(options.env);
     const requirementState = assertHostPrefixDnsSyncReady(config, options.env);
+    const cnameTarget = normalizeHostPrefixCnameTarget(options.cnameTarget)
+      || normalizeHostnameText(requirementState.host);
     return await persistCloudflareDnsRecordsForHost({
       env: options.env,
       kv: options.kv,
@@ -15579,9 +16550,9 @@ const Database = {
       host,
       mode: "cname",
       // PRX/host_prefix 节点只负责下发 DNS 解析，不为该子域开启 Cloudflare 代理。
-      desiredRecords: [{ type: "CNAME", content: requirementState.host, ttl: 1, proxied: false }],
+      desiredRecords: [{ type: "CNAME", content: cnameTarget, ttl: 1, proxied: false }],
       requestHost: normalizeHostnameText(options.requestHost || requirementState.host),
-      skipHistory: false,
+      skipHistory: options.skipHistory === true,
       includeAllRecords: false
     });
   },
@@ -15640,7 +16611,10 @@ const Database = {
         continue;
       }
       if (String(step?.type || "").trim().toLowerCase() === "upsert") {
-        await this.upsertHostPrefixDnsRecord(step.host, options);
+        await this.upsertHostPrefixDnsRecord(step.host, {
+          ...options,
+          cnameTarget: step.cnameTarget
+        });
       }
     }
     return {
@@ -15693,21 +16667,26 @@ const Database = {
     const rollbackFailures = [];
     for (let index = plannedMutations.length - 1; index >= 0; index -= 1) {
       const mutation = plannedMutations[index];
-      try {
-        if (mutation?.dnsPlan?.changed === true) {
+      if (mutation?.dnsPlan?.changed === true) {
+        try {
           await this.persistHostPrefixDnsSyncPlan({
             steps: mutation?.dnsPlan?.rollbackSteps || []
           }, {
             ...options,
-            config
+            config,
+            skipHistory: true
           });
+        } catch (rollbackError) {
+          rollbackFailures.push(`dns:${getErrorMessage(rollbackError, "rollback_failed")}`);
         }
-        if (mutation?.nodeChanged === true) {
+      }
+      if (mutation?.nodeChanged === true) {
+        try {
           await this.rollbackPreparedNodeMutation(mutation, options);
           rolledBackNodeCount += 1;
+        } catch (rollbackError) {
+          rollbackFailures.push(`node:${getErrorMessage(rollbackError, "rollback_failed")}`);
         }
-      } catch (rollbackError) {
-        rollbackFailures.push(getErrorMessage(rollbackError, "rollback_failed"));
       }
     }
     if (options.rebuildIndexes === true) {
@@ -15736,11 +16715,11 @@ const Database = {
     let rollbackError = "";
     try {
       for (const mutation of plannedMutations) {
+        appliedMutations.push(mutation);
         if (mutation?.nodeChanged === true) {
           await this.applyPreparedNodeMutation(mutation, options);
           mutatedNodeCount += 1;
         }
-        appliedMutations.push(mutation);
         if (mutation?.dnsPlan?.changed === true) {
           await this.persistHostPrefixDnsSyncPlan(mutation.dnsPlan, {
             ...options,
@@ -15894,9 +16873,9 @@ const Database = {
   // 管理 API 动作表 (ADMIN ACTION MAP)
   // 读取导航：
   // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
-  // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / importFull
+  // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / exportSettings / importSettings / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode
-  // - 运维动作：getLogs / clearLogs / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
+  // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
   // 设计意图：
   // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
   // - 新增 action 时，优先在这里挂处理器，再在 handleApi 做最小派发。
@@ -15941,13 +16920,16 @@ const Database = {
       }
     },
 
-    async previewConfig(data) {
+    async previewConfig(data, { env, kv, ctx }) {
       const rawConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config)
         ? data.config
         : {};
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+      const prepared = await Database.prepareRuntimeConfigPersistence(rawConfig, { env, kv, ctx });
       return jsonResponse({
-        config: sanitizeRuntimeConfig(rawConfig),
-        migration: collectLegacyRuntimeConfigState(rawConfig)
+        config: prepared.nextConfig,
+        migration: collectLegacyRuntimeConfigState(rawConfig),
+        hostPrefixDnsSyncCount: prepared.dnsPlans.length
       });
     },
 
@@ -15970,15 +16952,24 @@ const Database = {
         }
         if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace");
         const plan = await Database.buildKvTidyPlan(env, { kv });
+        const planToken = await Database.createKvTidyPlanToken(env, plan);
         return jsonResponse({
           success: true,
           scope: "kv",
+          planHash: plan.planHash,
+          planToken,
+          planExpiresAt: new Date(nowMs() + KV_TIDY_PLAN_TOKEN_TTL_MS).toISOString(),
           summary: plan.summary,
           ...plan.preview
         });
       } catch (error) {
         const message = error?.message || String(error);
-        return jsonError("TIDY_PREVIEW_FAILED", message, 500, { scope });
+        return jsonError(
+          String(error?.code || "TIDY_PREVIEW_FAILED"),
+          message,
+          normalizeErrorStatus(error?.status, 500),
+          { scope, ...(isPlainObject(error?.details) ? error.details : {}) }
+        );
       }
     },
 
@@ -16384,6 +17375,7 @@ const Database = {
     },
 
     async saveConfig(data, { env, ctx, kv, meta }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
       const savedConfig = data.config
         ? await Database.persistRuntimeConfig(data.config, {
             env,
@@ -16404,41 +17396,60 @@ const Database = {
       });
     },
 
-    async exportConfig(data, { env, ctx }) {
+    async exportConfig(data, { env, ctx, request }) {
       const kv = Database.getKV(env);
+      const includeSecrets = data?.includeSecrets === true;
+      if (includeSecrets && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportConfig") {
+        return jsonError("CONFIRMATION_REQUIRED", "导出完整密钥需要显式确认", 428);
+      }
+      const config = await getRuntimeConfigStrict(env);
       return jsonResponse({ 
         version: Config.Defaults.Version, 
         exportTime: new Date().toISOString(), 
         nodes: kv ? (await Database.loadAllNodeEntitiesFromKvStrict(kv, { ctx })).filter(Boolean) : [],
-        config: await getRuntimeConfigStrict(env) 
+        config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
+        secretsRedacted: includeSecrets !== true,
+        containsSecrets: includeSecrets === true
       });
     },
 
-    async exportSettings(data, { env }) {
+    async exportSettings(data, { env, request }) {
+      const includeSecrets = data?.includeSecrets === true;
+      if (includeSecrets && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportSettings") {
+        return jsonError("CONFIRMATION_REQUIRED", "导出完整密钥需要显式确认", 428);
+      }
+      const config = await getRuntimeConfigStrict(env);
       return jsonResponse({
         version: Config.Defaults.Version,
         type: "settings-only",
         exportTime: new Date().toISOString(),
-        config: await getRuntimeConfigStrict(env)
+        config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
+        secretsRedacted: includeSecrets !== true,
+        containsSecrets: includeSecrets === true
       });
     },
 
     async importSettings(data, { env, ctx, kv, meta }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
       const importedConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config)
         ? data.config
         : (data?.settings && typeof data.settings === "object" && !Array.isArray(data.settings) ? data.settings : null);
       if (!importedConfig) return jsonError("INVALID_SETTINGS_BACKUP", "设置备份文件无效，缺少 config/settings 对象");
-      const savedConfig = await Database.persistRuntimeConfig(importedConfig, {
-        env,
-        kv,
-        ctx,
-        snapshotMeta: {
-          reason: "import_settings",
-          section: String(meta?.section || "settings"),
-          source: String(meta?.source || "settings_backup"),
-          actor: "admin"
+      const currentConfig = await getRuntimeConfigStrict(env);
+      const savedConfig = await Database.persistRuntimeConfig(
+        mergeMissingRuntimeConfigSecrets(importedConfig, currentConfig),
+        {
+          env,
+          kv,
+          ctx,
+          snapshotMeta: {
+            reason: "import_settings",
+            section: String(meta?.section || "settings"),
+            source: String(meta?.source || "settings_backup"),
+            actor: "admin"
+          }
         }
-      });
+      );
       const [configSnapshots, revisions] = await Promise.all([
         Database.getConfigSnapshotsForRead(kv),
         Database.getAdminRevisions(env, { ctx, config: savedConfig })
@@ -16519,7 +17530,9 @@ const Database = {
           revisions: await Database.getAdminRevisions(env, { ctx, config: restoredConfig })
         });
       }
-      const savedConfig = await Database.persistRuntimeConfig(snapshot.config || {}, {
+      const currentConfig = await getRuntimeConfigStrict(env);
+      const restoredSnapshotConfig = preserveRuntimeConfigSecrets(snapshot.config || {}, currentConfig);
+      const savedConfig = await Database.persistRuntimeConfig(restoredSnapshotConfig, {
         env,
         kv,
         ctx,
@@ -16573,10 +17586,12 @@ const Database = {
       if (hostPrefixValidationError) {
         return jsonError(hostPrefixValidationError.code, hostPrefixValidationError.message, 400, hostPrefixValidationError);
       }
+      return await runKvDataMutation(async () => {
       const savedNodeNames = [];
       const renameMap = new Map();
       const preparedMutations = [];
       const configuredHost = resolveConfiguredHost(env);
+      const runtimeConfig = await getRuntimeConfigStrict(env);
 
       for (const n of nodesToSave) {
         if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
@@ -16606,7 +17621,8 @@ const Database = {
           mutation.previousNode,
           mutation.nextName,
           mutation.nextNode,
-          configuredHost
+          configuredHost,
+          { config: runtimeConfig, forceUpsert: true }
         );
         preparedMutations.push(mutation);
         if (mutation.isRename) renameMap.set(mutation.previousName, mutation.nextName);
@@ -16641,7 +17657,7 @@ const Database = {
         if (renameMap.size > 0 || (action === "save" && savedNodes.length === 1)) {
           configRollbackState = await Database.captureRuntimeConfigRollbackState(env, kv);
           if (renameMap.size > 0) {
-            await Database.syncSourceDirectNodesConfig(env, kv, ctx, {
+            await Database.commitSourceDirectNodesConfigWithinMutation(env, kv, ctx, {
               renameMap,
               allowedNames,
               source: action === "import" ? "node_import" : "node_save",
@@ -16650,7 +17666,7 @@ const Database = {
           }
           if (action === "save" && savedNodes.length === 1) {
             const savedNode = savedNodes[0];
-            await Database.syncSingleNodeMainVideoStreamShortcutShadow(env, kv, ctx, {
+            await Database.commitSingleNodeMainVideoStreamShortcutShadowWithinMutation(env, kv, ctx, {
               originalName: data.originalName,
               nodeName: savedNode?.name,
               mode: savedNode?.mainVideoStreamMode,
@@ -16703,10 +17719,12 @@ const Database = {
         }
         throw error;
       }
+      });
     },
 
     async saveMainVideoStreamPolicyShortcuts(data, { env, ctx, kv }) {
       if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
+      return await runKvDataMutation(async () => {
       const currentNodes = await Database.loadAllNodeEntitiesFromKv(kv, { ctx });
       const allowedNames = Array.isArray(currentNodes) ? currentNodes.map(node => node?.name) : [];
       const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], {
@@ -16715,6 +17733,7 @@ const Database = {
       const selectedKeys = new Set(selectedNodeNames.map(name => String(name || "").trim().toLowerCase()).filter(Boolean));
       let updatedNodeCount = 0;
       const configuredHost = resolveConfiguredHost(env);
+      const currentConfig = await getRuntimeConfigStrict(env);
       const preparedMutations = [];
 
       for (const rawNode of Array.isArray(currentNodes) ? currentNodes : []) {
@@ -16746,14 +17765,14 @@ const Database = {
             mutation.previousNode,
             mutation.nextName,
             mutation.nextNode,
-            configuredHost
+            configuredHost,
+            { config: currentConfig, forceUpsert: true }
           );
           preparedMutations.push(mutation);
           updatedNodeCount += 1;
         }
       }
 
-      const currentConfig = await getRuntimeConfig(env);
       const shouldSyncConfig = serializeConfigValue(currentConfig.sourceDirectNodes || []) !== serializeConfigValue(selectedNodeNames);
       const configRollbackState = (updatedNodeCount > 0 || shouldSyncConfig)
         ? await Database.captureRuntimeConfigRollbackState(env, kv)
@@ -16771,7 +17790,7 @@ const Database = {
           rebuiltState = await Database.rebuildNodeIndexesFromKv(kv, { ctx });
         }
         if (shouldSyncConfig) {
-          savedConfig = await Database.persistRuntimeConfig({ ...currentConfig, sourceDirectNodes: selectedNodeNames }, {
+          savedConfig = await Database.commitRuntimeConfig({ ...currentConfig, sourceDirectNodes: selectedNodeNames }, {
             env,
             kv,
             ctx,
@@ -16835,6 +17854,7 @@ const Database = {
           nodes: summaryNodes
         })
       });
+      });
     },
 
     async importFull(data, { env, ctx, kv }) {
@@ -16846,105 +17866,120 @@ const Database = {
       if (hostPrefixValidationError) {
         return jsonError(hostPrefixValidationError.code, hostPrefixValidationError.message, 400, hostPrefixValidationError);
       }
-      const configRollbackState = data.config
-        ? await Database.captureRuntimeConfigRollbackState(env, kv)
-        : null;
-      let savedConfig = null;
-      let nodeMutationCommitted = false;
-      const preparedMutations = [];
-      const configuredHost = resolveConfiguredHost(env);
-      if (data.nodes && Array.isArray(data.nodes)) {
-        for (const n of data.nodes) {
-          if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
-          const name = String(n.name).toLowerCase();
-          const existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
-          const mutation = Database.buildPreparedNodeMutation(n, existingNode, {
-            previousName: name,
-            nextName: name
-          });
-          if (!mutation) continue;
-          mutation.dnsPlan = Database.buildHostPrefixDnsSyncPlan(
-            mutation.previousName,
-            mutation.previousNode,
-            mutation.nextName,
-            mutation.nextNode,
-            configuredHost
-          );
-          preparedMutations.push(mutation);
-        }
-      }
-      try {
-        if (data.config) {
-          savedConfig = await Database.persistRuntimeConfig(data.config, {
-            env,
-            kv,
-            ctx,
-            snapshotMeta: {
-              reason: "import_full",
-              section: "all",
-              source: "full_backup",
-              actor: "admin"
-            }
-          });
-        }
-        if (preparedMutations.length > 0) {
-          await Database.applyPreparedNodeMutations(preparedMutations, {
-            env,
-            kv,
-            ctx,
-            requestHost: configuredHost
-          });
-          nodeMutationCommitted = true;
-          await Database.rebuildNodeIndexesFromKv(kv, { ctx, syncLegacyIndex: true });
-        }
-      } catch (error) {
-        let configRollbackError = "";
-        let nodeRollbackError = "";
-        if (configRollbackState) {
-          try {
-            await Database.restoreCapturedRuntimeConfigState(configRollbackState, { env, kv, ctx });
-          } catch (restoreError) {
-            configRollbackError = getErrorMessage(restoreError, "config_restore_failed");
+      return await runKvDataMutation(async () => {
+        const currentConfig = await getRuntimeConfigStrict(env);
+        const configRollbackState = data.config
+          ? await Database.captureRuntimeConfigRollbackState(env, kv)
+          : null;
+        const importedConfig = data.config
+          ? mergeMissingRuntimeConfigSecrets(data.config, currentConfig)
+          : null;
+        const nodeDnsConfig = importedConfig ? sanitizeRuntimeConfig(importedConfig) : currentConfig;
+        const configuredHost = resolveConfiguredHost(env);
+        const preparedMutations = [];
+        if (Array.isArray(data.nodes)) {
+          for (const n of data.nodes) {
+            if (!n.name || (!n.target && !(Array.isArray(n.lines) && n.lines.length))) continue;
+            const name = String(n.name).toLowerCase();
+            const existingNode = await kv.get(`${Database.PREFIX}${name}`, { type: "json" }) || {};
+            const mutation = Database.buildPreparedNodeMutation(n, existingNode, {
+              previousName: name,
+              nextName: name
+            });
+            if (!mutation) continue;
+            mutation.dnsPlan = Database.buildHostPrefixDnsSyncPlan(
+              mutation.previousName,
+              mutation.previousNode,
+              mutation.nextName,
+              mutation.nextNode,
+              configuredHost,
+              {
+                previousConfig: currentConfig,
+                nextConfig: nodeDnsConfig,
+                forceUpsert: true
+              }
+            );
+            preparedMutations.push(mutation);
           }
         }
-        if (nodeMutationCommitted) {
-          try {
-            await Database.rollbackPreparedNodeMutations(preparedMutations, {
+
+        let savedConfig = null;
+        let nodeMutationCommitted = false;
+        try {
+          if (importedConfig) {
+            savedConfig = await Database.commitRuntimeConfig(importedConfig, {
               env,
               kv,
               ctx,
-              requestHost: configuredHost,
-              rebuildIndexes: true
+              snapshotMeta: {
+                reason: "import_full",
+                section: "all",
+                source: "full_backup",
+                actor: "admin"
+              }
             });
-          } catch (rollbackError) {
-            nodeRollbackError = getErrorMessage(rollbackError, "rollback_failed");
           }
+          if (preparedMutations.length > 0) {
+            await Database.applyPreparedNodeMutations(preparedMutations, {
+              env,
+              kv,
+              ctx,
+              requestHost: configuredHost
+            });
+            nodeMutationCommitted = true;
+            await Database.rebuildNodeIndexesFromKv(kv, { ctx, syncLegacyIndex: true });
+          }
+        } catch (error) {
+          let configRollbackError = "";
+          let nodeRollbackError = "";
+          if (nodeMutationCommitted) {
+            try {
+              await Database.rollbackPreparedNodeMutations(preparedMutations, {
+                env,
+                kv,
+                ctx,
+                requestHost: configuredHost,
+                rebuildIndexes: true
+              });
+            } catch (rollbackError) {
+              nodeRollbackError = getErrorMessage(rollbackError, "rollback_failed");
+            }
+          }
+          if (configRollbackState) {
+            try {
+              await Database.restoreCapturedRuntimeConfigAndDnsState(configRollbackState, { env, kv, ctx });
+            } catch (restoreError) {
+              configRollbackError = getErrorMessage(restoreError, "config_restore_failed");
+            }
+          }
+          if (error && typeof error === "object") {
+            if (!String(error.code || "").trim()) error.code = "IMPORT_FULL_FAILED";
+            error.status = normalizeErrorStatus(error.status, 500);
+            error.details = {
+              ...(isPlainObject(error.details) ? error.details : {}),
+              rollbackAttempted: !!configRollbackState || nodeMutationCommitted,
+              configRollbackError,
+              nodeRollbackError
+            };
+          }
+          throw error;
         }
-        if (error && typeof error === "object") {
-          if (!String(error.code || "").trim()) error.code = "IMPORT_FULL_FAILED";
-          error.status = normalizeErrorStatus(error.status, 500);
-          error.details = {
-            ...(isPlainObject(error.details) ? error.details : {}),
-            rollbackAttempted: !!configRollbackState || nodeMutationCommitted,
-            configRollbackError,
-            nodeRollbackError
-          };
-        }
-        throw error;
-      }
-      const config = savedConfig || await getRuntimeConfig(env);
-      const nodes = await CacheManager.getNodesList(env, ctx);
-      return jsonResponse({
-        success: true,
-        config,
-        nodes,
-        revisions: await Database.getAdminRevisions(env, { ctx, config, nodes })
+        const config = savedConfig || await getRuntimeConfig(env);
+        const nodes = await CacheManager.getNodesList(env, ctx);
+        return jsonResponse({
+          success: true,
+          config,
+          nodes,
+          revisions: await Database.getAdminRevisions(env, { ctx, config, nodes })
+        });
       });
     },
 
     async delete(data, { ctx, kv, env }) {
+      return await runKvDataMutation(async () => {
       if (data.name) {
         const delName = String(data.name).toLowerCase();
+        const runtimeConfig = await getRuntimeConfigStrict(env);
         const existingNode = await kv.get(`${Database.PREFIX}${delName}`, { type: "json" }) || null;
         const normalizedExistingNode = existingNode
           ? Database.normalizeNode(delName, existingNode || {}).data
@@ -16962,7 +17997,8 @@ const Database = {
             normalizedExistingNode,
             "",
             null,
-            resolveConfiguredHost(env)
+            resolveConfiguredHost(env),
+            { config: runtimeConfig }
           )
         };
         const requestHost = resolveConfiguredHost(env);
@@ -16978,7 +18014,7 @@ const Database = {
           nodeMutationCommitted = deletionMutation.nodeChanged === true;
           const rebuiltState = await Database.rebuildNodeIndexesFromKv(kv, { ctx });
           configRollbackState = await Database.captureRuntimeConfigRollbackState(env, kv);
-          await Database.syncSourceDirectNodesConfig(env, kv, ctx, {
+          await Database.commitSourceDirectNodesConfigWithinMutation(env, kv, ctx, {
             removedNames: [delName],
             allowedNames: Array.isArray(rebuiltState?.index) ? rebuiltState.index : [],
             source: "node_delete",
@@ -17026,6 +18062,7 @@ const Database = {
         success: true,
         revisions: await Database.getAdminRevisions(env, { ctx })
       });
+      });
     },
 
     async purgeCache(data, { kv, request }) {
@@ -17048,7 +18085,11 @@ const Database = {
     async tidyKvData(data, { env, ctx, kv }) {
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace");
       try {
-        const result = await Database.tidyKvData(env, { kv, ctx });
+        const result = await Database.tidyKvData(env, {
+          kv,
+          ctx,
+          planToken: String(data?.planToken || "").trim()
+        });
         const nowIso = new Date().toISOString();
         await withNonCriticalFallback(Database.patchOpsStatus(env, {
           scheduled: {
@@ -17062,14 +18103,6 @@ const Database = {
         }), "manual.tidy_kv.patch_success_status", null, null);
         return jsonResponse({ success: true, ...result });
       } catch (error) {
-        if (String(error?.code || "") === "KV_TIDY_WRITE_LIMIT_EXCEEDED") {
-          return jsonError(
-            "KV_TIDY_WRITE_LIMIT_EXCEEDED",
-            error?.message || "KV tidy write budget exceeded",
-            normalizeErrorStatus(error?.status, 409),
-            isPlainObject(error?.details) ? error.details : null
-          );
-        }
         const message = error?.message || String(error);
         await withNonCriticalFallback(Database.patchOpsStatus(env, {
           scheduled: {
@@ -17081,7 +18114,12 @@ const Database = {
             }
           }
         }), "manual.tidy_kv.patch_failed_status", { message }, null);
-        return jsonError("KV_TIDY_FAILED", message, 500);
+        return jsonError(
+          String(error?.code || "KV_TIDY_FAILED"),
+          message,
+          normalizeErrorStatus(error?.status, 500),
+          isPlainObject(error?.details) ? error.details : null
+        );
       }
     },
 
@@ -17210,6 +18248,10 @@ const Database = {
         const cfApiToken = String(config.cfApiToken || "").trim();
         if (!cfZoneId || !cfApiToken) return jsonError("CF_API_ERROR", "请在账号设置中完善 Zone ID 和 API 令牌");
 
+        let rollbackDnsMutation = null;
+        let rollbackAttempted = false;
+        let rollbackSucceeded = false;
+        let rollbackError = "";
         try {
             const zone = await fetchCloudflareZoneDetailsRequired(cfZoneId, cfApiToken, {
               scope: "dns.update_record.zone_lookup"
@@ -17246,6 +18288,17 @@ const Database = {
                     body: JSON.stringify(updateBody)
                 });
                 updated = normalizeEditableDnsRecord(updatePayload?.result || { id: recordId, ...updateBody });
+                rollbackDnsMutation = async () => {
+                    const restoreBody = buildCloudflareDnsRecordBody(existing, {
+                        host: existing.name,
+                        type: existing.type,
+                        content: existing.content
+                    });
+                    await fetchCloudflareApiJson(getUrl, cfApiToken, {
+                        method: "PUT",
+                        body: JSON.stringify(restoreBody)
+                    });
+                };
             } else {
                 if (zoneName && !isHostnameInsideZone(nextHost, zoneName)) {
                     return jsonError("INVALID_HOST", "记录名称必须位于当前 Zone 下");
@@ -17261,19 +18314,41 @@ const Database = {
                     body: JSON.stringify(createBody)
                 });
                 updated = normalizeEditableDnsRecord(createPayload?.result || createBody);
+                rollbackDnsMutation = async () => {
+                    if (!updated?.id) throw new Error("created_dns_record_id_missing");
+                    await fetchCloudflareApiJson(
+                      `${zoneRecordsUrl}/${encodeURIComponent(updated.id)}`,
+                      cfApiToken,
+                      { method: "DELETE" }
+                    );
+                };
             }
 
-            const history = updated.type === "CNAME" && !skipHistory
-              ? await Database.recordDnsHostHistory(kv, cfZoneId, updated.name, {
-                  name: updated.name,
-                  type: updated.type,
-                  content: updated.content,
-                  actor: "admin",
-                  source: "ui",
-                  requestHost,
-                  savedAt: new Date().toISOString()
-                })
-              : await Database.getDnsHostHistory(kv, cfZoneId, updated.name);
+            let history;
+            try {
+                history = updated.type === "CNAME" && !skipHistory
+                  ? await Database.recordDnsHostHistory(kv, cfZoneId, updated.name, {
+                      name: updated.name,
+                      type: updated.type,
+                      content: updated.content,
+                      actor: "admin",
+                      source: "ui",
+                      requestHost,
+                      savedAt: new Date().toISOString()
+                    })
+                  : await Database.getDnsHostHistory(kv, cfZoneId, updated.name);
+            } catch (historyError) {
+                rollbackAttempted = typeof rollbackDnsMutation === "function";
+                if (rollbackAttempted) {
+                    try {
+                        await rollbackDnsMutation();
+                        rollbackSucceeded = true;
+                    } catch (restoreError) {
+                        rollbackError = getErrorMessage(restoreError, "dns_rollback_failed");
+                    }
+                }
+                throw historyError;
+            }
             return jsonResponse({
                 ok: true,
                 record: updated,
@@ -17286,7 +18361,12 @@ const Database = {
               : msg.includes("cf_api_http_401")
                 ? "Cloudflare DNS 更新失败：API 令牌无效"
                 : "Cloudflare DNS 更新失败";
-            return jsonError("CF_DNS_UPDATE_FAILED", hint, 400, { reason: msg });
+            return jsonError("CF_DNS_UPDATE_FAILED", hint, 400, {
+              reason: msg,
+              rollbackAttempted,
+              rollbackSucceeded,
+              rollbackError
+            });
         }
     },
 
@@ -17907,7 +18987,7 @@ const Database = {
       } catch (error) {
         console.warn("clearLogs FTS rebuild failed", error);
       }
-      const ftsReady = await Database.hasLogsFtsTable(db);
+      const ftsReady = await Database.isLogsFtsReady(db);
       const statsReady = await Database.hasStatsHourlyTable(db);
       const logStatus = await Database.bumpLogsRevision(env || { db }, {
         schemaReady: true,
@@ -17926,25 +19006,53 @@ const Database = {
       });
     },
 
-    async initLogsDb(data, { db }) {
-      if (!db) return jsonResponse({ error: "D1 not configured" }, 500);
+    async getD1SchemaStatus(data, { db }) {
+      if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+      return jsonResponse({ success: true, status: await Database.getD1SchemaStatus(db) });
+    },
+
+    async initD1Schema(data, { db }) {
+      if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+      Database.invalidateD1SchemaReadiness(db, "all");
       const bootstrap = await Database.bootstrapD1Schema(db, "logs-core");
-      const ftsReady = bootstrap.ftsReady === true;
-      const statsReady = bootstrap.statsReady === true;
+      const status = await Database.getD1SchemaStatus(db);
+      return jsonResponse({
+        success: status.runtimeCompatibilityReady === true,
+        runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
+        migrationReady: status.migrationReady === true,
+        schemaVersion: status.schemaVersion,
+        steps: bootstrap.steps,
+        status
+      });
+    },
+
+    async initLogsDb(data, { db }) {
+      if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+      Database.invalidateD1SchemaReadiness(db, "logs");
+      await Database.ensureLogsBaseSchema(db);
+      await Database.ensureStatsHourlySchema(db);
+      const schemaStatus = await Database.getD1SchemaStatus(db);
+      const ftsReady = schemaStatus.ftsReady === true;
+      const statsReady = schemaStatus.tables?.[Database.STATS_HOURLY_TABLE] === true;
       const logStatus = await Database.bumpLogsRevision(db, {
         schemaReady: true,
         ftsReady,
         statsReady,
-        schemaVersion: 4,
+        schemaVersion: schemaStatus.schemaVersion,
+        runtimeCompatibilityVersion: Database.D1_SCHEMA_VERSION,
+        migrationReady: schemaStatus.migrationReady === true,
         categoryEnabled: true
       });
       return jsonResponse({
         success: true,
-        schemaVersion: 4,
+        schemaVersion: schemaStatus.schemaVersion,
+        runtimeCompatibilityVersion: Database.D1_SCHEMA_VERSION,
+        runtimeCompatibilityReady: schemaStatus.runtimeCompatibilityReady === true,
+        migrationReady: schemaStatus.migrationReady === true,
         categoryEnabled: true,
         ftsReady,
         statsReady,
-        runtimeTablesReady: bootstrap.runtimeTablesReady === true,
+        status: schemaStatus,
         revisions: {
           logsRevision: Database.getLogsRevisionFromStatus(logStatus?.log || logStatus)
         }
@@ -17952,24 +19060,34 @@ const Database = {
     },
 
     async initLogsFts(data, { db }) {
-      if (!db) return jsonResponse({ error: "D1 not configured" }, 500);
-      const bootstrap = await Database.bootstrapD1Schema(db, "logs-fts");
-      const result = bootstrap.ftsResult || { migratedRows: 0, droppedTriggers: 0 };
-      const statsReady = bootstrap.statsReady === true;
+      if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+      Database.invalidateD1SchemaReadiness(db, "logs");
+      await Database.ensureLogsBaseSchema(db);
+      await Database.ensureStatsHourlySchema(db);
+      const result = await Database.ensureLogsFtsSchema(db);
+      const schemaStatus = await Database.getD1SchemaStatus(db);
+      const ftsReady = schemaStatus.ftsReady === true && result.rebuilt === true;
+      const statsReady = schemaStatus.tables?.[Database.STATS_HOURLY_TABLE] === true;
       const logStatus = await Database.bumpLogsRevision(db, {
         schemaReady: true,
-        ftsReady: true,
+        ftsReady,
         statsReady,
-        schemaVersion: 4,
+        schemaVersion: schemaStatus.schemaVersion,
+        runtimeCompatibilityVersion: Database.D1_SCHEMA_VERSION,
+        migrationReady: schemaStatus.migrationReady === true,
         categoryEnabled: true
       });
       return jsonResponse({
-        success: true,
-        ftsReady: true,
+        success: ftsReady,
+        ftsReady,
         statsReady,
+        schemaVersion: schemaStatus.schemaVersion,
+        runtimeCompatibilityVersion: Database.D1_SCHEMA_VERSION,
+        migrationReady: schemaStatus.migrationReady === true,
         migratedRows: result.migratedRows,
         droppedTriggers: result.droppedTriggers,
         triggerMode: "insert_only",
+        status: schemaStatus,
         revisions: {
           logsRevision: Database.getLogsRevisionFromStatus(logStatus?.log || logStatus)
         }
@@ -17987,7 +19105,7 @@ const Database = {
   async handleApi(request, env, ctx) {
     const kv = this.getKV(env);
     if (!kv) {
-        return jsonResponse({ error: "kv_missing" }, 500);
+        return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
     }
 
     let data; 
@@ -19456,7 +20574,8 @@ const Proxy = {
     } else if (options.proxiedExternalRedirect) {
       modifiedHeaders.set("Cache-Control", "no-store");
     } else if (requestTraits.isImage || requestTraits.isStaticFile || requestTraits.isSubtitle) {
-      modifiedHeaders.set("Cache-Control", `public, max-age=${imageCacheMaxAge}`);
+      const cacheVisibility = hasWorkerMetadataPrivateIdentity(request) ? "private" : "public";
+      modifiedHeaders.set("Cache-Control", `${cacheVisibility}, max-age=${imageCacheMaxAge}`);
     }
 
     applySecurityHeaders(modifiedHeaders);
@@ -20212,6 +21331,7 @@ const Proxy = {
       const cache = getDefaultCacheHandle();
       for (const target of targets) {
         if (!shouldWorkerCacheMetadataUrl(target.upstreamUrl)) continue;
+        const identityPartition = await buildWorkerMetadataPrewarmIdentityPartition(request, target.upstreamUrl);
         const cacheKey = buildCanonicalWorkerMetadataCacheKey(
           requestUrl,
           name,
@@ -20220,7 +21340,9 @@ const Proxy = {
           {
             search: target.proxySearch,
             nodeCacheRevision: options.nodeCacheRevision,
-            entryMode: options.entryMode
+            entryMode: options.entryMode,
+            identityPartition,
+            cachePolicyRevision: buildWorkerMetadataCachePolicyRevision(target.proxyPath, options)
           }
         );
         if (cache && cacheKey) {
@@ -20231,6 +21353,7 @@ const Proxy = {
         }
         try {
           const prewarmOptions = await buildFetchOptions(target.upstreamUrl, { method: "GET" });
+          prewarmOptions.cache = "no-store";
           const prewarmHeaders = new Headers(prewarmOptions.headers);
           prewarmHeaders.delete("Range");
           prewarmHeaders.delete("If-Modified-Since");
@@ -20894,11 +22017,22 @@ const Proxy = {
     const effectiveMediaAuthMode = resolveEffectiveNodeMediaAuthMode(node, currentConfig);
     const nodeDerivedCacheRevision = String(options.nodeCacheRevision || "").trim()
       || buildNodeDerivedCacheRevision(name, node);
+    const metadataCacheIdentityPartition = requestTraits.isMetadataCacheable
+      ? await buildWorkerMetadataCacheIdentityPartition(request)
+      : "";
+    const metadataCachePolicyRevision = requestTraits.isMetadataCacheable
+      ? buildWorkerMetadataCachePolicyRevision(proxyPath, {
+        imageCacheMaxAge,
+        prewarmCacheTtl: requestTraits.prewarmCacheTtl
+      })
+      : "";
     const metadataCacheKey = (requestTraits.isMetadataCacheable && shouldWorkerCacheMetadataUrl(requestUrl))
       ? buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath, {
         search: requestUrl.search,
         nodeCacheRevision: nodeDerivedCacheRevision,
-        entryMode: options.entryMode
+        entryMode: options.entryMode,
+        identityPartition: metadataCacheIdentityPartition,
+        cachePolicyRevision: metadataCachePolicyRevision
       })
       : null;
     const metadataCache = metadataCacheKey ? getDefaultCacheHandle() : null;
@@ -21005,6 +22139,8 @@ const Proxy = {
       imageCacheMaxAge,
       metadataCacheKey,
       metadataCache,
+      metadataCacheIdentityPartition,
+      metadataCachePolicyRevision,
       redirectTrace: null
     };
   },
@@ -21515,7 +22651,9 @@ const Proxy = {
   async tryServeMetadataCache(execution) {
     if (!execution.metadataCache || !execution.metadataCacheKey) return null;
     try {
-      const cachedResponse = await execution.metadataCache.match(execution.metadataCacheKey);
+      const lookupRequest = buildWorkerMetadataCacheLookupRequest(execution.metadataCacheKey, execution.request);
+      if (!lookupRequest) return null;
+      const cachedResponse = await execution.metadataCache.match(lookupRequest);
       if (!cachedResponse) return null;
       const modifiedHeaders = this.buildProxyResponseHeaders(
         cachedResponse,
@@ -21888,14 +23026,13 @@ const Proxy = {
         headers.delete("Content-Length");
       }
 
-      const canEdgeCacheSubtitle = effectiveMethod === "GET" && !requestTraits.rangeHeader && requestTraits.isSubtitle;
       /** @type {WorkerRequestInit} */
       const fetchOptions = {
         method: effectiveMethod,
         headers,
         redirect: "manual"
       };
-      if (canEdgeCacheSubtitle) fetchOptions.cf = { cacheEverything: true, cacheTtl: 86400 };
+      if (requestTraits.isMetadataCacheable) fetchOptions.cache = "no-store";
       if (effectiveMethod !== "GET" && effectiveMethod !== "HEAD") {
         if (effectiveBodyMode === "buffered" && effectiveBody !== null && effectiveBody !== undefined) {
           fetchOptions.body = effectiveBody.slice(0);
@@ -22303,7 +23440,8 @@ const Proxy = {
         prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
         imageCacheMaxAge: execution.imageCacheMaxAge,
         nodeCacheRevision: execution.nodeDerivedCacheRevision,
-        entryMode: execution.entryMode
+        entryMode: execution.entryMode,
+        identityPartition: execution.metadataCacheIdentityPartition
       }
     );
     this.maybeScheduleBackgroundFailoverRefresh(execution, finalUpstreamState);
@@ -22831,7 +23969,7 @@ const ADMIN_REMOTE_SHELL_EDGE_CACHE_CONTROL = "public, max-age=31536000, immutab
 const ADMIN_REMOTE_SHELL_REVALIDATE_MS = 5 * 60 * 1000;
 const ADMIN_REMOTE_SHELL_MAX_BYTES = 2 * 1024 * 1024;
 // Bump when the cached remote-shell representation changes.
-const ADMIN_REMOTE_SHELL_TRANSFORM_REVISION = "bootstrap-tailwind-v1";
+const ADMIN_REMOTE_SHELL_TRANSFORM_REVISION = "bootstrap-tailwind-assets-v2";
 const ADMIN_REMOTE_SHELL_CACHED_AT_HEADER = "X-Admin-Shell-Cached-At";
 const ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER = "X-Admin-Shell-Source-Etag";
 const ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER = "X-Admin-Shell-Source-Last-Modified";
@@ -23689,6 +24827,8 @@ function parseAdminHtmlOpeningTag(sourceHtml, tagStart) {
     while (cursor < tagEnd && isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
     let attributeValue = "";
     let quoted = false;
+    let valueStart = -1;
+    let valueEnd = -1;
     if (sourceHtml[cursor] === "=") {
       cursor += 1;
       while (cursor < tagEnd && isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
@@ -23696,17 +24836,21 @@ function parseAdminHtmlOpeningTag(sourceHtml, tagStart) {
       if (quote === '"' || quote === "'") {
         quoted = true;
         cursor += 1;
-        const attributeValueStart = cursor;
+        valueStart = cursor;
         while (cursor < tagEnd && sourceHtml[cursor] !== quote) cursor += 1;
-        attributeValue = sourceHtml.slice(attributeValueStart, cursor);
+        valueEnd = cursor;
+        attributeValue = sourceHtml.slice(valueStart, valueEnd);
         if (cursor < tagEnd) cursor += 1;
       } else {
-        const attributeValueStart = cursor;
+        valueStart = cursor;
         while (cursor < tagEnd && !isAdminHtmlSpace(sourceHtml[cursor])) cursor += 1;
-        attributeValue = sourceHtml.slice(attributeValueStart, cursor);
+        valueEnd = cursor;
+        attributeValue = sourceHtml.slice(valueStart, valueEnd);
       }
     }
-    if (!attributes.has(attributeName)) attributes.set(attributeName, { value: attributeValue, quoted });
+    if (!attributes.has(attributeName)) {
+      attributes.set(attributeName, { value: attributeValue, quoted, valueStart, valueEnd });
+    }
   }
 
   return { tagName, attributes, start: tagStart, tagEnd };
@@ -23826,6 +24970,57 @@ function applyAdminRemoteBootstrapMarkup(html = "", bootstrapJson = "{}") {
   return injectMarkupIntoHtmlDocument(sourceHtml, buildAdminRemoteBootstrapMarkup(bootstrapJson));
 }
 
+function getAdminRemoteShellAssetReference(openingTag) {
+  const tagName = String(openingTag?.tagName || "").trim().toLowerCase();
+  let attributeName = "";
+  let assetKind = "";
+  if (tagName === "script" && openingTag.attributes?.has("src")) {
+    attributeName = "src";
+    assetKind = "script";
+  } else if (tagName === "link" && openingTag.attributes?.has("href")) {
+    const relTokens = new Set(String(openingTag.attributes.get("rel")?.value || "")
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean));
+    const preloadKind = String(openingTag.attributes.get("as")?.value || "").trim().toLowerCase();
+    if (relTokens.has("stylesheet")) assetKind = "css";
+    else if (relTokens.has("modulepreload")) assetKind = "script";
+    else if ((relTokens.has("preload") || relTokens.has("prefetch")) && preloadKind === "style") assetKind = "css";
+    else if ((relTokens.has("preload") || relTokens.has("prefetch")) && preloadKind === "script") assetKind = "script";
+    if (assetKind) attributeName = "href";
+  }
+  if (!attributeName || !assetKind) return null;
+
+  const attribute = openingTag.attributes.get(attributeName);
+  const valueStart = Number(attribute?.valueStart);
+  const valueEnd = Number(attribute?.valueEnd);
+  if (!Number.isInteger(valueStart) || !Number.isInteger(valueEnd) || valueStart < 0 || valueEnd < valueStart) return null;
+  return {
+    rawValue: String(attribute?.value || ""),
+    assetKind,
+    valueStart,
+    valueEnd
+  };
+}
+
+function collectAdminRemoteShellAssetReferences(html = "") {
+  const references = [];
+  for (const openingTag of iterateAdminHtmlOpeningTags(html)) {
+    const reference = getAdminRemoteShellAssetReference(openingTag);
+    if (reference) references.push(reference);
+  }
+  return references;
+}
+
+function hasAdminRemoteShellImportMap(html = "") {
+  for (const openingTag of iterateAdminHtmlOpeningTags(html)) {
+    if (openingTag.tagName !== "script") continue;
+    if (String(openingTag.attributes.get("type")?.value || "").trim().toLowerCase() === "importmap") return true;
+  }
+  return false;
+}
+
 function extractAdminRemoteShellAssetDescriptors(html = "", baseUrl = "") {
   const sourceHtml = String(html || "");
   if (!sourceHtml) return [];
@@ -23838,11 +25033,9 @@ function extractAdminRemoteShellAssetDescriptors(html = "", baseUrl = "") {
   }
 
   const assetDescriptors = [];
-  const assetMatches = sourceHtml.matchAll(/\b(?:src|href)=["']([^"'#][^"']*)["']/gi);
-  for (const match of assetMatches) {
-    const rawAssetUrl = String(match?.[1] || "").trim();
+  for (const reference of collectAdminRemoteShellAssetReferences(sourceHtml)) {
+    const rawAssetUrl = String(reference.rawValue || "").trim();
     if (!rawAssetUrl || /^data:/i.test(rawAssetUrl) || /^javascript:/i.test(rawAssetUrl)) continue;
-    if (!/\.(?:m?js|css)(?:[?#]|$)/i.test(rawAssetUrl)) continue;
     try {
       const normalizedAssetUrl = resolvedBaseUrl
         ? new URL(rawAssetUrl, resolvedBaseUrl).toString()
@@ -23850,7 +25043,7 @@ function extractAdminRemoteShellAssetDescriptors(html = "", baseUrl = "") {
       assetDescriptors.push({
         rawValue: rawAssetUrl,
         normalizedUrl: normalizedAssetUrl,
-        assetKind: /\.css(?:[?#]|$)/i.test(normalizedAssetUrl) ? "css" : "script"
+        assetKind: reference.assetKind
       });
     } catch {
       continue;
@@ -23919,23 +25112,28 @@ function rewriteAdminRemoteShellAssetUrlsToProxy(html = "", manifest = {}, optio
     resolvedBaseUrl = null;
   }
 
-  return sourceHtml.replace(/\b(?:src|href)=["']([^"'#][^"']*)["']/gi, (fullMatch, rawAssetUrl) => {
-    const rawValue = String(rawAssetUrl || "").trim();
-    if (!rawValue || /^data:/i.test(rawValue) || /^javascript:/i.test(rawValue)) return fullMatch;
-    if (!/\.(?:m?js|css)(?:[?#]|$)/i.test(rawValue)) return fullMatch;
+  const replacements = [];
+  for (const reference of collectAdminRemoteShellAssetReferences(sourceHtml)) {
+    const rawValue = String(reference.rawValue || "").trim();
+    if (!rawValue || /^data:/i.test(rawValue) || /^javascript:/i.test(rawValue)) continue;
     try {
       const normalizedAssetUrl = resolvedBaseUrl
         ? new URL(rawValue, resolvedBaseUrl).toString()
         : new URL(rawValue).toString();
       const assetKey = entryMap.get(normalizedAssetUrl);
       const proxyPath = buildAdminReleaseVendorProxyPath(adminPath, releaseTag, assetKey);
-      return assetKey && proxyPath
-        ? fullMatch.replace(rawValue, proxyPath)
-        : fullMatch;
+      if (!assetKey || !proxyPath) continue;
+      replacements.push({ start: reference.valueStart, end: reference.valueEnd, value: proxyPath });
     } catch {
-      return fullMatch;
+      continue;
     }
-  });
+  }
+
+  let rewrittenHtml = sourceHtml;
+  for (const replacement of replacements.sort((left, right) => right.start - left.start)) {
+    rewrittenHtml = `${rewrittenHtml.slice(0, replacement.start)}${replacement.value}${rewrittenHtml.slice(replacement.end)}`;
+  }
+  return rewrittenHtml;
 }
 
 function normalizeAdminReleaseVendorManifestRecord(record = {}) {
@@ -23978,6 +25176,10 @@ function isMutableJsdelivrGithubAssetUrl(assetUrl = "") {
 function getAdminRemoteShellAssetPolicyViolations(html = "", baseUrl = "") {
   const assetDescriptors = extractAdminRemoteShellAssetDescriptors(html, baseUrl);
   const violations = [];
+
+  if (hasAdminRemoteShellImportMap(html)) {
+    violations.push("远端 index.html 不允许 importmap；所有运行时依赖必须通过显式 script/link 标签交付");
+  }
 
   for (const descriptor of assetDescriptors) {
     const rawAssetUrl = String(descriptor?.rawValue || "").trim();
@@ -26033,6 +27235,12 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     buildFastSegmentUpstreamUrlText,
     shouldUseSegmentFastUpstreamBuilder,
     isEmbyWebProxyPath,
+    buildWorkerMetadataCacheIdentityPartition,
+    buildWorkerMetadataPrewarmIdentityPartition,
+    buildWorkerMetadataCachePolicyRevision,
+    buildCanonicalWorkerMetadataCacheKey,
+    buildWorkerMetadataCacheLookupRequest,
+    hasWorkerMetadataPrivateIdentity,
     runSingleFlight,
     getRuntimeConfig,
     invalidateRuntimeConfigCache,

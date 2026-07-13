@@ -45,13 +45,14 @@
 2. 不把完整前端运行时代码重新内嵌进 `worker.js`；Worker 只保留壳、后端能力和极小降级内容。
 3. `frontend/index.html` 是唯一管理台入口，不新增第二套首页或替代入口。
 4. 管理台保持现有 SaaS 控制台信息架构。未经批准，不改成官网、内容站、文档页或另一套管理台。
-5. 浏览器不得直连 GitHub Release、raw GitHub 或相对 bundle 资源。远端壳中的 jsDelivr GitHub 引用也必须改写为 Worker 同源 vendor 路径。
+5. 浏览器不得直连 GitHub Release、raw GitHub 或相对 bundle 资源。远端壳按标签语义识别 JS/CSS（包括无扩展脚本）并改写为 Worker 同源 vendor 路径；禁止源判断先规范化绝对 URL，协议相对及尾点主机名写法不得绕过。正式壳不接受 importmap 或任何 inline 动态 `import()`。
 6. 前端更新由请求触发，不依赖 `scheduled()` 或 CRON。
 7. 浏览器缓存和 Worker Cache API 是两层独立缓存，不得混为一谈。
 8. 不破坏现有鉴权、代理、KV/D1、日志和 scheduled 语义，除非任务明确要求。
 9. `prompts/`、`banker/` 和历史对比文件只可用于比对，不进入正式构建或发布链。
 10. 正式发布源固定为 `axuitomo/CF-EMBY-PROXY-UI`，正式版本只认 GitHub Release。
-11. 不创建、维护或引用 wiki 交付物。
+11. 不在仓库内创建或维护 wiki、知识库镜像及额外文档站点；管理台可以引用外部 WIKI 教程入口。
+12. D1 schema 变更以根 `migrations/` 的 Wrangler 版本化迁移为真相源；`worker.js` 中的运行时建表与补列只承担旧库兼容和首次启动兜底，不得替代正式迁移流程。
 
 ## 默认工作上下文
 

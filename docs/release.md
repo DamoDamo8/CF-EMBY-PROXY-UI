@@ -43,12 +43,13 @@ Worker 壳使用解析后的 `indexUrl` 读取入口 HTML；内部 `workerSource
 
 正式前端构建读取 `frontend/admin-runtime.template.html` 与 `frontend/scripts/admin-runtime-enhancements.mjs`，确定性组合到 `frontend/index.html` 后再由 Vite 生成产物。
 
-```bash
-cd frontend && npm run build
-cd frontend && npm run build:cdn
+```powershell
+Set-Location frontend
+npm run build
+npm run build:cdn
 ```
 
-`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合 Release-only + Worker proxy 约束。
+Windows/WSL 选择见 [开发与验证](development.md#正式前端)。`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合 Release-only + Worker proxy 约束。
 
 ### Release 资产来源
 
@@ -77,7 +78,9 @@ node scripts/check-publish-cdn.mjs \
 - `WORKER_SOURCE_URL` 与同一 Release tag 一致。
 - `frontend/dist/index.html` 的资源引用符合 Worker 同源代理策略。
 - 构建产物不引用 `dist/assets/**` 或浏览器直连发布源的资源。
-- 远端壳中的外部依赖可被 Worker 重写。
+- 远端壳中的 `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch 可被 Worker 重写，单双引号与无扩展 URL 均纳入检查。
+- 正式 HTML 不含 importmap 或任何 inline 动态 `import()`；发布门禁拒绝无法安全改写的依赖形式，Worker 运行时额外拒绝 importmap 壳。禁止源与 jsDelivr GitHub 可变 ref 在绝对 URL 规范化后判断，协议相对及尾点主机名写法不能绕过发布门禁。
+- 发布检查先通过 `sync-admin-runtime.mjs --check`，并要求 `frontend/dist/index.html` 与同步后的 `frontend/index.html` 字节一致，陈旧 dist 不得发布。
 
 ## Push 与 Release 门禁
 

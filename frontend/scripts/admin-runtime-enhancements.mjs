@@ -5,7 +5,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_STYLE = `<style data-admin-runtime-enhancements=
 #app-shell [role="tab"]{position:relative;isolation:isolate}
 #app-shell [data-admin-toolbar-group="title"]{min-width:0;flex:1 1 auto}
 #app-shell [data-admin-page-title="1"]{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#app-shell [data-admin-toolbar-group="actions"]{display:flex;align-items:center;justify-content:flex-end;gap:.75rem;flex-shrink:0;position:relative;z-index:2;white-space:nowrap}
+#app-shell [data-admin-toolbar-group="actions"]{display:flex;align-items:center;justify-content:flex-end;gap:.25rem;flex-shrink:0;position:relative;z-index:2;white-space:nowrap}
+#app-shell [data-admin-toolbar-group="actions"]>*{margin-left:0 !important;margin-right:0 !important}
 #app-shell [data-admin-brand-mark="1"]{position:relative;overflow:hidden}
 #app-shell [data-admin-brand-mark="1"] svg{display:block;width:1.1rem;height:1.1rem;color:currentColor;filter:drop-shadow(0 1px 2px rgba(15,23,42,.16))}
 #app-shell [data-admin-toolbar-action]{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;width:2.5rem;height:2.5rem;padding:0;border:0 !important;background:transparent !important;color:#475569;box-shadow:none !important;border-radius:max(14px,var(--ui-control-radius-px));transition:background-color .18s ease,color .18s ease,transform .18s ease,opacity .18s ease}
@@ -50,6 +51,48 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #node-modal .node-modal-primary-btn,
 #node-modal .node-modal-secondary-btn{display:inline-flex;align-items:center;justify-content:center;isolation:isolate}
 #view-nodes .node-tag-filter-panel-shell{position:relative;z-index:4}
+#node-modal [data-admin-node-advanced="1"]{overflow:hidden;border:1px solid #e2e8f0;border-radius:max(16px,calc(var(--ui-control-radius-px) + 6px));background:rgba(248,250,252,.72)}
+.dark #node-modal [data-admin-node-advanced="1"]{border-color:#334155;background:rgba(2,6,23,.34)}
+#node-modal [data-admin-node-advanced="1"]>summary{display:flex;align-items:center;justify-content:space-between;gap:.75rem;padding:1rem;cursor:pointer;list-style:none;color:#334155;font-size:.875rem;font-weight:600;user-select:none}
+.dark #node-modal [data-admin-node-advanced="1"]>summary{color:#e2e8f0}
+#node-modal [data-admin-node-advanced="1"]>summary::-webkit-details-marker{display:none}
+#node-modal [data-admin-node-advanced="1"]>summary svg{width:1rem;height:1rem;transition:transform .18s ease}
+#node-modal [data-admin-node-advanced="1"][open]>summary svg{transform:rotate(180deg)}
+#node-modal [data-admin-node-advanced-content="1"]{display:grid;gap:1rem;padding:0 1rem 1rem;border-top:1px solid #e2e8f0}
+.dark #node-modal [data-admin-node-advanced-content="1"]{border-color:#334155}
+#node-modal [data-admin-node-advanced-fields="1"]{padding-top:1rem}
+#node-modal [data-admin-node-advanced-headers="1"]{margin:0;background:#fff}
+.dark #node-modal [data-admin-node-advanced-headers="1"]{background:rgba(15,23,42,.72)}
+#node-modal>div[data-ui-dialog-surface="1"]{padding:1rem !important}
+#node-modal #node-modal-title{margin-bottom:.75rem !important;font-size:1.125rem;line-height:1.5rem}
+#node-modal form{max-height:calc(86vh - env(safe-area-inset-bottom) - env(safe-area-inset-top)) !important}
+#node-modal form>*+*{margin-top:.75rem !important}
+#node-modal form>[class*="grid"]{gap:.75rem !important}
+#node-modal form label{margin-bottom:.2rem}
+#node-modal form p[class*="text-xs"]{margin-top:.2rem;line-height:1.15rem}
+#node-modal form input:not([type="checkbox"]):not([type="radio"]),
+#node-modal form select{min-height:2.25rem;padding-top:.4rem !important;padding-bottom:.4rem !important}
+#node-modal form .rounded-2xl.border{padding:.875rem !important}
+#node-modal #node-lines-container{gap:.5rem}
+#node-modal #node-lines-container>[data-node-line-row="1"]{padding:.625rem !important}
+#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:first-child{min-width:0;flex:1 1 auto}
+#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child{flex:0 0 auto;white-space:nowrap}
+#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child button{flex-shrink:0;white-space:nowrap}
+#node-modal [data-admin-node-advanced="1"]>summary{padding:.75rem .875rem}
+#node-modal [data-admin-node-advanced-content="1"]{gap:.75rem;padding:0 .875rem .875rem}
+#node-modal [data-admin-node-advanced-fields="1"]{padding-top:.875rem}
+#node-modal form>div:last-child{margin-top:1rem !important;padding-top:.625rem !important;padding-bottom:.25rem !important}
+#node-modal [data-admin-node-basic-grid="1"]{grid-template-columns:minmax(0,.85fr) repeat(3,minmax(0,1fr)) !important}
+#node-modal [data-admin-node-meta-grid="1"]{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr) minmax(15rem,1fr) !important}
+#node-modal [data-admin-node-entry-field="1"] p{margin-bottom:0}
+#node-modal [data-admin-node-stream-field="1"]{min-width:0}
+@media (max-width:767px){#node-modal [data-admin-node-basic-grid="1"],#node-modal [data-admin-node-meta-grid="1"]{grid-template-columns:minmax(0,1fr) !important}}
+@media (min-width:768px){#node-modal{max-width:72rem}}
+#view-nodes [data-admin-node-toolbar="1"]{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;align-items:start}
+#view-nodes [data-admin-node-toolbar-main="1"]{width:100%;max-width:none;min-width:0}
+#view-nodes [data-admin-node-toolbar-row="1"]{display:grid;grid-template-columns:max-content max-content minmax(15rem,1fr);align-items:center;gap:.5rem;width:100%}
+#view-nodes [data-admin-node-toolbar-actions="1"]{display:grid;grid-template-columns:repeat(3,max-content);align-items:center;justify-content:start;gap:.5rem;width:auto}
+#view-nodes [data-admin-node-toolbar-actions="1"]>*{width:auto;min-height:2.5rem;margin:0}
 .dark #view-nodes .node-toolbar-primary-btn,
 .dark #node-modal .node-modal-primary-btn{background:#2563eb !important;color:#fff !important;box-shadow:0 10px 24px rgba(37,99,235,.22) !important}
 .dark #view-nodes .node-toolbar-primary-btn:hover,
@@ -73,6 +116,15 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-settings .settings-block,
 #view-settings .settings-list-shell{background:var(--settings-surface) !important;border-color:var(--settings-border) !important;background-image:none !important;box-shadow:none !important}
 #view-settings .settings-summary-tile{border:1px solid var(--settings-border) !important;border-radius:max(16px,calc(var(--ui-control-radius-px) + 4px)) !important;background:var(--settings-soft) !important;padding:.875rem 1rem;box-shadow:none !important}
+#view-settings [data-admin-release-source-card="1"] [data-admin-settings-summary="1"],
+#view-settings .settings-worker-quick-card [data-admin-settings-summary="1"]{grid-template-columns:repeat(3,minmax(0,1fr))}
+#view-settings [data-admin-release-source-card="1"] [data-admin-settings-fields="1"]{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
+#view-settings [data-admin-release-source-card="1"] [data-admin-settings-derived-field="1"],
+#view-settings .settings-worker-quick-card [data-admin-settings-derived-field="1"]{min-width:0}
+#view-settings [data-admin-settings-derived-field="1"] input{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.75rem;line-height:1.25rem;text-overflow:ellipsis}
+#view-settings .settings-worker-quick-card [data-admin-worker-source-grid="1"]{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
+#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"]{display:flex;align-items:center;justify-content:flex-end;gap:.5rem;padding-top:.25rem}
+#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"] button{min-height:2.5rem}
 #view-settings .ui-block-head,
 #view-settings .settings-nav-shell .border-b,
 #view-settings #settings-forms>div>.ui-settings-panel+.ui-settings-panel{border-color:var(--settings-border) !important}
@@ -109,7 +161,9 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-settings button:disabled,
 #view-settings .settings-secondary-btn:disabled,
 #view-settings .set-tab:disabled{opacity:.65 !important;pointer-events:none}
-@media (max-width:767px){#view-settings .settings-view-layout{display:flex;flex-direction:column}}
+@media (max-width:767px){#view-nodes [data-admin-node-toolbar-row="1"],#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:minmax(0,1fr)}#view-nodes [data-admin-node-toolbar-row="1"]>*{width:100%}#view-settings .settings-view-layout{display:flex;flex-direction:column}#view-settings [data-admin-release-source-card="1"] [data-admin-settings-summary="1"],#view-settings [data-admin-release-source-card="1"] [data-admin-settings-fields="1"],#view-settings .settings-worker-quick-card [data-admin-settings-summary="1"],#view-settings .settings-worker-quick-card [data-admin-worker-source-grid="1"]{grid-template-columns:minmax(0,1fr)}#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"]{align-items:stretch;flex-direction:column}#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"] button{width:100%}}
+@media (min-width:768px) and (max-width:1535px){#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:repeat(3,minmax(0,1fr));width:100%}#view-nodes [data-admin-node-toolbar-actions="1"]>*{width:100%}}
+@media (min-width:1536px){#view-nodes [data-admin-node-toolbar="1"]{grid-template-columns:minmax(0,1fr) max-content}#view-nodes [data-admin-node-toolbar-actions="1"]{justify-content:end}}
 @media (min-width:768px){#app-shell.settings-split-layout #content-area{overflow:hidden}#app-shell.settings-split-layout #view-settings{height:100%;min-height:0;overflow:hidden}#app-shell.settings-split-layout #view-settings .settings-view-layout{height:100%;min-height:0}#app-shell.settings-split-layout #view-settings .settings-nav-shell{position:sticky;top:0;max-height:100%;overflow-y:auto;flex:0 0 auto}#app-shell.settings-split-layout #view-settings #settings-forms{height:100%;min-height:0;overflow-y:auto;padding-right:.25rem;scrollbar-gutter:stable}}
 #app-shell.render-lite.settings-split-layout #view-settings .settings-nav-shell{position:static;top:auto;max-height:none;overflow:visible}
 #app-shell input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="color"]),
@@ -130,9 +184,12 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     ? window.requestAnimationFrame.bind(window)
     : (callback) => window.setTimeout(callback, 16);
   const brandIconSvg = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7.25 5.75h9.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 12h6.75" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 18.25h9.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 5.75v12.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/></svg>';
-  const shellHookSelector = '[data-admin-toolbar-group="title"],[data-admin-toolbar-group="actions"],[data-admin-page-title="1"],[data-admin-brand-shell="1"],[data-admin-brand-title="1"],[data-admin-brand-mark="1"]';
+  const wikiTutorialUrl = 'https://wiki.8081666.xyz/新手教程';
+  const shellHookSelector = '[data-admin-toolbar-group="title"],[data-admin-toolbar-group="actions"],[data-admin-page-title="1"],[data-admin-brand-shell="1"],[data-admin-brand-title="1"],[data-admin-brand-mark="1"],#view-nodes,#view-logs,#view-settings,#node-modal';
   let iconFrameId = 0;
   let shellFrameId = 0;
+  let nodeModalWasOpen = false;
+  let patchedSafetyContractApp = null;
 
   function canRenderIcons() {
     return !!window.lucide && typeof window.lucide.createIcons === 'function';
@@ -167,6 +224,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       shellFrameId = 0;
       applyBrandEnhancements();
       applyToolbarEnhancements();
+      applyLayoutEnhancements();
+      applySafetyContractEnhancements();
     });
   }
 
@@ -216,6 +275,23 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     brandMark.innerHTML = brandIconSvg;
   }
 
+  function ensureWikiToolbarLink(actionGroup, themeButton) {
+    if (!actionGroup) return null;
+    let wikiLink = actionGroup.querySelector('[data-admin-toolbar-action="wiki"]');
+    if (!wikiLink) {
+      wikiLink = document.createElement('a');
+      wikiLink.setAttribute('data-admin-toolbar-action', 'wiki');
+      wikiLink.setAttribute('href', wikiTutorialUrl);
+      wikiLink.setAttribute('target', '_blank');
+      wikiLink.setAttribute('rel', 'noopener noreferrer');
+      wikiLink.innerHTML = '<i data-lucide="book-open" aria-hidden="true"></i>';
+      actionGroup.insertBefore(wikiLink, themeButton || null);
+    }
+    wikiLink.setAttribute('title', '打开 WIKI 新手教程');
+    wikiLink.setAttribute('aria-label', '打开 WIKI 新手教程');
+    return wikiLink;
+  }
+
   function applyToolbarEnhancements() {
     const { titleGroup, actionGroup, titleNode, githubLink, themeButton } = getToolbarNodes();
     if (titleNode) {
@@ -226,6 +302,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       githubLink.setAttribute('data-admin-toolbar-action', 'github');
       githubLink.setAttribute('aria-label', githubLink.getAttribute('aria-label') || '打开 GitHub 项目主页');
     }
+    ensureWikiToolbarLink(actionGroup, themeButton);
     if (themeButton) {
       themeButton.setAttribute('data-admin-toolbar-action', 'theme');
       themeButton.setAttribute('type', 'button');
@@ -239,6 +316,398 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         themeButton.addEventListener('click', () => scheduleShellRefresh());
       }
     }
+  }
+
+  function applyNodeToolbarLayout() {
+    const search = document.querySelector('#node-search');
+    const toolbarRow = search?.parentElement;
+    const toolbarMain = toolbarRow?.parentElement;
+    const toolbar = toolbarMain?.parentElement;
+    if (!toolbarRow || !toolbarMain || !toolbar) return;
+    toolbar.setAttribute('data-admin-node-toolbar', '1');
+    toolbarMain.setAttribute('data-admin-node-toolbar-main', '1');
+    toolbarRow.setAttribute('data-admin-node-toolbar-row', '1');
+    const actionGroup = [...toolbar.children].find((child) => child !== toolbarMain) || null;
+    actionGroup?.setAttribute('data-admin-node-toolbar-actions', '1');
+  }
+
+  function applySettingsLayout() {
+    const releaseRepoInput = document.querySelector('#cfg-release-repo');
+    const releaseCard = releaseRepoInput?.closest('.settings-block');
+    if (releaseCard) {
+      releaseCard.setAttribute('data-admin-release-source-card', '1');
+      const summaryGrid = releaseCard.querySelector('.settings-summary-tile')?.parentElement;
+      summaryGrid?.setAttribute('data-admin-settings-summary', '1');
+      const fieldsGrid = releaseRepoInput.parentElement?.parentElement;
+      fieldsGrid?.setAttribute('data-admin-settings-fields', '1');
+      for (const input of releaseCard.querySelectorAll('input[readonly]')) {
+        input.parentElement?.setAttribute('data-admin-settings-derived-field', '1');
+      }
+    }
+
+    const workerCard = document.querySelector('.settings-worker-quick-card');
+    if (!workerCard) return;
+    const sourceShell = workerCard.querySelector('.border-dashed');
+    const sourceGrid = sourceShell?.firstElementChild;
+    sourceGrid?.setAttribute('data-admin-worker-source-grid', '1');
+    const summaryGrid = sourceGrid;
+    summaryGrid?.setAttribute('data-admin-settings-summary', '1');
+    for (const input of workerCard.querySelectorAll('input[readonly]')) {
+      input.parentElement?.setAttribute('data-admin-settings-derived-field', '1');
+    }
+    const actionGroup = [...workerCard.querySelectorAll('div')].find((element) => {
+      const buttons = [...element.children].filter((child) => child.tagName === 'BUTTON');
+      return buttons.length === 2 && buttons.some((button) => String(button.textContent || '').includes('更新 Worker'));
+    });
+    actionGroup?.setAttribute('data-admin-worker-actions', '1');
+  }
+
+  function applyNodeAdvancedSettingsLayout() {
+    const nodeModal = document.querySelector('#node-modal');
+    const linesContainer = document.querySelector('#node-lines-container');
+    const linesPanel = linesContainer?.closest('.rounded-2xl.border');
+    const playbackInfoField = document.querySelector('#form-playback-info-mode');
+    const advancedFields = playbackInfoField?.closest('.grid');
+    const headersContainer = document.querySelector('#headers-container');
+    const headersPanel = headersContainer?.parentElement;
+    if (!linesPanel || !advancedFields || !headersPanel) return;
+    linesPanel.setAttribute('data-admin-node-lines-panel', '1');
+
+    let advancedSection = document.querySelector('[data-admin-node-advanced="1"]');
+    if (!advancedSection) {
+      advancedSection = document.createElement('details');
+      advancedSection.setAttribute('data-admin-node-advanced', '1');
+      advancedSection.open = true;
+      advancedSection.innerHTML = '<summary><span>高级设置</span><i data-lucide="chevron-down" aria-hidden="true"></i></summary><div data-admin-node-advanced-content="1"></div>';
+      linesPanel.insertAdjacentElement('afterend', advancedSection);
+    }
+    const content = advancedSection.querySelector('[data-admin-node-advanced-content="1"]');
+    if (!content) return;
+    const nodeModalIsOpen = !!nodeModal?.open;
+    if (nodeModalIsOpen && !nodeModalWasOpen) advancedSection.open = true;
+    nodeModalWasOpen = nodeModalIsOpen;
+    advancedFields.setAttribute('data-admin-node-advanced-fields', '1');
+    headersPanel.setAttribute('data-admin-node-advanced-headers', '1');
+    if (advancedFields.parentElement !== content) content.appendChild(advancedFields);
+    if (headersPanel.parentElement !== content) content.appendChild(headersPanel);
+  }
+
+  function applyNodePrimaryFieldsLayout() {
+    const entryMode = document.querySelector('#form-entry-mode');
+    const displayName = document.querySelector('#form-display-name');
+    const tag = document.querySelector('#form-tag');
+    const remark = document.querySelector('#form-remark');
+    const streamMode = document.querySelector('#form-main-video-stream-mode');
+    const entryField = entryMode?.parentElement;
+    const basicGrid = displayName?.parentElement?.parentElement;
+    const metaGrid = tag?.closest('.grid.grid-cols-1');
+    const streamField = streamMode?.parentElement;
+    const streamPanel = streamField?.closest('.rounded-2xl.border');
+    if (entryField && basicGrid) {
+      entryField.setAttribute('data-admin-node-entry-field', '1');
+      basicGrid.setAttribute('data-admin-node-basic-grid', '1');
+      if (basicGrid.firstElementChild !== entryField) basicGrid.insertBefore(entryField, basicGrid.firstElementChild);
+    }
+    if (metaGrid && remark && streamField) {
+      metaGrid.setAttribute('data-admin-node-meta-grid', '1');
+      streamField.setAttribute('data-admin-node-stream-field', '1');
+      const remarkField = remark.parentElement;
+      if (streamField.parentElement !== metaGrid || remarkField?.nextElementSibling !== streamField) {
+        remarkField?.insertAdjacentElement('afterend', streamField);
+      }
+    }
+    streamPanel?.remove();
+  }
+
+  function applyLayoutEnhancements() {
+    applyNodeToolbarLayout();
+    applySettingsLayout();
+    applyNodePrimaryFieldsLayout();
+    applyNodeAdvancedSettingsLayout();
+  }
+
+  function normalizeAdminActionError(responsePayload, status) {
+    const error = new Error(responsePayload?.error?.message || 'HTTP ' + status);
+    error.code = responsePayload?.error?.code || null;
+    error.status = status;
+    return error;
+  }
+
+  async function callConfirmedAdminAction(app, action, payload, confirmAction) {
+    const requestInit = {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Admin-Confirm': confirmAction
+      },
+      body: JSON.stringify({ action, ...payload })
+    };
+    const adminPath = String(window.location?.pathname || '/admin');
+    let response = await window.fetch(adminPath, requestInit);
+    if (response.status === 401 && typeof app?.promptLogin === 'function') {
+      await app.promptLogin();
+      response = await window.fetch(adminPath, requestInit);
+    }
+    const responsePayload = await response.json().catch(() => ({}));
+    if (!response.ok) throw normalizeAdminActionError(responsePayload, response.status);
+    return responsePayload;
+  }
+
+  function getTidyResultGroups(result, key) {
+    if (Array.isArray(result?.[key])) return result[key];
+    return Array.isArray(result?.preview?.[key]) ? result.preview[key] : [];
+  }
+
+  function buildTidyExecutionResultMessage(app, result, summaryMessage, refreshIncomplete) {
+    const groupDefinitions = [
+      ['实际迁移字段', 'fieldGroups', true],
+      ['实际删除', 'deleteGroups', false],
+      ['实际重写', 'rewriteGroups', false],
+      ['实际保留', 'preserveGroups', false]
+    ];
+    const lines = [summaryMessage];
+    for (const [title, key, isFieldGroup] of groupDefinitions) {
+      const groups = getTidyResultGroups(result, key);
+      lines.push('', title + '：');
+      if (!groups.length) {
+        lines.push('• 无');
+        continue;
+      }
+      for (const group of groups) {
+        const formatter = isFieldGroup ? app.formatTidyFieldGroupText : app.formatTidyPreviewGroupText;
+        lines.push(typeof formatter === 'function' ? formatter.call(app, group) : '• ' + String(group?.label || '未命名分组'));
+      }
+    }
+    if (refreshIncomplete) {
+      lines.push('', '设置或列表只完成了部分刷新，请手动刷新页面确认最新状态。');
+    }
+    return lines.join('\\n');
+  }
+
+  function collectD1ReadinessLines(status) {
+    const readiness = status?.readiness && typeof status.readiness === 'object' ? status.readiness : {};
+    const candidates = {
+      ...(status?.tables && typeof status.tables === 'object' ? status.tables : {}),
+      ...(status?.indexes && typeof status.indexes === 'object' ? status.indexes : {}),
+      ...readiness
+    };
+    const lines = [];
+    for (const [key, value] of Object.entries(candidates)) {
+      if (typeof value === 'boolean') lines.push('• ' + key + '：' + (value ? '就绪' : '未就绪'));
+      if (value && typeof value === 'object' && typeof value.ready === 'boolean') {
+        lines.push('• ' + key + '：' + (value.ready ? '就绪' : '未就绪'));
+      }
+    }
+    if (typeof status?.ftsReady === 'boolean' && !Object.prototype.hasOwnProperty.call(candidates, 'fts')) {
+      lines.push('• FTS：' + (status.ftsReady ? '就绪' : '未就绪'));
+    }
+    return [...new Set(lines)];
+  }
+
+  function formatD1SchemaStatus(status = {}) {
+    const appliedMigrations = Array.isArray(status?.appliedMigrations)
+      ? status.appliedMigrations.map((item) => String(item?.name || item?.id || item || '').trim()).filter(Boolean)
+      : [];
+    const missingMigrations = Array.isArray(status?.missingMigrations)
+      ? status.missingMigrations.map((item) => String(item?.name || item?.id || item || '').trim()).filter(Boolean)
+      : [];
+    const issues = Array.isArray(status?.issues)
+      ? status.issues.map((item) => String(item || '').trim()).filter(Boolean)
+      : [];
+    const runtimeVersion = status?.runtimeCompatibilityVersion ?? '未知';
+    const requiredMigration = String(status?.latestRequiredMigration || '未知');
+    const lines = [
+      '正式迁移：' + (status?.migrationReady === true ? '已就绪' : '未就绪'),
+      '运行时兼容：' + (status?.runtimeCompatibilityReady === true ? '已就绪' : '未确认'),
+      '运行时兼容版本：' + runtimeVersion,
+      '最新要求迁移：' + requiredMigration,
+      '已应用迁移：' + (appliedMigrations.length ? appliedMigrations.join('、') : '无或后端未返回'),
+      '缺失迁移：' + (missingMigrations.length ? missingMigrations.join('、') : '无')
+    ];
+    const readinessLines = collectD1ReadinessLines(status);
+    if (readinessLines.length) lines.push('', '结构就绪状态：', ...readinessLines);
+    const columns = status?.columns && typeof status.columns === 'object' ? status.columns : {};
+    const columnLines = [];
+    for (const [tableName, tableColumns] of Object.entries(columns)) {
+      if (!tableColumns || typeof tableColumns !== 'object') continue;
+      for (const [columnName, ready] of Object.entries(tableColumns)) {
+        if (typeof ready === 'boolean') columnLines.push('• ' + tableName + '.' + columnName + '：' + (ready ? '就绪' : '缺失'));
+      }
+    }
+    if (columnLines.length) lines.push('', '列就绪状态：', ...columnLines);
+    if (issues.length) lines.push('', '结构问题：', ...issues.map((issue) => '• ' + issue));
+    return lines.join('\\n');
+  }
+
+  function patchSafetyContractMethods(app) {
+    if (!app || patchedSafetyContractApp === app) return;
+    patchedSafetyContractApp = app;
+
+    app.runPreviewedTidy = async function runPreviewedTidyWithPlanToken(rawScope = 'kv') {
+      const scope = String(rawScope || 'kv').trim().toLowerCase() === 'd1' ? 'd1' : 'kv';
+      const title = scope === 'd1' ? '整理 D1 数据' : '整理 KV 数据';
+      const action = scope === 'd1' ? 'tidyD1Data' : 'tidyKvData';
+      const confirmText = scope === 'd1' ? '开始整理 D1' : '开始整理 KV';
+      try {
+        const preview = await this.apiCall('previewTidyData', { scope });
+        const dialog = this.buildTidyPreviewConfirmDialog(preview, scope);
+        const message = this.buildTidyPreviewConfirmText(preview, scope);
+        const quotaBlocked = preview?.quotaBudget?.blocked === true;
+        const accepted = await this.askConfirm(message, {
+          title,
+          tone: 'warning',
+          confirmText: quotaBlocked ? '关闭' : confirmText,
+          summary: dialog.summary,
+          sections: dialog.sections,
+          warnings: dialog.warnings
+        });
+        if (!accepted || quotaBlocked) return;
+        const planToken = String(preview?.planToken || '');
+        const executionPayload = scope === 'kv' ? { planToken } : {};
+        const result = await this.apiCall(action, executionPayload);
+        const refreshTasks = [this.loadSettings()];
+        if (scope === 'kv') {
+          refreshTasks.push(this.loadNodes());
+        } else {
+          if (String(this.currentHash || '') === '#logs') refreshTasks.push(this.loadLogs(1));
+          if (String(this.currentHash || '') === '#dashboard') refreshTasks.push(this.loadDashboard(null, { forceRefresh: true }));
+        }
+        const refreshIncomplete = (await Promise.allSettled(refreshTasks)).some((item) => item.status === 'rejected');
+        const summaryMessage = scope === 'd1'
+          ? this.buildD1TidySuccessMessage(result?.summary || {})
+          : this.buildKvTidySuccessMessage(result);
+        const resultMessage = buildTidyExecutionResultMessage(this, result, summaryMessage, refreshIncomplete);
+        await this.showMessage(resultMessage, {
+          title: scope === 'd1' ? 'D1 整理结果' : 'KV 整理结果',
+          tone: refreshIncomplete ? 'warning' : 'success',
+          modal: true
+        });
+      } catch (error) {
+        console.error('runPreviewedTidy failed', error);
+        const errorCode = String(error?.code || '');
+        const planRecoveryMessage = scope === 'kv' && errorCode === 'TIDY_PLAN_STALE'
+          ? 'KV 整理计划已过期或数据已变化，请重新预览并确认后再执行。'
+          : scope === 'kv' && errorCode === 'TIDY_PLAN_INVALID'
+            ? 'KV 整理计划凭证无效，请重新预览并确认后再执行。'
+            : '';
+        this.showMessage(planRecoveryMessage || title + '失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+      }
+    };
+
+    app.exportSettingsWithSecretsFromUi = async function exportSettingsWithSecretsFromUi() {
+      const accepted = await this.askConfirm(
+        '完整设置备份会包含 Cloudflare API Token、Telegram Bot Token 等敏感密钥。请仅保存到可信位置，使用后及时删除。',
+        { title: '导出含密钥设置', tone: 'danger', confirmText: '确认导出' }
+      );
+      if (!accepted) return;
+      try {
+        const result = await callConfirmedAdminAction(this, 'exportSettings', { includeSecrets: true }, 'exportSettings');
+        if (result) this.downloadJson(result, 'emby_proxy_settings_with_secrets_' + Date.now() + '.json');
+      } catch (error) {
+        console.error('exportSettingsWithSecretsFromUi failed', error);
+        this.showMessage('完整设置导出失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+      }
+    };
+
+    app.getD1SchemaStatusFromUi = async function getD1SchemaStatusFromUi() {
+      try {
+        const result = await this.apiCall('getD1SchemaStatus');
+        const status = result?.status && typeof result.status === 'object' ? result.status : result;
+        await this.showMessage(formatD1SchemaStatus(status), { title: 'D1 Schema 状态', tone: status?.migrationReady === true ? 'success' : 'warning', modal: true });
+        return status;
+      } catch (error) {
+        console.error('getD1SchemaStatusFromUi failed', error);
+        this.showMessage('读取 D1 Schema 状态失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+        return null;
+      }
+    };
+
+    app.initD1SchemaFromUi = async function initD1SchemaFromUi() {
+      const accepted = await this.askConfirm(
+        '该操作会检查 D1 当前结构并补齐运行时兼容列。正式版本仍以 Wrangler migrations 记录为准。',
+        { title: '初始化 D1 Schema', tone: 'warning', confirmText: '开始检查并补齐' }
+      );
+      if (!accepted) return;
+      try {
+        const result = await this.apiCall('initD1Schema');
+        if (result?.revisions) this.applyAdminRevisions(result.revisions);
+        const statusResult = await this.apiCall('getD1SchemaStatus');
+        const status = statusResult?.status && typeof statusResult.status === 'object' ? statusResult.status : statusResult;
+        await this.showMessage(formatD1SchemaStatus(status), {
+          title: 'D1 Schema 初始化结果',
+          tone: status?.runtimeCompatibilityReady === true ? 'success' : 'warning',
+          modal: true
+        });
+      } catch (error) {
+        console.error('initD1SchemaFromUi failed', error);
+        this.showMessage('D1 Schema 初始化失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+      }
+    };
+  }
+
+  function createRuntimeActionButton(referenceButton, actionName, label, iconName, onClick) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = referenceButton?.className || 'px-4 py-2 rounded-xl border border-slate-200 text-sm font-medium';
+    button.setAttribute('data-admin-runtime-action', actionName);
+    button.innerHTML = '<i data-lucide="' + iconName + '" class="w-4 h-4 mr-1" aria-hidden="true"></i>' + label;
+    button.addEventListener('click', onClick);
+    return button;
+  }
+
+  function syncD1SchemaActionButtons(app) {
+    const logsView = document.querySelector('#view-logs');
+    const initLogsButton = logsView
+      ? [...logsView.querySelectorAll('button')].find((button) => String(button.textContent || '').trim() === '初始化 DB')
+      : null;
+    const actionGroup = initLogsButton?.parentElement;
+    const existingButtons = actionGroup ? [...actionGroup.querySelectorAll('[data-admin-runtime-action^="d1-schema-"]')] : [];
+    if (!actionGroup || app?.isSettingsExpertMode?.() !== true) {
+      for (const button of existingButtons) button.remove();
+      return;
+    }
+    let statusButton = actionGroup.querySelector('[data-admin-runtime-action="d1-schema-status"]');
+    if (!statusButton) {
+      statusButton = createRuntimeActionButton(initLogsButton, 'd1-schema-status', 'Schema 状态', 'list-checks', () => app.getD1SchemaStatusFromUi());
+      initLogsButton.insertAdjacentElement('afterend', statusButton);
+    }
+    if (!actionGroup.querySelector('[data-admin-runtime-action="d1-schema-init"]')) {
+      const initSchemaButton = createRuntimeActionButton(initLogsButton, 'd1-schema-init', '初始化 Schema', 'database-zap', () => app.initD1SchemaFromUi());
+      statusButton.insertAdjacentElement('afterend', initSchemaButton);
+    }
+  }
+
+  function syncSecretExportButton(app) {
+    const settingsView = document.querySelector('#view-settings');
+    const defaultExportButton = settingsView
+      ? [...settingsView.querySelectorAll('button')].find((button) => String(button.textContent || '').trim() === '导出全局设置')
+      : null;
+    defaultExportButton?.setAttribute('title', '默认导出已脱敏，不包含 API Token 等密钥');
+    const actionGroup = defaultExportButton?.parentElement;
+    const existingButton = actionGroup?.querySelector('[data-admin-runtime-action="export-settings-secrets"]') || null;
+    if (!actionGroup || app?.isSettingsExpertMode?.() !== true) {
+      existingButton?.remove();
+      return;
+    }
+    if (existingButton) return;
+    const button = createRuntimeActionButton(
+      defaultExportButton,
+      'export-settings-secrets',
+      '导出含密钥设置',
+      'key-round',
+      () => app.exportSettingsWithSecretsFromUi()
+    );
+    button.className = 'px-4 py-2 border border-amber-300 text-amber-700 rounded-xl text-sm transition hover:bg-amber-100 dark:border-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/20';
+    defaultExportButton.insertAdjacentElement('afterend', button);
+  }
+
+  function applySafetyContractEnhancements() {
+    const app = window.App;
+    if (!app) return;
+    patchSafetyContractMethods(app);
+    syncD1SchemaActionButtons(app);
+    syncSecretExportButton(app);
   }
 
   if (document.readyState === 'loading') {
@@ -284,7 +753,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
           childList: true,
           subtree: true,
           attributes: true,
-          attributeFilter: ['class']
+          attributeFilter: ['class', 'open']
         });
       }
     };

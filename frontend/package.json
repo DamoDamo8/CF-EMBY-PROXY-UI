@@ -10,12 +10,12 @@
     "sync:admin-runtime": "node ./scripts/sync-admin-runtime.mjs",
     "check:admin-runtime": "node ./scripts/sync-admin-runtime.mjs --check",
     "dev": "node ./scripts/sync-admin-runtime.mjs && node ./scripts/dev-server.mjs",
-    "dev:vite": "node ./scripts/sync-admin-runtime.mjs && VITE_VENDOR_MODE=bundle vite --host 0.0.0.0 --port 5173",
-    "build": "node ./scripts/sync-admin-runtime.mjs && VITE_VENDOR_MODE=bundle vite build",
-    "build:bundle": "node ./scripts/sync-admin-runtime.mjs && VITE_VENDOR_MODE=bundle vite build",
-    "build:cdn": "node ./scripts/sync-admin-runtime.mjs && VITE_VENDOR_MODE=cdn vite build && VITE_VENDOR_MODE=cdn node ./scripts/check-cdn-paths.mjs",
+    "dev:vite": "node ./scripts/sync-admin-runtime.mjs && node ./node_modules/vite/bin/vite.js --host 0.0.0.0 --port 5173",
+    "build": "node ./scripts/sync-admin-runtime.mjs && node ./node_modules/vite/bin/vite.js build",
+    "build:bundle": "node ./scripts/sync-admin-runtime.mjs && node ./node_modules/vite/bin/vite.js build",
+    "build:cdn": "node ./scripts/sync-admin-runtime.mjs && node ./node_modules/vite/bin/vite.js build && node ./scripts/check-cdn-paths.mjs",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
-    "check:cdn": "VITE_VENDOR_MODE=cdn node ./scripts/check-cdn-paths.mjs"
+    "check:cdn": "node ./scripts/check-cdn-paths.mjs"
   },
   "dependencies": {
     "chart.js": "^4.5.1",

@@ -16,7 +16,6 @@ import {
 import SectionCard from '@/components/SectionCard.vue';
 import { useUiPreferences } from '@/composables/useUiPreferences';
 import ConfigBackupPanel from '@/features/settings/components/ConfigBackupPanel.vue';
-import DnsAutoUploadPanel from '@/features/settings/components/DnsAutoUploadPanel.vue';
 
 const props = defineProps({
   adminConsole: {
@@ -1041,17 +1040,6 @@ function createEmptyForm() {
     logBatchRetryBackoffMs: '75',
     scheduledLeaseMs: '300000',
     scheduleUtcOffsetMinutes: '480',
-    dnsAutoUploadEnabled: false,
-    dnsAutoUploadScheduleMode: 'clock_queue',
-    dnsAutoUploadClockTimes: '03:00',
-    dnsAutoUploadIntervalMinutes: '60',
-    dnsAutoUploadWindowStartTime: '00:00',
-    dnsAutoUploadWindowEndTime: '23:59',
-    dnsAutoUploadTopN: '10',
-    dnsAutoUploadCountryCodes: '',
-    dnsAutoUploadRecordTypes: 'A',
-    dnsAutoUploadNotifyEnabled: false,
-    dnsAutoUploadNotifyDelayMinutes: '5',
     tgDailyReportEnabled: false,
     tgDailyReportSummaryEnabled: false,
     tgDailyReportKvEnabled: false,
@@ -1153,17 +1141,6 @@ function buildFormFromConfig(rawConfig = {}) {
     logBatchRetryBackoffMs: formatIntegerInput(currentConfig.logBatchRetryBackoffMs, 75),
     scheduledLeaseMs: formatIntegerInput(currentConfig.scheduledLeaseMs, 300000),
     scheduleUtcOffsetMinutes: formatIntegerInput(currentConfig.scheduleUtcOffsetMinutes, 480),
-    dnsAutoUploadEnabled: currentConfig.dnsAutoUploadEnabled === true,
-    dnsAutoUploadScheduleMode: resolveSelectValue(currentConfig.dnsAutoUploadScheduleMode, 'clock_queue'),
-    dnsAutoUploadClockTimes: joinTextList(currentConfig.dnsAutoUploadClockTimes || ['03:00']),
-    dnsAutoUploadIntervalMinutes: formatIntegerInput(currentConfig.dnsAutoUploadIntervalMinutes, 60),
-    dnsAutoUploadWindowStartTime: resolveSelectValue(currentConfig.dnsAutoUploadWindowStartTime, '00:00'),
-    dnsAutoUploadWindowEndTime: resolveSelectValue(currentConfig.dnsAutoUploadWindowEndTime, '23:59'),
-    dnsAutoUploadTopN: formatIntegerInput(currentConfig.dnsAutoUploadTopN, 10),
-    dnsAutoUploadCountryCodes: joinTextList(parseRegionCodeList(currentConfig.dnsAutoUploadCountryCodes)),
-    dnsAutoUploadRecordTypes: joinTextList(parseLooseTextList(currentConfig.dnsAutoUploadRecordTypes || ['A'])),
-    dnsAutoUploadNotifyEnabled: currentConfig.dnsAutoUploadNotifyEnabled === true,
-    dnsAutoUploadNotifyDelayMinutes: formatIntegerInput(currentConfig.dnsAutoUploadNotifyDelayMinutes, 5),
     tgDailyReportEnabled: currentConfig.tgDailyReportEnabled === true,
     tgDailyReportSummaryEnabled: hasExplicitDailyReportKinds
       ? currentConfig.tgDailyReportSummaryEnabled === true
@@ -1259,17 +1236,6 @@ function buildConfigPayload(currentConfig = {}, currentForm = {}) {
     logBatchRetryBackoffMs: parseIntegerValue(currentForm.logBatchRetryBackoffMs, fallbackConfig.logBatchRetryBackoffMs, 75),
     scheduledLeaseMs: parseIntegerValue(currentForm.scheduledLeaseMs, fallbackConfig.scheduledLeaseMs, 300000),
     scheduleUtcOffsetMinutes: parseIntegerValue(currentForm.scheduleUtcOffsetMinutes, fallbackConfig.scheduleUtcOffsetMinutes, 480),
-    dnsAutoUploadEnabled: currentForm.dnsAutoUploadEnabled === true,
-    dnsAutoUploadScheduleMode: resolveSelectValue(currentForm.dnsAutoUploadScheduleMode, 'clock_queue'),
-    dnsAutoUploadClockTimes: parseTextList(currentForm.dnsAutoUploadClockTimes),
-    dnsAutoUploadIntervalMinutes: parseIntegerValue(currentForm.dnsAutoUploadIntervalMinutes, fallbackConfig.dnsAutoUploadIntervalMinutes, 60),
-    dnsAutoUploadWindowStartTime: resolveSelectValue(currentForm.dnsAutoUploadWindowStartTime, '00:00'),
-    dnsAutoUploadWindowEndTime: resolveSelectValue(currentForm.dnsAutoUploadWindowEndTime, '23:59'),
-    dnsAutoUploadTopN: parseIntegerValue(currentForm.dnsAutoUploadTopN, fallbackConfig.dnsAutoUploadTopN, 10),
-    dnsAutoUploadCountryCodes: joinCommaSeparatedList(parseRegionCodeList(currentForm.dnsAutoUploadCountryCodes)),
-    dnsAutoUploadRecordTypes: parseLooseTextList(currentForm.dnsAutoUploadRecordTypes),
-    dnsAutoUploadNotifyEnabled: currentForm.dnsAutoUploadNotifyEnabled === true,
-    dnsAutoUploadNotifyDelayMinutes: parseIntegerValue(currentForm.dnsAutoUploadNotifyDelayMinutes, fallbackConfig.dnsAutoUploadNotifyDelayMinutes, 5),
     tgDailyReportEnabled: currentForm.tgDailyReportEnabled === true,
     tgDailyReportSummaryEnabled: currentForm.tgDailyReportSummaryEnabled === true,
     tgDailyReportKvEnabled: currentForm.tgDailyReportKvEnabled === true,
@@ -1431,17 +1397,6 @@ function serializeFormState(value = {}) {
     logBatchRetryBackoffMs: String(value.logBatchRetryBackoffMs || '').trim(),
     scheduledLeaseMs: String(value.scheduledLeaseMs || '').trim(),
     scheduleUtcOffsetMinutes: String(value.scheduleUtcOffsetMinutes || '').trim(),
-    dnsAutoUploadEnabled: value.dnsAutoUploadEnabled === true,
-    dnsAutoUploadScheduleMode: resolveSelectValue(value.dnsAutoUploadScheduleMode, 'clock_queue'),
-    dnsAutoUploadClockTimes: parseTextList(value.dnsAutoUploadClockTimes),
-    dnsAutoUploadIntervalMinutes: String(value.dnsAutoUploadIntervalMinutes || '').trim(),
-    dnsAutoUploadWindowStartTime: resolveSelectValue(value.dnsAutoUploadWindowStartTime, '00:00'),
-    dnsAutoUploadWindowEndTime: resolveSelectValue(value.dnsAutoUploadWindowEndTime, '23:59'),
-    dnsAutoUploadTopN: String(value.dnsAutoUploadTopN || '').trim(),
-    dnsAutoUploadCountryCodes: parseRegionCodeList(value.dnsAutoUploadCountryCodes),
-    dnsAutoUploadRecordTypes: parseLooseTextList(value.dnsAutoUploadRecordTypes),
-    dnsAutoUploadNotifyEnabled: value.dnsAutoUploadNotifyEnabled === true,
-    dnsAutoUploadNotifyDelayMinutes: String(value.dnsAutoUploadNotifyDelayMinutes || '').trim(),
     tgDailyReportEnabled: value.tgDailyReportEnabled === true,
     tgDailyReportSummaryEnabled: value.tgDailyReportSummaryEnabled === true,
     tgDailyReportKvEnabled: value.tgDailyReportKvEnabled === true,
@@ -1837,7 +1792,7 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
               class="field-input"
               placeholder="cdn.example.com"
             />
-            <span class="field-hint">自动上传或兜底解析需要 CNAME 时会写回 `dnsDefaultFallbackCname`。</span>
+            <span class="field-hint">DNS 兜底解析需要 CNAME 时会写回 `dnsDefaultFallbackCname`。</span>
           </label>
 
           <label class="field-shell">
@@ -2228,14 +2183,6 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
     </div>
 
     <div class="mt-4 grid gap-4">
-      <DnsAutoUploadPanel
-        :form="form"
-        :disabled="authRequired || anySettingsBusy"
-        title="DNS 自动上传调度与通知"
-        description="这部分正式承接旧版 `dnsAutoUpload*` 字段，不再只停留在说明文案。保存设置时会和其他全局配置一起走 Worker 的 `saveConfig`。"
-        @update:form="Object.assign(form, $event)"
-      />
-
       <ConfigBackupPanel
         :data="configBackupPanelData"
         :loading="configBackupPanelLoading"

@@ -1,7 +1,14 @@
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 const FIXED_GITHUB_RELEASE_REPO = 'axuitomo/CF-EMBY-PROXY-UI';
+const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = path.resolve(scriptDirectory, '..');
+const frontendDirectory = path.join(repositoryRoot, 'frontend');
+const frontendSyncPath = path.join(frontendDirectory, 'scripts/sync-admin-runtime.mjs');
+const frontendCheckPath = path.join(frontendDirectory, 'scripts/check-cdn-paths.mjs');
 
 function parseArgs(argv = []) {
   const args = {};
@@ -74,6 +81,11 @@ if (!indexUrl) {
   process.exit(1);
 }
 
+if (!workerUrl) {
+  console.error('[check-publish-release] 缺少 `--worker-url <WORKER_SOURCE_URL>`。');
+  process.exit(1);
+}
+
 if (!explicitRepo) {
   console.error(`[check-publish-release] 非法 repo slug：${rawExplicitRepo}，请使用 owner/repo。`);
   process.exit(1);
@@ -91,21 +103,41 @@ const failures = [];
 if (indexUrl !== expectedIndexUrl) {
   failures.push(`INDEX_URL 不匹配。期望：${expectedIndexUrl}，实际：${indexUrl}`);
 }
-if (workerUrl && workerUrl !== expectedWorkerUrl) {
+if (workerUrl !== expectedWorkerUrl) {
   failures.push(`WORKER_SOURCE_URL 不匹配。期望：${expectedWorkerUrl}，实际：${workerUrl}`);
 }
-
-const releasePanelPath = path.resolve(process.cwd(), 'frontend/src/features/release/ReleasePanel.vue');
-const frontendCheckPath = path.resolve(process.cwd(), 'frontend/scripts/check-cdn-paths.mjs');
 
 if (failures.length > 0) {
   console.error('[check-publish-release] 校验失败：');
   for (const failure of failures) {
     console.error(`- ${failure}`);
   }
-  console.error(`- 正式发布链参考：${releasePanelPath}`);
   console.error(`- 正式发布链参考：${frontendCheckPath}`);
   process.exit(1);
+}
+
+const frontendSyncCheck = spawnSync(process.execPath, [frontendSyncPath, '--check'], {
+  cwd: frontendDirectory,
+  stdio: 'inherit',
+  shell: false
+});
+if (frontendSyncCheck.error) throw frontendSyncCheck.error;
+if (frontendSyncCheck.status !== 0) {
+  process.exit(frontendSyncCheck.status || 1);
+}
+
+const frontendCheck = spawnSync(process.execPath, [frontendCheckPath], {
+  cwd: frontendDirectory,
+  env: {
+    ...process.env,
+    VITE_VENDOR_MODE: 'cdn'
+  },
+  stdio: 'inherit',
+  shell: false
+});
+if (frontendCheck.error) throw frontendCheck.error;
+if (frontendCheck.status !== 0) {
+  process.exit(frontendCheck.status || 1);
 }
 
 console.log(`[check-publish-release] 目标 Release Tag ${targetRef} 的发布链接校验通过。`);
