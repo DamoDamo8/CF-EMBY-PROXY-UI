@@ -102,10 +102,17 @@ frontend/admin-runtime.template.html
 
 - 模块级 `GLOBALS` 只承担单个 Worker isolate 内的尽力读优化；KV、D1 和 Cache API 仍是真相源。isolate 被回收或请求落到另一个 isolate/PoP 时允许重新加载，不能依赖这里的状态实现跨请求一致性。
 - 运行配置使用 60 秒内存 TTL。同一缓存 namespace、同一失效代次的并发刷新通过 single-flight 合并；读取期只在内存中吸收旧字段，不向 KV 隐式写回，持久化由显式保存、恢复或 KV 整理负责。主配置写入成功后立即预填新缓存，较早启动的读取不得把旧值重新写回。
-- 代理节点读取路径的正缓存使用 60 秒 TTL，确认不存在的节点使用 1 秒负缓存，二者共用 5000 条有界 LRU；同一节点、同一失效代次的并发冷读取通过 single-flight 合并。管理台严格节点读取不使用负缓存。播放路由热快照使用 24 小时 TTL 和 1000 条上限，并复用快照中的节点派生 revision。
-- PlaybackInfo 成功 JSON 使用同 isolate 的短期响应缓存，TTL 最长 60 秒、上限 500 条；缓存键覆盖节点派生 revision、请求方法/路径/查询/body、鉴权身份和重写模式。节点写入会清除对应条目，缓存响应不保留 `Set-Cookie` 或失效的实体校验头。
+- 代理 CORS、IP 黑名单和地域 allow/block 规则按运行配置对象派生一个 `WeakMap` profile；原始规则字符串变化时 profile 自动失效，热请求复用已去重的 `Set`，不在每次请求中重复 `split/map/filter`。
+- 代理节点读取路径的正缓存使用 60 秒 TTL，确认不存在的节点使用 1 秒负缓存，二者共用 512 条有界 LRU；同一节点、同一失效代次的并发冷读取通过 single-flight 合并。管理台严格节点读取不使用负缓存。播放路由热快照使用 24 小时 TTL 和 256 条上限，并复用快照中的节点派生 revision。
+- PlaybackInfo 成功 JSON 使用同 isolate 的短期响应缓存，TTL 最长 60 秒、最多 64 条；单条响应体最多 256 KiB，所有条目的响应体合计最多 4 MiB，超过任一预算时不缓存或按 LRU 淘汰。重写路径只物化一次有界 body，后续缓存写入复用该快照，不重复 `clone()`/读取。缓存键覆盖节点派生 revision、请求方法/路径/查询/body、鉴权身份和重写模式。节点写入会清除对应条目，缓存响应不保留 `Set-Cookie` 或失效的实体校验头。
+- isolate 常驻读优化必须给反代数据面留出余量：节点实体最多 512 条，播放路由快照与故障转移状态各最多 256 条，进度转发会话最多 128 条且待转发 body 最多 32 KiB；会话淘汰、停止和节点失效会主动释放待转发 body 与请求上下文；日志队列最多 512 条、日志去重表最多 2048 条，字段在入队前截断。限流表最多 4096 个客户端。超过条数上限时淘汰最旧项，不通过增加 D1 读写维持这些内存状态。
+- 非幂等请求只有在可信 `Content-Length` 不超过 256 KiB 时才复制 body；未知长度或更大的 body 保持流式透传，并跳过依赖可重放 body 的 PlaybackInfo 缓存与进度合并。进度转发只取消并释放不需要的上游响应体，不得用 `text()`/`arrayBuffer()` 整包读取。媒体响应继续以 `ReadableStream` 直通或受控流转发，不进入上述 isolate 响应缓存。
+- 必须物化的非媒体请求和远端响应统一通过有界流读取：管理 API JSON body 最多 4 MiB、登录 JSON body 最多 16 KiB、metadata 预热解析最多 512 KiB；Cloudflare/GitHub/DNS/Telegram、远端管理壳、Worker 更新脚本和 vendor 资产分别使用其业务上限，未知 `Content-Length` 也必须在读取中止于上限。GitHub 成功响应超限或无法解析为 JSON 时直接失败，不把原始 body 交给无界 `response.json()`；日志详情超出 8 KiB 时写入合法的截断标记，避免破坏 D1 JSON 查询。
+- 每次代理准备只执行有 1 ms 时间预算的轮转增量清理；除节点、路由、密钥、限流和日志去重外，还覆盖 PlaybackInfo、故障转移、进度转发和月流量缓存。清理不能扫描无界集合或阻塞媒体首包。
 - 节点 revision 使用 1 秒 TTL 并合并同一 isolate 内的并发 KV 读取。节点写入会失效或预填 revision 及关联节点/播放缓存；单节点失效只推进该节点的读取代次，不会中断其他节点正在进行的冷读取，因此热节点命中不再逐请求强制读取 KV，但跨 isolate 可见性仍受 KV 与该短 TTL 约束。
 - 节点摘要、轻量索引和 revision meta 的读取—合并—提交在同一 isolate 内共用 mutation chain；重建操作把实体加载与索引提交作为一个完整操作，旧读取不能在较新提交后回填缓存或覆盖 KV。内容写入成功后才提交 meta，链内失败不会阻断后续 mutation。该顺序不提供跨 isolate 的强一致事务。
+- Dashboard 本月 CF Zone 流量使用独立的 isolate 内存缓存，TTL 为 30 分钟、最多 64 个键；相同 Zone、月份和业务时区的并发冷查询通过 single-flight 合并。该内存层只是尽力优化，不能作为跨 isolate 真相源。
+- D1 schema readiness 与 OpsStatus 热读状态都按 D1 binding 存在 `WeakMap` 中：schema 只保存少量 scope 到期时间，OpsStatus 最多保存 8 个小型 payload；管理壳状态节流只保存一个短指纹、时间戳和进行中的 Promise，不保留完整返回对象。不得为继续降低 D1 频率扩大这些上限或把日志、媒体响应搬入新的常驻缓存。
 
 ## KV 写入与整理一致性
 
@@ -130,8 +137,10 @@ frontend/admin-runtime.template.html
 ### Worker Cache API
 
 - Worker 使用 `caches.default` 的独立缓存键保存入口 HTML。当前缓存键同时包含完整 bootstrap 哈希和显式 transform revision；任一输入变化都会生成新的表示身份。
+- `getMonthlyTrafficStats` 只在管理台切换到“本月”时请求 Cloudflare GraphQL。结果按 Zone、月份、`scheduleUtcOffsetMinutes` 和显式版本生成 Cache API 键，30 分钟内直接命中，最多保留 24 小时 stale 回退；缓存体不含 API Token。Cache API 未命中或被驱逐时允许重新查询，上述缓存不承诺跨 PoP 一致性。
+- 月流量统计不读取或写入 `cf_dashboard_cache`、`cf_runtime_cache`、`proxy_logs` 或其他 D1 表，也不新增 D1 migration。这个边界避免卡片切换放大 D1 `rowsRead`/`rowsWritten`；D1 仍只承担其既有运行状态、日志和小时统计职责。
 - HTML 采用 Stale-While-Revalidate：先返回可用缓存，再通过请求上下文后台刷新。同一 Worker isolate 内，相同当前缓存键的并发读取/旧键迁移和后台重验证分别 single-flight，迁移与重验证写入再由该键的 mutation chain 排序；刷新失败时继续保留已返回的 stale 表示。该顺序保证不跨 Worker isolate 或 PoP。
-- 热缓存命中的运行状态记录通过 `ctx.waitUntil()` 后台提交，不阻塞 HTML 响应；显式预热请求会等待本次 HTML 与 vendor 缓存写入完成后再返回结果。vendor 按远端 HTML 出现顺序、最多 3 路并发预热，避免无界子请求和内存峰值。
+- 热缓存命中的运行状态记录通过 `ctx.waitUntil()` 后台提交，不阻塞 HTML 响应；相同稳定状态在同一 isolate、同一 D1 binding 上最多每 5 分钟写一次，状态指纹变化、冷加载、setup gate 和错误状态仍立即写入。显式预热请求会等待本次 HTML 与 vendor 缓存写入完成后再返回结果。vendor 按远端 HTML 出现顺序、最多 3 路并发预热，避免无界子请求和内存峰值。
 - 每次当前缓存键 miss 时只查找一次旧格式缓存键。命中的旧 stale HTML 先完成当前 bootstrap 与定向 Tailwind 兼容变换；获得写入权后再次读取当前键，只有仍为 miss 才写入迁移表示，若重验证已经写入则直接使用当前表示。当前键命中后不再读取旧键，旧缓存键也不再原地回写或参与后台更新。
 - 上游返回 `304 Not Modified` 时沿用当前缓存表示的 `ETag`、`Last-Modified` 和上游验证器，只刷新缓存时间，不重复执行兼容变换或重算表示 ETag。
 - 设置恢复页和远端壳错误页使用 `Cache-Control: no-store, max-age=0`，不写入 Cache API。
@@ -188,7 +197,9 @@ frontend/admin-runtime.template.html
 - `initLogsDb` 只负责日志基础表、旧日志列、日志索引和小时统计，不依赖 DNS IP、鉴权或 Cloudflare cache 表就绪；`initLogsFts` 只在日志基础结构上重建派生 FTS。`proxy_logs_fts` 不进入基础 migration，FTS 创建或重建失败不得报告 `ftsReady: true`。
 - `getD1SchemaStatus` 直接复检 `sqlite_master`、11 张运行时表的完整必需列、主键、`dns_ip_pool_items.ip` 唯一键、命名索引所属表与完整键列顺序，以及 `d1_migrations`；不以同名错误索引、partial index、夹带 expression key 的索引或此前初始化成功缓存代替结构检查。状态分别报告 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 与 `issues`。为兼容历史库，不把通用列类型、默认值、非空约束或索引升降序作为 readiness 门槛；仅 `proxy_logs.id` 要求 SQLite `INTEGER PRIMARY KEY` 语义。
 - `runtimeCompatibilityReady` 只表示当前结构满足 Worker v5 兼容读取；`migrationReady` 还要求 `d1_migrations` 表有效且三个要求 migration 均已记录。只有二者条件满足时 `schemaVersion` 才返回 `5`，运行时兜底不得伪造正式 migration 版本。
-- 日志、小时统计和 DNS IP 工作区初始化在同一 isolate、同一 D1 binding 上只缓存进行中的 single-flight，避免并发重复执行整套 DDL/PRAGMA；任务完成后释放缓存，后续初始化或显式状态检查会重新验证实际结构，避免 binding 漂移后永久误报 ready。
+- 运行时表、日志、小时统计和 DNS IP 工作区初始化在同一 isolate、同一 D1 binding 上合并进行中的 single-flight，并把成功 readiness 缓存 10 分钟，避免普通热调用重复执行 DDL/PRAGMA。`getD1SchemaStatus` 每次显式检查仍直接复检实际结构；`initD1Schema` 显式初始化会先失效 readiness 与 OpsStatus 热读缓存，不能用缓存掩盖 binding 漂移。
+- OpsStatus 的 root/section D1 读取使用 15 秒、每 binding 最多 8 项的 read-through/write-through 缓存，包含不存在结果；写入完成后直接更新缓存并返回合并结果，不再反读 root 与全部 section。其他 isolate 的状态变化最多可能延迟 15 秒可见；安全鉴权、scheduled 租约和显式 schema 检查不使用这层弱一致缓存。
+- Dashboard snapshot 与 Cloudflare runtime cache 的 fresh/stale 判定共用一次包含过期项的 D1 查询，miss、强制刷新或 live loader 失败时不再为 stale fallback 重复 SELECT。默认日志队列累计 100 条或达到 20 分钟窗口后刷盘；日志行与小时统计分别按最多 50 条 statement 使用 `db.batch()`。这只降低查询/事务频率，不减少应持久化的日志行，也不改变显式错误日志模式。
 - 索引必须对应正式查询：日志保留时间游标、客户端 IP + 时间、状态 + 时间、分类 + 时间；DNS IP 项按更新时间与 IP 排序，探测缓存覆盖 `entry_colo + ip + expires_at` 批量读取；过期清理索引继续保留。
 - 与复合主键或现有复合索引重复、且正式查询没有消费者的索引不属于基线，避免增加 D1 `rowsWritten` 和单库写队列压力。
 - DNS IP 来源列表的全量替换必须把清空与新记录写入放在同一个 D1 batch 中；任一语句失败时不得提交空列表或部分列表。

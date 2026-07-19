@@ -1,3 +1,5 @@
+#Requires -RunAsAdministrator
+
 param(
   [int]$Port = 5173,
   [string]$ListenAddress = "127.0.0.1",
@@ -8,25 +10,36 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ($Port -le 0) {
-  throw "Port 必须大于 0。"
+  throw "Port must be greater than zero."
 }
 
 function Get-WslIp {
   param([string]$TargetDistro)
 
   if ([string]::IsNullOrWhiteSpace($TargetDistro)) {
-    $raw = & wsl.exe -- bash -lc "hostname -I | awk '{print \$1}'"
+    $wslArgs = @("--", "hostname", "-I")
   }
   else {
-    $raw = & wsl.exe -d $TargetDistro -- bash -lc "hostname -I | awk '{print \$1}'"
+    $wslArgs = @("-d", $TargetDistro, "--", "hostname", "-I")
   }
 
-  $ip = ($raw | Select-Object -First 1).ToString().Trim()
+  $raw = & wsl.exe @wslArgs
+  if ($LASTEXITCODE -ne 0) {
+    throw "wsl.exe failed while resolving the WSL IP address."
+  }
+
+  $ip = (($raw -join " ") -split "\s+" | Where-Object { $_ } | Select-Object -First 1)
   if ([string]::IsNullOrWhiteSpace($ip)) {
-    throw "无法解析 WSL IP。请先确认目标发行版已启动。"
+    throw "Unable to resolve the WSL IP address. Start the target distribution first."
   }
 
-  return $ip
+  $parsedIp = $null
+  if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$parsedIp) -or
+      $parsedIp.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) {
+    throw "wsl.exe returned an invalid IPv4 address: $ip"
+  }
+
+  return $parsedIp.IPAddressToString
 }
 
 $wslIp = Get-WslIp -TargetDistro $Distro
@@ -34,11 +47,14 @@ $wslIp = Get-WslIp -TargetDistro $Distro
 Write-Host "WSL IP: $wslIp"
 Write-Host "Refreshing Windows portproxy for http://${ListenAddress}:$Port ..."
 
-& netsh interface portproxy delete v4tov4 listenaddress=$ListenAddress listenport=$Port | Out-Null
+& netsh interface portproxy delete v4tov4 listenaddress=$ListenAddress listenport=$Port 2>$null | Out-Null
 & netsh interface portproxy add v4tov4 listenaddress=$ListenAddress listenport=$Port connectaddress=$wslIp connectport=$Port | Out-Null
+if ($LASTEXITCODE -ne 0) {
+  throw "netsh failed to create the Windows portproxy rule."
+}
 
 Write-Host ""
-Write-Host "Windows 映射已更新："
+Write-Host "Windows portproxy updated:"
 Write-Host "  http://${ListenAddress}:$Port"
 Write-Host ""
-Write-Host "如果你还需要让局域网其他设备访问，请自行把 listenaddress 改成 0.0.0.0 并按需放行防火墙。"
+Write-Host "For LAN access, explicitly use listenaddress 0.0.0.0 and configure the firewall."

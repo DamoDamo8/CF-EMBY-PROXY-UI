@@ -39,6 +39,14 @@ test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
 });
 
+test('dashboard traffic card exposes an on-demand day and month toggle', () => {
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-dashboard-traffic-toggle/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-lucide="repeat-2"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getMonthlyTrafficStats'\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /今日视频流量 \(CF Zone 总流量\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /本月视频流量 \(CF Zone 总流量\)/);
+});
+
 test('D1 schema dialog includes migrations, columns, and reported issues', () => {
   const { formatD1SchemaStatus } = loadEnhancementTestHooks();
   const message = formatD1SchemaStatus({
@@ -105,6 +113,22 @@ test('Vue settings source and component tree contain no unsupported scheduled se
   assert.doesNotMatch(settingsPanel, /dnsAutoUpload|DnsAutoUploadPanel/);
   await assert.rejects(readFile(new URL('../frontend/src/features/settings/components/DnsAutoUploadPanel.vue', import.meta.url)));
   await assert.rejects(readFile(new URL('../frontend/src/features/settings/components/dnsAutoUploadPanel.shared.js', import.meta.url)));
+});
+
+test('development server launches the local Vite entry through Node on every platform', async () => {
+  const source = await readFile(new URL('../frontend/scripts/dev-server.mjs', import.meta.url), 'utf8');
+  assert.match(source, /const viteEntry = fileURLToPath\(new URL\('\.\.\/node_modules\/vite\/bin\/vite\.js'/);
+  assert.match(source, /spawn\(\s*process\.execPath,\s*\[viteEntry,/);
+  assert.doesNotMatch(source, /vite\.cmd/);
+});
+
+test('Windows portproxy helper remains compatible with Windows PowerShell', async () => {
+  const source = await readFile(new URL('../frontend/scripts/windows-portproxy.ps1', import.meta.url), 'utf8');
+  assert.equal([...source].every((character) => character.charCodeAt(0) <= 0x7f), true);
+  assert.match(source, /^#Requires -RunAsAdministrator/m);
+  assert.match(source, /& wsl\.exe @wslArgs/);
+  assert.doesNotMatch(source, /\bawk\b|bash -lc/);
+  assert.match(source, /netsh failed to create the Windows portproxy rule/);
 });
 
 test('CDN checker recognizes semantic assets and importmaps across attribute styles', () => {

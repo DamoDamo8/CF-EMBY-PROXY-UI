@@ -49,7 +49,7 @@ npm run build
 npm run build:cdn
 ```
 
-Windows/WSL 选择见 [开发与验证](development.md#正式前端)。`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合 Release-only + Worker proxy 约束。
+Windows PowerShell 环境要求见 [开发与验证](development.md#正式前端)。`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合 Release-only + Worker proxy 约束。
 
 ### Release 资产来源
 

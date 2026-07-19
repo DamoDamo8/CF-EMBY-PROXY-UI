@@ -8,8 +8,10 @@ const hooks = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
 assert.ok(hooks, "worker.js must expose Node test hooks");
 
 const {
+  Config,
   GLOBALS,
   Database,
+  CacheManager,
   Proxy,
   RuntimeEntry,
   isEmbyWebProxyPath,
@@ -19,6 +21,9 @@ const {
   buildCanonicalWorkerMetadataCacheKey,
   buildWorkerMetadataCacheLookupRequest,
   hasWorkerMetadataPrivateIdentity,
+  buildProxyAccessRuleProfile,
+  fetchGithubApiJson,
+  serializeBoundedLogDetailJson,
   runSingleFlight,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
@@ -31,6 +36,7 @@ const {
   buildAdminRemoteShellLegacyCacheKeyRequest,
   fetchAdminRemoteShellStoredResponse,
   buildAdminRemoteShellStoredResponse,
+  patchAdminShellRuntimeStatus,
   renderRemoteAdminPage,
   renderAdminPage,
   isAcceptedAdminHtmlDocumentContentType,
@@ -39,7 +45,8 @@ const {
   isAdminWarmRoute,
   warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
-  isAdminWarmResponseSuccessful
+  isAdminWarmResponseSuccessful,
+  buildDailyTelegramSummaryMessage
 } = hooks;
 
 assert.ok(RuntimeEntry && typeof RuntimeEntry === "object", "missing Node test hook: RuntimeEntry");
@@ -53,6 +60,9 @@ const requiredFunctionHooks = {
   buildCanonicalWorkerMetadataCacheKey,
   buildWorkerMetadataCacheLookupRequest,
   hasWorkerMetadataPrivateIdentity,
+  buildProxyAccessRuleProfile,
+  fetchGithubApiJson,
+  serializeBoundedLogDetailJson,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
   invalidateNodesRevisionCache,
@@ -64,6 +74,7 @@ const requiredFunctionHooks = {
   buildAdminRemoteShellLegacyCacheKeyRequest,
   fetchAdminRemoteShellStoredResponse,
   buildAdminRemoteShellStoredResponse,
+  patchAdminShellRuntimeStatus,
   renderRemoteAdminPage,
   renderAdminPage,
   isAcceptedAdminHtmlDocumentContentType,
@@ -72,7 +83,8 @@ const requiredFunctionHooks = {
   isAdminWarmRoute,
   warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
-  isAdminWarmResponseSuccessful
+  isAdminWarmResponseSuccessful,
+  buildDailyTelegramSummaryMessage
 };
 
 for (const [name, value] of Object.entries(requiredFunctionHooks)) {
@@ -211,6 +223,161 @@ function getComparableDnsRecords(records) {
     .sort((left, right) => `${left.type}:${left.content}`.localeCompare(`${right.type}:${right.content}`));
 }
 
+test("daily Telegram summary places monthly traffic below today's traffic", async () => {
+  const originalBuildDashboardStatsPayload = Database.buildDashboardStatsPayload;
+  const originalGetDashboardMonthlyTrafficPayload = Database.getDashboardMonthlyTrafficPayload;
+  const ctx = { waitUntil() {} };
+  try {
+    Database.buildDashboardStatsPayload = async () => ({
+      requestCountDisplay: "1,234",
+      todayTraffic: "12.5 GB",
+      playCount: 56,
+      infoCount: 78,
+      todayRequests: 1234
+    });
+    Database.getDashboardMonthlyTrafficPayload = async (_env, options = {}) => {
+      assert.equal(options.ctx, ctx);
+      return { traffic: "345.6 GB" };
+    };
+
+    const payload = await Database.buildDailyTelegramSummaryPayload({}, {
+      config: { scheduleUtcOffsetMinutes: 480 },
+      ctx,
+      now: new Date("2026-07-19T04:00:00.000Z")
+    });
+    assert.equal(payload.monthlyTraffic, "345.6 GB");
+
+    const message = buildDailyTelegramSummaryMessage(payload, { dateKey: "2026-07-19" });
+    assert.equal(message, [
+      "📊 EMBY-PROXY每日报表 (2026-07-19)",
+      "",
+      "请求数: 1,234",
+      "视频流量 (CF 总计): 12.5 GB",
+      "本月流量 (CF 总计): 345.6 GB",
+      "请求: 播放请求 56 次 | 获取播放信息 78 次",
+      "#Cloudflare #Emby #日报"
+    ].join("\n"));
+  } finally {
+    Database.buildDashboardStatsPayload = originalBuildDashboardStatsPayload;
+    Database.getDashboardMonthlyTrafficPayload = originalGetDashboardMonthlyTrafficPayload;
+  }
+});
+
+test("GitHub API success payloads are bounded and require valid JSON", async () => {
+  await withWorkerGlobals({
+    fetch: async () => new Response("{}", {
+      headers: { "Content-Length": String((4 * 1024 * 1024) + 1) }
+    })
+  }, async () => {
+    await assert.rejects(
+      fetchGithubApiJson("/repos/axuitomo/CF-EMBY-PROXY-UI"),
+      error => error?.code === "GITHUB_RELEASE_SOURCE_RESPONSE_TOO_LARGE" && error?.status === 502
+    );
+  });
+
+  await withWorkerGlobals({
+    fetch: async () => new Response("not-json")
+  }, async () => {
+    await assert.rejects(
+      fetchGithubApiJson("/repos/axuitomo/CF-EMBY-PROXY-UI"),
+      error => error?.code === "GITHUB_RELEASE_SOURCE_RESPONSE_INVALID" && error?.status === 502
+    );
+  });
+});
+
+test("oversized log detail fallback remains valid JSON", () => {
+  const serialized = serializeBoundedLogDetailJson({ detail: "x".repeat(9000) });
+  assert.ok(serialized.length <= 8192);
+  assert.deepEqual(JSON.parse(serialized), { truncated: true });
+});
+
+test("monthly traffic stats are on-demand cached without touching D1", async () => {
+  const zoneId = `monthly-zone-${Date.now()}`;
+  const { kv } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: {
+      cfZoneId: zoneId,
+      cfApiToken: "monthly-token",
+      scheduleUtcOffsetMinutes: 480
+    }
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: `monthly-traffic-${zoneId}`
+  };
+  const d1 = new globalThis.Proxy({}, {
+    get() {
+      throw new Error("monthly traffic must not access D1");
+    }
+  });
+  const cacheEntries = new Map();
+  const edgeCache = {
+    async match(request) {
+      return cacheEntries.get(request.url)?.clone() || null;
+    },
+    async put(request, response) {
+      cacheEntries.set(request.url, response.clone());
+    }
+  };
+  let graphqlRequestCount = 0;
+  const fetch = async (input, init = {}) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    graphqlRequestCount += 1;
+    const body = JSON.parse(String(init.body || "{}"));
+    assert.match(body.query, /httpRequestsAdaptiveGroups/);
+    assert.match(body.query, /edgeResponseBytes/);
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          zones: [{
+            series: [
+              { sum: { edgeResponseBytes: 1024 } },
+              { sum: { edgeResponseBytes: 2048 } }
+            ]
+          }]
+        }
+      }
+    }), { headers: { "Content-Type": "application/json" } });
+  };
+  const backgroundTasks = [];
+  const ctx = { waitUntil(task) { backgroundTasks.push(Promise.resolve(task)); } };
+
+  invalidateRuntimeConfigCache();
+  GLOBALS.DashboardMonthlyTrafficCache.clear();
+  await withWorkerGlobals({ fetch, caches: { default: edgeCache } }, async () => {
+    const firstResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+      env,
+      ctx,
+      kv,
+      db: d1
+    });
+    const firstPayload = await firstResponse.json();
+    assert.equal(firstPayload.traffic, "3 KB");
+    assert.equal(firstPayload.cfAnalyticsLoaded, true);
+    assert.equal(firstPayload.period, "month");
+    assert.equal(graphqlRequestCount, 1);
+    await Promise.all(backgroundTasks.splice(0));
+
+    const memoryResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+      env,
+      ctx,
+      kv,
+      db: d1
+    });
+    assert.equal((await memoryResponse.json()).cacheStatus, "cache");
+    assert.equal(graphqlRequestCount, 1);
+
+    GLOBALS.DashboardMonthlyTrafficCache.clear();
+    const edgeResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+      env,
+      ctx,
+      kv,
+      db: d1
+    });
+    assert.equal((await edgeResponse.json()).cacheStatus, "cache");
+    assert.equal(graphqlRequestCount, 1);
+  });
+});
+
 test("remote shell error responses are no-store and never expose saved secrets", async () => {
   let cacheReadCount = 0;
   let cacheWriteCount = 0;
@@ -266,6 +433,60 @@ test("remote shell error responses are no-store and never expose saved secrets",
 
   assert.equal(cacheReadCount, 0);
   assert.equal(cacheWriteCount, 0);
+});
+
+test("stable admin shell cache-hit status writes are throttled per D1 binding", async () => {
+  const db = { prepare() { throw new Error("unexpected D1 query"); } };
+  const env = { DB: db, ADMIN_PATH: "/admin" };
+  const originalPatchOpsStatus = Database.patchOpsStatus;
+  const writes = [];
+  Database.patchOpsStatus = async (_envOrStore, patch) => {
+    writes.push(patch);
+    return patch;
+  };
+  const baseStatus = {
+    shellState: {
+      remoteShellConfigured: true,
+      embeddedFallbackAvailable: true,
+      finalUiHtmlRetired: true,
+      remoteShellIndexUrl: "https://example.test/releases/v1/index.html"
+    },
+    initHealth: { ok: true, missing: [] },
+    mode: "remote",
+    sourceType: "remote_cache",
+    routeState: "remote_active",
+    remoteCacheState: "hit",
+    lastFetchStatus: "cached",
+    reason: "served_cached_remote_shell",
+    requestPath: "/admin",
+    throttleStableWrites: true
+  };
+
+  try {
+    await patchAdminShellRuntimeStatus(env, baseStatus);
+    await patchAdminShellRuntimeStatus(env, baseStatus);
+    assert.equal(writes.length, 1);
+    assert.deepEqual(
+      Object.keys(GLOBALS.AdminShellStatusWriteState.get(db) || {}).sort(),
+      ["fingerprint", "writePromise", "writtenAt"]
+    );
+
+    await patchAdminShellRuntimeStatus(env, {
+      ...baseStatus,
+      remoteCacheState: "stale_hit",
+      revalidateDue: true,
+      reason: "served_cached_remote_shell_and_scheduled_revalidate"
+    });
+    assert.equal(writes.length, 2);
+
+    await patchAdminShellRuntimeStatus(env, {
+      ...baseStatus,
+      throttleStableWrites: false
+    });
+    assert.equal(writes.length, 3);
+  } finally {
+    Database.patchOpsStatus = originalPatchOpsStatus;
+  }
 });
 
 test("error content contains only the manual setup link", () => {
@@ -1159,6 +1380,34 @@ test("runtime route context normalizes hostnames once and defers CORS headers", 
     assert.equal(response.headers.get("Vary"), "Origin");
     assert.equal(headersConstructionCount, 1);
   });
+});
+
+test("proxy access rules reuse one parsed profile per runtime config object", () => {
+  const runtimeConfig = {
+    corsOrigins: " https://client-a.test, https://client-b.test,https://client-a.test ",
+    ipBlacklist: "198.51.100.1, 198.51.100.2",
+    geoAllowlist: "us, ca",
+    geoBlocklist: "kp"
+  };
+  const firstProfile = buildProxyAccessRuleProfile(runtimeConfig);
+  const secondProfile = buildProxyAccessRuleProfile(runtimeConfig);
+
+  assert.equal(secondProfile, firstProfile);
+  assert.deepEqual(firstProfile.corsOrigins, ["https://client-a.test", "https://client-b.test"]);
+  assert.equal(
+    Proxy.resolveCorsOrigin(runtimeConfig, new Request("https://worker.test", {
+      headers: { Origin: "https://client-b.test" }
+    })),
+    "https://client-b.test"
+  );
+  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "198.51.100.1", "US", "*")?.status, 403);
+  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*"), null);
+  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "FR", "*")?.status, 403);
+
+  runtimeConfig.geoBlocklist = "US";
+  const updatedProfile = buildProxyAccessRuleProfile(runtimeConfig);
+  assert.notEqual(updatedProfile, firstProfile);
+  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*")?.status, 403);
 });
 
 test("playback-critical route detection preserves encoded and link-variant paths", () => {
@@ -3106,6 +3355,203 @@ test("immutable vendor assets use asset cache and immutable browser policy", asy
   assert.deepEqual(cacheWrites, ["admin-release-vendor-cache.invalid"]);
 });
 
+test("isolate cache defaults preserve bounded proxy headroom", () => {
+  assert.ok(Config.Defaults.NodeCacheMax <= 512);
+  assert.ok(Config.Defaults.PlaybackRouteHotCacheMax <= 256);
+  assert.ok(Config.Defaults.PlaybackInfoCacheMax <= 64);
+  assert.ok(Config.Defaults.PlaybackInfoCacheTotalMaxBytes <= 4 * 1024 * 1024);
+  assert.ok(Config.Defaults.VideoProgressForwardSessionMax <= 128);
+  assert.ok(Config.Defaults.BufferedRetryBodyMaxBytes <= 256 * 1024);
+  assert.ok(Config.Defaults.LogQueueMax <= 512);
+  assert.ok(Config.Defaults.LogDedupeMax <= 2048);
+  assert.ok(Config.Defaults.LogFlushCountThreshold >= 100);
+  assert.ok(Config.Defaults.OpsStatusReadCacheTtlMs <= 15 * 1000);
+});
+
+test("oversized PlaybackInfo responses are not retained in isolate memory", async () => {
+  GLOBALS.PlaybackInfoResponseCache.clear();
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    playbackInfoCacheKey: "playback-info:oversized",
+    requestMethod: "POST",
+    playbackInfoCacheTtlSec: 60,
+    nodeName: "alpha",
+    nodeDerivedCacheRevision: "rev-1"
+  };
+  const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
+  const stored = await Proxy.storePlaybackInfoResponseCache(execution, new Response(oversizedBody, {
+    headers: { "Content-Type": "application/json" }
+  }));
+  assert.equal(stored, false);
+  assert.equal(GLOBALS.PlaybackInfoResponseCache.size, 0);
+});
+
+test("oversized PlaybackInfo rewrite bypasses without blocking its original stream", { timeout: 2000 }, async () => {
+  const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
+  const response = new Response(oversizedBody, {
+    headers: { "Content-Type": "application/json" }
+  });
+  const upstreamState = { response };
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "rewrite",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  };
+  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  assert.equal(result, upstreamState);
+  assert.equal(execution.playbackInfoRewrite, "not_needed");
+  assert.equal((await response.text()).length, oversizedBody.length);
+});
+
+test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching", async () => {
+  GLOBALS.PlaybackInfoResponseCache.clear();
+  const originalCloneDescriptor = Object.getOwnPropertyDescriptor(Response.prototype, "clone");
+  const originalClone = originalCloneDescriptor.value;
+  let cloneCount = 0;
+  Response.prototype.clone = function countedClone() {
+    cloneCount += 1;
+    return originalClone.call(this);
+  };
+  try {
+    const execution = {
+      requestTraits: { isPlaybackInfoRequest: true },
+      effectivePlaybackInfoMode: "rewrite",
+      requestMethod: "POST",
+      playbackInfoRewrite: "",
+      playbackInfoRewriteUrlMode: "relative",
+      playbackInfoCacheKey: "playback-info:single-read",
+      playbackInfoCacheTtlSec: 60,
+      nodeName: "alpha",
+      nodeKey: "",
+      nodeDerivedCacheRevision: "rev-1",
+      proxyPath: "/Items/1/PlaybackInfo",
+      requestUrl: new URL("https://worker.test/alpha/Items/1/PlaybackInfo"),
+      rawRequestUrl: new URL("https://worker.test/alpha/Items/1/PlaybackInfo"),
+      entryMode: "kv_route"
+    };
+    const upstreamState = {
+      response: new Response(JSON.stringify({
+        MediaSources: [{ Path: "/Videos/1/stream" }]
+      }), {
+        headers: { "Content-Type": "application/json" }
+      }),
+      activeTargetBase: new URL("https://origin.test"),
+      finalUrl: new URL("https://origin.test/Items/1/PlaybackInfo")
+    };
+
+    const rewrittenState = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+    assert.equal(cloneCount, 1);
+    assert.equal(execution.playbackInfoCacheBodyResolved, true);
+    assert.ok(execution.playbackInfoCacheBody?.bytes > 0);
+
+    const stored = await Proxy.storePlaybackInfoResponseCache(execution, rewrittenState.response);
+    assert.equal(stored, true);
+    assert.equal(cloneCount, 1, "cache storage must reuse the rewrite snapshot");
+    assert.equal(GLOBALS.PlaybackInfoResponseCache.get("playback-info:single-read")?.bodyText, execution.playbackInfoCacheBody.text);
+  } finally {
+    Object.defineProperty(Response.prototype, "clone", originalCloneDescriptor);
+    GLOBALS.PlaybackInfoResponseCache.clear();
+  }
+});
+
+test("PlaybackInfo cache evicts oldest entries at its total byte budget", () => {
+  GLOBALS.PlaybackInfoResponseCache.clear();
+  const entryBytes = Config.Defaults.PlaybackInfoCacheEntryMaxBytes;
+  const entryCount = Math.floor(Config.Defaults.PlaybackInfoCacheTotalMaxBytes / entryBytes) + 1;
+  for (let index = 0; index < entryCount; index += 1) {
+    GLOBALS.PlaybackInfoResponseCache.set(`entry-${index}`, {
+      bodyText: "",
+      bodyBytes: entryBytes,
+      expiresAt: Date.now() + 60000
+    });
+  }
+  Proxy.cleanupPlaybackInfoResponseCache();
+  assert.equal(GLOBALS.PlaybackInfoResponseCache.has("entry-0"), false);
+  assert.equal(GLOBALS.PlaybackInfoResponseCache.has(`entry-${entryCount - 1}`), true);
+  const retainedBytes = [...GLOBALS.PlaybackInfoResponseCache.values()]
+    .reduce((total, entry) => total + entry.bodyBytes, 0);
+  assert.ok(retainedBytes <= Config.Defaults.PlaybackInfoCacheTotalMaxBytes);
+  GLOBALS.PlaybackInfoResponseCache.clear();
+});
+
+test("unknown-length control requests stay streamed instead of being cloned into memory", async () => {
+  const request = new Request("https://worker.test/Sessions/Playing/Progress", {
+    method: "POST",
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{}"));
+        controller.close();
+      }
+    }),
+    duplex: "half"
+  });
+  assert.equal(request.headers.has("Content-Length"), false);
+  const transport = await Proxy.buildProxyRequestState(
+    request,
+    {},
+    "/Sessions/Playing/Progress",
+    new URL(request.url),
+    "203.0.113.1",
+    {
+      isPlaybackInfoRequest: false,
+      isPlaybackSessionControlRequest: true,
+      isBigStream: false,
+      isSmartStrmMedia: false,
+      isSegment: false,
+      isManifest: false,
+      isWsUpgrade: false
+    },
+    false,
+    [],
+    {}
+  );
+  assert.equal(transport.preparedBodyMode, "stream");
+});
+
+test("playback progress relay enforces its bounded session table on insertion", () => {
+  const relayMap = GLOBALS.PlaybackProgressRelay;
+  relayMap.clear();
+  const maxEntries = Config.Defaults.VideoProgressForwardSessionMax;
+  const execution = {
+    videoProgressForwardIntervalSec: 3,
+    nodeName: "alpha",
+    nodeDerivedCacheRevision: "rev-1",
+    ctx: { waitUntil() {} }
+  };
+  for (let index = 0; index < maxEntries + 1; index += 1) {
+    Proxy.markPlaybackProgressRelayStopped(`session-${index}`, execution);
+  }
+  assert.equal(relayMap.size, maxEntries);
+  assert.equal(relayMap.has("session-0"), false);
+  assert.equal(relayMap.has(`session-${maxEntries}`), true);
+  relayMap.clear();
+});
+
+test("incremental isolate cleanup covers nonessential proxy-adjacent caches", () => {
+  const now = Date.now();
+  const staleCases = [
+    [5, GLOBALS.PlaybackInfoResponseCache, "stale-playback", { expiresAt: now - 1 }],
+    [6, GLOBALS.ProxyFailoverStateCache, "stale-failover", {
+      preferredTargetExpiresAt: now - 1,
+      failingTargets: new Map(),
+      inFlightProbe: null,
+      lastProbeResult: null
+    }],
+    [7, GLOBALS.PlaybackProgressRelay, "stale-progress", { lastTouchedAt: now - 120000 }],
+    [8, GLOBALS.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }]
+  ];
+  for (const [phase, cache, key, value] of staleCases) {
+    cache.clear();
+    cache.set(key, value);
+    GLOBALS.CleanupState.phase = phase;
+    GLOBALS.CleanupState.lastRunAt = 0;
+    GLOBALS.CleanupState.iterators = {};
+    CacheManager.maybeCleanup();
+    assert.equal(cache.has(key), false, `cleanup phase ${phase} should remove stale entry`);
+  }
+});
+
 function createD1Recorder() {
   const prepared = [];
   const batches = [];
@@ -3149,6 +3595,53 @@ function createD1Recorder() {
   return { db, prepared, batches };
 }
 
+test("D1 OpsStatus reads and writes reuse the binding-local hot cache", async () => {
+  const recorder = createD1Recorder();
+  const scope = Database.OPS_STATUS_DB_SCOPE_ROOT;
+
+  assert.equal(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), null);
+  assert.equal(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), null);
+  assert.equal(recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length, 1);
+  assert.equal(recorder.prepared.filter(record => /^CREATE TABLE IF NOT EXISTS sys_status/i.test(record.sql.trim())).length, 1);
+
+  await Database.putOpsStatusPayloadToDb(recorder.db, scope, { log: { status: "ready" } }, Date.now());
+  assert.deepEqual(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), { log: { status: "ready" } });
+  const selectCountBeforePatch = recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length;
+  await Database.patchOpsStatus(recorder.db, { log: { lastFlushStatus: "success" } });
+  assert.equal(
+    recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length,
+    selectCountBeforePatch,
+    "a hot status patch must not reread root or all section scopes"
+  );
+  assert.equal(recorder.prepared.filter(record => /^INSERT INTO sys_status/i.test(record.sql.trim())).length, 2);
+});
+
+test("Cloudflare runtime stale fallback performs one D1 cache lookup", async () => {
+  const database = Object.create(Database);
+  let cacheReadCount = 0;
+  database.getCfRuntimeCacheEntry = async () => {
+    cacheReadCount += 1;
+    return {
+      payload: { cached: true },
+      cachedAt: 1,
+      expiresAt: 2,
+      updatedAt: 1
+    };
+  };
+  await assert.rejects(
+    database.loadCfRuntimeCachePayload({}, {
+      cacheKey: "runtime:test",
+      cacheGroup: "test",
+      resourceId: "test",
+      nowMs: 3,
+      loader: async () => { throw new Error("refresh_failed"); },
+      allowStale: false
+    }),
+    /refresh_failed/
+  );
+  assert.equal(cacheReadCount, 1);
+});
+
 test("D1 schema initialization is single-flight and migration indexes match runtime queries", async () => {
   const logRecorder = createD1Recorder();
   await Promise.all([
@@ -3161,9 +3654,12 @@ test("D1 schema initialization is single-flight and migration indexes match runt
     Database.ensureStatsHourlySchema(logRecorder.db)
   ]);
 
-  assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 2);
+  assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 1);
   assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_stats_hourly \(/.test(record.sql)).length, 1);
   assert.ok(logRecorder.prepared.some(record => /idx_proxy_logs_client_time/.test(record.sql)));
+  Database.invalidateD1SchemaReadiness(logRecorder.db, "logs");
+  await Database.ensureLogsBaseSchema(logRecorder.db);
+  assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 2);
 
   const dnsRecorder = createD1Recorder();
   await Promise.all([
@@ -3172,9 +3668,12 @@ test("D1 schema initialization is single-flight and migration indexes match runt
   ]);
   await Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
 
-  assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
+  assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 1);
   assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_pool_items_updated_ip/.test(record.sql)));
   assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_probe_cache_colo_ip_expires/.test(record.sql)));
+  Database.invalidateD1SchemaReadiness(dnsRecorder.db, "all");
+  await Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
+  assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
 
   const migrationSql = await readFile(new URL("../migrations/0003_d1_schema_v5_indexes.sql", import.meta.url), "utf8");
   assert.match(migrationSql, /CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time/);

@@ -217,6 +217,15 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #app-shell label:has(> textarea){border-radius:var(--ui-control-radius-px) !important}
 #app-shell i[data-lucide]{display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
 #app-shell svg.lucide{display:block;flex-shrink:0;stroke:currentColor}
+#view-dashboard [data-dashboard-traffic-card="1"]{position:relative !important}
+#view-dashboard [data-dashboard-traffic-label="1"]{width:calc(100% - 2.75rem);padding-right:0;overflow:visible;text-overflow:clip;white-space:normal !important}
+#view-dashboard [data-dashboard-traffic-toggle="1"]{position:absolute;top:1rem;right:1rem;display:inline-flex;align-items:center;justify-content:center;width:2.25rem;height:2.25rem;padding:0;border:1px solid #dbe3ee;background:rgba(255,255,255,.9);color:#475569;border-radius:max(12px,var(--ui-control-radius-px));box-shadow:none;transition:background-color .18s ease,border-color .18s ease,color .18s ease,opacity .18s ease}
+#view-dashboard [data-dashboard-traffic-toggle="1"]:hover{background:#f8fafc;border-color:#94a3b8;color:#047857}
+#view-dashboard [data-dashboard-traffic-toggle="1"]:focus-visible{outline:none;box-shadow:0 0 0 2px rgba(16,185,129,.22)}
+#view-dashboard [data-dashboard-traffic-toggle="1"]:disabled{cursor:wait;opacity:.6}
+#view-dashboard [data-dashboard-traffic-toggle="1"] i,#view-dashboard [data-dashboard-traffic-toggle="1"] svg{width:1rem;height:1rem}
+.dark #view-dashboard [data-dashboard-traffic-toggle="1"]{border-color:#334155;background:rgba(15,23,42,.92);color:#cbd5e1}
+.dark #view-dashboard [data-dashboard-traffic-toggle="1"]:hover{border-color:#64748b;background:#111827;color:#34d399}
 </style><script data-admin-runtime-enhancements="1">
 (() => {
   if (window.__ADMIN_RUNTIME_ENHANCEMENTS_READY__) return;
@@ -227,11 +236,17 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     : (callback) => window.setTimeout(callback, 16);
   const brandIconSvg = '<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7.25 5.75h9.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 12h6.75" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 18.25h9.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/><path d="M7.25 5.75v12.5" stroke="currentColor" stroke-width="2.15" stroke-linecap="round"/></svg>';
   const wikiTutorialUrl = 'https://wiki.8081666.xyz/新手教程';
-  const shellHookSelector = '[data-admin-toolbar-group="title"],[data-admin-toolbar-group="actions"],[data-admin-page-title="1"],[data-admin-brand-shell="1"],[data-admin-brand-title="1"],[data-admin-brand-mark="1"],#view-nodes,#view-logs,#view-settings,#node-modal';
+  const shellHookSelector = '[data-admin-toolbar-group="title"],[data-admin-toolbar-group="actions"],[data-admin-page-title="1"],[data-admin-brand-shell="1"],[data-admin-brand-title="1"],[data-admin-brand-mark="1"],#view-dashboard,#view-nodes,#view-logs,#view-settings,#node-modal';
   let iconFrameId = 0;
   let shellFrameId = 0;
   let nodeModalWasOpen = false;
   let patchedSafetyContractApp = null;
+  const dashboardTrafficState = {
+    period: 'day',
+    daily: null,
+    monthly: null,
+    pending: false
+  };
 
   function canRenderIcons() {
     return !!window.lucide && typeof window.lucide.createIcons === 'function';
@@ -268,6 +283,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       applyToolbarEnhancements();
       applyLayoutEnhancements();
       applySafetyContractEnhancements();
+      syncDashboardTrafficToggle(window.App);
     });
   }
 
@@ -582,9 +598,206 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     return lines.join('\n');
   }
 
+  function getDashboardTrafficNodes() {
+    const count = document.querySelector('#dash-traffic-count');
+    const card = count?.closest?.('.glass-card') || null;
+    if (!card) return {};
+    return {
+      card,
+      label: card.querySelector('p'),
+      count,
+      hint: card.querySelector('#dash-traffic-hint'),
+      badges: card.querySelector('#dash-traffic-meta'),
+      detail: card.querySelector('#dash-traffic-detail'),
+      toggle: card.querySelector('[data-dashboard-traffic-toggle="1"]')
+    };
+  }
+
+  function snapshotDashboardTrafficCard(nodes = getDashboardTrafficNodes()) {
+    if (!nodes.card || !nodes.count) return null;
+    return {
+      count: String(nodes.count.textContent || ''),
+      hint: String(nodes.hint?.textContent || ''),
+      title: String(nodes.count.getAttribute('title') || ''),
+      detail: String(nodes.detail?.textContent || ''),
+      badgeHtml: String(nodes.badges?.innerHTML || '')
+    };
+  }
+
+  function renderDashboardTrafficBadges(nodes, badges = [], app = window.App) {
+    if (!nodes.badges) return;
+    nodes.badges.replaceChildren();
+    const normalizedBadges = Array.isArray(badges) ? badges : [];
+    for (const badge of normalizedBadges) {
+      if (!badge?.label) continue;
+      const span = document.createElement('span');
+      span.className = 'px-2.5 py-1 rounded-full text-[11px] font-medium ' + (app?.getDashboardBadgeClass?.(badge.tone) || 'bg-slate-100 text-slate-600');
+      span.textContent = String(badge.label);
+      nodes.badges.appendChild(span);
+    }
+  }
+
+  function renderDashboardTrafficCard(view = {}, period = 'day', app = window.App) {
+    const nodes = getDashboardTrafficNodes();
+    if (!nodes.card || !nodes.count) return false;
+    nodes.label.textContent = period === 'month'
+      ? '本月视频流量 (CF Zone 总流量)'
+      : '今日视频流量 (CF Zone 总流量)';
+    nodes.count.textContent = String(view.count || '0 B');
+    nodes.count.setAttribute('title', String(view.title || ''));
+    if (nodes.hint) {
+      nodes.hint.textContent = String(view.hint || ' ');
+      nodes.hint.setAttribute('title', String(view.title || ''));
+    }
+    if (nodes.detail) nodes.detail.textContent = String(view.detail || ' ');
+    if (view.badgeHtml !== undefined && nodes.badges) nodes.badges.innerHTML = String(view.badgeHtml || '');
+    else renderDashboardTrafficBadges(nodes, view.badges, app);
+    return true;
+  }
+
+  function buildMonthlyTrafficCardView(payload = {}, app = window.App) {
+    const title = [
+      payload.trafficSourceText,
+      payload.cfAnalyticsStatus,
+      payload.cfAnalyticsError,
+      payload.cfAnalyticsDetail,
+      payload.warning
+    ].filter(Boolean).join(' | ');
+    const statusBadge = app?.getTrafficStatusBadge?.(payload) || {
+      label: payload.cfAnalyticsLoaded ? '流量状态: Cloudflare 正常' : '流量状态: 查询失败',
+      tone: payload.cfAnalyticsLoaded ? 'emerald' : 'red'
+    };
+    const freshnessBadge = app?.getStatsFreshnessBadge?.(payload) || {
+      label: payload.cacheStatus === 'cache' ? '月统计: 缓存命中' : '月统计: 实时汇总',
+      tone: payload.cacheStatus === 'cache' ? 'blue' : 'emerald'
+    };
+    return {
+      count: payload.traffic || '0 B',
+      hint: payload.trafficSourceText || payload.cfAnalyticsStatus || payload.cfAnalyticsError || ' ',
+      title,
+      detail: [payload.cfAnalyticsStatus, payload.cfAnalyticsError, payload.cfAnalyticsDetail, payload.warning].filter(Boolean).join('\n') || ' ',
+      badges: [statusBadge, freshnessBadge]
+    };
+  }
+
+  function updateDashboardTrafficToggleButton(nodes = getDashboardTrafficNodes()) {
+    const button = nodes.toggle;
+    if (!button) return;
+    const showingMonth = dashboardTrafficState.period === 'month';
+    const nextLabel = showingMonth ? '切换为今日流量' : '切换为本月流量';
+    button.title = nextLabel;
+    button.setAttribute('aria-label', nextLabel);
+    button.setAttribute('aria-pressed', showingMonth ? 'true' : 'false');
+    button.setAttribute('aria-busy', dashboardTrafficState.pending ? 'true' : 'false');
+    button.disabled = dashboardTrafficState.pending;
+    const icon = button.querySelector('i,svg');
+    if (icon) icon.classList.toggle('animate-spin', dashboardTrafficState.pending);
+  }
+
+  async function toggleDashboardTrafficPeriod(app = window.App) {
+    if (!app || dashboardTrafficState.pending) return;
+    if (dashboardTrafficState.period === 'month') {
+      dashboardTrafficState.period = 'day';
+      if (dashboardTrafficState.daily) renderDashboardTrafficCard(dashboardTrafficState.daily, 'day', app);
+      updateDashboardTrafficToggleButton();
+      return;
+    }
+
+    dashboardTrafficState.daily = snapshotDashboardTrafficCard() || dashboardTrafficState.daily;
+    dashboardTrafficState.period = 'month';
+    if (dashboardTrafficState.monthly) {
+      renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+      updateDashboardTrafficToggleButton();
+      return;
+    }
+
+    dashboardTrafficState.pending = true;
+    renderDashboardTrafficCard({
+      count: '加载中...',
+      hint: '正在汇总本月 CF Zone 流量',
+      title: '本月流量按需加载',
+      detail: ' ',
+      badges: [{ label: '月统计: 加载中', tone: 'slate' }]
+    }, 'month', app);
+    updateDashboardTrafficToggleButton();
+    try {
+      const payload = await app.apiCall('getMonthlyTrafficStats');
+      dashboardTrafficState.monthly = buildMonthlyTrafficCardView(payload, app);
+      if (dashboardTrafficState.period === 'month') {
+        renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+      }
+    } catch (error) {
+      dashboardTrafficState.monthly = {
+        count: '加载失败',
+        hint: '本月流量查询失败',
+        title: String(error?.message || '未知错误'),
+        detail: String(error?.message || '未知错误'),
+        badges: [{ label: '月统计: 查询失败', tone: 'red' }]
+      };
+      if (dashboardTrafficState.period === 'month') {
+        renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+      }
+      app.showMessage?.('本月流量查询失败: ' + (error?.message || '未知错误'), { tone: 'error' });
+    } finally {
+      dashboardTrafficState.pending = false;
+      updateDashboardTrafficToggleButton();
+      scheduleIconRefresh(getDashboardTrafficNodes().card || document.body);
+    }
+  }
+
+  function syncDashboardTrafficToggle(app = window.App) {
+    const nodes = getDashboardTrafficNodes();
+    if (!app || !nodes.card || !nodes.count) return;
+    nodes.card.setAttribute('data-dashboard-traffic-card', '1');
+    nodes.label?.setAttribute('data-dashboard-traffic-label', '1');
+    if (!nodes.toggle) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.setAttribute('data-dashboard-traffic-toggle', '1');
+      button.innerHTML = '<i data-lucide="repeat-2" aria-hidden="true"></i>';
+      button.addEventListener('click', () => toggleDashboardTrafficPeriod(app));
+      nodes.card.appendChild(button);
+      nodes.toggle = button;
+      scheduleIconRefresh(nodes.card);
+    }
+    if (dashboardTrafficState.period === 'day' && !dashboardTrafficState.pending) {
+      dashboardTrafficState.daily = snapshotDashboardTrafficCard(nodes) || dashboardTrafficState.daily;
+      if (String(nodes.label?.textContent || '') !== '今日视频流量 (CF Zone 总流量)') {
+        nodes.label.textContent = '今日视频流量 (CF Zone 总流量)';
+      }
+    } else if (dashboardTrafficState.period === 'month' && dashboardTrafficState.monthly) {
+      const monthlyCount = String(dashboardTrafficState.monthly.count || '0 B');
+      if (
+        String(nodes.count.textContent || '') !== monthlyCount
+        || String(nodes.label?.textContent || '') !== '本月视频流量 (CF Zone 总流量)'
+      ) {
+        renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+      }
+    }
+    updateDashboardTrafficToggleButton(nodes);
+  }
+
   function patchSafetyContractMethods(app) {
     if (!app || patchedSafetyContractApp === app) return;
     patchedSafetyContractApp = app;
+
+    if (typeof app.applyDashboardStatsState === 'function') {
+      const applyDashboardStatsState = app.applyDashboardStatsState.bind(app);
+      app.applyDashboardStatsState = function applyDashboardStatsStateWithTrafficPeriod(...args) {
+        const result = applyDashboardStatsState(...args);
+        enqueue(() => {
+          const nodes = getDashboardTrafficNodes();
+          if (dashboardTrafficState.period === 'day') {
+            dashboardTrafficState.daily = snapshotDashboardTrafficCard(nodes) || dashboardTrafficState.daily;
+          } else if (dashboardTrafficState.monthly) {
+            renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+          }
+          syncDashboardTrafficToggle(app);
+        });
+        return result;
+      };
+    }
+    app.toggleDashboardTrafficPeriodFromUi = () => toggleDashboardTrafficPeriod(app);
 
     app.runPreviewedTidy = async function runPreviewedTidyWithPlanToken(rawScope = 'kv') {
       const scope = String(rawScope || 'kv').trim().toLowerCase() === 'd1' ? 'd1' : 'kv';

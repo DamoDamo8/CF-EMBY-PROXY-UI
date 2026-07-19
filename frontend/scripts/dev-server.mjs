@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 function resolvePort() {
   const rawValue = Number(process.env.PORT || process.env.VITE_DEV_PORT || 5173);
@@ -28,6 +29,7 @@ function resolveWslIpv4() {
 const port = resolvePort();
 const vendorMode = String(process.env.VITE_VENDOR_MODE || 'bundle').trim() || 'bundle';
 const wslIpv4 = resolveWslIpv4();
+const viteEntry = fileURLToPath(new URL('../node_modules/vite/bin/vite.js', import.meta.url));
 
 console.log('');
 console.log(`[dev] Vendor mode: ${vendorMode}`);
@@ -36,13 +38,13 @@ console.log(`[dev] Windows browser: http://localhost:${port}`);
 if (wslIpv4) {
   console.log(`[dev] WSL fallback IP: http://${wslIpv4}:${port}`);
 }
-console.log('[dev] 如果 Windows 无法通过 localhost 访问，可在 Windows PowerShell 中运行：');
+console.log('[dev] 如果 Windows 无法通过 localhost 访问，请在管理员 Windows PowerShell 中运行：');
 console.log(`[dev]   powershell -ExecutionPolicy Bypass -File .\\frontend\\scripts\\windows-portproxy.ps1 -Port ${port}`);
 console.log('');
 
 const child = spawn(
-  process.platform === 'win32' ? 'vite.cmd' : 'vite',
-  ['--host', '0.0.0.0', '--port', String(port)],
+  process.execPath,
+  [viteEntry, '--host', '0.0.0.0', '--port', String(port)],
   {
     stdio: 'inherit',
     env: {

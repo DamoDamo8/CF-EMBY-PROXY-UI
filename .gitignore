@@ -4,6 +4,7 @@ frontend/.env.local
 frontend/.env.*.local
 .dev.vars
 .dev.vars.*
+!.dev.vars.example
 .wrangler/
 npm-debug.log*
 .ace-tool/

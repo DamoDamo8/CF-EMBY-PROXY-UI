@@ -39,6 +39,8 @@
 
 管理台保持现有 SaaS 控制台结构，不新增第二套首页。
 
+Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上角的切换图标按需调用 `getMonthlyTrafficStats`，在今日与本月累计之间切换；本月数据不会随首屏自动加载，也不会刷新其他仪表盘卡片。月累计窗口按 `scheduleUtcOffsetMinutes` 从当月 1 日 00:00 计算到当前时刻，统计口径继续使用 Cloudflare `edgeResponseBytes`。
+
 ## 设置页
 
 视觉分区固定为八块：
@@ -93,6 +95,7 @@
 - `getSettingsBootstrap`
 - `getDashboardSnapshot`
 - `getDashboardStats`
+- `getMonthlyTrafficStats`
 - `getRuntimeStatus`
 
 ### 配置、备份与整理
@@ -160,6 +163,8 @@
 - `sendDailyReport`
 - `sendPredictedAlert`
 
+`sendDailyReport` 的综合日报在今日 CF Zone 总流量后追加本月累计流量；月累计与 Dashboard 本月流量卡复用同一统计口径和缓存链。
+
 `initLogsDb` 只初始化日志基础表、日志兼容列/索引和小时统计，不因 DNS、鉴权或 Cloudflare cache 表状态阻断；`initLogsFts` 在日志基础结构上重建可派生的 FTS5 表，只有结构复检和重建都成功时才返回 `ftsReady: true`。`initD1Schema` 是显式的全库运行时兼容初始化动作，会逐步补齐运行时表、日志表和小时统计，但不写入 Wrangler migration 记录。
 
 `getD1SchemaStatus` 每次显式检查都重新读取 `sqlite_master` 与 PRAGMA，核对完整必需列、运行时 upsert 依赖的主键/唯一键、命名索引所属表与键列顺序，返回 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 和 `issues`。只有要求的 migration 已记录且结构校验通过时 `schemaVersion` 才为 `5`；运行时补齐成功但 migration 未应用时只允许 `runtimeCompatibilityReady: true`。`tidyD1Data` 只执行保留期清理、统计/FTS 维护和 `PRAGMA optimize`，不得被用作跳过正式 migration apply 的升级入口。
@@ -178,6 +183,7 @@
 - 节点编辑弹窗采用紧凑表单密度：入口模式位于节点名称前；标签、备注和主视频流策略同一行，主视频流策略不展示额外说明；同时保持输入控件和线路操作按钮的可点击尺寸。
 - 发布源与 Worker 快捷更新设置区按“来源摘要、配置或派生地址、执行动作”分层；长 URL 不得撑破设置面板，主要更新动作与辅助刷新动作保持明确层级。
 - 默认“导出全局设置”必须明确提示结果已脱敏；专家模式才显示“导出含密钥设置”，并在请求前进行敏感操作确认。日志页专家模式显示“Schema 状态”和“初始化 Schema”，分别调用 `getD1SchemaStatus` 与 `initD1Schema`。
+- 视频流量卡的今日/本月切换由正式 runtime enhancement 挂载，使用 Lucide `repeat-2` 图标、固定点击区域和加载态；月统计只在用户首次切换时请求，切回今日直接恢复当前仪表盘快照。
 - `App.vue`、`src/features/*`、`src/composables/*` 不是当前首屏启动链。
 - 不把 `banker/.admin-ui.html` 或构建副本当作正式模板。
 - `check-cdn-paths.mjs` 必须按标签语义检查 `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch，覆盖单双引号、协议相对写法与无扩展 URL；同时检查占位符清空、`admin-bootstrap`、`#app`、禁止 importmap、任何 inline 动态 `import()`、禁止 `dist/assets/**`，并确认 `dist/index.html` 与同步后的 `index.html` 字节一致。

@@ -4,7 +4,7 @@ import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
 await import("../worker.js");
-const { Database } = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
+const { Database, GLOBALS, Logger } = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
 
 const MIGRATIONS_URL = new URL("../migrations/", import.meta.url);
 const REQUIRED_LOG_COLUMNS = new Map([
@@ -323,6 +323,232 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
     assert.equal(expressionStatus.constraints.uniqueKeys["dns_ip_pool_items.ip"], false);
     assert.ok(expressionStatus.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
     assert.equal(expressionStatus.migrationReady, false);
+  } finally {
+    database.close();
+  }
+});
+
+test("runtime D1 SQL executes against the fresh v5 schema", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+
+    const bootstrap = await Database.bootstrapD1Schema(d1, "logs-core");
+    assert.equal(bootstrap.runtimeTablesReady, true);
+    assert.equal(bootstrap.schemaReady, true);
+    assert.equal(bootstrap.statsReady, true);
+    assert.equal((await Database.ensureLogsFtsSchema(d1)).rebuilt, true);
+
+    await Database.upsertAuthFailureEntry(d1, "203.0.113.10", {
+      failCount: 2,
+      expiresAt: now + 60_000,
+      updatedAt: now
+    });
+    assert.equal((await Database.getAuthFailureEntry(d1, "203.0.113.10")).failCount, 2);
+    assert.equal(await Database.deleteAuthFailureEntry(d1, "203.0.113.10"), true);
+
+    await Database.putCfDashboardCacheEntry(d1, {
+      cacheKey: "dashboard:smoke",
+      zoneId: "zone-smoke",
+      bucketDate: "2026-07-19",
+      payload: { stats: { todayRequests: 1 } },
+      version: 1,
+      cachedAt: now,
+      expiresAt: now + 60_000,
+      updatedAt: now
+    });
+    assert.equal((await Database.getCfDashboardCacheEntry(d1, "dashboard:smoke"))?.zoneId, "zone-smoke");
+    assert.equal(await Database.deleteCfDashboardCacheEntry(d1, "dashboard:smoke"), true);
+
+    await Database.putCfRuntimeCacheEntry(d1, {
+      cacheKey: "runtime:smoke",
+      cacheGroup: "smoke",
+      resourceId: "resource-smoke",
+      payload: { ok: true },
+      cachedAt: now,
+      expiresAt: now + 60_000,
+      updatedAt: now
+    });
+    assert.equal((await Database.getCfRuntimeCacheEntry(d1, "runtime:smoke"))?.payload?.ok, true);
+
+    await Database.patchOpsStatus({ db: d1 }, {
+      log: { schemaReady: true, statsReady: true, ftsReady: true },
+      scheduled: { status: "smoke" }
+    });
+    assert.equal((await Database.getOpsStatusSection({ db: d1 }, "scheduled")).status, "smoke");
+
+    const dnsItems = await Database.upsertDnsIpPoolItems(d1, [{
+      id: "ip-smoke",
+      ip: "1.1.1.1",
+      ipType: "ipv4",
+      sourceKind: "custom",
+      sourceLabel: "smoke",
+      lineLabel: "line-a",
+      remark: "runtime SQL smoke",
+      createdAt: nowIso,
+      updatedAt: nowIso
+    }]);
+    assert.equal(dnsItems.length, 1);
+    assert.equal((await Database.getDnsIpPoolItems(d1)).length, 1);
+
+    await Database.persistDnsIpPoolSources({ db: d1 }, [{
+      id: "source-smoke",
+      name: "Smoke source",
+      url: "https://example.test/ips.txt",
+      sourceType: "url",
+      sourceKind: "custom",
+      enabled: true,
+      sortOrder: 0,
+      ipLimit: 5,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    }]);
+    assert.equal((await Database.getDnsIpPoolSourcesFromDb(d1)).length, 1);
+    assert.equal(await Database.updateDnsIpPoolSourceFetchState(d1, "source-smoke", {
+      lastFetchAt: nowIso,
+      lastFetchStatus: "success",
+      lastFetchCount: 1
+    }), true);
+
+    await Database.upsertDnsIpPoolFetchCacheEntry(d1, {
+      signature: "fetch-smoke",
+      items: dnsItems,
+      sourceResults: [],
+      importedCount: 1,
+      enabledSourceCount: 1,
+      cachedAtMs: now,
+      expiresAtMs: now + 60_000
+    });
+    assert.equal((await Database.getDnsIpPoolFetchCacheEntry(d1, "fetch-smoke"))?.importedCount, 1);
+
+    await Database.upsertDnsIpProbeCacheEntry(d1, {
+      ip: "1.1.1.1",
+      entryColo: "HKG",
+      probeStatus: "success",
+      latencyMs: 12,
+      probedAt: nowIso,
+      expiresAt: now + 60_000
+    });
+    assert.equal((await Database.getDnsIpProbeCacheEntry(d1, "1.1.1.1", "HKG"))?.latencyMs, 12);
+    assert.equal((await Database.getDnsIpProbeCacheEntries(d1, ["1.1.1.1"], "HKG")).length, 1);
+
+    await Database.upsertStatsHourlyBuckets(d1, [{
+      bucketDate: "2026-07-19",
+      bucketHour: 12,
+      requestCount: 3,
+      playCount: 1,
+      playbackInfoCount: 1
+    }]);
+    assert.equal((await Database.getDailyStatsHourly(d1, "2026-07-19"))[0]?.request_count, 3);
+
+    const lease = await Database.tryAcquireScheduledLeaseWithDb(d1, {
+      token: "lease-smoke",
+      owner: "test",
+      leaseMs: 60_000
+    });
+    assert.equal(lease.acquired, true);
+    assert.equal((await Database.renewScheduledLeaseWithDb(d1, "lease-smoke", 60_000, { owner: "test" }))?.token, "lease-smoke");
+    assert.equal(await Database.releaseScheduledLeaseWithDb(d1, "lease-smoke"), true);
+
+    GLOBALS.LogQueue.length = 0;
+    GLOBALS.LogQueue.push({
+      timestamp: now,
+      nodeName: "runtime-node",
+      requestPath: "/Items/runtime",
+      requestMethod: "GET",
+      statusCode: 404,
+      responseTime: 8,
+      clientIp: "203.0.113.20",
+      inboundColo: "HKG",
+      outboundColo: "SJC",
+      userAgent: "runtime-smoke-agent",
+      referer: "",
+      category: "api",
+      errorDetail: "runtime SQL smoke",
+      detailJson: JSON.stringify({ deliveryMode: "direct", protocolFailureReason: "timeout" }),
+      createdAt: nowIso
+    });
+    await Logger.flush({ DB: d1 });
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM proxy_logs WHERE node_name = ?").get("runtime-node").total, 1);
+
+    const likeResponse = await Database.ApiHandlers.getLogs({
+      page: 1,
+      pageSize: 10,
+      paginationMode: "offset",
+      filters: {
+        keyword: "runtime",
+        searchMode: "like",
+        requestGroup: "api",
+        statusGroup: "4xx",
+        deliveryMode: "direct",
+        protocolFailureReason: "timeout"
+      }
+    }, { db: d1, env: { DB: d1 } });
+    assert.equal(likeResponse.status, 200);
+    assert.equal((await likeResponse.json()).logs.length, 1);
+
+    const ftsResponse = await Database.ApiHandlers.getLogs({
+      page: 1,
+      pageSize: 10,
+      filters: { keyword: "runtime", searchMode: "fts" }
+    }, { db: d1, env: { DB: d1 } });
+    assert.equal(ftsResponse.status, 200);
+    assert.equal((await ftsResponse.json()).logs.length, 1);
+
+    database.exec(`
+      INSERT INTO proxy_logs (
+        timestamp, node_name, request_path, request_method, status_code, response_time,
+        client_ip, category, created_at
+      ) VALUES (1, 'expired-node', '/expired', 'GET', 200, 1, '198.51.100.1', 'api', '1970-01-01T00:00:00.001Z');
+      INSERT INTO sys_locks (scope, token, owner, acquired_at, expires_at)
+        VALUES ('expired-smoke', 'expired', 'test', 1, 1);
+      INSERT INTO dns_ip_pool_fetch_cache (
+        signature, items_json, source_results_json, imported_count, enabled_source_count,
+        cached_at, expires_at, created_at, updated_at
+      ) VALUES ('expired-smoke', '[]', '[]', 0, 0, 1, 1, '1970-01-01T00:00:00.001Z', '1970-01-01T00:00:00.001Z');
+      INSERT INTO dns_ip_probe_cache (ip, entry_colo, probe_status, probed_at, expires_at)
+        VALUES ('198.51.100.2', 'HKG', 'success', '1970-01-01T00:00:00.001Z', 1);
+      INSERT INTO auth_failures (ip, fail_count, expires_at, updated_at)
+        VALUES ('198.51.100.10', 1, 1, 1);
+      INSERT INTO cf_dashboard_cache (
+        cache_key, zone_id, bucket_date, payload, version, cached_at, expires_at, updated_at
+      ) VALUES ('expired-smoke', 'zone', '1970-01-01', '{}', 1, 1, 1, 1);
+      INSERT INTO cf_runtime_cache (
+        cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
+      ) VALUES ('expired-smoke', 'test', 'test', '{}', 1, 1, 1);
+    `);
+    const tidyPlan = await Database.buildD1TidyPlan({ DB: d1 }, {
+      db: d1,
+      config: { logRetentionDays: 7 },
+      mode: "manual",
+      maintenanceMode: "smart",
+      nowMs: now
+    });
+    const tidyResult = await Database.applyD1TidyPlan(tidyPlan, {
+      env: { DB: d1 },
+      db: d1,
+      mode: "manual"
+    });
+    assert.equal(tidyResult.summary.status, "success");
+    for (const [tableName, columnName, value] of [
+      ["proxy_logs", "node_name", "expired-node"],
+      ["sys_locks", "scope", "expired-smoke"],
+      ["dns_ip_pool_fetch_cache", "signature", "expired-smoke"],
+      ["dns_ip_probe_cache", "ip", "198.51.100.2"],
+      ["auth_failures", "ip", "198.51.100.10"],
+      ["cf_dashboard_cache", "cache_key", "expired-smoke"],
+      ["cf_runtime_cache", "cache_key", "expired-smoke"]
+    ]) {
+      const expiredCount = database.prepare(`SELECT COUNT(*) AS total FROM ${tableName} WHERE ${columnName} = ?`)
+        .get(value)
+        .total;
+      assert.equal(expiredCount, 0, `expired row remained in ${tableName}`);
+    }
+
+    assert.equal(await Database.deleteDnsIpPoolItems(d1, ["1.1.1.1"]), 1);
   } finally {
     database.close();
   }

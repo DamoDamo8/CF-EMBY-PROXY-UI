@@ -39,17 +39,24 @@ const CACHE_DEFAULTS = Object.freeze({
   NodeMissCacheTtlMs: 1000,
   CryptoKeyCacheTTL: 86400,
   CryptoKeyCacheMax: 100,
-  NodeCacheMax: 5000,
+  NodeCacheMax: 512,
   PlaybackRouteHotCacheTtlMs: 86400 * 1000,
-  PlaybackRouteHotCacheMax: 1000,
+  PlaybackRouteHotCacheMax: 256,
   NodesRevisionCacheTtlMs: 1000,
   NodesReadConcurrency: 12,
   CacheTtlImagesDays: 30,
   PingCacheMinutes: 10,
   PlaybackInfoCacheTtlSec: 60,
-  PlaybackInfoCacheMax: 500,
+  PlaybackInfoCacheMax: 64,
+  PlaybackInfoCacheEntryMaxBytes: 256 * 1024,
+  PlaybackInfoCacheTotalMaxBytes: 4 * 1024 * 1024,
   VideoProgressForwardIntervalSec: 3,
-  VideoProgressForwardSessionMax: 1000,
+  VideoProgressForwardSessionMax: 128,
+  VideoProgressSnapshotMaxBytes: 32 * 1024,
+  RateLimitCacheMax: 4096,
+  D1SchemaReadyTtlMs: 10 * 60 * 1000,
+  OpsStatusReadCacheTtlMs: 15 * 1000,
+  AdminShellStatusStableWriteIntervalMs: 5 * 60 * 1000,
   CleanupBudgetMs: 1,
   CleanupChunkSize: 64,
   CleanupMinIntervalMs: 1000
@@ -68,7 +75,7 @@ const LOG_DEFAULTS = Object.freeze({
   LogRetentionDays: 7,
   LogRetentionDaysMax: 365,
   LogFlushDelayMinutes: 20,
-  LogFlushCountThreshold: 50,
+  LogFlushCountThreshold: 100,
   LogBatchChunkSize: 50,
   LogBatchRetryCount: 2,
   LogBatchRetryBackoffMs: 75,
@@ -86,7 +93,11 @@ const LOG_DEFAULTS = Object.freeze({
   TgAlertKvUsageEnabled: false,
   TgAlertKvUsageThresholdPercent: 80,
   TgAlertD1UsageEnabled: false,
-  TgAlertD1UsageThresholdPercent: 80
+  TgAlertD1UsageThresholdPercent: 80,
+  LogQueueMax: 512,
+  LogQueueOverflowDropCount: 256,
+  LogDedupeMax: 2048,
+  LogDedupeTrimTarget: 1024
 });
 
 const KV_TIDY_PLAN_TOKEN_TTL_MS = 10 * 60 * 1000;
@@ -116,7 +127,7 @@ const PROXY_DEFAULTS = Object.freeze({
   UpstreamRetryAttempts: 0,
   ProxyStreamIdleTimeoutMs: 15000,
   ProxyPlaylistIdleTimeoutMs: 12000,
-  BufferedRetryBodyMaxBytes: 2 * 1024 * 1024,
+  BufferedRetryBodyMaxBytes: 256 * 1024,
   PrewarmCacheTtl: 120,
   MetadataPrewarmTimeoutMs: 3000,
   PrewarmPrefetchBytes: 4 * 1024 * 1024,
@@ -176,10 +187,18 @@ const DEFAULT_METADATA_PREWARM_TIMEOUT_MS = PROXY_DEFAULTS.MetadataPrewarmTimeou
 const DEFAULT_PREWARM_CACHE_TTL_SEC = PROXY_DEFAULTS.PrewarmCacheTtl;
 const DEFAULT_PLAYBACK_INFO_MODE = PROXY_DEFAULTS.DefaultPlaybackInfoMode;
 const DEFAULT_PLAYBACK_INFO_CACHE_TTL_SEC = CACHE_DEFAULTS.PlaybackInfoCacheTtlSec;
+const DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheEntryMaxBytes;
+const DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheTotalMaxBytes;
 const DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgressForwardIntervalSec;
+const DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES = CACHE_DEFAULTS.VideoProgressSnapshotMaxBytes;
 const DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
+const REMOTE_JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
+const REMOTE_ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
+const ADMIN_JSON_REQUEST_MAX_BYTES = 4 * 1024 * 1024;
+const LOGIN_JSON_REQUEST_MAX_BYTES = 16 * 1024;
+const METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
 
 const Config = {
   Defaults: CONFIG_DEFAULTS
@@ -233,6 +252,7 @@ const GLOBAL_CACHE_STATE = {
   NodesIndexCache: null,
   PlaybackInfoResponseCache: new Map(),
   PlaybackProgressRelay: new Map(),
+  DashboardMonthlyTrafficCache: new Map(),
   SingleFlightTasks: new Map(),
   RuntimeConfigCacheGeneration: 0,
   NodesRevisionCacheGeneration: 0,
@@ -241,7 +261,8 @@ const GLOBAL_CACHE_STATE = {
   NodeCacheGenerationEvictionEpoch: 0,
   NodeCacheGenerations: new Map(),
   AdminRemoteShellCacheMutationChains: new Map(),
-  LogsReadinessProbeCache: new WeakMap()
+  LogsReadinessProbeCache: new WeakMap(),
+  ProxyAccessRuleProfileCache: new WeakMap()
 };
 
 const GLOBAL_RUNTIME_STATE = {
@@ -253,7 +274,11 @@ const GLOBAL_RUNTIME_STATE = {
       playbackRoute: null,
       crypto: null,
       rate: null,
-      log: null
+      log: null,
+      playbackInfo: null,
+      failover: null,
+      progress: null,
+      monthlyTraffic: null
     }
   },
   LogQueue: [],
@@ -271,11 +296,13 @@ const GLOBAL_RUNTIME_STATE = {
 };
 
 const GLOBAL_DB_READY_STATE = {
+  D1SchemaReadyState: new WeakMap(),
   LogsBaseDbReady: new WeakMap(),
   StatsHourlyDbReady: new WeakMap(),
   DnsIpWorkspaceDbReady: new WeakMap(),
   OpsStatusDbReady: new WeakMap(),
   OpsStatusShadowCache: new WeakMap(),
+  AdminShellStatusWriteState: new WeakMap(),
   ScheduledLeaseDbReady: new WeakMap(),
   AuthFailuresDbReady: new WeakMap(),
   CfDashboardCacheDbReady: new WeakMap(),
@@ -786,7 +813,7 @@ function getDailyTelegramMetricPercentText(metrics = [], acceptedKeys = []) {
 }
 
 function buildDailyTelegramSummaryMessage(summary = {}, scheduleContext = {}) {
-  /** @type {{ zoneName?: string, requestCountDisplay?: string, requestSourceText?: string, todayTraffic?: string, trafficSourceText?: string, playCount?: number, infoCount?: number, nodeCount?: number, todayRequests?: number | null }} */
+  /** @type {{ zoneName?: string, requestCountDisplay?: string, requestSourceText?: string, todayTraffic?: string, monthlyTraffic?: string, trafficSourceText?: string, playCount?: number, infoCount?: number, nodeCount?: number, todayRequests?: number | null }} */
   const safeSummary = summary && typeof summary === "object" ? summary : {};
   /** @type {{ offsetLabel?: string, dateKey?: string }} */
   const safeContext = scheduleContext && typeof scheduleContext === "object" ? scheduleContext : {};
@@ -795,6 +822,7 @@ function buildDailyTelegramSummaryMessage(summary = {}, scheduleContext = {}) {
       ? "暂不可用"
       : String(Number(safeSummary.todayRequests) || 0));
   const todayTraffic = String(safeSummary.todayTraffic || "").trim() || "暂不可用";
+  const monthlyTraffic = String(safeSummary.monthlyTraffic || "").trim() || "暂不可用";
   const playCount = Math.max(0, Number(safeSummary.playCount) || 0);
   const infoCount = Math.max(0, Number(safeSummary.infoCount) || 0);
   const dateSuffix = safeContext.dateKey ? ` (${safeContext.dateKey})` : "";
@@ -803,6 +831,7 @@ function buildDailyTelegramSummaryMessage(summary = {}, scheduleContext = {}) {
     "",
     `请求数: ${requestCountDisplay}`,
     `视频流量 (CF 总计): ${todayTraffic}`,
+    `本月流量 (CF 总计): ${monthlyTraffic}`,
     `请求: 播放请求 ${formatCount(playCount)} 次 | 获取播放信息 ${formatCount(infoCount)} 次`,
     "#Cloudflare #Emby #日报"
   ];
@@ -1453,9 +1482,13 @@ function getAdminPath(env) {
   return normalizeAdminPath(env?.ADMIN_PATH);
 }
 
+function buildAdminLoginPath(adminPath = "/admin") {
+  const normalizedAdminPath = normalizeAdminPath(adminPath);
+  return normalizedAdminPath === "/" ? "/login" : `${normalizedAdminPath}/login`;
+}
+
 function getAdminLoginPath(env) {
-  const adminPath = getAdminPath(env);
-  return adminPath === "/" ? "/login" : `${adminPath}/login`;
+  return buildAdminLoginPath(getAdminPath(env));
 }
 
 function getReservedNodeNameEntries(env) {
@@ -1582,12 +1615,16 @@ function serializeInlineJson(value) {
     .replace(/\u2029/g, "\\u2029");
 }
 
-function buildInitHealth(env) {
+function buildInitHealth(env, resolvedPaths = null) {
   const missing = [];
   if (!env?.JWT_SECRET) missing.push("JWT_SECRET");
   if (!env?.ADMIN_PASS) missing.push("ADMIN_PASS");
-  const adminPath = getAdminPath(env);
-  const loginPath = getAdminLoginPath(env);
+  const adminPath = typeof resolvedPaths?.adminPath === "string"
+    ? resolvedPaths.adminPath
+    : getAdminPath(env);
+  const loginPath = typeof resolvedPaths?.loginPath === "string"
+    ? resolvedPaths.loginPath
+    : buildAdminLoginPath(adminPath);
   return {
     ok: missing.length === 0,
     missing,
@@ -1599,11 +1636,12 @@ function buildInitHealth(env) {
   };
 }
 
-function warnInitHealthOnce(env) {
-  const health = buildInitHealth(env);
+function warnInitHealthOnce(env, resolvedPaths = null) {
+  const health = buildInitHealth(env, resolvedPaths);
   if (health.ok) return health;
   const fingerprint = health.missing.join("|") || "unknown";
   if (!GLOBALS.InitCheckWarnedFingerprints.has(fingerprint)) {
+    if (GLOBALS.InitCheckWarnedFingerprints.size >= 32) GLOBALS.InitCheckWarnedFingerprints.clear();
     GLOBALS.InitCheckWarnedFingerprints.add(fingerprint);
     console.warn(`[Init Check] ${health.message} 管理入口: ${health.adminPath}`);
   }
@@ -3053,7 +3091,7 @@ function invalidatePlaybackProgressRelayForNodes(nodeNames = []) {
   for (const [sessionKey, entry] of relayMap.entries()) {
     const entryNodeName = String(entry?.nodeName || entry?.pendingSnapshot?.nodeName || "").trim().toLowerCase();
     if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
-    relayMap.delete(sessionKey);
+    deletePlaybackProgressRelayEntry(sessionKey);
   }
 }
 
@@ -3833,6 +3871,52 @@ function decodeBufferedBodyText(buffer) {
   }
 }
 
+async function readResponseBytesWithLimit(response, maxBytes) {
+  const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
+  const declaredBytes = parseContentLengthHeader(response?.headers?.get?.("Content-Length"));
+  if (Number.isFinite(declaredBytes) && declaredBytes > limit) {
+    try { Promise.resolve(response?.body?.cancel?.()).catch(() => {}); } catch {}
+    return { bodyBytes: new Uint8Array(0), bytes: declaredBytes, exceeded: true };
+  }
+  if (!response?.body) return { bodyBytes: new Uint8Array(0), bytes: 0, exceeded: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+      if ((totalBytes + chunk.byteLength) > limit) {
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
+        return { bodyBytes: new Uint8Array(0), bytes: totalBytes + chunk.byteLength, exceeded: true };
+      }
+      chunks.push(chunk);
+      totalBytes += chunk.byteLength;
+    }
+  } catch {
+    return { bodyBytes: new Uint8Array(0), bytes: totalBytes, exceeded: true };
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  const bodyBytes = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bodyBytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { bodyBytes, bytes: totalBytes, exceeded: false };
+}
+
+async function readResponseTextWithLimit(response, maxBytes) {
+  const result = await readResponseBytesWithLimit(response, maxBytes);
+  return {
+    text: result.exceeded ? "" : new TextDecoder().decode(result.bodyBytes),
+    bytes: result.bytes,
+    exceeded: result.exceeded
+  };
+}
+
 function normalizeCaseInsensitiveObject(input = {}) {
   const normalized = {};
   if (!input || typeof input !== "object" || Array.isArray(input)) return normalized;
@@ -3943,6 +4027,10 @@ function resolveEffectiveRoutingDecisionMode(node = {}, currentConfig = {}) {
 const CF_DASH_CACHE_VERSION = 8;
 const CF_DASH_CACHE_DB_KEY_PREFIX = "cf_dashboard_cache:";
 const LEGACY_CF_DASH_CACHE_KV_KEY_PREFIX = "sys:cf_dash_cache";
+const DASHBOARD_MONTHLY_TRAFFIC_CACHE_VERSION = 1;
+const DASHBOARD_MONTHLY_TRAFFIC_CACHE_TTL_MS = 30 * 60 * 1000;
+const DASHBOARD_MONTHLY_TRAFFIC_STALE_TTL_MS = 24 * 60 * 60 * 1000;
+const DASHBOARD_MONTHLY_TRAFFIC_CACHE_MAX = 64;
 
 function makeCfDashCacheDbKey(zoneId, dateKey = "") {
   const safeZoneId = encodeURIComponent(String(zoneId || "default").trim() || "default");
@@ -3954,6 +4042,58 @@ function makeLegacyCfDashCacheKvKey(zoneId, dateKey = "") {
   const safeZoneId = encodeURIComponent(String(zoneId || "default").trim() || "default");
   const safeDateKey = encodeURIComponent(String(dateKey || "current").trim() || "current");
   return `${LEGACY_CF_DASH_CACHE_KV_KEY_PREFIX}:${safeZoneId}:${safeDateKey}`;
+}
+
+function buildOffsetMonthWindow(now = new Date(), utcOffsetMinutes = Config.Defaults.ScheduleUtcOffsetMinutes) {
+  const context = buildScheduleLocalContext(now, utcOffsetMinutes);
+  const year = context.shiftedDate.getUTCFullYear();
+  const monthIndex = context.shiftedDate.getUTCMonth();
+  const startTs = Date.UTC(year, monthIndex, 1) - context.utcOffsetMinutes * 60 * 1000;
+  const nextMonthTs = Date.UTC(year, monthIndex + 1, 1) - context.utcOffsetMinutes * 60 * 1000;
+  const nowTimestamp = context.now.getTime();
+  return {
+    ...context,
+    monthKey: `${year}-${String(monthIndex + 1).padStart(2, "0")}`,
+    periodLabel: `${year}年${monthIndex + 1}月`,
+    startTs,
+    endTs: Math.min(Math.max(startTs, nowTimestamp), nextMonthTs - 1),
+    nextMonthTs
+  };
+}
+
+function makeDashboardMonthlyTrafficCacheKey(zoneId = "", monthKey = "", utcOffsetMinutes = 0) {
+  return [
+    "dashboard_monthly_traffic",
+    DASHBOARD_MONTHLY_TRAFFIC_CACHE_VERSION,
+    encodeURIComponent(String(zoneId || "default").trim() || "default"),
+    encodeURIComponent(String(monthKey || "current").trim() || "current"),
+    normalizeScheduleUtcOffsetMinutes(utcOffsetMinutes)
+  ].join(":");
+}
+
+function makeDashboardMonthlyTrafficCacheRequest(cacheKey = "") {
+  const normalizedKey = String(cacheKey || "").trim();
+  if (!normalizedKey) return null;
+  return new Request(`https://dashboard-monthly-traffic-cache.invalid/${encodeURIComponent(normalizedKey)}`);
+}
+
+function normalizeDashboardMonthlyTrafficPayload(raw = {}) {
+  const data = raw && typeof raw === "object" ? { ...raw } : {};
+  return {
+    period: "month",
+    periodKey: String(data.periodKey || "").trim(),
+    periodLabel: String(data.periodLabel || "本月").trim() || "本月",
+    traffic: String(data.traffic || "0 B").trim() || "0 B",
+    totalBytes: Math.max(0, Number(data.totalBytes) || 0),
+    cfAnalyticsLoaded: data.cfAnalyticsLoaded === true,
+    cfAnalyticsStatus: String(data.cfAnalyticsStatus || "").trim(),
+    cfAnalyticsError: String(data.cfAnalyticsError || "").trim(),
+    cfAnalyticsDetail: String(data.cfAnalyticsDetail || "").trim(),
+    trafficSourceText: String(data.trafficSourceText || "本月视频流量口径：CF Zone 总流量（edgeResponseBytes）").trim(),
+    generatedAt: String(data.generatedAt || "").trim(),
+    cacheStatus: String(data.cacheStatus || "live").trim().toLowerCase() || "live",
+    warning: String(data.warning || "").trim()
+  };
 }
 
 function sanitizeDashboardRequestSourceText(value = "", requestSource = "") {
@@ -4329,10 +4469,9 @@ async function fetchCloudflareApiJson(url, apiToken, init = {}) {
       ...extraHeaders
     }
   });
-  let rawText = "";
-  try {
-    rawText = await res.text();
-  } catch {}
+  const responseBody = await readResponseTextWithLimit(res, REMOTE_JSON_RESPONSE_MAX_BYTES);
+  if (responseBody.exceeded) throw new Error("cf_api_response_too_large");
+  const rawText = responseBody.text;
   /** @type {JsonApiEnvelope|null} */
   let payload = null;
   if (rawText) {
@@ -4366,8 +4505,10 @@ async function fetchCloudflareGraphQL(apiToken, query, variables) {
     body: JSON.stringify(body)
   });
   if (!cfRes.ok) throw new Error(`cf_graphql_http_${cfRes.status}`);
+  const responseBody = await readResponseTextWithLimit(cfRes, REMOTE_JSON_RESPONSE_MAX_BYTES);
+  if (responseBody.exceeded) throw new Error("cf_graphql_response_too_large");
   /** @type {JsonApiEnvelope} */
-  const cfData = await cfRes.json();
+  const cfData = JSON.parse(responseBody.text);
   if (Array.isArray(cfData?.errors) && cfData.errors.length) {
     throw new Error(cfData.errors.map(item => item?.message).filter(Boolean).join("; ") || "cf_graphql_error");
   }
@@ -5409,6 +5550,7 @@ const GITHUB_API_PAGE_SIZE = 100;
 const GITHUB_API_MAX_PAGES = 10;
 const GITHUB_TAG_REACHABILITY_CONCURRENCY = 6;
 const GITHUB_API_USER_AGENT = "cf-emby-proxy-ui-release-source/1.0";
+const LOG_DETAIL_JSON_MAX_LENGTH = 8192;
 
 function readGithubApiToken(env = null) {
   const primaryToken = String(env?.GITHUB_TOKEN || "").trim();
@@ -5465,9 +5607,11 @@ async function readGithubApiFailurePayload(response) {
   let apiMessage = "";
   let documentationUrl = "";
   let bodySnippet = "";
+  const bodyResult = await readResponseTextWithLimit(response.clone(), REMOTE_ERROR_RESPONSE_MAX_BYTES);
+  const rawText = bodyResult.text.trim();
   if (contentType.includes("json")) {
     try {
-      const errorPayload = await response.clone().json();
+      const errorPayload = JSON.parse(rawText);
       apiMessage = String(
         errorPayload?.message
         || errorPayload?.error_description
@@ -5478,10 +5622,7 @@ async function readGithubApiFailurePayload(response) {
     } catch {}
   }
   if (!apiMessage) {
-    try {
-      const rawText = String(await response.clone().text() || "").trim();
-      if (rawText) bodySnippet = rawText.slice(0, 280);
-    } catch {}
+    if (rawText) bodySnippet = rawText.slice(0, 280);
   }
   return {
     apiMessage,
@@ -5627,7 +5768,45 @@ async function fetchGithubApiJson(pathname = "", options = {}) {
     );
   }
 
-  return response.json();
+  const responseBody = await readResponseTextWithLimit(response, REMOTE_JSON_RESPONSE_MAX_BYTES);
+  const responseDetails = {
+    repo: FIXED_GITHUB_RELEASE_REPO,
+    owner,
+    repository: repo,
+    url: url.toString(),
+    maxBytes: REMOTE_JSON_RESPONSE_MAX_BYTES
+  };
+  if (responseBody.exceeded) {
+    throw createStructuredConfigError(
+      "GITHUB_RELEASE_SOURCE_RESPONSE_TOO_LARGE",
+      `GitHub API 成功响应超过 ${REMOTE_JSON_RESPONSE_MAX_BYTES} 字节上限`,
+      502,
+      responseDetails
+    );
+  }
+  try {
+    return JSON.parse(responseBody.text);
+  } catch {
+    throw createStructuredConfigError(
+      "GITHUB_RELEASE_SOURCE_RESPONSE_INVALID",
+      "GitHub API 成功响应不是有效 JSON",
+      502,
+      responseDetails
+    );
+  }
+}
+
+function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LENGTH) {
+  const limit = Math.max(2, Math.floor(Number(maxLength) || LOG_DETAIL_JSON_MAX_LENGTH));
+  let serialized = "";
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    serialized = "";
+  }
+  if (serialized && serialized.length <= limit) return serialized;
+  const truncated = JSON.stringify({ truncated: true });
+  return truncated.length <= limit ? truncated : "{}";
 }
 
 async function fetchGithubApiCollection(pathname = "", options = {}) {
@@ -6003,20 +6182,10 @@ async function fetchGithubReleaseWorkerScriptSource(config = {}, overrides = {})
     );
   }
 
-  const scriptContent = await response.text();
-  const scriptBytes = new TextEncoder().encode(String(scriptContent || "")).length;
-  if (!String(scriptContent || "").trim()) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_EMPTY",
-      "Release worker.js 资产为空，无法更新 Worker",
-      400,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        effectiveRef: indexState.effectiveRef
-      }
-    );
-  }
-  if (scriptBytes > GITHUB_RELEASE_WORKER_MAX_BYTES) {
+  const scriptBody = await readResponseTextWithLimit(response, GITHUB_RELEASE_WORKER_MAX_BYTES);
+  const scriptContent = scriptBody.text;
+  const scriptBytes = scriptBody.bytes;
+  if (scriptBody.exceeded || scriptBytes > GITHUB_RELEASE_WORKER_MAX_BYTES) {
     throw createStructuredConfigError(
       "WORKER_RELEASE_TOO_LARGE",
       `Release worker.js 资产体积超过限制（${scriptBytes} bytes）`,
@@ -6025,6 +6194,17 @@ async function fetchGithubReleaseWorkerScriptSource(config = {}, overrides = {})
         sourceUrl: indexState.workerSourceUrl,
         contentLength: scriptBytes,
         maxBytes: GITHUB_RELEASE_WORKER_MAX_BYTES
+      }
+    );
+  }
+  if (!String(scriptContent || "").trim()) {
+    throw createStructuredConfigError(
+      "WORKER_RELEASE_EMPTY",
+      "Release worker.js 资产为空，无法更新 Worker",
+      400,
+      {
+        sourceUrl: indexState.workerSourceUrl,
+        effectiveRef: indexState.effectiveRef
       }
     );
   }
@@ -7590,8 +7770,10 @@ async function normalizeJsonApiResponse(response) {
   Object.entries(corsHeaders).forEach(([k, v]) => headers.set(k, v));
   applySecurityHeaders(headers);
   if (response.ok) return new Response(response.body, { status: response.status, headers });
-  let payload = null, fallbackText = "";
-  try { payload = await response.clone().json(); } catch { fallbackText = await response.text().catch(() => ""); }
+  const bodyResult = await readResponseTextWithLimit(response, REMOTE_ERROR_RESPONSE_MAX_BYTES);
+  let payload = null;
+  const fallbackText = bodyResult.text;
+  try { payload = JSON.parse(fallbackText); } catch {}
   const code = payload?.error?.code || (typeof payload?.error === "string" ? payload.error.toUpperCase() : `HTTP_${response.status}`);
   const message = payload?.error?.message || payload?.message || (typeof payload?.error === "string" ? payload.error : fallbackText || response.statusText || "request_failed");
   const details = payload?.error?.details ?? payload?.details ?? null;
@@ -7811,6 +7993,37 @@ function setBoundedMapEntry(map, key, value, maxSize) {
     if (oldestKey === undefined) break;
     map.delete(oldestKey);
   }
+}
+
+function releasePlaybackProgressRelayEntry(entry) {
+  if (!entry || typeof entry !== "object") return;
+  entry.pendingSnapshot = null;
+  entry.scheduledFlushAt = 0;
+  entry.waitUntilCtx = null;
+}
+
+function deletePlaybackProgressRelayEntry(sessionKey) {
+  const relayMap = GLOBALS.PlaybackProgressRelay;
+  if (!(relayMap instanceof Map)) return false;
+  const entry = relayMap.get(sessionKey);
+  if (entry) releasePlaybackProgressRelayEntry(entry);
+  return relayMap.delete(sessionKey);
+}
+
+function setBoundedPlaybackProgressRelayEntry(sessionKey, entry) {
+  const relayMap = GLOBALS.PlaybackProgressRelay;
+  if (!(relayMap instanceof Map)) return entry;
+  if (relayMap.has(sessionKey)) relayMap.delete(sessionKey);
+  relayMap.set(sessionKey, entry);
+  const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+  while (relayMap.size > maxEntries) {
+    const oldestKey = relayMap.keys().next().value;
+    if (oldestKey === undefined) break;
+    const oldestEntry = relayMap.get(oldestKey);
+    if (oldestKey !== sessionKey) releasePlaybackProgressRelayEntry(oldestEntry);
+    relayMap.delete(oldestKey);
+  }
+  return entry;
 }
 
 function touchMapEntry(map, key) {
@@ -8743,7 +8956,9 @@ async function fetchDnsIpItemsFromUrlSource(source = {}, maxBytes = Config.Defau
       signal: controller.signal
     });
     if (!res.ok) throw new Error(`HTTP_${res.status}`);
-    const text = String(await res.text()).slice(0, maxBytes);
+    const bodyResult = await readResponseTextWithLimit(res, maxBytes);
+    if (bodyResult.exceeded) throw new Error("SOURCE_TOO_LARGE");
+    const text = bodyResult.text;
     const builtinId = normalizeDnsIpPoolBuiltInSourceId(source?.builtinId || source?.builtin_id || "");
     const extractedItems = builtinId === "all"
       ? extractStructuredDnsIpCandidatesFromCarrierHtml(text)
@@ -8785,7 +9000,8 @@ async function queryDnsJsonResolverAnswers(resolver = {}, domain = "", recordTyp
       signal: controller.signal
     });
     if (!res.ok) throw new Error(`DOH_HTTP_${res.status}`);
-    const payload = await res.json().catch(() => null);
+    const responseBody = await readResponseTextWithLimit(res, REMOTE_ERROR_RESPONSE_MAX_BYTES);
+    const payload = responseBody.exceeded ? null : JSON.parse(responseBody.text || "null");
     return extractIpListFromDnsAnswers(payload).map(item => ({
       ...item,
       sourceKind: "domain",
@@ -9565,18 +9781,22 @@ const Auth = {
       let password = "";
       const ct = request.headers.get("content-type") || "";
       if (ct.includes("application/json")) {
-        const body = await request.json();
+        const bodyResult = await readResponseTextWithLimit(request, LOGIN_JSON_REQUEST_MAX_BYTES);
+        if (bodyResult.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
+        const body = JSON.parse(bodyResult.text || "{}");
         password = (body.password || "").trim();
       }
       if (!env.JWT_SECRET) return jsonError("SERVER_MISCONFIGURED", "JWT_SECRET 未配置", 503);
       if (!env.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
       if (password && password === env.ADMIN_PASS) {
-        await withNonCriticalFallback(
-          Database.deleteAuthFailureEntry(db, ip),
-          "auth.login.clear_auth_failure",
-          { ip },
-          false
-        );
+        if (failEntry) {
+          await withNonCriticalFallback(
+            Database.deleteAuthFailureEntry(db, ip),
+            "auth.login.clear_auth_failure",
+            { ip },
+            false
+          );
+        }
         const jwt = await this.generateJwt(env.JWT_SECRET, expSeconds);
         return jsonResponse({ ok: true, expiresIn: expSeconds }, 200, { "Set-Cookie": `auth_token=${jwt}; Path=${adminCookiePath}; Max-Age=${expSeconds}; HttpOnly; Secure; SameSite=Strict` });
       }
@@ -9670,7 +9890,17 @@ const CacheManager = {
     const budget = Config.Defaults.CleanupBudgetMs;
     const chunkSize = Config.Defaults.CleanupChunkSize;
     const state = GLOBALS.CleanupState;
-    const iterators = state.iterators || (state.iterators = { node: null, playbackRoute: null, crypto: null, rate: null, log: null });
+    const iterators = state.iterators || (state.iterators = {
+      node: null,
+      playbackRoute: null,
+      crypto: null,
+      rate: null,
+      log: null,
+      playbackInfo: null,
+      failover: null,
+      progress: null,
+      monthlyTraffic: null
+    });
     const start = now;
     const cleanMap = (map, shouldDelete, iteratorKey) => {
       let iterator = iterators[iteratorKey];
@@ -9679,7 +9909,7 @@ const CacheManager = {
         iterators[iteratorKey] = iterator;
       }
       let scanned = 0;
-      while (scanned < chunkSize && (nowMs() - start) < budget) {
+      while (scanned < chunkSize && (scanned === 0 || (nowMs() - start) < budget)) {
         const next = iterator.next();
         if (next.done) {
           iterators[iteratorKey] = null;
@@ -9703,8 +9933,40 @@ const CacheManager = {
     } else if (state.phase === 3) {
       cleanMap(GLOBALS.RateLimitCache, v => !v || v.resetAt < now, "rate");
       state.phase = 4;
-    } else {
+    } else if (state.phase === 4) {
       cleanMap(GLOBALS.LogDedupe, v => !v || (now - v) > 300000, "log");
+      state.phase = 5;
+    } else if (state.phase === 5) {
+      cleanMap(GLOBALS.PlaybackInfoResponseCache, v => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
+      state.phase = 6;
+    } else if (state.phase === 6) {
+      cleanMap(GLOBALS.ProxyFailoverStateCache, v => {
+        if (!v || typeof v !== "object") return true;
+        if (v.failingTargets instanceof Map) {
+          for (const [targetKey, expiresAt] of v.failingTargets) {
+            if (Number(expiresAt) <= now) v.failingTargets.delete(targetKey);
+          }
+        }
+        const hasPreferred = Number(v.preferredTargetExpiresAt) > now;
+        const hasFailing = v.failingTargets instanceof Map && v.failingTargets.size > 0;
+        const hasProbe = !!v.inFlightProbe && Number(v.inFlightProbe.expiresAt) > now;
+        const lastProbeAt = Number(v.lastProbeResult?.completedAt) || 0;
+        const hasLastProbe = !!v.lastProbeResult && (lastProbeAt + DEFAULT_HEDGE_PREFERRED_TTL_SEC * 1000) > now;
+        return !hasPreferred && !hasFailing && !hasProbe && !hasLastProbe;
+      }, "failover");
+      state.phase = 7;
+    } else if (state.phase === 7) {
+      const staleWindowMs = Math.max(30000, Math.max(1, Number(DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC) || 1) * 20000);
+      cleanMap(GLOBALS.PlaybackProgressRelay, v => {
+        if (!v || v.pendingSnapshot || v.activeFlushPromise) return !v;
+        const terminalUntil = Number(v.terminalTombstoneUntil) || 0;
+        if (terminalUntil > 0) return terminalUntil <= now;
+        const touchedAt = Number(v.lastTouchedAt || v.lastForwardAt) || 0;
+        return touchedAt > 0 && (touchedAt + staleWindowMs) <= now;
+      }, "progress");
+      state.phase = 8;
+    } else {
+      cleanMap(GLOBALS.DashboardMonthlyTrafficCache, v => !v || (Number(v.staleUntil) || 0) <= now, "monthlyTraffic");
       state.phase = 0;
     }
   }
@@ -10394,6 +10656,39 @@ const Database = {
   },
   getKV(env) { return Auth.getKV(env); },
   getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
+  getD1SchemaReadyState(db) {
+    if (!db || typeof db.prepare !== "function") return null;
+    let state = GLOBALS.D1SchemaReadyState.get(db);
+    if (!(state instanceof Map)) {
+      state = new Map();
+      GLOBALS.D1SchemaReadyState.set(db, state);
+    }
+    return state;
+  },
+  isD1SchemaReadyCached(db, scope) {
+    const state = this.getD1SchemaReadyState(db);
+    return !!state && (Number(state.get(String(scope || ""))) || 0) > nowMs();
+  },
+  markD1SchemaReady(db, scope) {
+    const state = this.getD1SchemaReadyState(db);
+    if (!state) return;
+    state.set(
+      String(scope || ""),
+      nowMs() + Math.max(1000, Number(Config.Defaults.D1SchemaReadyTtlMs) || 1000)
+    );
+  },
+  clearD1SchemaReady(db, scopes = []) {
+    const state = GLOBALS.D1SchemaReadyState.get(db);
+    if (!(state instanceof Map)) return;
+    const normalizedScopes = (Array.isArray(scopes) ? scopes : [scopes])
+      .map(scope => String(scope || "").trim())
+      .filter(Boolean);
+    if (!normalizedScopes.length) {
+      state.clear();
+      return;
+    }
+    for (const scope of normalizedScopes) state.delete(scope);
+  },
   /**
    * @template {Record<string, any>} T
    * @param {T | null | undefined} [meta]
@@ -10672,18 +10967,24 @@ const Database = {
   },
   async hasLogsBaseTable(db) {
     if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "logsTableExists")) return true;
     try {
       const row = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").bind(this.LOGS_TABLE).first();
-      return String(row?.name || "") === this.LOGS_TABLE;
+      const ready = String(row?.name || "") === this.LOGS_TABLE;
+      if (ready) this.markD1SchemaReady(db, "logsTableExists");
+      return ready;
     } catch {
       return false;
     }
   },
   async hasStatsHourlyTable(db) {
     if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "statsTableExists")) return true;
     try {
       const row = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").bind(this.STATS_HOURLY_TABLE).first();
-      return String(row?.name || "") === this.STATS_HOURLY_TABLE;
+      const ready = String(row?.name || "") === this.STATS_HOURLY_TABLE;
+      if (ready) this.markD1SchemaReady(db, "statsTableExists");
+      return ready;
     } catch {
       return false;
     }
@@ -11012,6 +11313,7 @@ const Database = {
   },
   async ensureLogsBaseSchema(db) {
     if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "logsBaseSchema")) return true;
     let initTask = GLOBALS.LogsBaseDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
@@ -11060,6 +11362,8 @@ const Database = {
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_time ON ${this.LOGS_TABLE} (client_ip, timestamp DESC)`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON ${this.LOGS_TABLE} (status_code, timestamp)`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time ON ${this.LOGS_TABLE} (category, timestamp)`).run();
+        this.markD1SchemaReady(db, "logsBaseSchema");
+        this.markD1SchemaReady(db, "logsTableExists");
         GLOBALS.LogsReadinessProbeCache.delete(db);
         return true;
       })().catch(error => {
@@ -11076,6 +11380,7 @@ const Database = {
   },
   async ensureStatsHourlySchema(db) {
     if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "statsHourlySchema")) return true;
     let initTask = GLOBALS.StatsHourlyDbReady.get(db);
     if (!initTask) {
       initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${this.STATS_HOURLY_TABLE} (
@@ -11087,6 +11392,8 @@ const Database = {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (bucket_date, bucket_hour)
       )`).run().then(() => {
+        this.markD1SchemaReady(db, "statsHourlySchema");
+        this.markD1SchemaReady(db, "statsTableExists");
         GLOBALS.LogsReadinessProbeCache.delete(db);
         return true;
       }).catch(error => {
@@ -11112,11 +11419,16 @@ const Database = {
     if (!db) return;
     const normalizedScope = String(scope || "all").trim().toLowerCase();
     if (normalizedScope === "all" || normalizedScope === "logs") {
+      this.clearD1SchemaReady(db, ["logsBaseSchema", "logsTableExists", "statsHourlySchema", "statsTableExists"]);
       GLOBALS.LogsBaseDbReady.delete(db);
       GLOBALS.StatsHourlyDbReady.delete(db);
       GLOBALS.LogsReadinessProbeCache.delete(db);
     }
     if (normalizedScope === "all") {
+      this.clearD1SchemaReady(db);
+      const opsStatusState = GLOBALS.OpsStatusShadowCache.get(db);
+      if (opsStatusState?.payloadCache instanceof Map) opsStatusState.payloadCache.clear();
+      GLOBALS.AdminShellStatusWriteState.delete(db);
       GLOBALS.DnsIpWorkspaceDbReady.delete(db);
       GLOBALS.OpsStatusDbReady.delete(db);
       GLOBALS.ScheduledLeaseDbReady.delete(db);
@@ -11254,7 +11566,10 @@ const Database = {
         await statement.run();
       }
     } else {
-      await db.batch(statements);
+      const batchSize = 50;
+      for (let index = 0; index < statements.length; index += batchSize) {
+        await db.batch(statements.slice(index, index + batchSize));
+      }
     }
     return true;
   },
@@ -11282,6 +11597,7 @@ const Database = {
   },
   async ensureDnsIpWorkspaceSchema(db) {
     if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "dnsIpWorkspaceSchema")) return true;
     let initTask = GLOBALS.DnsIpWorkspaceDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
@@ -11367,6 +11683,7 @@ const Database = {
         )`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_probe_cache_expire ON ${this.DNS_IP_PROBE_CACHE_TABLE} (expires_at)`).run();
         await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_probe_cache_colo_ip_expires ON ${this.DNS_IP_PROBE_CACHE_TABLE} (entry_colo, ip, expires_at)`).run();
+        this.markD1SchemaReady(db, "dnsIpWorkspaceSchema");
         return true;
       })().catch(error => {
         GLOBALS.DnsIpWorkspaceDbReady.delete(db);
@@ -11458,9 +11775,13 @@ const Database = {
     await this.ensureDnsIpWorkspaceSchema(db);
     const normalizedIps = [...new Set((Array.isArray(ips) ? ips : []).map(item => String(item || "").trim()).filter(ip => detectIpType(ip)))];
     if (!normalizedIps.length) return 0;
-    for (const ip of normalizedIps) {
-      await db.prepare(`DELETE FROM ${this.DNS_IP_POOL_ITEMS_TABLE} WHERE ip = ?`).bind(ip).run();
-      await db.prepare(`DELETE FROM ${this.DNS_IP_PROBE_CACHE_TABLE} WHERE ip = ?`).bind(ip).run();
+    const statements = normalizedIps.flatMap(ip => [
+      db.prepare(`DELETE FROM ${this.DNS_IP_POOL_ITEMS_TABLE} WHERE ip = ?`).bind(ip),
+      db.prepare(`DELETE FROM ${this.DNS_IP_PROBE_CACHE_TABLE} WHERE ip = ?`).bind(ip)
+    ]);
+    const batchSize = 50;
+    for (let index = 0; index < statements.length; index += batchSize) {
+      await db.batch(statements.slice(index, index + batchSize));
     }
     return normalizedIps.length;
   },
@@ -11741,7 +12062,7 @@ const Database = {
     }));
     return await this.incrementStatsHourly(db, normalizedEntries, {
       utcOffsetMinutes: options.utcOffsetMinutes,
-      useBatch: false
+      useBatch: true
     });
   },
   async rebuildStatsHourlyWindow(db, options = {}) {
@@ -11762,7 +12083,7 @@ const Database = {
     }));
     return await this.incrementStatsHourly(db, normalizedEntries, {
       utcOffsetMinutes: options.utcOffsetMinutes,
-      useBatch: false
+      useBatch: true
     });
   },
   async ensureStatsHourlyWindowAligned(envOrStore, options = {}) {
@@ -11893,7 +12214,8 @@ const Database = {
     if (!state) {
       state = {
         pendingPatch: {},
-        flushPromise: null
+        flushPromise: null,
+        payloadCache: new Map()
       };
       GLOBALS.OpsStatusShadowCache.set(db, state);
     }
@@ -11902,6 +12224,20 @@ const Database = {
   getOpsStatusShadowPatch(db) {
     const state = this.getOpsStatusShadowState(db);
     return isPlainObject(state?.pendingPatch) ? state.pendingPatch : {};
+  },
+  getOpsStatusPayloadCache(db) {
+    const state = this.getOpsStatusShadowState(db);
+    if (!state) return null;
+    if (!(state.payloadCache instanceof Map)) state.payloadCache = new Map();
+    return state.payloadCache;
+  },
+  cacheOpsStatusPayload(db, scope, payload) {
+    const cache = this.getOpsStatusPayloadCache(db);
+    if (!cache) return;
+    setBoundedMapEntry(cache, String(scope || ""), {
+      payload: payload && typeof payload === "object" ? payload : null,
+      expiresAt: nowMs() + Math.max(1000, Number(Config.Defaults.OpsStatusReadCacheTtlMs) || 1000)
+    }, 8);
   },
   buildOpsStatusRootPatch(patch = {}) {
     const patchObject = patch && typeof patch === "object" ? patch : {};
@@ -11943,7 +12279,7 @@ const Database = {
         const nextRoot = mergeStatusPatch(currentRoot, pendingPatch);
         nextRoot.updatedAt = nowIso;
         await this.putOpsStatusPayloadToDb(db, this.getOpsStatusDbScope(), nextRoot, updatedAtMs);
-        return await this.getOpsStatusFromStores(stores);
+        return mergeStatusPatch(nextRoot, this.getOpsStatusShadowPatch(db));
       } catch (error) {
         shadowState.pendingPatch = mergeStatusPatch(pendingPatch, shadowState.pendingPatch);
         throw error;
@@ -11956,11 +12292,13 @@ const Database = {
   },
   async ensureSysStatusTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
+    if (this.isD1SchemaReadyCached(db, "sysStatusTable")) return true;
     let initTask = GLOBALS.OpsStatusDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
         try {
           await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SYS_STATUS_TABLE} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`).run();
+          this.markD1SchemaReady(db, "sysStatusTable");
           return true;
         } catch (error) {
           console.warn("sys_status init failed", error);
@@ -11977,6 +12315,7 @@ const Database = {
   },
   async ensureAuthFailuresTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
+    if (this.isD1SchemaReadyCached(db, "authFailuresTable")) return true;
     let initTask = GLOBALS.AuthFailuresDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
@@ -11988,6 +12327,7 @@ const Database = {
             updated_at INTEGER NOT NULL
           )`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_auth_failures_expires_at ON ${this.AUTH_FAILURES_TABLE} (expires_at)`).run();
+          this.markD1SchemaReady(db, "authFailuresTable");
           return true;
         } catch (error) {
           console.warn("auth_failures init failed", error);
@@ -12065,6 +12405,7 @@ const Database = {
   },
   async ensureCfDashboardCacheTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
+    if (this.isD1SchemaReadyCached(db, "cfDashboardCacheTable")) return true;
     let initTask = GLOBALS.CfDashboardCacheDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
@@ -12080,6 +12421,7 @@ const Database = {
             updated_at INTEGER NOT NULL
           )`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_dashboard_cache_expires_at ON ${this.CF_DASH_CACHE_TABLE} (expires_at)`).run();
+          this.markD1SchemaReady(db, "cfDashboardCacheTable");
           return true;
         } catch (error) {
           console.warn("cf_dashboard_cache init failed", error);
@@ -12214,6 +12556,7 @@ const Database = {
   },
   async ensureCfRuntimeCacheTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
+    if (this.isD1SchemaReadyCached(db, "cfRuntimeCacheTable")) return true;
     let initTask = GLOBALS.CfRuntimeCacheDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
@@ -12228,6 +12571,7 @@ const Database = {
             updated_at INTEGER NOT NULL
           )`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_cf_runtime_cache_expires_at ON ${this.CF_RUNTIME_CACHE_TABLE} (expires_at)`).run();
+          this.markD1SchemaReady(db, "cfRuntimeCacheTable");
           return true;
         } catch (error) {
           console.warn("cf_runtime_cache init failed", error);
@@ -12331,8 +12675,11 @@ const Database = {
     const skipCacheRead = options.skipCacheRead === true;
     const loader = typeof options.loader === "function" ? options.loader : null;
     if (!cacheKey || !loader) throw new Error("cf_runtime_cache_loader_missing");
-    const freshEntry = !skipCacheRead && db
-      ? await this.getCfRuntimeCacheEntry(db, cacheKey, { nowMs: nowTimestamp })
+    const cachedEntry = db
+      ? await this.getCfRuntimeCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true })
+      : null;
+    const freshEntry = !skipCacheRead && cachedEntry && cachedEntry.expiresAt > nowTimestamp
+      ? cachedEntry
       : null;
     if (freshEntry?.payload !== undefined) {
       return {
@@ -12345,9 +12692,7 @@ const Database = {
         error: null
       };
     }
-    const staleEntry = db
-      ? await this.getCfRuntimeCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true })
-      : null;
+    const staleEntry = cachedEntry;
     try {
       const payload = await runSingleFlight(
         buildSingleFlightKey(["cf_runtime", cacheGroup, cacheKey]),
@@ -12578,6 +12923,206 @@ const Database = {
       peakLabel,
       legendMaxLabel: formatCount(maxRowsWritten)
     };
+  },
+  async buildDashboardMonthlyTrafficPayload(env, options = {}) {
+    const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
+    const nowTimestamp = Math.max(0, Number(options.nowMs) || nowMs());
+    const monthWindow = options?.monthWindow || buildOffsetMonthWindow(
+      new Date(nowTimestamp),
+      config.scheduleUtcOffsetMinutes
+    );
+    const cfZoneId = String(config.cfZoneId || "").trim();
+    const cfApiToken = String(config.cfApiToken || "").trim();
+    const basePayload = {
+      period: "month",
+      periodKey: monthWindow.monthKey,
+      periodLabel: monthWindow.periodLabel,
+      generatedAt: new Date(nowTimestamp).toISOString(),
+      cacheStatus: "live"
+    };
+    if (!cfZoneId || !cfApiToken) {
+      return normalizeDashboardMonthlyTrafficPayload({
+        ...basePayload,
+        traffic: "未配置",
+        cfAnalyticsLoaded: false,
+        cfAnalyticsStatus: "未配置 Cloudflare",
+        cfAnalyticsError: "请在账号设置中填写并保存 Cloudflare Zone ID 与 API 令牌",
+        trafficSourceText: "本月视频流量：未配置 Cloudflare，无法获取 CF Zone 总流量"
+      });
+    }
+
+    const startIso = new Date(monthWindow.startTs).toISOString();
+    const endIso = new Date(monthWindow.endTs).toISOString();
+    const query = `
+      query {
+        viewer {
+          zones(filter: { zoneTag: ${toGraphQLString(cfZoneId)} }) {
+            series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)} }) {
+              sum { edgeResponseBytes }
+            }
+          }
+        }
+      }`;
+    const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, query);
+    if (!zoneData) throw new Error("cf_graphql_empty_zone");
+    const seriesData = Array.isArray(zoneData.series) ? zoneData.series : [];
+    const totalBytes = seriesData.reduce(
+      (sum, item) => sum + Math.max(0, Number(item?.sum?.edgeResponseBytes) || 0),
+      0
+    );
+    return normalizeDashboardMonthlyTrafficPayload({
+      ...basePayload,
+      traffic: formatBytes(totalBytes),
+      totalBytes,
+      cfAnalyticsLoaded: true,
+      cfAnalyticsStatus: "Cloudflare 统计正常",
+      cfAnalyticsError: "",
+      cfAnalyticsDetail: "",
+      trafficSourceText: `${monthWindow.periodLabel}视频流量：CF Zone 总流量（edgeResponseBytes）`
+    });
+  },
+  async getDashboardMonthlyTrafficPayload(env, options = {}) {
+    const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
+    const ctx = options?.ctx || null;
+    const forceRefresh = options?.forceRefresh === true;
+    const nowTimestamp = Math.max(0, Number(options.nowMs) || nowMs());
+    const monthWindow = options?.monthWindow || buildOffsetMonthWindow(
+      new Date(nowTimestamp),
+      config.scheduleUtcOffsetMinutes
+    );
+    const zoneId = String(config.cfZoneId || "").trim();
+    if (!zoneId || !String(config.cfApiToken || "").trim()) {
+      return await this.buildDashboardMonthlyTrafficPayload(env, { config, monthWindow, nowMs: nowTimestamp });
+    }
+
+    const cacheKey = makeDashboardMonthlyTrafficCacheKey(
+      zoneId,
+      monthWindow.monthKey,
+      config.scheduleUtcOffsetMinutes
+    );
+    const cacheRequest = makeDashboardMonthlyTrafficCacheRequest(cacheKey);
+    const edgeCache = getDefaultCacheHandle();
+    let staleEntry = null;
+    const memoryEntry = GLOBALS.DashboardMonthlyTrafficCache.get(cacheKey);
+    if (memoryEntry?.staleUntil > nowTimestamp) {
+      setBoundedMapEntry(
+        GLOBALS.DashboardMonthlyTrafficCache,
+        cacheKey,
+        memoryEntry,
+        DASHBOARD_MONTHLY_TRAFFIC_CACHE_MAX
+      );
+      staleEntry = memoryEntry;
+      if (!forceRefresh && memoryEntry.expiresAt > nowTimestamp) {
+        return normalizeDashboardMonthlyTrafficPayload({ ...memoryEntry.payload, cacheStatus: "cache" });
+      }
+    } else if (memoryEntry) {
+      GLOBALS.DashboardMonthlyTrafficCache.delete(cacheKey);
+    }
+
+    if (edgeCache && cacheRequest) {
+      try {
+        const cachedResponse = await edgeCache.match(cacheRequest);
+        if (cachedResponse) {
+          const cachedBody = await readResponseTextWithLimit(cachedResponse, REMOTE_ERROR_RESPONSE_MAX_BYTES);
+          const cachedEnvelope = cachedBody.exceeded ? null : JSON.parse(cachedBody.text || "null");
+          if (
+            Number(cachedEnvelope?.version) === DASHBOARD_MONTHLY_TRAFFIC_CACHE_VERSION
+            && String(cachedEnvelope?.cacheKey || "") === cacheKey
+            && Number(cachedEnvelope?.staleUntil) > nowTimestamp
+          ) {
+            staleEntry = {
+              payload: normalizeDashboardMonthlyTrafficPayload(cachedEnvelope.payload),
+              cachedAt: Number(cachedEnvelope.cachedAt) || 0,
+              expiresAt: Number(cachedEnvelope.expiresAt) || 0,
+              staleUntil: Number(cachedEnvelope.staleUntil) || 0
+            };
+            setBoundedMapEntry(
+              GLOBALS.DashboardMonthlyTrafficCache,
+              cacheKey,
+              staleEntry,
+              DASHBOARD_MONTHLY_TRAFFIC_CACHE_MAX
+            );
+            if (!forceRefresh && staleEntry.expiresAt > nowTimestamp) {
+              return normalizeDashboardMonthlyTrafficPayload({ ...staleEntry.payload, cacheStatus: "cache" });
+            }
+          }
+        }
+      } catch (error) {
+        logRuntimeFailure("dashboard.monthly_traffic_cache_read_failed", error, { cacheKey });
+      }
+    }
+
+    try {
+      return await runSingleFlight(
+        buildSingleFlightKey(["dashboard_monthly_traffic", cacheKey, forceRefresh ? "force" : "default"]),
+        async () => {
+          const payload = await this.buildDashboardMonthlyTrafficPayload(env, {
+            config,
+            monthWindow,
+            nowMs: nowTimestamp
+          });
+          const cachedAt = nowTimestamp;
+          const expiresAt = cachedAt + DASHBOARD_MONTHLY_TRAFFIC_CACHE_TTL_MS;
+          const staleUntil = cachedAt + DASHBOARD_MONTHLY_TRAFFIC_STALE_TTL_MS;
+          const envelope = {
+            version: DASHBOARD_MONTHLY_TRAFFIC_CACHE_VERSION,
+            cacheKey,
+            cachedAt,
+            expiresAt,
+            staleUntil,
+            payload
+          };
+          setBoundedMapEntry(
+            GLOBALS.DashboardMonthlyTrafficCache,
+            cacheKey,
+            { payload, cachedAt, expiresAt, staleUntil },
+            DASHBOARD_MONTHLY_TRAFFIC_CACHE_MAX
+          );
+          if (edgeCache && cacheRequest) {
+            const cacheWriteTask = edgeCache.put(cacheRequest, new Response(JSON.stringify(envelope), {
+              headers: {
+                "Content-Type": "application/json; charset=utf-8",
+                "Cache-Control": `public, max-age=${Math.floor(DASHBOARD_MONTHLY_TRAFFIC_STALE_TTL_MS / 1000)}`
+              }
+            }));
+            if (ctx) ctx.waitUntil(withNonCriticalFallback(
+              cacheWriteTask,
+              "dashboard.monthly_traffic_cache_write",
+              { cacheKey },
+              null
+            ));
+            else await withNonCriticalFallback(
+              cacheWriteTask,
+              "dashboard.monthly_traffic_cache_write",
+              { cacheKey },
+              null
+            );
+          }
+          return payload;
+        }
+      );
+    } catch (error) {
+      if (staleEntry?.payload && staleEntry.staleUntil > nowTimestamp) {
+        return normalizeDashboardMonthlyTrafficPayload({
+          ...staleEntry.payload,
+          cacheStatus: "stale",
+          warning: trimDashboardSnapshotErrorMessage(error, "monthly_traffic_refresh_failed")
+        });
+      }
+      const cfDiag = classifyCloudflareAnalyticsError(error?.message || error, { zoneId });
+      return normalizeDashboardMonthlyTrafficPayload({
+        periodKey: monthWindow.monthKey,
+        periodLabel: monthWindow.periodLabel,
+        traffic: "CF 查询失败",
+        cfAnalyticsLoaded: false,
+        cfAnalyticsStatus: cfDiag.status,
+        cfAnalyticsError: cfDiag.hint,
+        cfAnalyticsDetail: cfDiag.detail,
+        trafficSourceText: `${monthWindow.periodLabel}视频流量：CF Zone 总流量（edgeResponseBytes）`,
+        generatedAt: new Date(nowTimestamp).toISOString(),
+        cacheStatus: "live"
+      });
+    }
   },
   async buildDashboardStatsPayload(env, options = {}) {
     const ctx = options?.ctx || null;
@@ -12857,8 +13402,11 @@ const Database = {
     const zoneId = String(config.cfZoneId || "").trim();
     const cacheKey = makeCfDashCacheDbKey(zoneId, dayWindow.dateKey);
 
+    const cachedEntry = db
+      ? await this.getCfDashboardCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true })
+      : null;
     if (!forceRefresh && db) {
-      const freshEntry = await this.getCfDashboardCacheEntry(db, cacheKey, { nowMs: nowTimestamp });
+      const freshEntry = cachedEntry && cachedEntry.expiresAt > nowTimestamp ? cachedEntry : null;
       if (freshEntry && freshEntry.version === CF_DASH_CACHE_VERSION) {
         return withDashboardSnapshotCacheStatus(freshEntry.payload, "cache", {
           cachedAt: freshEntry.cachedAt,
@@ -12870,9 +13418,7 @@ const Database = {
       }
     }
 
-    const staleEntry = db
-      ? await this.getCfDashboardCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true })
-      : null;
+    const staleEntry = cachedEntry;
 
     try {
       const snapshot = await runSingleFlight(
@@ -13107,13 +13653,21 @@ const Database = {
   },
   async getOpsStatusPayloadFromDb(db, scope) {
     if (!db || !scope) return null;
+    const cache = this.getOpsStatusPayloadCache(db);
+    const cached = cache?.get(String(scope));
+    if (cached && Number(cached.expiresAt) > nowMs()) return cached.payload;
+    if (cached) cache.delete(String(scope));
     const ready = await this.ensureSysStatusTable(db);
     if (!ready) return null;
     try {
       const row = await db.prepare(`SELECT payload FROM ${this.SYS_STATUS_TABLE} WHERE scope = ? LIMIT 1`).bind(scope).first();
-      if (!row?.payload) return null;
-      return typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
+      const payload = !row?.payload
+        ? null
+        : (typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload);
+      this.cacheOpsStatusPayload(db, scope, payload);
+      return payload;
     } catch {
+      cache?.delete(String(scope));
       return null;
     }
   },
@@ -13123,6 +13677,7 @@ const Database = {
     if (!ready) return false;
     await db.prepare(`INSERT INTO ${this.SYS_STATUS_TABLE} (scope, payload, updated_at) VALUES (?, ?, ?)
       ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`).bind(scope, JSON.stringify(payload), Number(updatedAtMs) || nowMs()).run();
+    this.cacheOpsStatusPayload(db, scope, payload);
     return true;
   },
   getOpsStatusSectionEntries() {
@@ -13243,12 +13798,14 @@ const Database = {
   },
   async ensureScheduledLeaseTable(db) {
     if (!db || typeof db.prepare !== "function") return false;
+    if (this.isD1SchemaReadyCached(db, "scheduledLeaseTable")) return true;
     let initTask = GLOBALS.ScheduledLeaseDbReady.get(db);
     if (!initTask) {
       initTask = (async () => {
         try {
           await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SCHEDULED_LOCKS_TABLE} (scope TEXT PRIMARY KEY, token TEXT NOT NULL, owner TEXT NOT NULL, acquired_at INTEGER NOT NULL, renewed_at INTEGER, expires_at INTEGER NOT NULL)`).run();
           await db.prepare(`CREATE INDEX IF NOT EXISTS idx_sys_locks_expires_at ON ${this.SCHEDULED_LOCKS_TABLE} (expires_at DESC)`).run();
+          this.markD1SchemaReady(db, "scheduledLeaseTable");
           return true;
         } catch (error) {
           console.warn("scheduled lease table init failed", error);
@@ -15868,8 +16425,10 @@ const Database = {
           headers: {"Content-Type": "application/json"},
           body: JSON.stringify({ chat_id: chatId, text: String(text || "") })
       });
+      const responseBody = await readResponseTextWithLimit(res, REMOTE_ERROR_RESPONSE_MAX_BYTES);
+      if (responseBody.exceeded) throw new Error("Telegram API response too large");
       /** @type {JsonApiEnvelope} */
-      const tgData = await res.json();
+      const tgData = JSON.parse(responseBody.text);
       if (!tgData.ok) throw new Error(tgData.description || "Telegram API 返回错误");
       return tgData;
   },
@@ -15882,12 +16441,19 @@ const Database = {
       const dayWindow = options?.dayWindow && typeof options.dayWindow === "object"
         ? options.dayWindow
         : buildOffsetDayWindow(referenceNow, config.scheduleUtcOffsetMinutes);
-      const stats = await this.buildDashboardStatsPayload(env, {
-        config,
-        dayWindow,
-        nowMs: referenceNow.getTime(),
-        skipD1WriteHotspot: true
-      });
+      const [stats, monthlyTrafficStats] = await Promise.all([
+        this.buildDashboardStatsPayload(env, {
+          config,
+          dayWindow,
+          nowMs: referenceNow.getTime(),
+          skipD1WriteHotspot: true
+        }),
+        this.getDashboardMonthlyTrafficPayload(env, {
+          config,
+          ctx: options?.ctx || null,
+          nowMs: referenceNow.getTime()
+        })
+      ]);
       return {
         zoneName: String(stats?.zoneName || "").trim(),
         requestCountDisplay: String(stats?.requestCountDisplay || "").trim()
@@ -15896,6 +16462,7 @@ const Database = {
             : String(Number(stats?.todayRequests) || 0)),
         requestSourceText: String(stats?.requestSourceText || "").trim(),
         todayTraffic: String(stats?.todayTraffic || "").trim() || "暂不可用",
+        monthlyTraffic: String(monthlyTrafficStats?.traffic || "").trim() || "暂不可用",
         trafficSourceText: String(stats?.trafficSourceText || "").trim(),
         playCount: Math.max(0, Number(stats?.playCount) || 0),
         infoCount: Math.max(0, Number(stats?.infoCount) || 0),
@@ -16872,7 +17439,7 @@ const Database = {
   // ============================================================================
   // 管理 API 动作表 (ADMIN ACTION MAP)
   // 读取导航：
-  // - 面板统计 / 运行状态：getDashboardStats / getRuntimeStatus
+  // - 面板统计 / 运行状态：getDashboardStats / getMonthlyTrafficStats / getRuntimeStatus
   // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / exportSettings / importSettings / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode
   // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
@@ -16908,6 +17475,15 @@ const Database = {
         ...(snapshot?.stats && typeof snapshot.stats === "object" ? snapshot.stats : {}),
         cacheMeta: snapshot?.cacheMeta && typeof snapshot.cacheMeta === "object" ? snapshot.cacheMeta : {}
       });
+    },
+    async getMonthlyTrafficStats(data, { env, ctx }) {
+      const config = await getRuntimeConfigStrict(env);
+      const payload = await Database.getDashboardMonthlyTrafficPayload(env, {
+        ctx,
+        config,
+        forceRefresh: data?.forceRefresh === true
+      });
+      return jsonResponse(payload);
     },
 
     async loadConfig(data, { env, kv, db, ctx }) {
@@ -19108,9 +19684,11 @@ const Database = {
         return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
     }
 
-    let data; 
-    try { 
-        data = await request.json(); 
+    let data;
+    try {
+        const bodyResult = await readResponseTextWithLimit(request, ADMIN_JSON_REQUEST_MAX_BYTES);
+        if (bodyResult.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
+        data = JSON.parse(bodyResult.text || "");
     } catch { 
         return jsonError("INVALID_JSON", "请求 JSON 无效", 400); 
     }
@@ -19500,6 +20078,50 @@ function buildMediaRoutingCapabilityMatrix() {
 
 const MEDIA_ROUTING_CAPABILITY_MATRIX = buildMediaRoutingCapabilityMatrix();
 
+function buildProxyAccessRuleProfile(currentConfig = {}) {
+  const configKey = currentConfig && typeof currentConfig === "object" ? currentConfig : null;
+  const corsOriginsRaw = String(currentConfig?.corsOrigins || "");
+  const ipBlacklistRaw = String(currentConfig?.ipBlacklist || "");
+  const geoAllowlistRaw = String(currentConfig?.geoAllowlist || "");
+  const geoBlocklistRaw = String(currentConfig?.geoBlocklist || "");
+  const cachedProfile = configKey ? GLOBALS.ProxyAccessRuleProfileCache.get(configKey) : null;
+  if (cachedProfile
+    && cachedProfile.corsOriginsRaw === corsOriginsRaw
+    && cachedProfile.ipBlacklistRaw === ipBlacklistRaw
+    && cachedProfile.geoAllowlistRaw === geoAllowlistRaw
+    && cachedProfile.geoBlocklistRaw === geoBlocklistRaw
+  ) {
+    return cachedProfile;
+  }
+
+  const normalizeList = (rawValue, uppercase = false) => {
+    const values = [];
+    const valueSet = new Set();
+    for (const rawItem of rawValue.split(",")) {
+      const trimmedItem = rawItem.trim();
+      const item = uppercase ? trimmedItem.toUpperCase() : trimmedItem;
+      if (!item || valueSet.has(item)) continue;
+      valueSet.add(item);
+      values.push(item);
+    }
+    return { values, valueSet };
+  };
+  const corsOrigins = normalizeList(corsOriginsRaw);
+  const profile = {
+    corsOriginsRaw,
+    ipBlacklistRaw,
+    geoAllowlistRaw,
+    geoBlocklistRaw,
+    corsOrigins: corsOrigins.values,
+    corsOriginSet: corsOrigins.valueSet,
+    ipBlacklist: normalizeList(ipBlacklistRaw).valueSet,
+    geoAllowlist: normalizeList(geoAllowlistRaw, true).valueSet,
+    geoBlocklist: normalizeList(geoBlocklistRaw, true).valueSet
+  };
+  if (configKey) GLOBALS.ProxyAccessRuleProfileCache.set(configKey, profile);
+  return profile;
+}
+
 const Proxy = {
   // Proxy 模块阅读顺序建议：
   // 1. resolve/evaluate/classify：环境裁决与请求分类
@@ -19508,8 +20130,10 @@ const Proxy = {
   // 4. handle：把上述阶段串成完整代理链路
   resolveCorsOrigin(currentConfig, request) {
     const reqOrigin = request.headers.get("Origin");
-    const allowedOrigins = String(currentConfig.corsOrigins || "").split(",").map(i => i.trim()).filter(Boolean);
-    if (allowedOrigins.length > 0) return reqOrigin && allowedOrigins.includes(reqOrigin) ? reqOrigin : allowedOrigins[0];
+    const accessRules = buildProxyAccessRuleProfile(currentConfig);
+    if (accessRules.corsOrigins.length > 0) {
+      return reqOrigin && accessRules.corsOriginSet.has(reqOrigin) ? reqOrigin : accessRules.corsOrigins[0];
+    }
     return reqOrigin || "*";
   },
   buildEdgeResponseHeaders(finalOrigin, extra = {}) {
@@ -19778,14 +20402,14 @@ const Proxy = {
     );
   },
   evaluateFirewall(currentConfig, clientIp, country, finalOrigin) {
-    const ipBlacklist = String(currentConfig.ipBlacklist || "").split(",").map(i => i.trim()).filter(Boolean);
-    if (ipBlacklist.includes(clientIp)) {
+    const accessRules = buildProxyAccessRuleProfile(currentConfig);
+    if (accessRules.ipBlacklist.has(clientIp)) {
       return new Response("Forbidden by IP Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
     }
 
-    const geoAllow = String(currentConfig.geoAllowlist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
-    const geoBlock = String(currentConfig.geoBlocklist || "").split(",").map(i => i.trim().toUpperCase()).filter(Boolean);
-    if ((geoAllow.length > 0 && !geoAllow.includes(country)) || (geoBlock.length > 0 && geoBlock.includes(country))) {
+    if ((accessRules.geoAllowlist.size > 0 && !accessRules.geoAllowlist.has(country))
+      || (accessRules.geoBlocklist.size > 0 && accessRules.geoBlocklist.has(country))
+    ) {
       return new Response("Forbidden by Geo Firewall", { status: 403, headers: this.buildEdgeResponseHeaders(finalOrigin) });
     }
 
@@ -19798,7 +20422,7 @@ const Proxy = {
     let rlData = GLOBALS.RateLimitCache.get(clientIp);
     if (!rlData || startTime > rlData.resetAt) rlData = { count: 0, resetAt: startTime + 60000 };
     rlData.count += 1;
-    GLOBALS.RateLimitCache.set(clientIp, rlData);
+    setBoundedMapEntry(GLOBALS.RateLimitCache, clientIp, rlData, Config.Defaults.RateLimitCacheMax);
     if (rlData.count > rpmLimit) {
       return new Response("Rate Limit Exceeded", { status: 429, headers: this.buildEdgeResponseHeaders(finalOrigin) });
     }
@@ -20507,13 +21131,14 @@ const Proxy = {
     let preparedBodyText = "";
     if (isNonIdempotent && request.body) {
       const contentLength = parseContentLengthHeader(request.headers.get("Content-Length"));
-      const shouldPreferBufferedControlBody = requestTraits.isPlaybackInfoRequest === true || requestTraits.isPlaybackSessionControlRequest === true;
       const canBufferRetryBody = Number.isFinite(contentLength) && contentLength >= 0 && contentLength <= DEFAULT_BUFFERED_RETRY_BODY_MAX_BYTES;
-      if (shouldPreferBufferedControlBody || canBufferRetryBody) {
+      if (canBufferRetryBody) {
         try {
           preparedBody = await request.clone().arrayBuffer();
           preparedBodyMode = "buffered";
-          if (shouldPreferBufferedControlBody) preparedBodyText = decodeBufferedBodyText(preparedBody);
+          if (requestTraits.isPlaybackInfoRequest === true || requestTraits.isPlaybackSessionControlRequest === true) {
+            preparedBodyText = decodeBufferedBodyText(preparedBody);
+          }
         } catch {
           preparedBody = request.body;
           preparedBodyMode = "stream";
@@ -20812,13 +21437,24 @@ const Proxy = {
       execution.playbackInfoRewrite = "not_needed";
       return upstreamState;
     }
-    let bodyText = "";
-    try {
-      bodyText = await response.clone().text();
-    } catch {
+    const declaredBodyBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
+    if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES) {
+      execution.playbackInfoCacheBodyResolved = true;
+      execution.playbackInfoCacheBody = null;
       execution.playbackInfoRewrite = "not_needed";
       return upstreamState;
     }
+    const bodyResult = await readResponseTextWithLimit(
+      response.clone(),
+      DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
+    );
+    execution.playbackInfoCacheBodyResolved = true;
+    execution.playbackInfoCacheBody = null;
+    if (bodyResult.exceeded) {
+      execution.playbackInfoRewrite = "not_needed";
+      return upstreamState;
+    }
+    const bodyText = bodyResult.text;
     try {
       const parsedPayload = JSON.parse(bodyText);
       const responseBaseUrl = upstreamState?.finalUrl
@@ -20832,11 +21468,20 @@ const Proxy = {
         || new URL(String(execution?.requestUrl || execution?.rawRequestUrl || ""));
       const rewriteResult = this.rewritePlaybackInfoPayload(execution, parsedPayload, upstreamState?.activeTargetBase, responseBaseUrl);
       execution.playbackInfoRewrite = rewriteResult.rewriteState;
-      if (rewriteResult.rewriteState !== "applied") return upstreamState;
+      if (rewriteResult.rewriteState !== "applied") {
+        execution.playbackInfoCacheBody = { text: bodyText, bytes: bodyResult.bytes };
+        return upstreamState;
+      }
+      const serializedBodyText = JSON.stringify(rewriteResult.payload);
+      const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
+      execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
+        ? { text: serializedBodyText, bytes: serializedBodyBytes }
+        : null;
       const responseHeaders = this.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
+      try { Promise.resolve(response.body?.cancel?.()).catch(() => {}); } catch {}
       return {
         ...upstreamState,
-        response: new Response(JSON.stringify(rewriteResult.payload), {
+        response: new Response(serializedBodyText, {
           status: response.status,
           statusText: response.statusText,
           headers: responseHeaders
@@ -21319,9 +21964,14 @@ const Proxy = {
     if (!(response.status >= 200 && response.status < 300)) return;
     const contentType = String(response.headers.get("Content-Type") || "").toLowerCase();
     if (!contentType.includes("json")) return;
+    const bodyResult = await readResponseTextWithLimit(
+      response.clone(),
+      METADATA_PREWARM_RESPONSE_MAX_BYTES
+    );
+    if (bodyResult.exceeded) return;
     let payload;
     try {
-      payload = await response.clone().json();
+      payload = JSON.parse(bodyResult.text);
     } catch {
       return;
     }
@@ -21892,9 +22542,18 @@ const Proxy = {
       ? options.runtimeConfig
       : await getRuntimeConfig(env);
     const rawRequestUrl = options.requestUrl || new URL(request.url);
-    const requestHost = normalizeHostnameText(rawRequestUrl.hostname);
-    const configuredHost = resolveConfiguredHost(env);
-    const configuredLegacyHost = resolveConfiguredLegacyHost(env);
+    const runtimeRouteContext = options.runtimeRouteContext && typeof options.runtimeRouteContext === "object"
+      ? options.runtimeRouteContext
+      : null;
+    const requestHost = typeof runtimeRouteContext?.requestHost === "string"
+      ? runtimeRouteContext.requestHost
+      : normalizeHostnameText(rawRequestUrl.hostname);
+    const configuredHost = typeof runtimeRouteContext?.configuredHost === "string"
+      ? runtimeRouteContext.configuredHost
+      : resolveConfiguredHost(env);
+    const configuredLegacyHost = typeof runtimeRouteContext?.configuredLegacyHost === "string"
+      ? runtimeRouteContext.configuredLegacyHost
+      : resolveConfiguredLegacyHost(env);
     const resolvedEntryMode = normalizeNodeEntryMode(options.entryMode || node?.entryMode);
     const routeKindOverride = String(options.routeKindOverride || "").trim();
     const isLegacyHostRequest = !!(
@@ -22157,6 +22816,24 @@ const Proxy = {
       if (!oldestKey) break;
       cache.delete(oldestKey);
     }
+    const maxTotalBytes = Math.max(1, Number(DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES) || 1);
+    let totalBytes = 0;
+    for (const entry of cache.values()) {
+      const bodyBytes = Number(entry?.bodyBytes);
+      totalBytes += Number.isFinite(bodyBytes) && bodyBytes >= 0
+        ? bodyBytes
+        : new TextEncoder().encode(String(entry?.bodyText || "")).byteLength;
+    }
+    while (cache.size > 0 && totalBytes > maxTotalBytes) {
+      const oldestKey = cache.keys().next().value;
+      if (!oldestKey) break;
+      const oldestEntry = cache.get(oldestKey);
+      const oldestBodyBytes = Number(oldestEntry?.bodyBytes);
+      totalBytes -= Number.isFinite(oldestBodyBytes) && oldestBodyBytes >= 0
+        ? oldestBodyBytes
+        : new TextEncoder().encode(String(oldestEntry?.bodyText || "")).byteLength;
+      cache.delete(oldestKey);
+    }
   },
   buildPlaybackInfoAuthSignature(execution, transport = null) {
     const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
@@ -22213,12 +22890,17 @@ const Proxy = {
     if (!response || !(response.status >= 200 && response.status < 300)) return false;
     const contentType = String(response.headers.get("Content-Type") || "").toLowerCase();
     if (!contentType.includes("json")) return false;
-    let bodyText = "";
-    try {
-      bodyText = execution.requestMethod === "HEAD" ? "" : await response.text();
-    } catch {
-      return false;
-    }
+    const bodyResult = execution.requestMethod === "HEAD"
+      ? { text: "", bytes: 0, exceeded: false }
+      : execution.playbackInfoCacheBodyResolved === true
+        ? {
+          text: String(execution.playbackInfoCacheBody?.text || ""),
+          bytes: Math.max(0, Number(execution.playbackInfoCacheBody?.bytes) || 0),
+          exceeded: !execution.playbackInfoCacheBody
+        }
+        : await readResponseTextWithLimit(response.clone(), DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES);
+    if (bodyResult.exceeded) return false;
+    const bodyText = bodyResult.text;
     const responseHeaders = this.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
     responseHeaders.delete("Set-Cookie");
     const now = nowMs();
@@ -22234,6 +22916,7 @@ const Proxy = {
       statusText: response.statusText,
       headers: [...responseHeaders.entries()],
       bodyText,
+      bodyBytes: bodyResult.bytes,
       storedAt: now,
       expiresAt: now + ttlMs
     });
@@ -22410,8 +23093,7 @@ const Proxy = {
     entry.terminalAt = stoppedAt;
     entry.terminalTombstoneUntil = stoppedAt + this.getPlaybackProgressRelayTerminalTtlMs(entry.intervalMs);
     entry.lastTouchedAt = stoppedAt;
-    relayMap.delete(sessionKey);
-    relayMap.set(sessionKey, entry);
+    setBoundedPlaybackProgressRelayEntry(sessionKey, entry);
     return entry;
   },
   cleanupPlaybackProgressRelay(now = nowMs()) {
@@ -22423,20 +23105,24 @@ const Proxy = {
       const hasPending = !!entry?.pendingSnapshot || !!entry?.activeFlushPromise;
       const terminalTombstoneUntil = Number(entry?.terminalTombstoneUntil || 0) || 0;
       if (terminalTombstoneUntil > 0) {
-        if (!hasPending && terminalTombstoneUntil <= now) relayMap.delete(sessionKey);
+        if (!hasPending && terminalTombstoneUntil <= now) deletePlaybackProgressRelayEntry(sessionKey);
         continue;
       }
-      if (!hasPending && touchedAt > 0 && (touchedAt + staleWindowMs) <= now) relayMap.delete(sessionKey);
+      if (!hasPending && touchedAt > 0 && (touchedAt + staleWindowMs) <= now) deletePlaybackProgressRelayEntry(sessionKey);
     }
     const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
     while (relayMap.size > maxEntries) {
       const oldestKey = relayMap.keys().next().value;
       if (!oldestKey) break;
-      relayMap.delete(oldestKey);
+      deletePlaybackProgressRelayEntry(oldestKey);
     }
   },
   buildPlaybackProgressSnapshot(execution, transport, buildFetchOptions, targetRecord) {
     if (!execution || !transport || typeof buildFetchOptions !== "function" || !isTargetRecord(targetRecord)) return null;
+    const preparedBodyBytes = transport.preparedBodyMode === "buffered"
+      ? Number(transport.preparedBody?.byteLength) || 0
+      : 0;
+    if (preparedBodyBytes > DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES) return null;
     const preparedBody = transport.preparedBodyMode === "buffered" && transport.preparedBody
       ? transport.preparedBody.slice(0)
       : transport.preparedBody;
@@ -22488,13 +23174,7 @@ const Proxy = {
       }
     );
     try {
-      if (upstream.response.body) {
-        try {
-          await upstream.response.arrayBuffer();
-        } catch {
-          try { upstream.response.body?.cancel?.(); } catch {}
-        }
-      }
+      try { await upstream.response.body?.cancel?.(); } catch {}
     } finally {
       try { upstream.releaseFetchController?.(); } catch {}
     }
@@ -22587,7 +23267,7 @@ const Proxy = {
     }
     if (execution.requestTraits.isPlaybackStartedRequest === true) {
       execution.progressForwardMode = "started_passthrough";
-      if (execution.progressForwardSessionKey) GLOBALS.PlaybackProgressRelay.delete(execution.progressForwardSessionKey);
+      if (execution.progressForwardSessionKey) deletePlaybackProgressRelayEntry(execution.progressForwardSessionKey);
       return null;
     }
     if (execution.requestTraits.isPlaybackStoppedRequest === true) {
@@ -22612,7 +23292,6 @@ const Proxy = {
     let relayEntry = relayMap.get(sessionKey);
     if (!relayEntry) {
       relayEntry = this.buildPlaybackProgressRelayEntry(intervalSec * 1000, execution.ctx);
-      relayMap.set(sessionKey, relayEntry);
     }
     relayEntry.intervalMs = intervalSec * 1000;
     relayEntry.waitUntilCtx = execution.ctx;
@@ -22627,8 +23306,7 @@ const Proxy = {
     relayEntry.terminalState = "";
     relayEntry.terminalAt = 0;
     relayEntry.terminalTombstoneUntil = 0;
-    relayMap.delete(sessionKey);
-    relayMap.set(sessionKey, relayEntry);
+    setBoundedPlaybackProgressRelayEntry(sessionKey, relayEntry);
     const withinWindow = relayEntry.lastForwardAt > 0 && (now - relayEntry.lastForwardAt) < relayEntry.intervalMs;
     if (!withinWindow && !relayEntry.activeFlushPromise && !relayEntry.pendingSnapshot) {
       relayEntry.pendingSnapshot = null;
@@ -23423,7 +24101,7 @@ const Proxy = {
       }));
     }
     if (execution.requestTraits.isPlaybackInfoRequest === true) {
-      await this.storePlaybackInfoResponseCache(execution, finalUpstreamState.response.clone());
+      await this.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
     }
     await this.maybePrewarmMetadataResponse(
       execution.request,
@@ -23667,9 +24345,12 @@ const Logger = {
     const writeClientIp = runtimeConfig.logWriteClientIp !== false;
     const writeColo = runtimeConfig.logWriteColo !== false;
     const writeUa = runtimeConfig.logWriteUa !== false;
-    const inboundColo = logData.inboundColo || logData.inboundIp || logData.clientIp || "unknown";
-    const outboundColo = logData.outboundColo || logData.outboundIp || "";
-    const clientIp = writeClientIp ? (logData.clientIp || "unknown") : "";
+    const boundedText = (value, maxLength) => String(value || "").slice(0, maxLength);
+    const inboundColo = boundedText(logData.inboundColo || logData.inboundIp || logData.clientIp || "unknown", 32);
+    const outboundColo = boundedText(logData.outboundColo || logData.outboundIp || "", 32);
+    const clientIp = writeClientIp ? boundedText(logData.clientIp || "unknown", 128) : "";
+    const nodeName = boundedText(logData.nodeName || "unknown", 128) || "unknown";
+    const requestPath = boundedText(logData.requestPath || "/", 2048) || "/";
 
     const currentMs = nowMs();
     const logClearEpochMs = Math.max(0, Number(GLOBALS.LogClearEpochMs) || 0);
@@ -23680,60 +24361,56 @@ const Logger = {
 
     if (dedupeWindow > 0) {
       const dedupKey = [
-        logData.nodeName || "unknown",
+        nodeName,
         logData.requestMethod || "GET",
         statusCode,
-        logData.requestPath || "/",
+        requestPath,
         clientIp,
         outboundColo
       ].join("|");
       const lastSeen = GLOBALS.LogDedupe.get(dedupKey);
       if (lastSeen && (currentMs - lastSeen) < dedupeWindow) return;
       GLOBALS.LogDedupe.set(dedupKey, currentMs);
-      if (GLOBALS.LogDedupe.size > 10000) {
-        const scannedEntries = [];
+      if (GLOBALS.LogDedupe.size > Config.Defaults.LogDedupeMax) {
         for (const [key, ts] of GLOBALS.LogDedupe) {
-          scannedEntries.push([key, ts]);
-          if (scannedEntries.length >= 5000) break;
-        }
-        for (const [key, ts] of scannedEntries) {
           if (!GLOBALS.LogDedupe.has(key)) continue;
-          if ((currentMs - ts) > dedupeWindow) {
+          if ((currentMs - ts) > dedupeWindow || GLOBALS.LogDedupe.size > Config.Defaults.LogDedupeTrimTarget) {
             GLOBALS.LogDedupe.delete(key);
           }
-          if (GLOBALS.LogDedupe.size <= 5000) break;
+          if (GLOBALS.LogDedupe.size <= Config.Defaults.LogDedupeTrimTarget) break;
         }
       }
     }
 
     GLOBALS.LogQueue.push({
       timestamp: recordTimestamp,
-      nodeName: logData.nodeName || "unknown",
-      requestPath: logData.requestPath || "/",
+      nodeName,
+      requestPath,
       requestMethod: logData.requestMethod || "GET",
       statusCode,
       responseTime: Number(logData.responseTime) || 0,
       clientIp,
       inboundColo: writeColo ? inboundColo : null,
       outboundColo: writeColo ? outboundColo : null,
-      userAgent: writeUa ? (logData.userAgent || null) : null,
-      referer: logData.referer || null,
+      userAgent: writeUa ? (boundedText(logData.userAgent, 512) || null) : null,
+      referer: boundedText(logData.referer, 1024) || null,
       category: logData.category || "api",
-      errorDetail: logData.errorDetail || null, // [新增] 记录错误详情
-      detailJson: logData.detailJson ? JSON.stringify(logData.detailJson) : null,
+      errorDetail: boundedText(logData.errorDetail, 2048) || null,
+      detailJson: logData.detailJson ? serializeBoundedLogDetailJson(logData.detailJson) : null,
       createdAt: new Date(recordTimestamp).toISOString()
     });
     // 💡 [极简修复 1] 内存泄流阀：如果 D1 阻塞导致队列堆积，强行丢弃最老的日志，死守内存底线
-    if (GLOBALS.LogQueue.length > 2000) {
-      GLOBALS.LogQueue.splice(0, 1000); 
+    if (GLOBALS.LogQueue.length > Config.Defaults.LogQueueMax) {
+      const overflowDropCount = Math.min(Config.Defaults.LogQueueOverflowDropCount, GLOBALS.LogQueue.length);
+      GLOBALS.LogQueue.splice(0, overflowDropCount);
       Database.patchOpsStatus(env, {
         log: {
           lastOverflowAt: new Date().toISOString(),
-          lastOverflowDropCount: 1000,
+          lastOverflowDropCount: overflowDropCount,
           queueLengthAfterDrop: GLOBALS.LogQueue.length
         }
       }, ctx);
-      console.error("Log queue overflow, dropping 1000 logs to prevent OOM.");
+      console.error(`Log queue overflow, dropping ${overflowDropCount} logs to preserve isolate headroom.`);
     }
 
     if (!GLOBALS.LogLastFlushAt) GLOBALS.LogLastFlushAt = currentMs;
@@ -23847,7 +24524,7 @@ const Logger = {
       if (logReadiness.statsReady === true && aggregatedStatsBuckets.size > 0) {
         try {
           await Database.upsertStatsHourlyBuckets(db, [...aggregatedStatsBuckets.values()], {
-            useBatch: false
+            useBatch: true
           });
         } catch (statsErr) {
           console.warn("upsertStatsHourlyBuckets failed", statsErr);
@@ -24194,16 +24871,58 @@ async function patchAdminShellRuntimeStatus(envOrStore, options = {}, ctx = null
     ...options,
     shellState
   });
-  return withNonCriticalFallback(
-    Database.patchOpsStatus(envOrStore, { adminShell: statusPatch }, ctx),
+  const stores = Database.resolveOpsStatusStores(envOrStore);
+  const db = stores.db;
+  const { updatedAt: _updatedAt, ...stableStatusPatch } = statusPatch;
+  const fingerprint = hashStableText(serializeConfigValue(stableStatusPatch));
+  const previousState = db ? GLOBALS.AdminShellStatusWriteState.get(db) : null;
+  const stableWriteIntervalMs = Math.max(
+    1000,
+    Number(Config.Defaults.AdminShellStatusStableWriteIntervalMs) || 1000
+  );
+  if (options.throttleStableWrites === true && previousState?.fingerprint === fingerprint) {
+    if (previousState.writePromise) return previousState.writePromise;
+    if ((nowMs() - (Number(previousState.writtenAt) || 0)) < stableWriteIntervalMs) {
+      return null;
+    }
+  }
+
+  const writePromise = withNonCriticalFallback(
+    Promise.resolve(Database.patchOpsStatus(envOrStore, { adminShell: statusPatch }, ctx))
+      .then(result => ({ ok: true, result })),
     "admin.shell_status_patch",
     {
       requestPath: statusPatch.requestPath,
       mode: statusPatch.mode,
       sourceType: statusPatch.sourceType
     },
-    null
+    { ok: false, result: null }
   );
+  const trackedWritePromise = writePromise.then(outcome => {
+    if (!db) return outcome?.result ?? null;
+    const currentState = GLOBALS.AdminShellStatusWriteState.get(db);
+    if (currentState?.writePromise !== trackedWritePromise) return outcome?.result ?? null;
+    if (outcome?.ok === true) {
+      GLOBALS.AdminShellStatusWriteState.set(db, {
+        fingerprint,
+        writtenAt: nowMs(),
+        writePromise: null
+      });
+    } else if (previousState) {
+      GLOBALS.AdminShellStatusWriteState.set(db, previousState);
+    } else {
+      GLOBALS.AdminShellStatusWriteState.delete(db);
+    }
+    return outcome?.result ?? null;
+  });
+  if (db) {
+    GLOBALS.AdminShellStatusWriteState.set(db, {
+      fingerprint,
+      writtenAt: 0,
+      writePromise: trackedWritePromise
+    });
+  }
+  return trackedWritePromise;
 }
 
 function withAdminShellRuntimeStatus(runtimeStatus = {}, env, config = {}, initHealth = buildInitHealth(env)) {
@@ -25264,7 +25983,9 @@ function buildAdminRemoteShellStoredResponse(html = "", options = {}) {
 }
 
 async function migrateLegacyAdminRemoteShellStoredResponse(response, remoteShellIndexUrl, bootstrap, initHealth) {
-  const sourceHtml = await response.text();
+  const sourceBody = await readResponseTextWithLimit(response, ADMIN_REMOTE_SHELL_MAX_BYTES);
+  if (sourceBody.exceeded) throw new Error("legacy remote admin shell too large");
+  const sourceHtml = sourceBody.text;
   const normalizedHtml = applyAdminRemoteBootstrapMarkup(sourceHtml, serializeInlineJson(bootstrap));
   const originEtag = response.headers.get(ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER) || "";
   const originLastModified = normalizeAdminHttpDateHeader(response.headers.get(ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER) || "");
@@ -25370,7 +26091,9 @@ async function readAdminReleaseVendorManifestFromCache(edgeCache, releaseTag = "
   const cachedResponse = await edgeCache.match(buildAdminReleaseVendorManifestCacheKeyRequest(releaseTag, sourceUrl));
   if (!cachedResponse) return null;
   try {
-    return normalizeAdminReleaseVendorManifestRecord(JSON.parse(await cachedResponse.text()));
+    const cachedBody = await readResponseTextWithLimit(cachedResponse, METADATA_PREWARM_RESPONSE_MAX_BYTES);
+    if (cachedBody.exceeded) return null;
+    return normalizeAdminReleaseVendorManifestRecord(JSON.parse(cachedBody.text));
   } catch {
     return null;
   }
@@ -25391,9 +26114,10 @@ async function buildAdminReleaseVendorManifestFromSource(releaseTag = "", source
   if (Number.isFinite(contentLength) && contentLength > ADMIN_REMOTE_SHELL_MAX_BYTES) {
     throw new Error(`release index too large: ${contentLength} bytes`);
   }
-  const remoteHtml = await response.text();
-  const remoteHtmlSize = new TextEncoder().encode(remoteHtml).length;
-  if (!remoteHtml || remoteHtmlSize > ADMIN_REMOTE_SHELL_MAX_BYTES) {
+  const remoteBody = await readResponseTextWithLimit(response, ADMIN_REMOTE_SHELL_MAX_BYTES);
+  const remoteHtml = remoteBody.text;
+  const remoteHtmlSize = remoteBody.bytes;
+  if (remoteBody.exceeded || !remoteHtml || remoteHtmlSize > ADMIN_REMOTE_SHELL_MAX_BYTES) {
     throw new Error(`release index payload invalid: ${remoteHtmlSize} bytes`);
   }
   const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(remoteHtml);
@@ -25498,7 +26222,9 @@ async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstra
     headers: requestHeaders
   });
   if (remoteResponse.status === 304 && previousResponse) {
-    const previousHtml = await previousResponse.text();
+    const previousBody = await readResponseTextWithLimit(previousResponse, ADMIN_REMOTE_SHELL_MAX_BYTES);
+    if (previousBody.exceeded) throw new Error("cached remote admin shell too large");
+    const previousHtml = previousBody.text;
     const variantEtag = normalizeEtagToken(previousResponse.headers.get("ETag") || "");
     const lastModified = normalizeAdminHttpDateHeader(previousResponse.headers.get("Last-Modified") || "");
     return {
@@ -25522,9 +26248,10 @@ async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstra
     throw new Error(`remote admin shell too large: ${contentLength} bytes`);
   }
 
-  const remoteHtml = await remoteResponse.text();
-  const remoteHtmlSize = new TextEncoder().encode(remoteHtml).length;
-  if (!remoteHtml || remoteHtmlSize > ADMIN_REMOTE_SHELL_MAX_BYTES) {
+  const remoteBody = await readResponseTextWithLimit(remoteResponse, ADMIN_REMOTE_SHELL_MAX_BYTES);
+  const remoteHtml = remoteBody.text;
+  const remoteHtmlSize = remoteBody.bytes;
+  if (remoteBody.exceeded || !remoteHtml || remoteHtmlSize > ADMIN_REMOTE_SHELL_MAX_BYTES) {
     throw new Error(`remote admin shell payload invalid: ${remoteHtmlSize} bytes`);
   }
   const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(remoteHtml);
@@ -25799,7 +26526,8 @@ async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHe
         reason: legacyCacheMigrated
           ? (revalidateDue ? "migrated_legacy_remote_shell_and_scheduled_revalidate" : "migrated_legacy_remote_shell")
           : (revalidateDue ? "served_cached_remote_shell_and_scheduled_revalidate" : "served_cached_remote_shell"),
-        requestPath
+        requestPath,
+        throttleStableWrites: true
       }, null);
       const backgroundTask = revalidateTask
         ? Promise.all([revalidateTask, statusPatchTask])
@@ -25939,9 +26667,9 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
     );
   }
 
-  const responseBuffer = await upstreamResponse.arrayBuffer();
-  const responseBytes = responseBuffer.byteLength;
-  if (!responseBytes || responseBytes > ADMIN_RELEASE_VENDOR_MAX_BYTES) {
+  const vendorBody = await readResponseBytesWithLimit(upstreamResponse, ADMIN_RELEASE_VENDOR_MAX_BYTES);
+  const responseBytes = vendorBody.bytes;
+  if (vendorBody.exceeded || !responseBytes || responseBytes > ADMIN_RELEASE_VENDOR_MAX_BYTES) {
     return buildAdminReleaseVendorErrorResponse(
       `Release vendor asset payload invalid: ${responseBytes} bytes`,
       502
@@ -25956,7 +26684,7 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
   if (lastModified) storedHeaders.set("Last-Modified", lastModified);
   storedHeaders.set(ADMIN_RELEASE_VENDOR_CACHED_AT_HEADER, String(nowMs()));
   storedHeaders.set(ADMIN_RELEASE_VENDOR_SOURCE_HASH_HEADER, hashStableText(manifestEntry.upstreamUrl));
-  const storedResponse = new Response(responseBuffer, {
+  const storedResponse = new Response(vendorBody.bodyBytes, {
     status: 200,
     headers: storedHeaders
   });
@@ -26452,15 +27180,15 @@ const RuntimeEntry = {
   },
 
   buildFetchRouteContext(request, env) {
-    const initHealth = warnInitHealthOnce(env);
     const requestUrl = new URL(request.url);
     const requestHost = normalizeHostnameText(requestUrl.hostname);
     const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
     const pathnameLower = normalizedPathname.toLowerCase();
     const adminPath = getAdminPath(env);
     const adminPathLower = adminPath.toLowerCase();
-    const adminLoginPath = getAdminLoginPath(env);
+    const adminLoginPath = buildAdminLoginPath(adminPath);
     const adminLoginPathLower = adminLoginPath.toLowerCase();
+    const initHealth = warnInitHealthOnce(env, { adminPath, loginPath: adminLoginPath });
     const segments = normalizedPathname.split("/").filter(Boolean);
     const rootRaw = segments[0] || "";
     const root = safeDecodeSegment(rootRaw).toLowerCase();
@@ -26796,9 +27524,10 @@ const RuntimeEntry = {
           cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords)
             ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords
             : null,
-          nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-          runtimeConfig,
-          entryMode: hostPrefixRoute.entryMode
+           nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+           runtimeConfig,
+           runtimeRouteContext: routeContext,
+           entryMode: hostPrefixRoute.entryMode
         });
       }
       return RuntimeEntry.buildRouteCorsResponse(request, env, "Not Found", 404);
@@ -26901,9 +27630,10 @@ const RuntimeEntry = {
           cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords)
             ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords
             : null,
-          nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-          runtimeConfig,
-          entryMode: hostPrefixCompatRoute.entryMode,
+           nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+           runtimeConfig,
+           runtimeRouteContext: routeContext,
+           entryMode: hostPrefixCompatRoute.entryMode,
           routeKindOverride: hostPrefixCompatRoute.routeKindOverride
         }
       );
@@ -26928,9 +27658,10 @@ const RuntimeEntry = {
         cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords)
           ? proxyRoute.playbackRouteHotSnapshot.targetRecords
           : null,
-        nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-        runtimeConfig,
-        entryMode: proxyRoute.entryMode
+         nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+         runtimeConfig,
+         runtimeRouteContext: routeContext,
+         entryMode: proxyRoute.entryMode
       });
       return isLegacyHostRequest
         ? await RuntimeEntry.maybeAttachLegacyProxyContextResponse(proxyResponse, requestHost, routeContext.root, env)
@@ -26956,9 +27687,10 @@ const RuntimeEntry = {
             cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords)
               ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords
               : null,
-            nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-            runtimeConfig,
-            entryMode: legacyCookieRoute.entryMode,
+             nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+             runtimeConfig,
+             runtimeRouteContext: routeContext,
+             entryMode: legacyCookieRoute.entryMode,
             routeKindOverride: legacyCookieRoute.routeKindOverride
           }
         );
@@ -27227,6 +27959,8 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     Config,
     GLOBALS,
     Database,
+    CacheManager,
+    Logger,
     Proxy,
     RuntimeEntry,
     createTargetRecord,
@@ -27241,6 +27975,9 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     buildCanonicalWorkerMetadataCacheKey,
     buildWorkerMetadataCacheLookupRequest,
     hasWorkerMetadataPrivateIdentity,
+    buildProxyAccessRuleProfile,
+    fetchGithubApiJson,
+    serializeBoundedLogDetailJson,
     runSingleFlight,
     getRuntimeConfig,
     invalidateRuntimeConfigCache,
@@ -27255,6 +27992,7 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     buildAdminRemoteShellStoredResponse,
     migrateLegacyAdminRemoteShellStoredResponse,
     fetchAdminRemoteShellStoredResponse,
+    patchAdminShellRuntimeStatus,
     renderRemoteAdminPage,
     renderAdminPage,
     isAcceptedAdminHtmlDocumentContentType,
@@ -27266,6 +28004,7 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     warmAdminReleaseVendorEntries,
     buildAdminWarmSubrequest,
     isAdminWarmResponseSuccessful,
+    buildDailyTelegramSummaryMessage,
     ADMIN_REMOTE_SHELL_TRANSFORM_REVISION,
     ADMIN_RELEASE_VENDOR_CACHE_CONTROL,
     ADMIN_RELEASE_VENDOR_MUTABLE_CACHE_CONTROL

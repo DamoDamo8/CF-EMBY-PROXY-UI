@@ -22,6 +22,33 @@
 - 涉及管理台边界时，先核对页面入口、启动动作、五个主视图、八个设置视觉分区和五个保存分组。
 - 涉及 Cache API、`ctx.waitUntil()`、Request/Response、`compatibility_flags` 或平台限制时，先查 `developers.cloudflare.com`，重点核对 Workers Cache API、缓存工作方式、Runtime Context 和平台限制。
 
+## Windows 开发环境
+
+正式开发环境使用 Windows PowerShell，不依赖 WSL：
+
+- Node.js 版本由 `frontend/.nvmrc` 与 `frontend/package.json#engines` 约束。
+- Python 版本由根 `.python-version` 约束；当前基线为 Python 3.14.6。`scripts/extract-ui-from-js.py` 的最低语法要求为 Python 3.10。
+- Git 使用 Windows 版 Git。
+- Wrangler 不要求全局安装，通过 `npx wrangler@latest` 调用。
+
+首次进入仓库后验证工具链并安装锁定依赖：
+
+```powershell
+node --version
+npm --version
+python --version
+py --version
+git --version
+npx wrangler@latest --version
+npm --prefix frontend ci
+```
+
+Python UI 提取工具可通过以下命令验证：
+
+```powershell
+python scripts/extract-ui-from-js.py --help
+```
+
 ## 实施顺序
 
 跨边界工作默认按以下顺序推进：
@@ -37,8 +64,6 @@
 
 ## 本地调试
 
-WSL 中优先使用 WSL 内的 `npx wrangler@latest`，不要依赖 Windows 全局 wrangler。
-
 从 `.dev.vars.example` 创建根 `.dev.vars`，最小配置：
 
 ```dotenv
@@ -52,21 +77,26 @@ ADMIN_PASS=<password>
 GITHUB_TOKEN=<token>
 ```
 
-启动顺序：
+在第一个 Windows PowerShell 终端启动 Worker：
 
-```bash
-cp .dev.vars.example .dev.vars
+```powershell
+Copy-Item .dev.vars.example .dev.vars
 npx wrangler@latest dev --local --ip 127.0.0.1 --port 8787 --env-file .dev.vars
-cd frontend && npm run dev
+```
+
+在第二个 Windows PowerShell 终端启动前端：
+
+```powershell
+Set-Location frontend
+npm run dev
 ```
 
 地址：
 
-- WSL 前端：`http://127.0.0.1:5173`
-- WSL Worker：`http://127.0.0.1:8787`
-- Windows 浏览器：`http://localhost:5173`
+- 前端：`http://localhost:5173`
+- Worker：`http://localhost:8787`
 
-`npm run dev` 会先运行管理台同步脚本，再由 `frontend/scripts/dev-server.mjs` 启动 Vite 并输出 WSL/Windows 访问提示。
+`npm run dev` 会先运行管理台同步脚本，再由 `frontend/scripts/dev-server.mjs` 使用当前 Node 进程启动项目内的 Vite CLI。该入口不依赖全局 Vite 或平台专用的 `.cmd` 启动器。
 
 ## D1 schema 迁移
 
@@ -75,7 +105,7 @@ cd frontend && npm run dev
 - 历史库的未知列组合不得由静态 migration 猜测。运行时兼容初始化必须严格读取 `sqlite_master`/`PRAGMA table_info`，逐项补齐已知列后再创建依赖索引；PRAGMA 失败、半初始化结构或未知结构均 fail-closed。
 - 本地验证由用户在已配置 Wrangler 的环境中执行，代理不得自动安装依赖或直接应用远端 migration：
 
-```bash
+```powershell
 npx wrangler@latest d1 migrations list <DATABASE_NAME> --local
 npx wrangler@latest d1 migrations apply <DATABASE_NAME> --local
 npx wrangler@latest d1 execute <DATABASE_NAME> --local --command="SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name"
@@ -110,7 +140,13 @@ node --test tests/worker-defensive-boundaries.test.mjs tests/config-kv-safety.te
 git diff --check
 ```
 
-聚焦回归需要保持以下 I/O 边界：同代配置与节点 revision 并发刷新各只访问一次 KV；同节点、同失效代次的代理冷读取只访问一次节点实体，代理热节点和有效期内的短期负缓存不重复读取节点实体；一次完整 OpsStatus 聚合只读取一次 root 和每个 section 一次。并发节点摘要 upsert 必须合并而不丢项，索引重建必须串行覆盖实体加载与提交，旧 revision 候选不得覆盖当前 meta。节点 `/web` 子树必须在上游请求前固定拒绝，Playback relay、同节点重定向和 `__pb_abs` 回退不得绕过；同时不能误伤 `/websocket`、`/webhooks`、普通 API 或媒体路径。
+Dashboard 月流量回归必须确认三点：连续读取由 single-flight/内存缓存合并，清空 isolate 缓存后可命中 Cache API，并且传入任何访问都会失败的 D1 binding 时 `getMonthlyTrafficStats` 仍成功。前端增强回归同时检查 `repeat-2` 切换图标、按需动作名及今日/本月文案。
+
+涉及 isolate 内存边界时，聚焦回归必须确认：PlaybackInfo 超过 256 KiB 不进入缓存、总响应体预算不超过 4 MiB；未知长度控制请求保持流式；节点/路由/故障状态/进度会话/日志与限流默认上限不被放大；轮转清理覆盖 PlaybackInfo、故障转移、进度转发和月流量 Map。媒体反代响应不得新增 `text()` 或 `arrayBuffer()` 整包读取，相关优化不得通过提高 D1 flush 或查询频率换取内存下降。
+
+远端 GitHub 成功 JSON 超过 4 MiB 或解析失败时必须 fail-closed；日志 `detail_json` 超过 8 KiB 时仍必须保持可 `JSON.parse` 的合法值。
+
+聚焦回归需要保持以下 I/O 边界：同代配置与节点 revision 并发刷新各只访问一次 KV；同节点、同失效代次的代理冷读取只访问一次节点实体，代理热节点和有效期内的短期负缓存不重复读取节点实体；一次完整 OpsStatus 聚合只读取一次 root 和每个 section 一次。D1 频率回归还要确认同 binding 的 schema 热调用只执行一轮 DDL、显式失效后会重新检查，OpsStatus 在 15 秒窗口复用 root/section 读取且写后不全量反读，Dashboard/runtime stale fallback 只查询一次缓存表，相同管理壳热命中状态只写一次而状态变化立即写。并发节点摘要 upsert 必须合并而不丢项，索引重建必须串行覆盖实体加载与提交，旧 revision 候选不得覆盖当前 meta。节点 `/web` 子树必须在上游请求前固定拒绝，Playback relay、同节点重定向和 `__pb_abs` 回退不得绕过；同时不能误伤 `/websocket`、`/webhooks`、普通 API 或媒体路径。
 
 节点 metadata 自动化覆盖不同 Token、Cookie、用户和会话参数的 SHA-256 身份分区、目标预热 URL 的敏感 query 分区、原始凭据不进入缓存 URL、TTL/资源类别 revision 和条件请求 lookup。匿名/私有缓存头及真实 Cache API `206`/`304` 行为仍需浏览器或预发 smoke；metadata 上游必须保持 `cache: no-store`。
 
@@ -132,19 +168,12 @@ D1 管理动作的职责边界保持不变：`initLogsDb` 只补日志与小时�
 
 ### 正式前端
 
-正式前端构建应在 Windows PowerShell 中运行，不在 WSL 内安装或更新依赖。在 Windows PowerShell 已定位到仓库根目录时执行：
+正式前端构建应在 Windows PowerShell 中运行。在 Windows PowerShell 已定位到仓库根目录时执行：
 
 ```powershell
 Set-Location frontend
 npm run build
 npm run build:cdn
-```
-
-必须从 WSL 发起时，在仓库根目录显式交给已安装的 Windows PowerShell；当前环境可使用 `powershell.exe`，安装 PowerShell 7 的环境可等价替换为 `pwsh.exe`：
-
-```bash
-powershell.exe -NoProfile -Command "npm --prefix frontend run build"
-powershell.exe -NoProfile -Command "npm --prefix frontend run build:cdn"
 ```
 
 重点检查：
