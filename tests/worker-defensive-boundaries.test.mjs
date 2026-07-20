@@ -22,12 +22,13 @@ const {
   buildWorkerMetadataCacheLookupRequest,
   hasWorkerMetadataPrivateIdentity,
   buildProxyAccessRuleProfile,
-  fetchGithubApiJson,
   serializeBoundedLogDetailJson,
   runSingleFlight,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
   invalidateNodesRevisionCache,
+  buildResolvedAdminIndexState,
+  buildAdminLocalIndexUploadRecord,
   buildAdminRemoteShellErrorContent,
   renderAdminRemoteShellErrorPage,
   isAdminIndexSetupForced,
@@ -61,11 +62,12 @@ const requiredFunctionHooks = {
   buildWorkerMetadataCacheLookupRequest,
   hasWorkerMetadataPrivateIdentity,
   buildProxyAccessRuleProfile,
-  fetchGithubApiJson,
   serializeBoundedLogDetailJson,
   getRuntimeConfig,
   invalidateRuntimeConfigCache,
   invalidateNodesRevisionCache,
+  buildResolvedAdminIndexState,
+  buildAdminLocalIndexUploadRecord,
   buildAdminRemoteShellErrorContent,
   renderAdminRemoteShellErrorPage,
   isAdminIndexSetupForced,
@@ -261,28 +263,6 @@ test("daily Telegram summary places monthly traffic below today's traffic", asyn
     Database.buildDashboardStatsPayload = originalBuildDashboardStatsPayload;
     Database.getDashboardMonthlyTrafficPayload = originalGetDashboardMonthlyTrafficPayload;
   }
-});
-
-test("GitHub API success payloads are bounded and require valid JSON", async () => {
-  await withWorkerGlobals({
-    fetch: async () => new Response("{}", {
-      headers: { "Content-Length": String((4 * 1024 * 1024) + 1) }
-    })
-  }, async () => {
-    await assert.rejects(
-      fetchGithubApiJson("/repos/axuitomo/CF-EMBY-PROXY-UI"),
-      error => error?.code === "GITHUB_RELEASE_SOURCE_RESPONSE_TOO_LARGE" && error?.status === 502
-    );
-  });
-
-  await withWorkerGlobals({
-    fetch: async () => new Response("not-json")
-  }, async () => {
-    await assert.rejects(
-      fetchGithubApiJson("/repos/axuitomo/CF-EMBY-PROXY-UI"),
-      error => error?.code === "GITHUB_RELEASE_SOURCE_RESPONSE_INVALID" && error?.status === 502
-    );
-  });
 });
 
 test("oversized log detail fallback remains valid JSON", () => {
@@ -535,7 +515,14 @@ test("manual setup renders GET and HEAD as no-store with the recovery reason", a
     );
     assert.equal(getResponse.status, 200);
     assert.equal(getResponse.headers.get("Cache-Control"), "no-store, max-age=0");
-    assert.match(await getResponse.text(), /class="admin-gate-shell"/);
+    const setupHtml = await getResponse.text();
+    assert.match(setupHtml, /class="admin-gate-shell"/);
+    assert.match(setupHtml, /id="admin-gate-local-file"/);
+    assert.match(setupHtml, /action: "uploadAdminIndex"/);
+    assert.doesNotMatch(setupHtml, /GitHub Release|getGithubReleaseSourceOptions|saveConfig|currentConfig|INDEX_URL/);
+    const gateScript = setupHtml.match(/<script>\s*(const ADMIN_INDEX_GATE_RUNTIME[\s\S]*?)<\/script>/)?.[1] || "";
+    assert.ok(gateScript, "setup gate script must be present");
+    assert.doesNotThrow(() => new Function(gateScript));
 
     const headResponse = await renderAdminPage(
       new Request("https://worker.test/console?setup=true", { method: "HEAD" }),
@@ -3175,8 +3162,11 @@ test("fresh remote shell keeps the external asset policy boundary", async () => 
       "/assets/app.js",
       "https://esm.sh/vue@3/dist/vue.runtime.esm-browser.js",
       "https://raw.githubusercontent.com/owner/repo/main/app.js",
+      "https://raw.githubusercontent.com./owner/repo/main/app.js",
       "https://github.com/owner/repo/releases/download/v1.0.0/app.js",
-      "https://github.com/owner/repo/releases/download/v1.0.0/runtime"
+      "https://github.com/owner/repo/releases/download/v1.0.0/runtime",
+      "https://github.com./owner/repo/releases/download/v1.0.0/runtime",
+      "https://esm.sh./vue@3/dist/vue.runtime.esm-browser.js"
     ];
     for (const forbiddenAssetUrl of forbiddenAssetUrls) {
       assetUrl = forbiddenAssetUrl;
@@ -3227,6 +3217,146 @@ test("remote shell rejects importmaps and rewrites semantic assets without exten
   });
 });
 
+test("local index uploads use the remote shell policy and a content-addressed source", async () => {
+  const validHtml = `<!doctype html><html><head>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="modulepreload" href="https://cdn.jsdelivr.net/npm/vue@3/dist/vue.esm-browser.prod.js">
+  </head><body><div id="app"></div></body></html>`;
+  const record = await buildAdminLocalIndexUploadRecord(validHtml, "C:\\exports\\index.html");
+  assert.match(record.sourceUrl, /^https:\/\/admin-local-index\.invalid\/[a-f0-9]{64}\/index\.html$/);
+  assert.match(record.assetRevision, /^local-[a-f0-9]{64}$/);
+  assert.equal(record.fileName, "index.html");
+  assert.equal(record.manifest.entries.length, 2);
+
+  await assert.rejects(
+    buildAdminLocalIndexUploadRecord('<!doctype html><html><body><div id="app"></div><script src="/assets/app.js"></script></body></html>'),
+    /asset policy invalid/
+  );
+  await assert.rejects(
+    buildAdminLocalIndexUploadRecord('<!doctype html><html><head><script type="importmap">{}</script></head><body><div id="app"></div></body></html>'),
+    /asset policy invalid/
+  );
+  await assert.rejects(
+    buildAdminLocalIndexUploadRecord('<!doctype html><html><body><div id="app"></div><script>void import("https://evil.test/runtime.js")</script></body></html>'),
+    /动态 import/
+  );
+});
+
+test("admin index resolution ignores Release fields and environment INDEX_URL", () => {
+  const resolved = buildResolvedAdminIndexState(
+    { INDEX_URL: "https://example.test/index.html" },
+    {
+      releaseRepo: "axuitomo/CF-EMBY-PROXY-UI",
+      releaseBranch: "main",
+      releaseTag: "v1.0.0",
+      indexUrl: "https://example.test/index.html"
+    }
+  );
+  assert.equal(resolved.indexUrl, "");
+  assert.equal(resolved.indexUrlSource, "unset");
+  assert.equal(resolved.hasGithubRelease, false);
+  assert.equal(resolved.gateState, "setup_required");
+});
+
+test("Worker and HTML update requires both uploaded files", async () => {
+  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-files-required" };
+  invalidateRuntimeConfigCache();
+  const validHtml = '<!doctype html><html><body><div id="app"></div></body></html>';
+  const cases = [
+    {
+      workerFileName: "worker.js",
+      workerScriptContent: "export default { fetch() { return new Response('ok'); } }"
+    },
+    {
+      indexFileName: "index.html",
+      indexHtml: validHtml
+    }
+  ];
+
+  for (const data of cases) {
+    const response = await Database.ApiHandlers.updateWorkerAndAdminIndex(data, {
+      env,
+      kv,
+      ctx: null,
+      request: new Request("https://worker.test/admin")
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "WORKER_HTML_FILES_REQUIRED");
+  }
+});
+
+test("local index source persists in KV and renders through the same-origin vendor path", async () => {
+  const { kv } = createInMemoryKvStore({ "sys:theme": {} });
+  const env = { ADMIN_PATH: "/admin", ENI_KV: kv };
+  const html = '<!doctype html><html><head><script src="https://cdn.example.test/app.js"></script></head><body><div id="app"></div></body></html>';
+  const record = await buildAdminLocalIndexUploadRecord(html, "index.html");
+  const persisted = await Database.persistAdminIndexUpload(record, { env, kv });
+  const resolved = buildResolvedAdminIndexState({}, persisted.config);
+  assert.equal(resolved.indexUrlSource, "local_upload");
+  assert.equal(resolved.localUploadRevision, record.revision);
+  assert.equal((await Database.getAdminIndexUploadRecord(kv, record.revision)).html, html);
+
+  const response = await renderAdminPage(
+    new Request("https://worker.test/admin"),
+    env,
+    null,
+    { ok: true, missing: [] },
+    persisted.config
+  );
+  const rendered = await response.text();
+  assert.equal(response.status, 200);
+  assert.doesNotMatch(rendered, /https:\/\/cdn\.example\.test\/app\.js/);
+  assert.match(rendered, new RegExp(`/admin/__release/${record.assetRevision}/vendor/`));
+
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      assert.equal(url, "https://cdn.example.test/app.js");
+      return new Response("window.localVendorLoaded=true;", {
+        headers: { "Content-Type": "application/javascript" }
+      });
+    }
+  }, async () => {
+    const vendorResponse = await renderAdminReleaseVendorAsset(
+      new Request(`https://worker.test/admin/__release/${record.assetRevision}/vendor/${record.manifest.entries[0].assetKey}`),
+      env,
+      null,
+      { releaseTag: record.assetRevision, assetKey: record.manifest.entries[0].assetKey },
+      persisted.config
+    );
+    assert.equal(vendorResponse.status, 200);
+    assert.match(await vendorResponse.text(), /localVendorLoaded/);
+  });
+});
+
+test("local index upload replaces a corrupted record under the same revision", async () => {
+  const html = '<!doctype html><html><body><div id="app"></div></body></html>';
+  const record = await buildAdminLocalIndexUploadRecord(html, "index.html");
+  const uploadKey = Database.buildAdminIndexUploadKey(record.revision);
+  const corruptedRecord = {
+    ...record,
+    html: '<!doctype html><html><body><div id="app">corrupted</div></body></html>'
+  };
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [Database.CONFIG_KEY]: {},
+    [uploadKey]: corruptedRecord
+  });
+  const env = {
+    ADMIN_PATH: "/admin",
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "local-index-corrupt-record"
+  };
+  invalidateRuntimeConfigCache();
+
+  const persisted = await Database.persistAdminIndexUpload(record, { env, kv });
+
+  assert.equal(persisted.record.html, html);
+  assert.equal(JSON.parse(storedValues.get(uploadKey)).html, html);
+  assert.ok(putKeys.includes(uploadKey));
+  assert.equal((await Database.getAdminIndexUploadRecord(kv, record.revision)).html, html);
+});
+
 test("fresh remote shell enforces the byte limit after reading the body", async () => {
   const html = `<!doctype html><html><body><div id="app">${"x".repeat(2 * 1024 * 1024)}</div></body></html>`;
   await withWorkerGlobals({
@@ -3258,6 +3388,15 @@ test("jsDelivr GitHub mutable-ref classifier distinguishes branches from immutab
 
 test("mutable vendor assets bypass asset cache and return no-store", async () => {
   const upstreamUrl = "https://cdn.jsdelivr.net./gh/owner/repo/app.js";
+  const indexRecord = await buildAdminLocalIndexUploadRecord(
+    `<!doctype html><html><head><script src="${upstreamUrl}"></script></head><body><div id="app"></div></body></html>`,
+    "index.html"
+  );
+  const manifestEntry = indexRecord.manifest.entries[0];
+  const { kv } = createInMemoryKvStore({
+    [Database.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
+  });
+  const env = { ENI_KV: kv };
   const cacheReads = [];
   const cacheWrites = [];
   const edgeCache = {
@@ -3266,10 +3405,8 @@ test("mutable vendor assets bypass asset cache and return no-store", async () =>
       cacheReads.push(url.hostname);
       if (url.hostname === "admin-release-vendor-manifest.invalid") {
         return new Response(JSON.stringify({
-          version: 1,
-          releaseTag: "v1.0.0",
-          sourceUrl: "https://example.test/index.html",
-          entries: [{ assetKey: "app.js", assetKind: "script", upstreamUrl }]
+          ...indexRecord.manifest,
+          entries: [manifestEntry]
         }));
       }
       return null;
@@ -3289,10 +3426,10 @@ test("mutable vendor assets bypass asset cache and return no-store", async () =>
     }
   }, async () => {
     const response = await renderAdminReleaseVendorAsset(
-      new Request("https://worker.test/admin/__release/v1.0.0/vendor/app.js"),
-      {},
+      new Request(`https://worker.test/admin/__release/${indexRecord.assetRevision}/vendor/${manifestEntry.assetKey}`),
+      env,
       null,
-      { releaseTag: "v1.0.0", assetKey: "app.js" },
+      { releaseTag: indexRecord.assetRevision, assetKey: manifestEntry.assetKey },
       {}
     );
     assert.equal(response.status, 200);
@@ -3306,6 +3443,15 @@ test("mutable vendor assets bypass asset cache and return no-store", async () =>
 
 test("immutable vendor assets use asset cache and immutable browser policy", async () => {
   const upstreamUrl = "https://cdn.jsdelivr.net/gh/owner/repo@v1.2.3/app.js";
+  const indexRecord = await buildAdminLocalIndexUploadRecord(
+    `<!doctype html><html><head><script src="${upstreamUrl}"></script></head><body><div id="app"></div></body></html>`,
+    "index.html"
+  );
+  const manifestEntry = indexRecord.manifest.entries[0];
+  const { kv } = createInMemoryKvStore({
+    [Database.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
+  });
+  const env = { ENI_KV: kv };
   const cacheReads = [];
   const cacheWrites = [];
   const edgeCache = {
@@ -3314,10 +3460,8 @@ test("immutable vendor assets use asset cache and immutable browser policy", asy
       cacheReads.push(url.hostname);
       if (url.hostname === "admin-release-vendor-manifest.invalid") {
         return new Response(JSON.stringify({
-          version: 1,
-          releaseTag: "v1.0.0",
-          sourceUrl: "https://example.test/index.html",
-          entries: [{ assetKey: "app.js", assetKind: "script", upstreamUrl }]
+          ...indexRecord.manifest,
+          entries: [manifestEntry]
         }));
       }
       return null;
@@ -3337,10 +3481,10 @@ test("immutable vendor assets use asset cache and immutable browser policy", asy
     }
   }, async () => {
     const response = await renderAdminReleaseVendorAsset(
-      new Request("https://worker.test/admin/__release/v1.0.0/vendor/app.js"),
-      {},
+      new Request(`https://worker.test/admin/__release/${indexRecord.assetRevision}/vendor/${manifestEntry.assetKey}`),
+      env,
       null,
-      { releaseTag: "v1.0.0", assetKey: "app.js" },
+      { releaseTag: indexRecord.assetRevision, assetKey: manifestEntry.assetKey },
       {}
     );
     assert.equal(response.status, 200);

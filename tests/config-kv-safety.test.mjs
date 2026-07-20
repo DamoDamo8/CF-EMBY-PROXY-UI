@@ -6,7 +6,7 @@ await import("../worker.js");
 const hooks = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
 assert.ok(hooks, "worker.js must expose Node test hooks");
 
-const { Database, invalidateRuntimeConfigCache } = hooks;
+const { Database, buildAdminLocalIndexUploadRecord, invalidateRuntimeConfigCache } = hooks;
 
 function createDeferred() {
   let resolve;
@@ -324,12 +324,21 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
 });
 
 test("redacted full backup roundtrip preserves current secrets", async () => {
+  const adminIndexRecord = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app"></div></body></html>',
+    "index.html"
+  );
   const currentConfig = {
     rateLimitRpm: 30,
     cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret"
+    tgBotToken: "current-tg-secret",
+    indexUrl: adminIndexRecord.sourceUrl
   };
-  const { kv } = createKv({ [Database.CONFIG_KEY]: currentConfig });
+  const uploadKey = Database.buildAdminIndexUploadKey(adminIndexRecord.revision);
+  const { kv } = createKv({
+    [Database.CONFIG_KEY]: currentConfig,
+    [uploadKey]: adminIndexRecord
+  });
   const env = {
     ENI_KV: kv,
     __CONFIG_CACHE_NAMESPACE: "config-kv-safety-full-roundtrip"
@@ -345,11 +354,15 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     assert.equal(backup.secretsRedacted, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.adminIndexUpload.revision, adminIndexRecord.revision);
+    assert.equal(backup.adminIndexUpload.html, adminIndexRecord.html);
 
+    await kv.delete(uploadKey);
     await Database.ApiHandlers.importFull(backup, { env, ctx: null, kv });
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    assert.equal((await Database.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
   } finally {
     invalidateRuntimeConfigCache();
   }

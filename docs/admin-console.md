@@ -10,20 +10,15 @@
 - `POST ADMIN_PATH/login` 登录并签发 `auth_token`。
 - `POST ADMIN_PATH` 是登录后的统一管理 API 入口。
 - `GET/HEAD ${ADMIN_PATH}/__warm` 仅对已认证请求开放，用于显式预热管理台壳和可缓存依赖；登录成功后立即跳转，并通过 `keepalive` 尽力触发该路径，不等待完整 vendor 预热。
+- `GET ADMIN_PATH?setup=1` 的 `Index Source` 启动门只提供本地 `index.html` 上传；文件名必须是 `index.html`，上限 2 MiB，由 Worker 重新校验后写入 KV 并切换当前壳来源。
 - 默认首屏调用 `getAdminBootstrap`。
 - 当前 hash 为 `#settings` 时优先调用 `getSettingsBootstrap`。
 
 ### 手动重设与错误恢复
 
 - 已认证用户可通过 `GET ADMIN_PATH?setup=1` 手动进入设置恢复页；兼容既有的 `setup=true`，错误页统一链接到 `setup=1`。
-- 进入恢复页本身不调用 `saveConfig`，也不清空现有配置；错误页不下发完整配置对象，恢复页仍按既有设置表单契约加载当前配置。
-- 远端壳错误页只提供刷新、登录、远端资产检查和恢复页链接，不包含客户端配置回写脚本；`HEAD` 响应保持空 body。页面缓存语义见 [运行时架构](architecture.md#worker-cache-api)。
-
-管理台视图链固定为：
-
-```text
-#dashboard -> #nodes -> #logs -> #dns -> #settings
-```
+- 进入恢复页本身不调用 `saveConfig`，也不清空现有配置；页面只下发 `adminPath`，不下发完整配置对象或密钥。
+- 本地 HTML 错误页只提供刷新和重新上传链接，不包含客户端配置回写脚本；`HEAD` 响应保持空 body。页面缓存语义见 [运行时架构](architecture.md#worker-cache-api)。
 
 `GET /` 仍是静态说明页，不属于管理台实时视图。
 
@@ -66,12 +61,12 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 
 ### 设置写入与备份安全
 
-- `previewConfig`、`saveConfig` 和 `importSettings` 共用字段清洗与完整校验链。预览必须执行发布源、Host Prefix CNAME、DNS 同步前置条件等正式保存校验，不得把预览成功但保存必然失败的配置交给用户确认。
+- `previewConfig`、`saveConfig` 和 `importSettings` 共用字段清洗与完整校验链。预览必须执行本地 HTML 内部版本、Host Prefix CNAME、DNS 同步前置条件等正式保存校验，不得把预览成功但保存必然失败的配置交给用户确认。
 - `saveConfig` 和 `importSettings` 必须有 KV binding；缺少 `ENI_KV`/兼容 KV binding 时返回 `KV_NOT_CONFIGURED`、HTTP `503`，不得以仅保存在 isolate 内存中的配置返回成功。
 - 一次设置写入同时提交配置、配置 meta、设置快照、快照 meta 和遗留键删除，并在单 isolate 的 KV mutation chain 中串行。节点保存/导入、删除、主视频流快捷策略和完整导入共用该链，后发写入等待前序索引提交或补偿完成。失败补偿只恢复仍等于本次写入结果的键；若检测到并发新值，返回 `KV_MUTATION_ROLLBACK_CONFLICT`、HTTP `409`，并通过 `rollbackConflicts`/`rollbackFailures` 说明未覆盖的新值或补偿失败。
 - `importFull` 将导入前快照、配置和节点读取、DNS 计划、配置/节点提交及失败补偿作为同一个串行操作。节点阶段失败时先恢复节点和导入前 CNAME，再恢复旧配置及其 DNS；同 isolate 内后发设置保存必须等待导入完成，不能被旧快照覆盖。
 - `exportSettings` 默认移除 `cfApiToken`、`tgBotToken`，返回 `secretsRedacted: true`、`containsSecrets: false`。完整设置导出必须同时提交 `includeSecrets: true` 和 `X-Admin-Confirm: exportSettings`；缺少确认头时返回 `CONFIRMATION_REQUIRED`、HTTP `428`，成功结果标记 `containsSecrets: true`。
-- `exportConfig` 的默认响应同样脱敏，节点导出不得把配置密钥带回浏览器。只有提交 `includeSecrets: true` 且携带 `X-Admin-Confirm: exportConfig` 时才允许生成包含密钥的完整配置备份；普通设置导出仍应调用 `exportSettings`。
+- `exportConfig` 的默认响应同样脱敏，节点导出不得把配置密钥带回浏览器。只有提交 `includeSecrets: true` 且携带 `X-Admin-Confirm: exportConfig` 时才允许生成包含密钥的完整配置备份；完整备份同时携带当前内容寻址 `index.html`，`importFull` 校验其 SHA-256 与配置版本一致后恢复。普通设置导出仍应调用 `exportSettings`。
 - 默认脱敏的 settings/full 备份回导时，缺少 `cfApiToken` 或 `tgBotToken` 表示保留当前密钥；备份显式包含字段时才允许覆盖，显式空字符串表示清空。配置快照及 KV 整理迁移快照只保存脱敏配置；恢复普通快照或整理迁移快照时同样沿用当前密钥。
 - Worker 不保存也不消费 `dnsAutoUpload*`。正式模板、生成入口和 Vue 设置源均不得包含或展示这些设置；实现完整 scheduled 能力前不能用占位表单暗示功能已经生效。
 
@@ -100,11 +95,11 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 
 ### 配置、备份与整理
 
-- `getGithubReleaseSourceOptions`
 - `loadConfig`
 - `previewConfig`
 - `previewTidyData`
 - `saveConfig`
+- `uploadAdminIndex`
 - `exportConfig`
 - `exportSettings`
 - `importSettings`
@@ -119,7 +114,7 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 
 - `getWorkerPlacementStatus`
 - `saveWorkerPlacement`
-- `updateWorkerScriptContent`
+- `updateWorkerAndAdminIndex`
 - `purgeCache`
 
 ### 节点
@@ -149,6 +144,8 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - `deleteDnsIpPoolItems`
 
 `createDnsRecord` / `updateDnsRecord` 在 Cloudflare 写入成功但 CNAME history 持久化失败时返回 `CF_DNS_UPDATE_FAILED`，并携带补偿是否尝试、是否成功及错误原因；创建操作删除刚创建的记录，更新操作恢复写入前记录。
+
+设置页“保存 DNS 设置”同时保存当前 DNS 配置与发生变化的优选源草稿。只有优选源变化时不重复写入主配置；优选源未变化时不调用 `saveDnsIpPoolSources`，避免无意义地改写 D1 和推进 DNS IP revision。任一保存失败时不得显示整体成功；若主配置已保存但优选源失败，前端应用已持久化的配置、保留优选源草稿供重试，并明确提示部分成功。
 - `fillDnsDraftFromIpPool`
 
 ### 日志与告警
@@ -181,7 +178,7 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - 节点工具栏在桌面端保持“新建、标签筛选、搜索”同行，导入、导出和健康检查作为独立操作组；窄屏按控件完整宽度依次堆叠。
 - 节点编辑弹窗在线路列表下方提供默认展开、可手动收起的“高级设置”，统一容纳 PlaybackInfo 模式、媒体认证头模式、真实客户端 IP 透传、线路故障转移探针路径和自定义请求头；这些字段继续使用既有节点保存契约。
 - 节点编辑弹窗采用紧凑表单密度：入口模式位于节点名称前；标签、备注和主视频流策略同一行，主视频流策略不展示额外说明；同时保持输入控件和线路操作按钮的可点击尺寸。
-- 发布源与 Worker 快捷更新设置区按“来源摘要、配置或派生地址、执行动作”分层；长 URL 不得撑破设置面板，主要更新动作与辅助刷新动作保持明确层级。
+- 静态资源策略不展示发布源、Release 或 `INDEX_URL` 配置，保存按钮文案固定为“保存静态资源策略”。备份与恢复中的“Worker 和 HTML 更新”必须同时选择 `worker.js` 与 `index.html`，任一缺失、文件名错误或超出上限时禁用提交；后端动作继续执行同样的双文件强制校验。
 - 默认“导出全局设置”必须明确提示结果已脱敏；专家模式才显示“导出含密钥设置”，并在请求前进行敏感操作确认。日志页专家模式显示“Schema 状态”和“初始化 Schema”，分别调用 `getD1SchemaStatus` 与 `initD1Schema`。
 - 视频流量卡的今日/本月切换由正式 runtime enhancement 挂载，使用 Lucide `repeat-2` 图标、固定点击区域和加载态；月统计只在用户首次切换时请求，切回今日直接恢复当前仪表盘快照。
 - `App.vue`、`src/features/*`、`src/composables/*` 不是当前首屏启动链。

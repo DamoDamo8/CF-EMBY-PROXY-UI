@@ -30,10 +30,10 @@
 
 ## 当前基线
 
-系统采用 `Worker Shell + frontend admin runtime sync + GitHub Release-only + Worker vendor proxy + Cache API SWR`：
+系统采用 `Worker Shell + frontend admin runtime sync + KV local index + Worker vendor proxy + Cache API SWR`：
 
 - `GET /` 返回静态说明页。
-- `GET ADMIN_PATH` 由 Worker 从 GitHub Release 拉取并返回唯一管理台入口 `index.html`。
+- `GET ADMIN_PATH` 由 Worker 从 KV 中读取经启动门或双文件更新动作上传的内容寻址 `index.html`，并返回唯一管理台入口。
 - `POST ADMIN_PATH/login` 与 `POST ADMIN_PATH` 保持既有登录和管理 API 契约，细节见 [管理台契约](docs/admin-console.md)。
 - 浏览器使用 Worker 同源 vendor 路径加载依赖；Worker 负责源站重写和 Cache API 缓冲。
 - Emby 节点代理只承载 API、WebSocket 与媒体请求，不反代 `/web` 子树；该边界不影响管理台 `/admin` 的资源交付。
@@ -45,7 +45,7 @@
 2. 不把完整前端运行时代码重新内嵌进 `worker.js`；Worker 只保留壳、后端能力和极小降级内容。
 3. `frontend/index.html` 是唯一管理台入口，不新增第二套首页或替代入口。
 4. 管理台保持现有 SaaS 控制台信息架构。未经批准，不改成官网、内容站、文档页或另一套管理台。
-5. 浏览器不得直连 GitHub Release、raw GitHub 或相对 bundle 资源。远端壳按标签语义识别 JS/CSS（包括无扩展脚本）并改写为 Worker 同源 vendor 路径；禁止源判断先规范化绝对 URL，协议相对及尾点主机名写法不得绕过。正式壳不接受 importmap 或任何 inline 动态 `import()`。
+5. 浏览器不得直连 GitHub Release、raw GitHub 或相对 bundle 资源。上传的 HTML 按标签语义识别 JS/CSS（包括无扩展脚本）并改写为 Worker 同源 vendor 路径；禁止源判断先规范化绝对 URL，协议相对及尾点主机名写法不得绕过。正式壳不接受 importmap 或任何 inline 动态 `import()`。
 6. 前端更新由请求触发，不依赖 `scheduled()` 或 CRON。
 7. 浏览器缓存和 Worker Cache API 是两层独立缓存，不得混为一谈。
 8. 不破坏现有鉴权、代理、KV/D1、日志和 scheduled 语义，除非任务明确要求。

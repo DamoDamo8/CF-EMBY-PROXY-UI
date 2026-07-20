@@ -47,6 +47,37 @@ test('dashboard traffic card exposes an on-demand day and month toggle', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /本月视频流量 \(CF Zone 总流量\)/);
 });
 
+test('backup view exposes only the paired Worker and HTML upload flow', async () => {
+  const template = await readFile(new URL('../frontend/admin-runtime.template.html', import.meta.url), 'utf8');
+  const adminConsoleDoc = await readFile(new URL('../docs/admin-console.md', import.meta.url), 'utf8');
+  const cdnChecker = await readFile(new URL('../frontend/scripts/check-cdn-paths.mjs', import.meta.url), 'utf8');
+  assert.match(template, /id:"admin-worker-html-update-root"/);
+  assert.doesNotMatch(template, /cfg-release-repo|cfg-release-branch|cfg-release-tag|cfg-index-url/);
+  assert.doesNotMatch(template, /releaseRepo|releaseBranch|releaseTag|buildGithubReleaseSourceState/);
+  assert.doesNotMatch(template, /updateWorkerScriptContent|从 GitHub 拉取并更新 Worker/);
+  assert.match(template, /\\u4fdd\\u5b58\\u9759\\u6001\\u8d44\\u6e90\\u7b56\\u7565/);
+  assert.doesNotMatch(template, /\\u4fdd\\u5b58\\u9759\\u6001\\u8d44\\u6e90\\u7b56\\u7565\\u4e0e\\u53d1\\u5e03\\u6e90/);
+  assert.doesNotMatch(adminConsoleDoc, /#dashboard\s*->\s*#nodes\s*->\s*#logs\s*->\s*#dns\s*->\s*#settings/);
+  assert.doesNotMatch(cdnChecker, /Release-only/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('updateWorkerAndAdminIndex'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /workerFileName: state\.workerFile\.name/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /indexFileName: state\.indexFile\.name/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /必须同时选择 worker\.js 和 index\.html/);
+});
+
+test('DNS settings save includes changed preferred sources without redundant source writes', async () => {
+  const template = await readFile(new URL('../frontend/admin-runtime.template.html', import.meta.url), 'utf8');
+  const runtimeScript = template.match(/<script>(const UI_DEFAULTS=[\s\S]*?)<\/script><\/body>/)?.[1] || '';
+  assert.match(template, /hasDnsIpSourceDraftChanges\(\)/);
+  assert.match(template, /"dns"===r&&this\.hasDnsIpSourceDraftChanges\(\)/);
+  assert.match(template, /f&&!await this\.saveDnsIpPoolSourcesFromSettings\(\{silentSuccess:!0,silentError:!0\}\)/);
+  assert.match(template, /"dns"===r&&!g\?\{config:p\}:await this\.apiCall\("saveConfig"/);
+  assert.match(template, /g&&this\.applyRuntimeConfig\(u\.config\|\|p\)/);
+  assert.match(template, /DNS \\u8bbe\\u7f6e\\u5df2\\u4fdd\\u5b58\\uff0c\\u4f46\\u4f18\\u9009\\u6e90\\u4fdd\\u5b58\\u5931\\u8d25/);
+  assert.ok(runtimeScript, 'formal admin runtime script must be extractable');
+  assert.doesNotThrow(() => new vm.Script(runtimeScript));
+});
+
 test('D1 schema dialog includes migrations, columns, and reported issues', () => {
   const { formatD1SchemaStatus } = loadEnhancementTestHooks();
   const message = formatD1SchemaStatus({

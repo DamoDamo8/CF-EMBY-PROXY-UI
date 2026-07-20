@@ -1,4 +1,4 @@
-// EMBY-PROXY-UI V19.2 (SaaS UI Optimized - Ultimate Fix + Media Auth Compatibility)
+// EMBY-PROXY-UI V19.3 (SaaS UI Optimized - Ultimate Fix + Media Auth Compatibility)
 
 /** @typedef {{ get(key: string, options?: { type?: string }): Promise<any>, put(key: string, value: string): Promise<void>, delete(key: string): Promise<void>, list(options?: { prefix?: string, cursor?: string }): Promise<{ keys: Array<{ name: string }>, cursor?: string, list_complete?: boolean }> }} KVNamespaceLike */
 /** @typedef {{ waitUntil(promise: Promise<any>): void }} ExecutionContextLike */
@@ -154,8 +154,8 @@ const CLOUDFLARE_DEFAULTS = Object.freeze({
 });
 
 const BUILD_DEFAULTS = Object.freeze({
-  AssetHash: "v19.2",
-  Version: "19.2"
+  AssetHash: "v19.3",
+  Version: "19.3"
 });
 
 const CONFIG_DEFAULTS = Object.freeze({
@@ -196,9 +196,12 @@ const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotC
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
 const REMOTE_JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 const REMOTE_ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
-const ADMIN_JSON_REQUEST_MAX_BYTES = 4 * 1024 * 1024;
+const ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
 const LOGIN_JSON_REQUEST_MAX_BYTES = 16 * 1024;
 const METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
+const ADMIN_LOCAL_INDEX_SOURCE_ORIGIN = "https://admin-local-index.invalid";
+const ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX = "local-";
+const ADMIN_LOCAL_INDEX_KV_PREFIX = "sys:admin_index_upload:v1:";
 
 const Config = {
   Defaults: CONFIG_DEFAULTS
@@ -3240,6 +3243,16 @@ function hashStableText(input = "") {
   return (hash >>> 0).toString(36);
 }
 
+async function sha256HexText(input = "") {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(String(input || ""))
+  );
+  return [...new Uint8Array(digest)]
+    .map(byte => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function createDnsIpPoolSourceId(seed = "") {
   return `dns-ip-source-${hashStableText(seed || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`)}`;
 }
@@ -5429,6 +5442,37 @@ function detectCloudflareWorkerScriptUploadSyntax(scriptContent = "") {
   return "service-worker";
 }
 
+function validateUploadedWorkerScriptSource(scriptContent = "", fileName = "worker.js") {
+  const normalizedFileName = normalizeCloudflareWorkerScriptUploadFileName(fileName);
+  if (normalizedFileName.toLowerCase() !== "worker.js") {
+    throw createStructuredConfigError(
+      "WORKER_UPLOAD_FILE_NAME_INVALID",
+      "Worker 文件名必须是 worker.js",
+      400,
+      { fileName: normalizedFileName || String(fileName || "").trim() }
+    );
+  }
+  const normalizedScriptContent = String(scriptContent || "");
+  const contentLength = new TextEncoder().encode(normalizedScriptContent).length;
+  if (!normalizedScriptContent.trim()) {
+    throw createStructuredConfigError("WORKER_UPLOAD_EMPTY", "worker.js 不能为空", 400);
+  }
+  if (contentLength > ADMIN_WORKER_UPLOAD_MAX_BYTES) {
+    throw createStructuredConfigError(
+      "WORKER_UPLOAD_TOO_LARGE",
+      `worker.js 体积超过限制（${contentLength} bytes）`,
+      400,
+      { contentLength, maxBytes: ADMIN_WORKER_UPLOAD_MAX_BYTES }
+    );
+  }
+  return {
+    fileName: normalizedFileName,
+    scriptContent: normalizedScriptContent,
+    contentLength,
+    syntax: detectCloudflareWorkerScriptUploadSyntax(normalizedScriptContent)
+  };
+}
+
 function buildCloudflareWorkerScriptUploadMetadata(fileName = "", syntax = "module") {
   const normalizedFileName = normalizeCloudflareWorkerScriptUploadFileName(fileName) || "worker.js";
   return syntax === "module"
@@ -5536,265 +5580,14 @@ function normalizeCloudflareWorkerScriptUpdateErrorMessage(error) {
   ) {
     return message;
   }
-  if (status === 401) return "Cloudflare Worker 快捷更新失败：API Token 无效";
+  if (status === 401) return "Cloudflare Worker 和 HTML 更新失败：API Token 无效";
   if (status === 403) return buildCloudflareWorkerScriptUpdatePermissionMessage("更新");
-  if (status === 404) return "Cloudflare Worker 快捷更新失败：未找到目标 Worker 脚本";
+  if (status === 404) return "Cloudflare Worker 和 HTML 更新失败：未找到目标 Worker 脚本";
   return message;
 }
 
-const GITHUB_RELEASE_WORKER_MAX_BYTES = 3 * 1024 * 1024;
-const FIXED_GITHUB_RELEASE_REPO = "axuitomo/CF-EMBY-PROXY-UI";
-const GITHUB_API_BASE_URL = "https://api.github.com";
-const GITHUB_API_VERSION = "2022-11-28";
-const GITHUB_API_PAGE_SIZE = 100;
-const GITHUB_API_MAX_PAGES = 10;
-const GITHUB_TAG_REACHABILITY_CONCURRENCY = 6;
-const GITHUB_API_USER_AGENT = "cf-emby-proxy-ui-release-source/1.0";
+const ADMIN_WORKER_UPLOAD_MAX_BYTES = 3 * 1024 * 1024;
 const LOG_DETAIL_JSON_MAX_LENGTH = 8192;
-
-function readGithubApiToken(env = null) {
-  const primaryToken = String(env?.GITHUB_TOKEN || "").trim();
-  if (primaryToken) return primaryToken;
-  return String(env?.GITHUB_API_TOKEN || "").trim();
-}
-
-function readGithubApiTokenSource(env = null) {
-  const primaryToken = String(env?.GITHUB_TOKEN || "").trim();
-  if (primaryToken) return "GITHUB_TOKEN";
-  const legacyToken = String(env?.GITHUB_API_TOKEN || "").trim();
-  if (legacyToken) return "GITHUB_API_TOKEN";
-  return "";
-}
-
-function buildGithubApiRequestHeaders(env = null) {
-  const headers = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": GITHUB_API_VERSION,
-    "User-Agent": GITHUB_API_USER_AGENT
-  };
-  const githubApiToken = readGithubApiToken(env);
-  if (githubApiToken) {
-    headers.Authorization = `Bearer ${githubApiToken}`;
-  }
-  return headers;
-}
-
-function buildGithubApiUrl(pathname = "", query = {}) {
-  const url = new URL(String(pathname || "").trim(), GITHUB_API_BASE_URL);
-  for (const [key, value] of Object.entries(query || {})) {
-    if (value === undefined || value === null || value === "") continue;
-    url.searchParams.set(key, String(value));
-  }
-  return url;
-}
-
-function normalizeGithubApiHeaderValue(response, headerName = "") {
-  return String(response?.headers?.get?.(headerName) || "").trim();
-}
-
-function normalizeGithubRateLimitResetAt(value = "") {
-  const rawValue = Number(value);
-  if (!Number.isFinite(rawValue) || rawValue <= 0) return "";
-  try {
-    return new Date(rawValue * 1000).toISOString();
-  } catch {
-    return "";
-  }
-}
-
-async function readGithubApiFailurePayload(response) {
-  const contentType = normalizeGithubApiHeaderValue(response, "Content-Type").toLowerCase();
-  let apiMessage = "";
-  let documentationUrl = "";
-  let bodySnippet = "";
-  const bodyResult = await readResponseTextWithLimit(response.clone(), REMOTE_ERROR_RESPONSE_MAX_BYTES);
-  const rawText = bodyResult.text.trim();
-  if (contentType.includes("json")) {
-    try {
-      const errorPayload = JSON.parse(rawText);
-      apiMessage = String(
-        errorPayload?.message
-        || errorPayload?.error_description
-        || errorPayload?.error
-        || ""
-      ).trim();
-      documentationUrl = String(errorPayload?.documentation_url || errorPayload?.docs_url || "").trim();
-    } catch {}
-  }
-  if (!apiMessage) {
-    if (rawText) bodySnippet = rawText.slice(0, 280);
-  }
-  return {
-    apiMessage,
-    documentationUrl,
-    bodySnippet,
-    contentType
-  };
-}
-
-function buildGithubApiFailureDetails(response, env = null, baseDetails = {}, failurePayload = {}) {
-  const tokenSource = readGithubApiTokenSource(env);
-  const rateLimitReset = normalizeGithubApiHeaderValue(response, "X-RateLimit-Reset");
-  const details = {
-    ...(isPlainObject(baseDetails) ? baseDetails : {}),
-    httpStatus: Number(response?.status) || 0,
-    githubTokenConfigured: !!tokenSource,
-    githubTokenSource: tokenSource || undefined,
-    responseContentType: failurePayload?.contentType || normalizeGithubApiHeaderValue(response, "Content-Type") || undefined,
-    githubMessage: String(failurePayload?.apiMessage || "").trim() || undefined,
-    githubDocumentationUrl: String(failurePayload?.documentationUrl || "").trim() || undefined,
-    githubRequestId: normalizeGithubApiHeaderValue(response, "X-GitHub-Request-Id") || undefined,
-    rateLimitLimit: normalizeGithubApiHeaderValue(response, "X-RateLimit-Limit") || undefined,
-    rateLimitRemaining: normalizeGithubApiHeaderValue(response, "X-RateLimit-Remaining") || undefined,
-    rateLimitReset: rateLimitReset || undefined,
-    rateLimitResetAt: normalizeGithubRateLimitResetAt(rateLimitReset) || undefined,
-    rateLimitResource: normalizeGithubApiHeaderValue(response, "X-RateLimit-Resource") || undefined,
-    retryAfter: normalizeGithubApiHeaderValue(response, "Retry-After") || undefined,
-    responseServer: normalizeGithubApiHeaderValue(response, "Server") || undefined,
-    responseCfRay: normalizeGithubApiHeaderValue(response, "CF-Ray") || undefined,
-    responseBodySnippet: String(failurePayload?.bodySnippet || "").trim() || undefined
-  };
-  return Object.fromEntries(Object.entries(details).filter(([, value]) => value !== undefined && value !== ""));
-}
-
-function buildGithubApiErrorMessage(response, fallbackMessage = "GitHub API 请求失败", env = null, failureDetails = {}) {
-  const status = Number(response?.status) || 0;
-  const tokenConfigured = failureDetails?.githubTokenConfigured === true;
-  const githubMessage = String(failureDetails?.githubMessage || "").trim().toLowerCase();
-  const responseBodySnippet = String(failureDetails?.responseBodySnippet || "").trim().toLowerCase();
-  const rateLimitRemaining = String(failureDetails?.rateLimitRemaining || "").trim();
-  const rateLimitResetAt = String(failureDetails?.rateLimitResetAt || "").trim();
-  const retryAfter = String(failureDetails?.retryAfter || "").trim();
-  const contentType = String(failureDetails?.responseContentType || "").trim().toLowerCase();
-  const responseServer = String(failureDetails?.responseServer || "").trim().toLowerCase();
-  const failureText = `${githubMessage}\n${responseBodySnippet}`;
-
-  if (status === 401 || githubMessage.includes("bad credentials")) {
-    return tokenConfigured
-      ? "GITHUB_TOKEN 无效、过期，或当前 Worker 没有正确读取到该 Secret"
-      : "GitHub API 未授权，请检查 GITHUB_TOKEN 配置";
-  }
-  if (failureText.includes("user-agent header")) {
-    return "GitHub API 拒绝了当前请求：缺少必需的 User-Agent 请求头";
-  }
-  if (status === 403 || status === 429) {
-    if (githubMessage.includes("secondary rate limit")) {
-      return retryAfter
-        ? `GitHub API 次级限流，建议 ${retryAfter} 秒后重试`
-        : "GitHub API 次级限流，请稍后重试";
-    }
-    if (rateLimitRemaining === "0") {
-      return tokenConfigured
-        ? `GitHub API 配额已耗尽${rateLimitResetAt ? `，预计 ${rateLimitResetAt} 后恢复` : ""}`
-        : `GitHub API 匿名配额已耗尽${rateLimitResetAt ? `，预计 ${rateLimitResetAt} 后恢复` : ""}，建议为 Worker 配置 GITHUB_TOKEN`;
-    }
-    if (githubMessage.includes("resource not accessible by personal access token") || githubMessage.includes("resource not accessible")) {
-      return "GITHUB_TOKEN 无法访问固定发布仓库，请检查仓库授权范围、只读权限和组织 SSO 授权";
-    }
-    if (githubMessage.includes("sso")) {
-      return "GITHUB_TOKEN 尚未通过组织 SSO 授权，GitHub 拒绝了当前请求";
-    }
-    if (contentType && !contentType.includes("json") && responseServer && !responseServer.includes("github")) {
-      return "上游返回了非 GitHub JSON 响应，可能不是 GitHub API 本身拒绝，而是被中间层或网关拦截";
-    }
-    return tokenConfigured
-      ? "GitHub API 拒绝了当前请求，请检查 GITHUB_TOKEN 是否已部署到当前 Worker、仓库范围和权限是否正确"
-      : "GitHub API 请求受限，请稍后重试，或为 Worker 配置 GITHUB_TOKEN";
-  }
-  if (status === 404) {
-    return "固定发布仓库不存在或当前请求无法访问";
-  }
-  if (contentType && !contentType.includes("json")) {
-    return "GitHub API 返回了非 JSON 响应，可能是上游错误页、网关异常或访问被拦截";
-  }
-  return fallbackMessage;
-}
-
-async function fetchGithubApiJson(pathname = "", options = {}) {
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  const url = buildGithubApiUrl(pathname, options.query);
-  const githubEnv = options?.env || null;
-  let response = null;
-  try {
-    response = await fetch(url.toString(), {
-      method: "GET",
-      headers: buildGithubApiRequestHeaders(githubEnv)
-    });
-  } catch (error) {
-    throw createStructuredConfigError(
-      "GITHUB_RELEASE_SOURCE_FETCH_FAILED",
-      `访问 GitHub API 失败：${String(error?.message || error || "unknown_error").trim() || "unknown_error"}`,
-      502,
-      {
-        repo: FIXED_GITHUB_RELEASE_REPO,
-        owner,
-        repository: repo,
-        url: url.toString()
-      }
-    );
-  }
-
-  if (!response.ok) {
-    const failurePayload = await readGithubApiFailurePayload(response);
-    const failureDetails = buildGithubApiFailureDetails(response, githubEnv, {
-      repo: FIXED_GITHUB_RELEASE_REPO,
-      owner,
-      repository: repo,
-      url: url.toString()
-    }, failurePayload);
-    const errorCode = (() => {
-      const status = Number(response.status) || 0;
-      const githubMessage = String(failurePayload?.apiMessage || "").trim().toLowerCase();
-      const bodySnippet = String(failurePayload?.bodySnippet || "").trim().toLowerCase();
-      if (status === 401 || githubMessage.includes("bad credentials")) return "GITHUB_TOKEN_INVALID";
-      if (`${githubMessage}\n${bodySnippet}`.includes("user-agent header")) return "GITHUB_RELEASE_SOURCE_USER_AGENT_REQUIRED";
-      if (status === 403 || status === 429) {
-        if (String(failureDetails.rateLimitRemaining || "").trim() === "0") return "GITHUB_RELEASE_SOURCE_RATE_LIMITED";
-        if (githubMessage.includes("secondary rate limit")) return "GITHUB_RELEASE_SOURCE_SECONDARY_RATE_LIMITED";
-        if (githubMessage.includes("resource not accessible")) return "GITHUB_TOKEN_PERMISSION_DENIED";
-        if (githubMessage.includes("sso")) return "GITHUB_TOKEN_SSO_REQUIRED";
-      }
-      if (failureDetails.responseContentType && !String(failureDetails.responseContentType).toLowerCase().includes("json")) {
-        return "GITHUB_RELEASE_SOURCE_NON_JSON_RESPONSE";
-      }
-      return response.status === 404 ? "GITHUB_RELEASE_SOURCE_NOT_FOUND" : "GITHUB_RELEASE_SOURCE_FETCH_FAILED";
-    })();
-    console.warn("[github_release_source.fetch_failed]", errorCode, failureDetails);
-    throw createStructuredConfigError(
-      errorCode,
-      buildGithubApiErrorMessage(response, "GitHub API 请求失败", githubEnv, failureDetails),
-      response.status === 404 ? 404 : 502,
-      failureDetails
-    );
-  }
-
-  const responseBody = await readResponseTextWithLimit(response, REMOTE_JSON_RESPONSE_MAX_BYTES);
-  const responseDetails = {
-    repo: FIXED_GITHUB_RELEASE_REPO,
-    owner,
-    repository: repo,
-    url: url.toString(),
-    maxBytes: REMOTE_JSON_RESPONSE_MAX_BYTES
-  };
-  if (responseBody.exceeded) {
-    throw createStructuredConfigError(
-      "GITHUB_RELEASE_SOURCE_RESPONSE_TOO_LARGE",
-      `GitHub API 成功响应超过 ${REMOTE_JSON_RESPONSE_MAX_BYTES} 字节上限`,
-      502,
-      responseDetails
-    );
-  }
-  try {
-    return JSON.parse(responseBody.text);
-  } catch {
-    throw createStructuredConfigError(
-      "GITHUB_RELEASE_SOURCE_RESPONSE_INVALID",
-      "GitHub API 成功响应不是有效 JSON",
-      502,
-      responseDetails
-    );
-  }
-}
 
 function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LENGTH) {
   const limit = Math.max(2, Math.floor(Number(maxLength) || LOG_DETAIL_JSON_MAX_LENGTH));
@@ -5807,419 +5600,6 @@ function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LE
   if (serialized && serialized.length <= limit) return serialized;
   const truncated = JSON.stringify({ truncated: true });
   return truncated.length <= limit ? truncated : "{}";
-}
-
-async function fetchGithubApiCollection(pathname = "", options = {}) {
-  const items = [];
-  for (let page = 1; page <= GITHUB_API_MAX_PAGES; page += 1) {
-    const chunk = await fetchGithubApiJson(pathname, {
-      ...options,
-      query: {
-        per_page: GITHUB_API_PAGE_SIZE,
-        page,
-        ...(isPlainObject(options?.query) ? options.query : {})
-      }
-    });
-    if (!Array.isArray(chunk)) {
-      throw createStructuredConfigError(
-        "GITHUB_RELEASE_SOURCE_RESPONSE_INVALID",
-        "GitHub API 返回了无效的数据结构",
-        502,
-        {
-          repo: FIXED_GITHUB_RELEASE_REPO,
-          pathname,
-          page
-        }
-      );
-    }
-    items.push(...chunk);
-    if (chunk.length < GITHUB_API_PAGE_SIZE) break;
-  }
-  return items;
-}
-
-async function getFixedGithubReleaseRepositoryInfo(env = null) {
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  const payload = await fetchGithubApiJson(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`, {
-    env
-  });
-  const defaultBranch = normalizeGithubReleaseRefValue(payload?.default_branch);
-  return {
-    defaultBranch,
-    visibility: String(payload?.visibility || "").trim()
-  };
-}
-
-async function listFixedGithubReleaseBranches(env = null) {
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  const [{ defaultBranch }, branchPayload] = await Promise.all([
-    getFixedGithubReleaseRepositoryInfo(env),
-    fetchGithubApiCollection(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/branches`, {
-      env
-    })
-  ]);
-  const branches = [...new Set(branchPayload
-    .map(item => normalizeGithubReleaseRefValue(item?.name))
-    .filter(Boolean))]
-    .sort((left, right) => left.localeCompare(right, "en"));
-  return {
-    defaultBranch: defaultBranch && branches.includes(defaultBranch)
-      ? defaultBranch
-      : (branches[0] || ""),
-    branches
-  };
-}
-
-async function listFixedGithubReleaseTags(env = null) {
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  const tagPayload = await fetchGithubApiCollection(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tags`, {
-    env
-  });
-  const tags = [];
-  const seen = new Set();
-  for (const item of tagPayload) {
-    const name = normalizeGithubReleaseRefValue(item?.name);
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    tags.push({
-      name,
-      commitSha: String(item?.commit?.sha || "").trim()
-    });
-  }
-  return tags;
-}
-
-function normalizeGithubReleaseAssetRecord(asset = {}) {
-  const rawAsset = isPlainObject(asset) ? asset : {};
-  const name = String(rawAsset.name || "").trim();
-  return {
-    id: String(rawAsset.id || "").trim(),
-    name,
-    nameLower: name.toLowerCase(),
-    browserDownloadUrl: normalizeHttpUrl(rawAsset.browser_download_url),
-    contentType: String(rawAsset.content_type || "").trim(),
-    size: Number(rawAsset.size) || 0,
-    updatedAt: String(rawAsset.updated_at || "").trim()
-  };
-}
-
-function normalizeGithubPublishedReleaseRecord(release = {}) {
-  const rawRelease = isPlainObject(release) ? release : {};
-  const tagName = normalizeGithubReleaseRefValue(rawRelease.tag_name);
-  const assets = (Array.isArray(rawRelease.assets) ? rawRelease.assets : [])
-    .map(item => normalizeGithubReleaseAssetRecord(item))
-    .filter(item => item.name);
-  const assetByName = new Map(assets.map(item => [item.nameLower, item]));
-  const indexAsset = assetByName.get("index.html") || null;
-  const workerAsset = assetByName.get("worker.js") || null;
-  return {
-    tagName,
-    title: String(rawRelease.name || "").trim(),
-    targetCommitish: normalizeGithubReleaseRefValue(rawRelease.target_commitish),
-    htmlUrl: normalizeHttpUrl(rawRelease.html_url),
-    publishedAt: String(rawRelease.published_at || "").trim(),
-    createdAt: String(rawRelease.created_at || "").trim(),
-    draft: rawRelease.draft === true,
-    prerelease: rawRelease.prerelease === true,
-    indexUrl: normalizeHttpUrl(indexAsset?.browserDownloadUrl) || buildGithubFrontendIndexUrl(FIXED_GITHUB_RELEASE_REPO, tagName),
-    workerSourceUrl: normalizeHttpUrl(workerAsset?.browserDownloadUrl) || buildGithubWorkerSourceUrl(FIXED_GITHUB_RELEASE_REPO, tagName),
-    hasRequiredAssets: Boolean(tagName && indexAsset && workerAsset),
-    assets
-  };
-}
-
-async function listFixedGithubPublishedReleases(env = null) {
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  const releasePayload = await fetchGithubApiCollection(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases`, {
-    env
-  });
-  return releasePayload
-    .map(item => normalizeGithubPublishedReleaseRecord(item))
-    .filter(item => item.tagName && item.draft !== true && item.prerelease !== true && item.hasRequiredAssets);
-}
-
-async function isGithubTagReachableFromBranch(tagName = "", branchName = "", env = null) {
-  const normalizedTag = normalizeGithubReleaseRefValue(tagName);
-  const normalizedBranch = normalizeGithubReleaseRefValue(branchName);
-  if (!normalizedTag || !normalizedBranch) return false;
-  const { owner, repo } = splitGithubReleaseRepoSlug(FIXED_GITHUB_RELEASE_REPO);
-  let comparison = null;
-  try {
-    comparison = await fetchGithubApiJson(
-      `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${encodeURIComponent(normalizedTag)}...${encodeURIComponent(normalizedBranch)}`,
-      { env }
-    );
-  } catch (error) {
-    const errorCode = String(error?.code || "").trim();
-    const githubMessage = String(error?.details?.githubMessage || error?.message || "").trim().toLowerCase();
-    const sourceUrl = String(error?.details?.url || "").trim();
-    const isCompareRequest = sourceUrl.includes("/compare/");
-    const isNoCommonAncestor = githubMessage.includes("no common ancestor");
-    if (isCompareRequest && (errorCode === "GITHUB_RELEASE_SOURCE_NOT_FOUND" || isNoCommonAncestor)) {
-      return false;
-    }
-    throw error;
-  }
-  const status = String(comparison?.status || "").trim().toLowerCase();
-  return status === "ahead" || status === "identical";
-}
-
-async function filterGithubTagsReachableFromBranch(tags = [], branchName = "", env = null) {
-  const queue = (Array.isArray(tags) ? tags : []).slice();
-  const results = [];
-  const workerCount = Math.max(1, Math.min(GITHUB_TAG_REACHABILITY_CONCURRENCY, queue.length || 1));
-  await Promise.all(Array.from({ length: workerCount }, async () => {
-    while (queue.length > 0) {
-      const currentTag = queue.shift();
-      const tagName = normalizeGithubReleaseRefValue(currentTag?.name);
-      if (!tagName) continue;
-      if (await isGithubTagReachableFromBranch(tagName, branchName, env)) {
-        results.push({
-          name: tagName,
-          commitSha: String(currentTag?.commitSha || "").trim()
-        });
-      }
-    }
-  }));
-  return results;
-}
-
-async function buildGithubReleaseSourceOptionsPayload(config = {}, options = {}) {
-  const runtimeConfig = isPlainObject(config) ? config : {};
-  const githubEnv = options?.env || null;
-  const requestedBranch = normalizeGithubReleaseRefValue(options?.branch ?? runtimeConfig.releaseBranch);
-  const requestedTag = normalizeGithubReleaseRefValue(options?.tag ?? runtimeConfig.releaseTag);
-  const releases = await listFixedGithubPublishedReleases(githubEnv);
-  if (!releases.length) {
-    throw createStructuredConfigError(
-      "GITHUB_RELEASE_LIST_EMPTY",
-      "固定发布仓库没有可用的已发布 Release（需同时包含 index.html 和 worker.js）",
-      502,
-      { repo: FIXED_GITHUB_RELEASE_REPO }
-    );
-  }
-
-  const selectedRelease = (() => {
-    if (requestedTag) {
-      return releases.find(item => item.tagName === requestedTag) || null;
-    }
-    if (requestedBranch) {
-      return releases.find(item => item.targetCommitish === requestedBranch) || null;
-    }
-    return releases[0] || null;
-  })();
-  const fallbackRelease = selectedRelease || releases[0] || null;
-  const selectedTag = normalizeGithubReleaseRefValue(fallbackRelease?.tagName);
-  const selectedBranch = normalizeGithubReleaseRefValue(fallbackRelease?.targetCommitish);
-  const effectiveRef = selectedTag;
-  const effectiveRefType = selectedTag ? "tag" : resolveGithubReleaseEffectiveRefType("", selectedBranch);
-  const releasePreviews = releases.map(item => ({
-    tag: item.tagName,
-    title: item.title || item.tagName,
-    targetCommitish: item.targetCommitish,
-    htmlUrl: item.htmlUrl,
-    publishedAt: item.publishedAt || item.createdAt,
-    indexUrl: item.indexUrl,
-    workerSourceUrl: item.workerSourceUrl,
-    selected: item.tagName === selectedTag
-  }));
-
-  return {
-    repo: FIXED_GITHUB_RELEASE_REPO,
-    defaultBranch: selectedBranch,
-    branches: selectedBranch ? [{
-      name: selectedBranch,
-      selected: true,
-      isDefault: true
-    }] : [],
-    selectedBranch,
-    tags: releases.map(item => ({
-      name: item.tagName,
-      commitSha: item.targetCommitish,
-      selected: item.tagName === selectedTag
-    })),
-    releases: releasePreviews,
-    selectedTag,
-    effectiveRef,
-    effectiveRefType,
-    indexUrl: String(fallbackRelease?.indexUrl || "").trim(),
-    workerSourceUrl: String(fallbackRelease?.workerSourceUrl || "").trim()
-  };
-}
-
-function isAcceptedGithubWorkerContentType(contentType = "") {
-  const normalizedContentType = String(contentType || "").trim().toLowerCase();
-  if (!normalizedContentType) return true;
-  return normalizedContentType.includes("javascript")
-    || normalizedContentType.includes("ecmascript")
-    || normalizedContentType.startsWith("text/plain")
-    || normalizedContentType.startsWith("application/octet-stream");
-}
-
-async function fetchGithubReleaseWorkerScriptSource(config = {}, overrides = {}) {
-  const releaseConfig = {
-    releaseRepo: FIXED_GITHUB_RELEASE_REPO,
-    releaseBranch: overrides?.releaseBranch ?? config?.releaseBranch,
-    releaseTag: overrides?.releaseTag ?? config?.releaseTag,
-    indexUrl: overrides?.indexUrl ?? config?.indexUrl
-  };
-  assertReleaseSourceConfigValid(releaseConfig);
-  const requestedTag = normalizeGithubReleaseRefValue(releaseConfig.releaseTag);
-  if (!requestedTag) {
-    throw createStructuredConfigError(
-      "RELEASE_TAG_REQUIRED",
-      "Worker 更新前请先配置一个已发布的 Release Tag",
-      400,
-      { field: "releaseTag" }
-    );
-  }
-  const releaseOptions = await buildGithubReleaseSourceOptionsPayload(releaseConfig, {
-    branch: releaseConfig.releaseBranch,
-    tag: releaseConfig.releaseTag,
-    env: overrides?.env || null
-  });
-  if (requestedTag && requestedTag !== releaseOptions.selectedTag) {
-    throw createStructuredConfigError(
-      "RELEASE_TAG_NOT_FOUND",
-      `找不到已发布且包含 index.html / worker.js 的 Release Tag：${requestedTag}`,
-      404,
-      {
-        repo: FIXED_GITHUB_RELEASE_REPO,
-        releaseBranch: releaseOptions.selectedBranch,
-        releaseTag: requestedTag
-      }
-    );
-  }
-  const indexState = {
-    ...buildResolvedAdminIndexState(null, {
-      ...releaseConfig,
-      releaseRepo: releaseOptions.repo,
-      releaseBranch: releaseOptions.selectedBranch,
-      releaseTag: releaseOptions.selectedTag,
-      indexUrl: releaseOptions.indexUrl
-    }),
-    releaseRepo: releaseOptions.repo,
-    releaseBranch: releaseOptions.selectedBranch,
-    releaseTag: releaseOptions.selectedTag,
-    effectiveRef: releaseOptions.effectiveRef,
-    indexUrl: releaseOptions.indexUrl,
-    derivedIndexUrl: releaseOptions.indexUrl,
-    workerSourceUrl: releaseOptions.workerSourceUrl
-  };
-  if (!indexState.releaseRepo || !indexState.releaseTag || !indexState.workerSourceUrl) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_SOURCE_REQUIRED",
-      "Worker 更新前请先配置一个已发布的 Release Tag",
-      400,
-      {
-        releaseRepo: indexState.releaseRepo,
-        releaseTag: indexState.releaseTag
-      }
-    );
-  }
-
-  let response = null;
-  try {
-    response = await fetch(indexState.workerSourceUrl, {
-      method: "GET",
-      headers: {
-        "Accept": "application/javascript, text/javascript, text/plain;q=0.9, */*;q=0.1"
-      }
-    });
-  } catch (error) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_FETCH_FAILED",
-      `拉取 Release worker.js 资产失败：${String(error?.message || error || "unknown_error").trim() || "unknown_error"}`,
-      502,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        effectiveRef: indexState.effectiveRef,
-        releaseRepo: indexState.releaseRepo
-      }
-    );
-  }
-
-  if (!response.ok) {
-    throw createStructuredConfigError(
-      response.status === 404 ? "WORKER_RELEASE_SOURCE_NOT_FOUND" : "WORKER_RELEASE_FETCH_FAILED",
-      response.status === 404
-        ? "所选 Release 中缺少 worker.js 资产，请检查发行版文件"
-        : `拉取 Release worker.js 资产失败（HTTP ${response.status}）`,
-      response.status === 404 ? 404 : 502,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        effectiveRef: indexState.effectiveRef,
-        releaseRepo: indexState.releaseRepo,
-        httpStatus: response.status
-      }
-    );
-  }
-
-  const contentType = String(response.headers.get("Content-Type") || "").trim();
-  if (!isAcceptedGithubWorkerContentType(contentType)) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_CONTENT_TYPE_INVALID",
-      `Release worker.js 资产返回的内容类型无效：${contentType || "unknown"}`,
-      400,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        contentType
-      }
-    );
-  }
-
-  const contentLength = Number.parseInt(String(response.headers.get("Content-Length") || ""), 10);
-  if (Number.isFinite(contentLength) && contentLength > GITHUB_RELEASE_WORKER_MAX_BYTES) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_TOO_LARGE",
-      `Release worker.js 资产体积超过限制（${contentLength} bytes）`,
-      400,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        contentLength,
-        maxBytes: GITHUB_RELEASE_WORKER_MAX_BYTES
-      }
-    );
-  }
-
-  const scriptBody = await readResponseTextWithLimit(response, GITHUB_RELEASE_WORKER_MAX_BYTES);
-  const scriptContent = scriptBody.text;
-  const scriptBytes = scriptBody.bytes;
-  if (scriptBody.exceeded || scriptBytes > GITHUB_RELEASE_WORKER_MAX_BYTES) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_TOO_LARGE",
-      `Release worker.js 资产体积超过限制（${scriptBytes} bytes）`,
-      400,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        contentLength: scriptBytes,
-        maxBytes: GITHUB_RELEASE_WORKER_MAX_BYTES
-      }
-    );
-  }
-  if (!String(scriptContent || "").trim()) {
-    throw createStructuredConfigError(
-      "WORKER_RELEASE_EMPTY",
-      "Release worker.js 资产为空，无法更新 Worker",
-      400,
-      {
-        sourceUrl: indexState.workerSourceUrl,
-        effectiveRef: indexState.effectiveRef
-      }
-    );
-  }
-
-  return {
-    sourceUrl: indexState.workerSourceUrl,
-    effectiveRef: indexState.effectiveRef,
-    releaseRepo: indexState.releaseRepo,
-    releaseBranch: indexState.releaseBranch,
-    releaseTag: indexState.releaseTag,
-    scriptContent,
-    contentType,
-    contentLength: scriptBytes,
-    syntax: detectCloudflareWorkerScriptUploadSyntax(scriptContent)
-  };
 }
 
 function createWorkerPlacementStatusPayload(overrides = {}) {
@@ -7038,10 +6418,11 @@ function sanitizeRuntimeConfig(input = {}) {
   sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
   sanitized.scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(sanitized.scheduleUtcOffsetMinutes);
   sanitized.tgDailyReportClockTimes = normalizeScheduleClockTimeList(sanitized.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
-  sanitized.releaseRepo = FIXED_GITHUB_RELEASE_REPO;
-  sanitized.releaseBranch = normalizeGithubReleaseRefValue(sanitized.releaseBranch);
-  sanitized.releaseTag = normalizeGithubReleaseRefValue(sanitized.releaseTag);
-  sanitized.indexUrl = buildResolvedAdminIndexState(null, sanitized).persistedIndexUrl;
+  const localIndexRevision = parseAdminLocalIndexSourceUrl(sanitized.indexUrl);
+  sanitized.indexUrl = localIndexRevision ? buildAdminLocalIndexSourceUrl(localIndexRevision) : "";
+  delete sanitized.releaseRepo;
+  delete sanitized.releaseBranch;
+  delete sanitized.releaseTag;
   applyDailyTelegramReportKindCompat(sanitized, migratedRawConfig);
   delete sanitized.tgDailyReportTime;
   return sanitized;
@@ -8119,9 +7500,6 @@ const CONFIG_LEGACY_SNAPSHOT_DROP_KEY_SET = new Set([
 const CONFIG_ALLOWED_FIELDS = [
   "uiRadiusPx",
   "settingsExperienceMode",
-  "releaseRepo",
-  "releaseBranch",
-  "releaseTag",
   "indexUrl",
   "cfQuotaPlanOverride",
   "protocolStrategy",
@@ -8247,7 +7625,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: {},
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "releaseRepo", "releaseBranch", "releaseTag", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "tgDailyReportTime"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "tgDailyReportTime"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList"
   },
@@ -8363,12 +7741,6 @@ function normalizeHttpUrl(value = "") {
   }
 }
 
-function normalizeGithubReleaseRepoSlug(value = "") {
-  const rawValue = String(value || "").trim().replace(/^\/+|\/+$/g, "");
-  if (!rawValue) return "";
-  return /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(rawValue) ? rawValue : "";
-}
-
 function isValidGithubReleaseRefValue(value = "") {
   const rawValue = String(value || "").trim();
   if (!rawValue) return false;
@@ -8384,125 +7756,75 @@ function normalizeGithubReleaseRefValue(value = "") {
   return isValidGithubReleaseRefValue(rawValue) ? rawValue : "";
 }
 
-function splitGithubReleaseRepoSlug(repoSlug = "") {
-  const normalizedRepoSlug = normalizeGithubReleaseRepoSlug(repoSlug);
-  if (!normalizedRepoSlug) return { owner: "", repo: "" };
-  const [owner, repo] = normalizedRepoSlug.split("/");
-  return {
-    owner: String(owner || "").trim(),
-    repo: String(repo || "").trim()
-  };
+function normalizeAdminLocalIndexRevision(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return /^[a-f0-9]{64}$/.test(normalized) ? normalized : "";
 }
 
-function buildGithubReleaseAssetDownloadUrl(repoSlug = "", tag = "", assetName = "") {
-  const { owner, repo } = splitGithubReleaseRepoSlug(repoSlug);
-  const releaseTag = normalizeGithubReleaseRefValue(tag);
-  const normalizedAssetName = String(assetName || "").trim().replace(/^\/+/, "");
-  if (!owner || !repo || !releaseTag || !normalizedAssetName) return "";
-  return `https://github.com/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/releases/download/${encodeURIComponent(releaseTag)}/${encodeURIComponent(normalizedAssetName)}`;
+function buildAdminLocalIndexSourceUrl(revision = "") {
+  const normalizedRevision = normalizeAdminLocalIndexRevision(revision);
+  return normalizedRevision
+    ? `${ADMIN_LOCAL_INDEX_SOURCE_ORIGIN}/${normalizedRevision}/index.html`
+    : "";
 }
 
-function buildGithubWorkerSourceUrl(repoSlug = "", ref = "") {
-  return buildGithubReleaseAssetDownloadUrl(repoSlug, ref, "worker.js");
+function parseAdminLocalIndexSourceUrl(value = "") {
+  const normalizedUrl = normalizeHttpUrl(value);
+  if (!normalizedUrl) return "";
+  try {
+    const parsedUrl = new URL(normalizedUrl);
+    if (parsedUrl.origin !== ADMIN_LOCAL_INDEX_SOURCE_ORIGIN || parsedUrl.search || parsedUrl.hash) return "";
+    const matched = parsedUrl.pathname.match(/^\/([a-f0-9]{64})\/index\.html$/i);
+    return normalizeAdminLocalIndexRevision(matched?.[1] || "");
+  } catch {
+    return "";
+  }
 }
 
-function buildGithubFrontendIndexUrl(repoSlug = "", ref = "") {
-  return buildGithubReleaseAssetDownloadUrl(repoSlug, ref, "index.html");
+function buildAdminLocalIndexAssetRevision(revision = "") {
+  const normalizedRevision = normalizeAdminLocalIndexRevision(revision);
+  return normalizedRevision ? `${ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX}${normalizedRevision}` : "";
 }
 
-function resolveGithubReleaseEffectiveRefType(releaseTag = "", releaseBranch = "") {
-  if (normalizeGithubReleaseRefValue(releaseTag)) return "tag";
-  if (normalizeGithubReleaseRefValue(releaseBranch)) return "branch";
-  return "";
+function parseAdminLocalIndexAssetRevision(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (!normalized.startsWith(ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX)) return "";
+  return normalizeAdminLocalIndexRevision(normalized.slice(ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX.length));
 }
 
 function buildResolvedAdminIndexState(env = null, config = {}) {
   const runtimeConfig = isPlainObject(config) ? config : {};
-  const releaseRepo = FIXED_GITHUB_RELEASE_REPO;
-  const releaseBranch = normalizeGithubReleaseRefValue(runtimeConfig.releaseBranch);
-  const releaseTag = normalizeGithubReleaseRefValue(runtimeConfig.releaseTag);
-  const effectiveRef = releaseTag || releaseBranch;
-  const effectiveRefType = resolveGithubReleaseEffectiveRefType(releaseTag, releaseBranch);
-  const derivedIndexUrl = releaseTag ? buildGithubFrontendIndexUrl(releaseRepo, releaseTag) : "";
   const configIndexUrl = normalizeHttpUrl(runtimeConfig.indexUrl);
-  const envIndexUrl = normalizeHttpUrl(env?.INDEX_URL);
-  const indexUrl = derivedIndexUrl || configIndexUrl || envIndexUrl;
-  const indexUrlSource = derivedIndexUrl
-    ? "github_release"
-    : (configIndexUrl ? "config_index_url" : (envIndexUrl ? "env_index_url" : "unset"));
+  const localUploadRevision = parseAdminLocalIndexSourceUrl(configIndexUrl);
+  const isLocalUpload = Boolean(localUploadRevision);
+  const indexUrl = isLocalUpload ? buildAdminLocalIndexSourceUrl(localUploadRevision) : "";
   return {
-    releaseRepo,
-    releaseBranch,
-    releaseTag,
-    effectiveRef,
-    effectiveRefType,
-    derivedIndexUrl,
-    workerSourceUrl: releaseTag ? buildGithubWorkerSourceUrl(releaseRepo, releaseTag) : "",
+    effectiveRef: localUploadRevision,
+    effectiveRefType: isLocalUpload ? "local_upload" : "",
     configIndexUrl,
-    envIndexUrl,
+    envIndexUrl: "",
     indexUrl,
-    persistedIndexUrl: derivedIndexUrl || configIndexUrl,
-    indexUrlSource,
-    hasGithubRelease: Boolean(releaseRepo && releaseTag),
-    hasDerivedIndexUrl: Boolean(derivedIndexUrl),
+    persistedIndexUrl: indexUrl,
+    indexUrlSource: isLocalUpload ? "local_upload" : "unset",
+    isLocalUpload,
+    localUploadRevision,
+    assetRevision: isLocalUpload ? buildAdminLocalIndexAssetRevision(localUploadRevision) : "",
+    hasGithubRelease: false,
+    hasLocalUpload: isLocalUpload,
+    hasDerivedIndexUrl: false,
     gateState: indexUrl ? "shell_ready" : "setup_required"
   };
 }
 
-function assertReleaseSourceConfigValid(rawConfig = {}) {
-  const inputConfig = isPlainObject(rawConfig) ? rawConfig : {};
-  const rawReleaseRepo = String(inputConfig.releaseRepo || "").trim();
-  const rawReleaseBranch = String(inputConfig.releaseBranch || "").trim();
-  const rawReleaseTag = String(inputConfig.releaseTag || "").trim();
-  const rawIndexUrl = String(inputConfig.indexUrl || "").trim();
-  if (rawReleaseRepo && !normalizeGithubReleaseRepoSlug(rawReleaseRepo)) {
-    throw createStructuredConfigError(
-      "RELEASE_REPO_INVALID",
-      "GitHub 仓库格式无效，请使用 owner/repo",
-      400,
-      { field: "releaseRepo", value: rawReleaseRepo }
-    );
-  }
-
-  if (rawReleaseRepo && rawReleaseRepo !== FIXED_GITHUB_RELEASE_REPO) {
-    throw createStructuredConfigError(
-      "RELEASE_REPO_FIXED",
-      `正式发布源已固定为 ${FIXED_GITHUB_RELEASE_REPO}，不再接受自定义仓库`,
-      400,
-      {
-        field: "releaseRepo",
-        expected: FIXED_GITHUB_RELEASE_REPO,
-        value: rawReleaseRepo
-      }
-    );
-  }
-
-  if (rawReleaseBranch && !isValidGithubReleaseRefValue(rawReleaseBranch)) {
-    throw createStructuredConfigError(
-      "RELEASE_BRANCH_INVALID",
-      "GitHub 分支名无效，请检查 releaseBranch",
-      400,
-      { field: "releaseBranch", value: rawReleaseBranch }
-    );
-  }
-
-  if (rawReleaseTag && !isValidGithubReleaseRefValue(rawReleaseTag)) {
-    throw createStructuredConfigError(
-      "RELEASE_TAG_INVALID",
-      "GitHub 标签名无效，请检查 releaseTag",
-      400,
-      { field: "releaseTag", value: rawReleaseTag }
-    );
-  }
-
-  if (rawIndexUrl && !normalizeHttpUrl(rawIndexUrl)) {
-    throw createStructuredConfigError(
-      "INDEX_URL_INVALID",
-      "INDEX_URL 无效，请填写合法的 http(s) 地址",
-      400,
-      { field: "indexUrl", value: rawIndexUrl }
-    );
-  }
+function assertAdminIndexSourceConfigValid(rawConfig = {}) {
+  const rawIndexUrl = String(isPlainObject(rawConfig) ? rawConfig.indexUrl || "" : "").trim();
+  if (!rawIndexUrl || parseAdminLocalIndexSourceUrl(rawIndexUrl)) return;
+  throw createStructuredConfigError(
+    "ADMIN_INDEX_SOURCE_UPLOAD_ONLY",
+    "管理台 HTML 仅支持本地上传，请通过启动门或 Worker 和 HTML 更新面板提交 index.html",
+    400,
+    { field: "indexUrl" }
+  );
 }
 
 function buildHostPrefixRuntimeRequirementState(config = {}, env = null) {
@@ -10611,6 +9933,7 @@ const LogQueryPlanner = {
 
 const Database = {
   PREFIX: "node:", CONFIG_KEY: "sys:theme", NODES_INDEX_KEY: "sys:nodes_index:v1", NODES_SUMMARY_INDEX_KEY: "sys:nodes_index_full:v2",
+  ADMIN_INDEX_UPLOAD_PREFIX: ADMIN_LOCAL_INDEX_KV_PREFIX,
   LEGACY_OPS_STATUS_KEY: "sys:ops_status:v1",
   LEGACY_SCHEDULED_LOCK_KEY: "sys:scheduled_lock:v1",
   WORKER_PLACEMENT_REGION_OVERRIDE_PREFIX: "sys:worker_placement_region:v1:",
@@ -14938,6 +14261,9 @@ const Database = {
         dnsRecordHistoryKeyCount += 1;
         continue;
       }
+      if (keyName.startsWith(this.ADMIN_INDEX_UPLOAD_PREFIX)) {
+        continue;
+      }
       if (
         keyName === this.CONFIG_KEY
         || keyName === this.NODES_INDEX_KEY
@@ -16028,6 +15354,143 @@ const Database = {
     const snapshots = await this.getConfigSnapshotsForRead(kv, { withConfig: true });
     return snapshots.find(item => item.id === snapshotId) || null;
   },
+  buildAdminIndexUploadKey(revision = "") {
+    const normalizedRevision = normalizeAdminLocalIndexRevision(revision);
+    return normalizedRevision ? `${this.ADMIN_INDEX_UPLOAD_PREFIX}${normalizedRevision}` : "";
+  },
+  normalizeAdminIndexUploadRecord(record = {}, expectedRevision = "") {
+    if (!isPlainObject(record)) return null;
+    const revision = normalizeAdminLocalIndexRevision(record.revision);
+    const normalizedExpectedRevision = normalizeAdminLocalIndexRevision(expectedRevision);
+    if (!revision || (normalizedExpectedRevision && revision !== normalizedExpectedRevision)) return null;
+    const sourceUrl = buildAdminLocalIndexSourceUrl(revision);
+    const assetRevision = buildAdminLocalIndexAssetRevision(revision);
+    const html = String(record.html || "");
+    if (!html) return null;
+    return {
+      version: Number(record.version) || 1,
+      revision,
+      assetRevision,
+      sourceUrl,
+      fileName: String(record.fileName || "index.html").trim() || "index.html",
+      uploadedAt: String(record.uploadedAt || "").trim(),
+      bytes: Number(record.bytes) || new TextEncoder().encode(html).length,
+      html,
+      manifest: normalizeAdminReleaseVendorManifestRecord(record.manifest || {})
+    };
+  },
+  async getAdminIndexUploadRecord(kv, revision = "") {
+    const key = this.buildAdminIndexUploadKey(revision);
+    if (!kv || !key) return null;
+    const record = await kvGetStrict(kv, key, { type: "json" });
+    const normalizedRecord = this.normalizeAdminIndexUploadRecord(record, revision);
+    if (!normalizedRecord) return null;
+    const contentRevision = await sha256HexText(normalizedRecord.html);
+    if (contentRevision !== normalizedRecord.revision) return null;
+    try {
+      const validated = validateAdminShellHtmlSource(normalizedRecord.html, normalizedRecord.sourceUrl, {
+        sourceLabel: "local admin index",
+        contentType: "text/html"
+      });
+      return {
+        ...normalizedRecord,
+        bytes: validated.bytes,
+        manifest: normalizeAdminReleaseVendorManifestRecord(buildAdminReleaseVendorManifest(validated.html, {
+          releaseTag: normalizedRecord.assetRevision,
+          sourceUrl: normalizedRecord.sourceUrl
+        }))
+      };
+    } catch {
+      return null;
+    }
+  },
+  collectReferencedAdminIndexUploadRevisions(config = {}, snapshots = []) {
+    const revisions = new Set();
+    const addConfigRevision = (candidateConfig) => {
+      const revision = parseAdminLocalIndexSourceUrl(candidateConfig?.indexUrl || "");
+      if (revision) revisions.add(revision);
+    };
+    addConfigRevision(config);
+    for (const snapshot of Array.isArray(snapshots) ? snapshots : []) {
+      addConfigRevision(snapshot?.config);
+    }
+    return revisions;
+  },
+  async pruneUnreferencedAdminIndexUploads(kv, config = {}) {
+    if (!kv) return [];
+    const [snapshots, keys] = await Promise.all([
+      this.getConfigSnapshotsForRead(kv, { withConfig: true }),
+      this.listKvKeysStrict(kv, { prefix: this.ADMIN_INDEX_UPLOAD_PREFIX })
+    ]);
+    const referencedRevisions = this.collectReferencedAdminIndexUploadRevisions(config, snapshots);
+    const removableKeys = keys.filter((key) => {
+      const keyName = String(key || "").trim();
+      const revision = normalizeAdminLocalIndexRevision(keyName.slice(this.ADMIN_INDEX_UPLOAD_PREFIX.length));
+      return revision && !referencedRevisions.has(revision);
+    });
+    await Promise.all(removableKeys.map(key => kv.delete(key)));
+    return removableKeys;
+  },
+  async persistAdminIndexUpload(record = {}, options = {}) {
+    const { env, kv, ctx } = options;
+    if (!kv) {
+      const error = new Error("KV namespace is required to persist the local admin index");
+      error.code = "KV_NOT_CONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const normalizedRecord = this.normalizeAdminIndexUploadRecord(record, record?.revision);
+    if (!normalizedRecord) {
+      const error = new Error("本地 index.html 上传记录无效");
+      error.code = "ADMIN_INDEX_UPLOAD_INVALID";
+      error.status = 400;
+      throw error;
+    }
+    return await runKvDataMutation(async () => {
+      const uploadKey = this.buildAdminIndexUploadKey(normalizedRecord.revision);
+      const previousRecord = await kvGetStrict(kv, uploadKey, { type: "json" });
+      let existingRecord = this.normalizeAdminIndexUploadRecord(previousRecord, normalizedRecord.revision);
+      if (existingRecord) {
+        const existingContentRevision = await sha256HexText(existingRecord.html);
+        if (existingContentRevision !== normalizedRecord.revision) existingRecord = null;
+      }
+      const persistedRecord = existingRecord || normalizedRecord;
+      if (!existingRecord) await kv.put(uploadKey, JSON.stringify(normalizedRecord));
+      try {
+        const currentConfig = env
+          ? await getRuntimeConfigStrict(env)
+          : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
+        const savedConfig = await this.commitRuntimeConfig({
+          ...currentConfig,
+          indexUrl: persistedRecord.sourceUrl
+        }, {
+          env,
+          kv,
+          ctx,
+          snapshotMeta: {
+            reason: "upload_admin_index",
+            section: "static_assets_policy",
+            source: "admin_gate_local_upload",
+            actor: "admin",
+            note: persistedRecord.fileName
+          }
+        });
+        return { config: savedConfig, record: persistedRecord };
+      } catch (error) {
+        if (!existingRecord) {
+          await withNonCriticalFallback(
+            previousRecord
+              ? kv.put(uploadKey, JSON.stringify(previousRecord))
+              : kv.delete(uploadKey),
+            "admin.local_index_upload_rollback",
+            { revision: normalizedRecord.revision },
+            null
+          );
+        }
+        throw error;
+      }
+    });
+  },
   async clearConfigSnapshots(kv) {
     if (!kv) return;
     await this.writeStoredConfigSnapshots(kv, []);
@@ -16239,7 +15702,7 @@ const Database = {
       ? await getRuntimeConfigStrict(env)
       : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
     const nextConfig = sanitizeRuntimeConfig(rawConfig);
-    assertReleaseSourceConfigValid(rawConfig);
+    assertAdminIndexSourceConfigValid(rawConfig);
     assertHostPrefixProxyConfigReady(nextConfig, env);
     const configuredHost = resolveConfiguredHost(env);
     const previousDefaultTarget = resolveHostPrefixCnameTarget(null, prevConfig, configuredHost);
@@ -17440,7 +16903,7 @@ const Database = {
   // 管理 API 动作表 (ADMIN ACTION MAP)
   // 读取导航：
   // - 面板统计 / 运行状态：getDashboardStats / getMonthlyTrafficStats / getRuntimeStatus
-  // - 配置与备份：loadConfig / previewConfig / saveConfig / exportConfig / exportSettings / importSettings / importFull
+  // - 配置与备份：loadConfig / previewConfig / saveConfig / uploadAdminIndex / updateWorkerAndAdminIndex / exportConfig / exportSettings / importSettings / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode
   // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
   // 设计意图：
@@ -17665,18 +17128,6 @@ const Database = {
       });
     },
 
-    async getGithubReleaseSourceOptions(data, { env }) {
-      let config = {};
-      try {
-        config = await getRuntimeConfig(env);
-      } catch {}
-      return jsonResponse(await buildGithubReleaseSourceOptionsPayload(config, {
-        branch: data?.branch,
-        tag: data?.tag,
-        env
-      }));
-    },
-
     async getWorkerPlacementStatus(data, { env, request, kv }) {
       try {
         const config = await getRuntimeConfigStrict(env);
@@ -17841,113 +17292,147 @@ const Database = {
       }
     },
 
-    async updateWorkerScriptContent(data, { env, request }) {
+    async updateWorkerAndAdminIndex(data, { env, request, kv, ctx }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
       let config;
       try {
         config = await getRuntimeConfigStrict(env);
       } catch (error) {
         throw remapAdminReadKvError(
           error,
-          "WORKER_SCRIPT_UPDATE_FAILED",
-          "Worker 快捷更新失败：KV 读取异常",
-          "admin.write.worker_script"
+          "WORKER_HTML_UPDATE_FAILED",
+          "Worker 和 HTML 更新失败：KV 读取异常",
+          "admin.write.worker_html"
         );
       }
 
-      const fileName = normalizeCloudflareWorkerScriptUploadFileName(data?.fileName) || "worker.js";
-      const compatibilityScriptContent = typeof data?.scriptContent === "string" ? data.scriptContent : "";
-
-      try {
-        const authContext = assertCloudflareWorkerPlacementConfig(config);
-        const scriptContext = await resolveCloudflareWorkerScriptContext({
-          ...authContext,
-          request
-        });
-        const releaseSource = await fetchGithubReleaseWorkerScriptSource(config, {
-          ...(isPlainObject(data) ? data : {}),
-          env
-        });
-        const scriptContent = String(releaseSource.scriptContent || "");
-        const uploadResult = await updateCloudflareWorkerScriptContent(
-          authContext.cfAccountId,
-          scriptContext.scriptName,
-          authContext.cfApiToken,
-          scriptContent,
-          { fileName }
-        );
-        const result = uploadResult.result;
-        return jsonResponse({
-          success: true,
-          scriptName: scriptContext.scriptName,
-          requestHost: scriptContext.requestHost,
-          uploadedFileName: uploadResult.fileName,
-          syntax: uploadResult.syntax,
-          sourceUrl: releaseSource.sourceUrl,
-          effectiveRef: releaseSource.effectiveRef,
-          releaseRepo: releaseSource.releaseRepo,
-          releaseBranch: releaseSource.releaseBranch,
-          releaseTag: releaseSource.releaseTag,
-          modifiedOn: String(result?.modified_on || result?.modifiedOn || "").trim(),
-          etag: String(result?.etag || "").trim(),
-          handlers: Array.isArray(result?.handlers) ? result.handlers : [],
-          hasModules: result?.has_modules === true || result?.hasModules === true,
-          compatibilityDate: String(result?.compatibility_date || "").trim(),
-          compatibilityFlags: Array.isArray(result?.compatibility_flags) ? result.compatibility_flags : [],
-          lastDeployedFrom: String(result?.last_deployed_from || "").trim(),
-          compatibilityFallbackUsed: false
-        });
-      } catch (error) {
-        if (String(compatibilityScriptContent || "").trim()) {
-          try {
-            const authContext = assertCloudflareWorkerPlacementConfig(config);
-            const scriptContext = await resolveCloudflareWorkerScriptContext({
-              ...authContext,
-              request
-            });
-            const uploadResult = await updateCloudflareWorkerScriptContent(
-              authContext.cfAccountId,
-              scriptContext.scriptName,
-              authContext.cfApiToken,
-              compatibilityScriptContent,
-              { fileName }
-            );
-            const result = uploadResult.result;
-            return jsonResponse({
-              success: true,
-              scriptName: scriptContext.scriptName,
-              requestHost: scriptContext.requestHost,
-              uploadedFileName: uploadResult.fileName,
-              syntax: uploadResult.syntax,
-              sourceUrl: "",
-              effectiveRef: "",
-              releaseRepo: "",
-              releaseBranch: "",
-              releaseTag: "",
-              modifiedOn: String(result?.modified_on || result?.modifiedOn || "").trim(),
-              etag: String(result?.etag || "").trim(),
-              handlers: Array.isArray(result?.handlers) ? result.handlers : [],
-              hasModules: result?.has_modules === true || result?.hasModules === true,
-              compatibilityDate: String(result?.compatibility_date || "").trim(),
-              compatibilityFlags: Array.isArray(result?.compatibility_flags) ? result.compatibility_flags : [],
-              lastDeployedFrom: String(result?.last_deployed_from || "").trim(),
-              compatibilityFallbackUsed: true
-            });
-          } catch (compatibilityError) {
-            return jsonError(
-              "WORKER_SCRIPT_UPDATE_FAILED",
-              normalizeCloudflareWorkerScriptUpdateErrorMessage(compatibilityError),
-              normalizeErrorStatus(compatibilityError?.status, 400),
-              isPlainObject(compatibilityError?.details) ? compatibilityError.details : null
-            );
-          }
-        }
+      const workerScriptContent = typeof data?.workerScriptContent === "string" ? data.workerScriptContent : "";
+      const indexHtml = typeof data?.indexHtml === "string" ? data.indexHtml : "";
+      if (!workerScriptContent.trim() || !indexHtml.trim()) {
         return jsonError(
-          String(error?.code || "WORKER_SCRIPT_UPDATE_FAILED"),
+          "WORKER_HTML_FILES_REQUIRED",
+          "必须同时上传 worker.js 和 index.html，缺一不可",
+          400,
+          {
+            workerFileProvided: Boolean(workerScriptContent.trim()),
+            indexFileProvided: Boolean(indexHtml.trim())
+          }
+        );
+      }
+
+      let workerSource;
+      let indexRecord;
+      try {
+        workerSource = validateUploadedWorkerScriptSource(workerScriptContent, data?.workerFileName);
+        const indexFileName = String(data?.indexFileName || "").trim().split(/[\\/]+/).pop() || "";
+        if (indexFileName.toLowerCase() !== "index.html") {
+          return jsonError(
+            "ADMIN_INDEX_UPLOAD_FILE_NAME_INVALID",
+            "HTML 文件名必须是 index.html",
+            400,
+            { fileName: indexFileName || String(data?.indexFileName || "").trim() }
+          );
+        }
+        indexRecord = await buildAdminLocalIndexUploadRecord(indexHtml, indexFileName);
+      } catch (error) {
+        return jsonError(
+          String(error?.code || "WORKER_HTML_VALIDATION_FAILED"),
+          getErrorMessage(error, "Worker 或 HTML 文件校验失败"),
+          normalizeErrorStatus(error?.status, 400),
+          isPlainObject(error?.details) ? error.details : null
+        );
+      }
+
+      let authContext;
+      let scriptContext;
+      try {
+        authContext = assertCloudflareWorkerPlacementConfig(config);
+        scriptContext = await resolveCloudflareWorkerScriptContext({ ...authContext, request });
+      } catch (error) {
+        return jsonError(
+          String(error?.code || "WORKER_SCRIPT_CONTEXT_FAILED"),
           normalizeCloudflareWorkerScriptUpdateErrorMessage(error),
           normalizeErrorStatus(error?.status, 400),
           isPlainObject(error?.details) ? error.details : null
         );
       }
+
+      let persistedIndex;
+      try {
+        persistedIndex = await Database.persistAdminIndexUpload(indexRecord, { env, kv, ctx });
+      } catch (error) {
+        return jsonError(
+          String(error?.code || "ADMIN_INDEX_UPLOAD_FAILED"),
+          getErrorMessage(error, "index.html 激活失败"),
+          normalizeErrorStatus(error?.status, 500),
+          isPlainObject(error?.details) ? error.details : null
+        );
+      }
+
+      let uploadResult;
+      try {
+        uploadResult = await updateCloudflareWorkerScriptContent(
+          authContext.cfAccountId,
+          scriptContext.scriptName,
+          authContext.cfApiToken,
+          workerSource.scriptContent,
+          { fileName: workerSource.fileName }
+        );
+      } catch (error) {
+        let rollbackSucceeded = false;
+        let rollbackError = "";
+        try {
+          await Database.commitRuntimeConfig(config, {
+            env,
+            kv,
+            ctx,
+            snapshotMeta: {
+              reason: "rollback_worker_html_update",
+              section: "static_assets_policy",
+              source: "worker_html_upload",
+              actor: "system"
+            }
+          });
+          rollbackSucceeded = true;
+        } catch (restoreError) {
+          rollbackError = getErrorMessage(restoreError, "rollback_failed");
+        }
+        return jsonError(
+          String(error?.code || "WORKER_HTML_UPDATE_FAILED"),
+          normalizeCloudflareWorkerScriptUpdateErrorMessage(error),
+          normalizeErrorStatus(error?.status, 400),
+          {
+            ...(isPlainObject(error?.details) ? error.details : {}),
+            htmlRollbackAttempted: true,
+            htmlRollbackSucceeded: rollbackSucceeded,
+            htmlRollbackError: rollbackError
+          }
+        );
+      }
+
+      const result = uploadResult.result;
+      return jsonResponse({
+        success: true,
+        scriptName: scriptContext.scriptName,
+        requestHost: scriptContext.requestHost,
+        worker: {
+          fileName: uploadResult.fileName,
+          bytes: workerSource.contentLength,
+          syntax: uploadResult.syntax,
+          modifiedOn: String(result?.modified_on || result?.modifiedOn || "").trim(),
+          etag: String(result?.etag || "").trim(),
+          handlers: Array.isArray(result?.handlers) ? result.handlers : [],
+          hasModules: result?.has_modules === true || result?.hasModules === true
+        },
+        html: {
+          fileName: persistedIndex.record.fileName,
+          bytes: persistedIndex.record.bytes,
+          revision: persistedIndex.record.revision,
+          uploadedAt: persistedIndex.record.uploadedAt
+        },
+        config: persistedIndex.config,
+        revisions: await Database.getAdminRevisions(env, { ctx, config: persistedIndex.config })
+      });
     },
 
     async saveConfig(data, { env, ctx, kv, meta }) {
@@ -17972,6 +17457,42 @@ const Database = {
       });
     },
 
+    async uploadAdminIndex(data, { env, ctx, kv }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+      try {
+        const fileName = String(data?.fileName || "").trim().split(/[\\/]+/).pop() || "";
+        if (fileName.toLowerCase() !== "index.html") {
+          return jsonError(
+            "ADMIN_INDEX_UPLOAD_FILE_NAME_INVALID",
+            "HTML 文件名必须是 index.html",
+            400,
+            { fileName: fileName || String(data?.fileName || "").trim() }
+          );
+        }
+        const record = await buildAdminLocalIndexUploadRecord(data?.indexHtml, fileName);
+        const persisted = await Database.persistAdminIndexUpload(record, { env, kv, ctx });
+        return jsonResponse({
+          success: true,
+          source: "local_upload",
+          revision: persisted.record.revision,
+          assetRevision: persisted.record.assetRevision,
+          sourceUrl: persisted.record.sourceUrl,
+          fileName: persisted.record.fileName,
+          bytes: persisted.record.bytes,
+          uploadedAt: persisted.record.uploadedAt,
+          config: persisted.config,
+          revisions: await Database.getAdminRevisions(env, { ctx, config: persisted.config })
+        });
+      } catch (error) {
+        return jsonError(
+          String(error?.code || "ADMIN_INDEX_UPLOAD_FAILED"),
+          getErrorMessage(error, "本地 index.html 上传失败"),
+          normalizeErrorStatus(error?.status, 500),
+          isPlainObject(error?.details) ? error.details : null
+        );
+      }
+    },
+
     async exportConfig(data, { env, ctx, request }) {
       const kv = Database.getKV(env);
       const includeSecrets = data?.includeSecrets === true;
@@ -17979,11 +17500,25 @@ const Database = {
         return jsonError("CONFIRMATION_REQUIRED", "导出完整密钥需要显式确认", 428);
       }
       const config = await getRuntimeConfigStrict(env);
+      const indexState = buildResolvedAdminIndexState(env, config);
+      const adminIndexUpload = kv && indexState.localUploadRevision
+        ? await Database.getAdminIndexUploadRecord(kv, indexState.localUploadRevision)
+        : null;
       return jsonResponse({ 
         version: Config.Defaults.Version, 
         exportTime: new Date().toISOString(), 
         nodes: kv ? (await Database.loadAllNodeEntitiesFromKvStrict(kv, { ctx })).filter(Boolean) : [],
         config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
+        adminIndexUpload: adminIndexUpload
+          ? {
+              version: adminIndexUpload.version,
+              revision: adminIndexUpload.revision,
+              fileName: adminIndexUpload.fileName,
+              uploadedAt: adminIndexUpload.uploadedAt,
+              bytes: adminIndexUpload.bytes,
+              html: adminIndexUpload.html
+            }
+          : null,
         secretsRedacted: includeSecrets !== true,
         containsSecrets: includeSecrets === true
       });
@@ -18442,6 +17977,43 @@ const Database = {
       if (hostPrefixValidationError) {
         return jsonError(hostPrefixValidationError.code, hostPrefixValidationError.message, 400, hostPrefixValidationError);
       }
+      const importedIndexRevision = parseAdminLocalIndexSourceUrl(data?.config?.indexUrl || "");
+      let importedIndexRecord = null;
+      if (isPlainObject(data?.adminIndexUpload)) {
+        const backupFileName = String(data.adminIndexUpload.fileName || "").trim().split(/[\\/]+/).pop() || "";
+        if (backupFileName.toLowerCase() !== "index.html") {
+          return jsonError("ADMIN_INDEX_BACKUP_INVALID", "完整备份中的 HTML 文件名必须是 index.html", 400);
+        }
+        try {
+          importedIndexRecord = await buildAdminLocalIndexUploadRecord(data.adminIndexUpload.html, backupFileName);
+        } catch (error) {
+          return jsonError(
+            String(error?.code || "ADMIN_INDEX_BACKUP_INVALID"),
+            getErrorMessage(error, "完整备份中的 index.html 无效"),
+            normalizeErrorStatus(error?.status, 400),
+            isPlainObject(error?.details) ? error.details : null
+          );
+        }
+        if (importedIndexRevision && importedIndexRecord.revision !== importedIndexRevision) {
+          return jsonError(
+            "ADMIN_INDEX_BACKUP_REVISION_MISMATCH",
+            "完整备份中的 index.html 与配置版本不一致",
+            400,
+            { expectedRevision: importedIndexRevision, actualRevision: importedIndexRecord.revision }
+          );
+        }
+      }
+      if (importedIndexRevision && !importedIndexRecord) {
+        const existingIndexRecord = await Database.getAdminIndexUploadRecord(kv, importedIndexRevision);
+        if (!existingIndexRecord) {
+          return jsonError(
+            "ADMIN_INDEX_BACKUP_MISSING",
+            "完整备份缺少当前配置引用的 index.html",
+            400,
+            { revision: importedIndexRevision }
+          );
+        }
+      }
       return await runKvDataMutation(async () => {
         const currentConfig = await getRuntimeConfigStrict(env);
         const configRollbackState = data.config
@@ -18452,6 +18024,10 @@ const Database = {
           : null;
         const nodeDnsConfig = importedConfig ? sanitizeRuntimeConfig(importedConfig) : currentConfig;
         const configuredHost = resolveConfiguredHost(env);
+        const importedIndexKey = importedIndexRecord
+          ? Database.buildAdminIndexUploadKey(importedIndexRecord.revision)
+          : "";
+        const previousImportedIndexValue = importedIndexKey ? await kv.get(importedIndexKey) : null;
         const preparedMutations = [];
         if (Array.isArray(data.nodes)) {
           for (const n of data.nodes) {
@@ -18482,6 +18058,7 @@ const Database = {
         let savedConfig = null;
         let nodeMutationCommitted = false;
         try {
+          if (importedIndexKey) await kv.put(importedIndexKey, JSON.stringify(importedIndexRecord));
           if (importedConfig) {
             savedConfig = await Database.commitRuntimeConfig(importedConfig, {
               env,
@@ -18508,6 +18085,7 @@ const Database = {
         } catch (error) {
           let configRollbackError = "";
           let nodeRollbackError = "";
+          let adminIndexRollbackError = "";
           if (nodeMutationCommitted) {
             try {
               await Database.rollbackPreparedNodeMutations(preparedMutations, {
@@ -18528,14 +18106,23 @@ const Database = {
               configRollbackError = getErrorMessage(restoreError, "config_restore_failed");
             }
           }
+          if (importedIndexKey) {
+            try {
+              if (previousImportedIndexValue === null) await kv.delete(importedIndexKey);
+              else await kv.put(importedIndexKey, previousImportedIndexValue);
+            } catch (restoreError) {
+              adminIndexRollbackError = getErrorMessage(restoreError, "admin_index_restore_failed");
+            }
+          }
           if (error && typeof error === "object") {
             if (!String(error.code || "").trim()) error.code = "IMPORT_FULL_FAILED";
             error.status = normalizeErrorStatus(error.status, 500);
             error.details = {
               ...(isPlainObject(error.details) ? error.details : {}),
-              rollbackAttempted: !!configRollbackState || nodeMutationCommitted,
+              rollbackAttempted: !!configRollbackState || nodeMutationCommitted || Boolean(importedIndexKey),
               configRollbackError,
-              nodeRollbackError
+              nodeRollbackError,
+              adminIndexRollbackError
             };
           }
           throw error;
@@ -18546,6 +18133,13 @@ const Database = {
           success: true,
           config,
           nodes,
+          adminIndexUpload: importedIndexRecord
+            ? {
+                revision: importedIndexRecord.revision,
+                fileName: importedIndexRecord.fileName,
+                bytes: importedIndexRecord.bytes
+              }
+            : null,
           revisions: await Database.getAdminRevisions(env, { ctx, config, nodes })
         });
       });
@@ -24787,12 +24381,7 @@ function buildAdminShellState(env, initHealth = buildInitHealth(env), config = {
     gateState: adminIndexState.gateState,
     indexUrl: adminIndexState.indexUrl,
     indexUrlSource: adminIndexState.indexUrlSource,
-    releaseRepo: adminIndexState.releaseRepo,
-    releaseBranch: adminIndexState.releaseBranch,
-    releaseTag: adminIndexState.releaseTag,
     effectiveRef: adminIndexState.effectiveRef,
-    derivedIndexUrl: adminIndexState.derivedIndexUrl,
-    workerSourceUrl: adminIndexState.workerSourceUrl,
     remoteShellConfigured,
     remoteShellIndexUrl,
     remoteShellOrigin,
@@ -24839,12 +24428,8 @@ function normalizeAdminShellRuntimeStatus(options = {}) {
     routeState,
     indexUrl: String(options.indexUrl || shellState.indexUrl || indexState.indexUrl || configuredRemoteIndexUrl).trim(),
     indexUrlSource: String(options.indexUrlSource || shellState.indexUrlSource || indexState.indexUrlSource || "").trim(),
-    releaseRepo: String(options.releaseRepo || shellState.releaseRepo || indexState.releaseRepo || "").trim(),
-    releaseBranch: String(options.releaseBranch || shellState.releaseBranch || indexState.releaseBranch || "").trim(),
-    releaseTag: String(options.releaseTag || shellState.releaseTag || indexState.releaseTag || "").trim(),
     effectiveRef: String(options.effectiveRef || shellState.effectiveRef || indexState.effectiveRef || "").trim(),
     effectiveRefType: String(options.effectiveRefType || shellState.effectiveRefType || indexState.effectiveRefType || "").trim(),
-    workerSourceUrl: String(options.workerSourceUrl || shellState.workerSourceUrl || indexState.workerSourceUrl || "").trim(),
     remoteShellIndexUrl: configuredRemoteIndexUrl,
     remoteShellOrigin: String(shellState.remoteShellOrigin || "").trim(),
     remoteCacheState: String(options.remoteCacheState || "").trim().toLowerCase(),
@@ -24940,12 +24525,8 @@ function withAdminShellRuntimeStatus(runtimeStatus = {}, env, config = {}, initH
       gateState: adminIndexState.gateState,
       indexUrl: adminIndexState.indexUrl,
       indexUrlSource: adminIndexState.indexUrlSource,
-      releaseRepo: adminIndexState.releaseRepo,
-      releaseBranch: adminIndexState.releaseBranch,
-      releaseTag: adminIndexState.releaseTag,
       effectiveRef: adminIndexState.effectiveRef,
       effectiveRefType: adminIndexState.effectiveRefType,
-      workerSourceUrl: adminIndexState.workerSourceUrl,
       mode: isPlainObject(safeRuntimeStatus.adminShell) && String(safeRuntimeStatus.adminShell.mode || "").trim()
         ? safeRuntimeStatus.adminShell.mode
         : (adminIndexState.indexUrl ? "remote" : "gate"),
@@ -24962,20 +24543,19 @@ function withAdminShellRuntimeStatus(runtimeStatus = {}, env, config = {}, initH
 function describeAdminRemoteShellFailureReason(reason = "") {
   const normalizedReason = String(reason || "").trim();
   if (!normalizedReason) {
-    return "远端管理台壳暂时不可用，请稍后重试。";
+    return "已上传的管理台 HTML 暂时不可用，请重新上传。";
   }
   if (normalizedReason.startsWith("remote_shell_render_failed")) {
     const detail = normalizedReason.replace(/^remote_shell_render_failed:\s*/i, "").trim();
     return detail
-      ? `Worker 拉取远端 index.html 失败：${detail}`
-      : "Worker 拉取远端 index.html 失败。";
+      ? `Worker 读取 index.html 失败：${detail}`
+      : "Worker 读取 index.html 失败。";
   }
   return normalizedReason;
 }
 
 function buildAdminRemoteShellErrorContent(bootstrap = {}, shellState = {}, initHealth = {}, statusOptions = {}) {
   const adminPath = String(bootstrap.adminPath || "/admin").trim() || "/admin";
-  const loginPath = String(bootstrap.loginPath || "").trim();
   const remoteShellIndexUrl = String(statusOptions.remoteShellIndexUrl || shellState.remoteShellIndexUrl || "").trim();
   const reasonSummary = describeAdminRemoteShellFailureReason(statusOptions.reason || "");
   const setupPath = `${adminPath}?setup=1`;
@@ -25015,22 +24595,20 @@ function buildAdminRemoteShellErrorContent(bootstrap = {}, shellState = {}, init
   <div class="admin-remote-error-shell">
     <section class="admin-remote-error-card">
       <div class="admin-remote-error-head">
-        <div class="admin-remote-error-kicker">Remote Shell Error</div>
-        <h1 class="admin-remote-error-title">/admin 远端壳暂时不可用</h1>
+        <div class="admin-remote-error-kicker">HTML Error</div>
+        <h1 class="admin-remote-error-title">管理台 HTML 暂时不可用</h1>
         <p class="admin-remote-error-desc">${escapeHtml(reasonSummary)}</p>
       </div>
       <div class="admin-remote-error-body">
         <div class="admin-remote-error-grid">
           <article class="admin-remote-error-stat"><div class="admin-remote-error-k">错误原因</div><div class="admin-remote-error-v">${escapeHtml(reasonSummary)}</div></article>
-          <article class="admin-remote-error-stat"><div class="admin-remote-error-k">当前 INDEX_URL</div><div class="admin-remote-error-v">${escapeHtml(remoteShellIndexUrl || "INDEX_URL 尚未配置")}</div></article>
+          <article class="admin-remote-error-stat"><div class="admin-remote-error-k">本地版本标识</div><div class="admin-remote-error-v">${escapeHtml(remoteShellIndexUrl || "未找到本地 HTML 版本")}</div></article>
         </div>
         <div class="admin-remote-error-actions">
           <a href="${escapeHtml(adminPath)}" class="admin-remote-error-btn admin-remote-error-btn-primary">刷新 /admin</a>
-          ${loginPath ? `<a href="${escapeHtml(loginPath)}" class="admin-remote-error-btn admin-remote-error-btn-secondary">打开登录页</a>` : ""}
-          ${remoteShellIndexUrl ? `<a href="${escapeHtml(remoteShellIndexUrl)}" class="admin-remote-error-btn admin-remote-error-btn-secondary" target="_blank" rel="noopener noreferrer">打开远端 index.html</a>` : ""}
-          <a href="${escapeHtml(setupPath)}" class="admin-remote-error-btn admin-remote-error-btn-secondary">重新设置发布源</a>
+          <a href="${escapeHtml(setupPath)}" class="admin-remote-error-btn admin-remote-error-btn-secondary">重新上传 index.html</a>
         </div>
-        <p class="admin-remote-error-note">如果这里继续报错，请优先检查 Release 的 index.html、Worker vendor 代理链路，以及当前发布源配置。</p>
+        <p class="admin-remote-error-note">如果这里继续报错，请重新上传与当前 Worker 匹配的 index.html。</p>
       </div>
     </section>
   </div>`;
@@ -25038,123 +24616,64 @@ function buildAdminRemoteShellErrorContent(bootstrap = {}, shellState = {}, init
 
 function buildAdminIndexSetupContent(bootstrap = {}, shellState = {}, initHealth = {}, config = {}, indexState = {}) {
   const adminPath = String(bootstrap.adminPath || "/admin").trim() || "/admin";
-  const loginPath = String(bootstrap.loginPath || "").trim() || `${adminPath.replace(/\/+$/, "")}/login`;
-  const runtimePayload = serializeInlineJson({
-    adminPath,
-    loginPath,
-    releaseRepo: FIXED_GITHUB_RELEASE_REPO,
-    releaseBranch: String(indexState.releaseBranch || "").trim(),
-    releaseTag: String(indexState.releaseTag || "").trim(),
-    indexUrl: String(indexState.indexUrl || "").trim(),
-    workerSourceUrl: String(indexState.workerSourceUrl || "").trim(),
-    effectiveRefType: String(indexState.effectiveRefType || "").trim(),
-    currentConfig: sanitizeRuntimeConfig(config)
-  });
+  const hasLocalUpload = indexState?.isLocalUpload === true;
+  const runtimePayload = serializeInlineJson({ adminPath });
   return `<style>
-    .admin-gate-shell{max-width:980px;margin:0 auto;padding:40px 20px 56px;color:#0f172a}
-    .admin-gate-card{background:rgba(255,255,255,.95);border:1px solid rgba(148,163,184,.2);border-radius:28px;box-shadow:0 24px 80px rgba(15,23,42,.12);overflow:hidden}
-    .dark .admin-gate-card{background:rgba(15,23,42,.92);border-color:rgba(71,85,105,.65);color:#e2e8f0}
-    .admin-gate-hero{padding:30px 30px 22px;border-bottom:1px solid rgba(148,163,184,.16)}
-    .admin-gate-kicker{display:inline-flex;align-items:center;padding:7px 12px;border-radius:999px;background:rgba(14,165,233,.1);color:#0369a1;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
-    .dark .admin-gate-kicker{background:rgba(14,165,233,.16);color:#7dd3fc}
-    .admin-gate-title{margin:16px 0 10px;font-size:clamp(30px,5vw,42px);line-height:1.05}
-    .admin-gate-desc{margin:0;color:#475569;line-height:1.8}
-    .dark .admin-gate-desc{color:#cbd5e1}
-    .admin-gate-note{margin-top:18px;padding:14px 16px;border-radius:18px;background:#f8fafc;border:1px solid rgba(148,163,184,.16);color:#475569;line-height:1.8}
-    .dark .admin-gate-note{background:#111827;border-color:rgba(71,85,105,.5);color:#cbd5e1}
-    .admin-gate-body{padding:30px;display:grid;gap:22px}
-    .admin-gate-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
-    .admin-gate-field{display:grid;gap:8px}
-    .admin-gate-field-full{grid-column:1 / -1}
-    .admin-gate-label{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#64748b}
-    .admin-gate-input,.admin-gate-readonly{width:100%;padding:14px 16px;border-radius:16px;border:1px solid rgba(148,163,184,.22);background:#fff;color:#0f172a;font-size:14px;outline:none}
-    .dark .admin-gate-input,.dark .admin-gate-readonly{background:#020617;color:#e2e8f0;border-color:rgba(71,85,105,.8)}
-    .admin-gate-input:focus{border-color:#0ea5e9;box-shadow:0 0 0 4px rgba(14,165,233,.12)}
-    .admin-gate-readonly{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;background:#f8fafc}
-    .dark .admin-gate-readonly{background:#0f172a}
-    .admin-gate-link{display:block;text-decoration:none}
-    .admin-gate-actions{display:flex;flex-wrap:wrap;gap:12px}
-    .admin-gate-btn{display:inline-flex;align-items:center;justify-content:center;padding:12px 18px;border-radius:999px;border:1px solid rgba(148,163,184,.24);font-weight:700;font-size:14px;text-decoration:none;cursor:pointer;transition:transform .12s ease,background .12s ease,border-color .12s ease}
-    .admin-gate-btn:hover{transform:translateY(-1px)}
-    .admin-gate-btn-primary{background:linear-gradient(135deg,#0ea5e9,#22c55e);border-color:transparent;color:#082f49}
-    .admin-gate-btn-secondary{background:#fff;color:#334155}
-    .dark .admin-gate-btn-secondary{background:#0f172a;color:#e2e8f0;border-color:rgba(71,85,105,.8)}
-    .admin-gate-status{min-height:48px;padding:12px 14px;border-radius:16px;background:#f8fafc;border:1px solid rgba(148,163,184,.16);color:#475569;line-height:1.7}
-    .dark .admin-gate-status{background:#111827;border-color:rgba(71,85,105,.5);color:#cbd5e1}
-    .admin-gate-status.is-error{background:rgba(244,63,94,.08);border-color:rgba(244,63,94,.24);color:#be123c}
-    .dark .admin-gate-status.is-error{color:#fecdd3}
-    .admin-gate-status.is-success{background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.24);color:#166534}
-    .dark .admin-gate-status.is-success{color:#bbf7d0}
-    @media (max-width: 820px){
-      .admin-gate-form-grid{grid-template-columns:1fr}
-      .admin-gate-body,.admin-gate-hero{padding:22px}
-    }
+    .admin-gate-shell{max-width:720px;margin:0 auto;padding:48px 20px 64px;color:#0f172a}
+    .admin-gate-card{background:#fff;border:1px solid #dbe3ee;border-radius:8px;box-shadow:0 18px 50px rgba(15,23,42,.1);overflow:hidden}
+    .dark .admin-gate-card{background:#0f172a;border-color:#334155;color:#e2e8f0}
+    .admin-gate-head{padding:24px 24px 18px;border-bottom:1px solid #e2e8f0}
+    .dark .admin-gate-head{border-color:#334155}
+    .admin-gate-kicker{margin:0 0 8px;color:#0369a1;font-size:12px;font-weight:700;text-transform:uppercase}
+    .dark .admin-gate-kicker{color:#7dd3fc}
+    .admin-gate-title{margin:0;font-size:24px;line-height:1.3}
+    .admin-gate-body{padding:24px;display:grid;gap:18px}
+    .admin-gate-field{display:grid;gap:8px;min-width:0}
+    .admin-gate-label{font-size:13px;font-weight:700;color:#475569}
+    .dark .admin-gate-label{color:#cbd5e1}
+    .admin-gate-input{width:100%;min-width:0;padding:12px;border-radius:6px;border:1px solid #cbd5e1;background:#fff;color:#0f172a;font-size:14px;outline:none}
+    .dark .admin-gate-input{background:#020617;color:#e2e8f0;border-color:#475569}
+    .admin-gate-input:focus{border-color:#0284c7;box-shadow:0 0 0 3px rgba(2,132,199,.14)}
+    .admin-gate-hint{font-size:12px;line-height:1.6;color:#64748b;overflow-wrap:anywhere}
+    .dark .admin-gate-hint{color:#94a3b8}
+    .admin-gate-status{min-height:44px;padding:11px 12px;border-radius:6px;background:#f8fafc;border:1px solid #e2e8f0;color:#475569;line-height:1.6;overflow-wrap:anywhere}
+    .dark .admin-gate-status{background:#111827;border-color:#334155;color:#cbd5e1}
+    .admin-gate-status.is-error{background:#fff1f2;border-color:#fecdd3;color:#be123c}
+    .dark .admin-gate-status.is-error{background:#4c0519;border-color:#881337;color:#fecdd3}
+    .admin-gate-status.is-success{background:#ecfdf5;border-color:#a7f3d0;color:#166534}
+    .dark .admin-gate-status.is-success{background:#052e16;border-color:#166534;color:#bbf7d0}
+    .admin-gate-actions{display:flex;justify-content:flex-end}
+    .admin-gate-btn{min-height:42px;padding:10px 16px;border:0;border-radius:6px;background:#0369a1;color:#fff;font-size:14px;font-weight:700;cursor:pointer}
+    .admin-gate-btn:hover{background:#075985}
+    .admin-gate-btn:disabled{cursor:wait;opacity:.65}
+    @media (max-width:640px){.admin-gate-shell{padding:24px 12px 40px}.admin-gate-head,.admin-gate-body{padding:18px}.admin-gate-actions,.admin-gate-btn{width:100%}}
   </style>
   <div class="admin-gate-shell">
     <section class="admin-gate-card">
-      <div class="admin-gate-hero">
-        <div class="admin-gate-kicker">Index Source Required</div>
-        <h1 class="admin-gate-title">先锁定 GitHub Release，再进入 /admin 壳层</h1>
-        <p class="admin-gate-desc">这里会固定使用 <code>${escapeHtml(FIXED_GITHUB_RELEASE_REPO)}</code>，并只允许你选择同时包含 <code>index.html</code> 与 <code>worker.js</code> 的已发布 Release Tag。无论是首次进入 /admin，还是需要重新切换当前发布源，都可以在这里重新锁定。</p>
-        <p class="admin-gate-note">正式版本只认 Release Tag。这里会自动派生 Release 的 <code>INDEX_URL</code> 与 <code>WORKER_SOURCE_URL</code>，并把 <code>target_commitish</code> 回写到 <code>releaseBranch</code> 作为兼容镜像字段。</p>
-      </div>
-      <div class="admin-gate-body">
-        <form id="admin-index-gate-form" class="admin-gate-form-grid" novalidate>
-          <label class="admin-gate-field">
-            <span class="admin-gate-label">固定 GitHub Repo</span>
-            <a
-              id="admin-gate-release-repo"
-              class="admin-gate-readonly admin-gate-link"
-              href="https://github.com/${escapeHtml(FIXED_GITHUB_RELEASE_REPO)}"
-              target="_blank"
-              rel="noopener noreferrer"
-            >${escapeHtml(FIXED_GITHUB_RELEASE_REPO)}</a>
-          </label>
-          <label class="admin-gate-field">
-            <span class="admin-gate-label">Release Tag</span>
-            <select id="admin-gate-release-tag" class="admin-gate-input">
-              <option value="">正在加载 Release...</option>
-            </select>
-          </label>
-          <label class="admin-gate-field">
-            <span class="admin-gate-label">Target Commitish</span>
-            <input id="admin-gate-release-branch" class="admin-gate-readonly" type="text" value="${escapeHtml(String(indexState.releaseBranch || "").trim())}" readonly />
-          </label>
-          <label class="admin-gate-field admin-gate-field-full">
-            <span class="admin-gate-label">INDEX_URL</span>
-            <input id="admin-gate-index-url" class="admin-gate-readonly" type="text" value="${escapeHtml(String(indexState.derivedIndexUrl || "").trim())}" readonly />
-          </label>
-          <label class="admin-gate-field admin-gate-field-full">
-            <span class="admin-gate-label">WORKER_SOURCE_URL</span>
-            <input id="admin-gate-worker-source-url" class="admin-gate-readonly" type="text" value="${escapeHtml(String(indexState.workerSourceUrl || "").trim())}" readonly />
-          </label>
-          <div class="admin-gate-field admin-gate-field-full">
-            <span class="admin-gate-label">当前状态</span>
-            <div id="admin-gate-status" class="admin-gate-status" role="status" aria-live="polite">正在加载固定发布仓库的 Release 选项...</div>
-          </div>
-          <div class="admin-gate-actions admin-gate-field-full">
-            <button id="admin-gate-submit" type="submit" class="admin-gate-btn admin-gate-btn-primary">保存并进入 /admin</button>
-            <button id="admin-gate-refresh" type="button" class="admin-gate-btn admin-gate-btn-secondary">刷新 Release</button>
-            <a href="${escapeHtml(loginPath)}" class="admin-gate-btn admin-gate-btn-secondary">回到登录页</a>
-          </div>
-        </form>
-      </div>
+      <header class="admin-gate-head">
+        <p class="admin-gate-kicker">Index Source</p>
+        <h1 class="admin-gate-title">上传 index.html</h1>
+      </header>
+      <form id="admin-index-gate-form" class="admin-gate-body" novalidate>
+        <label class="admin-gate-field">
+          <span class="admin-gate-label">index.html</span>
+          <input id="admin-gate-local-file" class="admin-gate-input" type="file" accept=".html,text/html" required />
+          <span id="admin-gate-local-hint" class="admin-gate-hint">文件上限 2 MiB</span>
+        </label>
+        <div id="admin-gate-status" class="admin-gate-status${hasLocalUpload ? " is-success" : ""}" role="status" aria-live="polite">${hasLocalUpload ? "当前已有 HTML 版本，可上传新文件替换。" : "请选择 index.html。"}</div>
+        <div class="admin-gate-actions">
+          <button id="admin-gate-submit" type="submit" class="admin-gate-btn">上传并进入管理台</button>
+        </div>
+      </form>
     </section>
   </div>
   <script>
     const ADMIN_INDEX_GATE_RUNTIME = ${runtimePayload};
     const gateForm = document.getElementById("admin-index-gate-form");
-    const releaseBranchInput = document.getElementById("admin-gate-release-branch");
-    const releaseTagInput = document.getElementById("admin-gate-release-tag");
-    const indexUrlInput = document.getElementById("admin-gate-index-url");
-    const workerSourceUrlInput = document.getElementById("admin-gate-worker-source-url");
+    const localFileInput = document.getElementById("admin-gate-local-file");
+    const localFileHint = document.getElementById("admin-gate-local-hint");
     const submitButton = document.getElementById("admin-gate-submit");
-    const refreshButton = document.getElementById("admin-gate-refresh");
     const gateStatus = document.getElementById("admin-gate-status");
-    const gateState = {
-      repo: String(ADMIN_INDEX_GATE_RUNTIME.releaseRepo || "").trim() || "${FIXED_GITHUB_RELEASE_REPO}",
-      releases: []
-    };
 
     function setGateStatus(message, tone) {
       if (!gateStatus) return;
@@ -25164,202 +24683,68 @@ function buildAdminIndexSetupContent(bootstrap = {}, shellState = {}, initHealth
       if (tone === "success") gateStatus.classList.add("is-success");
     }
 
-    function normalizeReleaseRef(value) {
-      const raw = String(value || "").trim();
-      if (!raw) return "";
-      if(/[\\x00-\\x20~^:?*[\\\\\\]]/.test(raw)) return "";
-      if(raw.includes("..") || raw.includes("@{") || raw.includes("//")) return "";
-      if(raw.startsWith("/") || raw.endsWith("/") || raw.endsWith(".") || raw.endsWith(".lock")) return "";
-      return raw;
+    function formatFileSize(bytes) {
+      const value = Number(bytes) || 0;
+      return value >= 1024 * 1024
+        ? (value / (1024 * 1024)).toFixed(2) + " MiB"
+        : Math.max(0, Math.round(value / 1024)) + " KiB";
     }
 
-    function buildReleaseAssetUrl(repo, releaseTag, assetName) {
-      const normalizedRepo = String(repo || "").trim().replace(/^\\/+|\\/+$/g, "");
-      const normalizedTag = normalizeReleaseRef(releaseTag);
-      const normalizedAssetName = String(assetName || "").trim().replace(/^\\/+/, "");
-      if (!normalizedRepo || !normalizedTag || !normalizedAssetName) return "";
-      return "https://github.com/" + normalizedRepo + "/releases/download/" + encodeURIComponent(normalizedTag) + "/" + encodeURIComponent(normalizedAssetName);
+    function validateFile(file) {
+      if (!file) return "请选择 index.html。";
+      if (String(file.name || "").trim().toLowerCase() !== "index.html") return "文件名必须是 index.html。";
+      if (file.size > 2 * 1024 * 1024) return "文件超过 2 MiB 上限。";
+      return "";
     }
 
-    function buildDerivedState() {
-      const releaseRepo = String(gateState.repo || "${FIXED_GITHUB_RELEASE_REPO}").trim() || "${FIXED_GITHUB_RELEASE_REPO}";
-      const releaseTag = normalizeReleaseRef(releaseTagInput?.value || "");
-      const matchedRelease = gateState.releases.find((release) => normalizeReleaseRef(release?.tag || "") === releaseTag) || null;
-      const releaseBranch = normalizeReleaseRef(matchedRelease?.targetCommitish || "");
-      const indexUrl = releaseTag
-        ? (String(matchedRelease?.indexUrl || "").trim() || buildReleaseAssetUrl(releaseRepo, releaseTag, "index.html"))
-        : "";
-      const workerSourceUrl = releaseTag
-        ? (String(matchedRelease?.workerSourceUrl || "").trim() || buildReleaseAssetUrl(releaseRepo, releaseTag, "worker.js"))
-        : "";
-      return {
-        releaseRepo,
-        releaseBranch,
-        releaseTag,
-        effectiveRef: releaseTag,
-        effectiveRefType: releaseTag ? "tag" : "",
-        indexUrl,
-        workerSourceUrl,
-        publishedAt: String(matchedRelease?.publishedAt || "").trim()
-      };
-    }
-
-    function buildReleaseSelectionStatus(nextState = {}) {
-      if (!nextState.releaseTag) {
-        return "请选择一个已发布且包含 index.html / worker.js 的 Release Tag。";
-      }
-      if (nextState.releaseBranch) {
-        return "当前已锁定 Release Tag " + nextState.releaseTag + "，target_commitish 为 " + nextState.releaseBranch + "。";
-      }
-      return "当前已锁定 Release Tag " + nextState.releaseTag + "。";
-    }
-
-    function syncDerivedPreview() {
-      const nextState = buildDerivedState();
-      if (releaseBranchInput) releaseBranchInput.value = nextState.releaseBranch;
-      if (indexUrlInput) indexUrlInput.value = nextState.indexUrl;
-      if (workerSourceUrlInput) workerSourceUrlInput.value = nextState.workerSourceUrl;
-      return nextState;
-    }
-
-    function setButtonPending(pending) {
-      const disabled = pending === true;
-      if (submitButton) submitButton.disabled = disabled;
-      if (refreshButton) refreshButton.disabled = disabled;
-      if (releaseTagInput) releaseTagInput.disabled = disabled;
-    }
-
-    function fillReleaseOptions(releases, selectedTag) {
-      if (!releaseTagInput) return;
-      const releaseList = Array.isArray(releases) ? releases : [];
-      releaseTagInput.innerHTML = '<option value="">请选择已发布 Release</option>' + releaseList.map((release) => {
-        const tagName = normalizeReleaseRef(release && typeof release === "object" ? release.tag : release);
-        if (!tagName) return "";
-        const title = String(release?.title || tagName).trim() || tagName;
-        const publishedAt = String(release?.publishedAt || "").trim();
-        const label = publishedAt ? (tagName + " · " + title + " · " + publishedAt) : (tagName + " · " + title);
-        return '<option value="' + tagName + '">' + label + '</option>';
-      }).join("");
-      releaseTagInput.value = selectedTag || "";
-    }
-
-    function applyReleaseOptions(payload) {
-      const releaseOptions = Array.isArray(payload?.releases) ? payload.releases : [];
-      gateState.repo = String(payload?.repo || gateState.repo || "${FIXED_GITHUB_RELEASE_REPO}").trim() || "${FIXED_GITHUB_RELEASE_REPO}";
-      gateState.releases = releaseOptions;
-      fillReleaseOptions(releaseOptions, normalizeReleaseRef(payload?.selectedTag || ""));
-      const nextState = syncDerivedPreview();
-      setGateStatus(buildReleaseSelectionStatus(nextState), nextState.effectiveRefType === "tag" ? "success" : "");
-    }
-
-    async function fetchReleaseOptions(options = {}) {
-      const tag = normalizeReleaseRef(options.tag || releaseTagInput?.value || "");
-      const response = await fetch(ADMIN_INDEX_GATE_RUNTIME.adminPath || "/admin", {
-        method: "POST",
-        credentials: "same-origin",
-        headers: {
-          "Content-Type": "application/json",
-          "Accept": "application/json"
-        },
-        body: JSON.stringify({
-          action: "getGithubReleaseSourceOptions",
-          ...(tag ? { tag } : {})
-        })
-      });
-      const payload = await response.json().catch(() => ({}));
-      if (!response.ok) {
-        const message = payload?.message || payload?.error?.message || payload?.error || ("Release 读取失败（HTTP " + response.status + "）");
-        throw new Error(String(message || "Release 读取失败"));
-      }
-      return payload;
-    }
-
-    async function refreshReleaseOptions(options = {}) {
-      setButtonPending(true);
-      setGateStatus("正在加载固定发布仓库的 Release 选项...", "");
-      try {
-        const payload = await fetchReleaseOptions(options);
-        applyReleaseOptions(payload);
-        return payload;
-      } catch (error) {
-        setGateStatus(error?.message ? "Release 读取失败：" + error.message : "Release 读取失败，请稍后重试。", "error");
-        return null;
-      } finally {
-        setButtonPending(false);
-      }
-    }
-
-    releaseTagInput?.addEventListener("change", () => {
-      const nextState = syncDerivedPreview();
-      setGateStatus(buildReleaseSelectionStatus(nextState), nextState.effectiveRefType === "tag" ? "success" : "");
-    });
-
-    refreshButton?.addEventListener("click", async () => {
-      await refreshReleaseOptions({
-        tag: releaseTagInput?.value || ""
-      });
+    localFileInput?.addEventListener("change", () => {
+      const file = localFileInput.files?.[0];
+      const error = validateFile(file);
+      if (localFileHint) localFileHint.textContent = file ? file.name + " · " + formatFileSize(file.size) : "文件上限 2 MiB";
+      setGateStatus(error || ("已选择 " + file.name + "。"), error ? "error" : "success");
     });
 
     gateForm?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const nextState = syncDerivedPreview();
-      if (!nextState.releaseTag) {
-        setGateStatus("请选择一个已发布的 Release Tag。", "error");
-        releaseTagInput?.focus();
-        return;
-      }
-      if (!nextState.indexUrl) {
-        setGateStatus("当前选择还不能派生出有效 INDEX_URL，请检查 Release。", "error");
+      const file = localFileInput?.files?.[0];
+      const validationError = validateFile(file);
+      if (validationError) {
+        setGateStatus(validationError, "error");
+        localFileInput?.focus();
         return;
       }
 
-      setButtonPending(true);
-      setGateStatus("正在保存正式发布源配置...", "");
-
+      if (submitButton) submitButton.disabled = true;
+      if (localFileInput) localFileInput.disabled = true;
+      setGateStatus("正在上传并校验 index.html...", "");
+      let redirecting = false;
       try {
-        const currentConfig = ADMIN_INDEX_GATE_RUNTIME.currentConfig && typeof ADMIN_INDEX_GATE_RUNTIME.currentConfig === "object"
-          ? ADMIN_INDEX_GATE_RUNTIME.currentConfig
-          : {};
         const response = await fetch(ADMIN_INDEX_GATE_RUNTIME.adminPath || "/admin", {
           method: "POST",
           credentials: "same-origin",
-          headers: {
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-          },
+          headers: { "Content-Type": "application/json", "Accept": "application/json" },
           body: JSON.stringify({
-            action: "saveConfig",
-            meta: {
-              section: "static_assets_policy",
-              source: "admin_gate"
-            },
-            config: {
-              ...currentConfig,
-              releaseRepo: nextState.releaseRepo,
-              releaseBranch: nextState.releaseBranch,
-              releaseTag: nextState.releaseTag,
-              indexUrl: nextState.indexUrl
-            }
+            action: "uploadAdminIndex",
+            fileName: file.name,
+            indexHtml: await file.text()
           })
         });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
-          const message = payload?.message || payload?.error?.message || payload?.error || ("保存失败（HTTP " + response.status + "）");
-          throw new Error(String(message || "保存失败"));
+          const message = payload?.message || payload?.error?.message || payload?.error || ("上传失败（HTTP " + response.status + "）");
+          throw new Error(String(message || "上传失败"));
         }
-        setGateStatus("发布源已保存，正在进入 /admin...", "success");
+        redirecting = true;
+        setGateStatus("index.html 已更新，正在进入管理台...", "success");
         window.location.assign(ADMIN_INDEX_GATE_RUNTIME.adminPath || "/admin");
       } catch (error) {
-        setGateStatus(error?.message ? "保存失败：" + error.message : "保存失败，请稍后重试。", "error");
+        setGateStatus(error?.message ? "上传失败：" + error.message : "上传失败，请稍后重试。", "error");
       } finally {
-        setButtonPending(false);
+        if (!redirecting) {
+          if (submitButton) submitButton.disabled = false;
+          if (localFileInput) localFileInput.disabled = false;
+        }
       }
-    });
-
-    fillReleaseOptions([], "");
-    syncDerivedPreview();
-    refreshReleaseOptions({
-      tag: ADMIN_INDEX_GATE_RUNTIME.releaseTag || ""
     });
   </script>`;
 }
@@ -25892,6 +25277,176 @@ function isMutableJsdelivrGithubAssetUrl(assetUrl = "") {
   return true;
 }
 
+function collectAdminInlineDynamicImports(scriptBody = "") {
+  const source = String(scriptBody || "");
+  const imports = [];
+
+  const isIdentifierStart = (character = "") => /[A-Za-z_$]/.test(character);
+  const isIdentifierPart = (character = "") => /[A-Za-z0-9_$]/.test(character);
+
+  function skipQuotedString(startIndex, quote) {
+    let cursor = startIndex + 1;
+    while (cursor < source.length) {
+      if (source[cursor] === "\\") cursor += 2;
+      else if (source[cursor] === quote) return cursor + 1;
+      else cursor += 1;
+    }
+    return source.length;
+  }
+
+  function skipLineComment(startIndex) {
+    const lineEnd = source.indexOf("\n", startIndex + 2);
+    return lineEnd < 0 ? source.length : lineEnd + 1;
+  }
+
+  function skipBlockComment(startIndex) {
+    const commentEnd = source.indexOf("*/", startIndex + 2);
+    return commentEnd < 0 ? source.length : commentEnd + 2;
+  }
+
+  function skipRegexLiteral(startIndex) {
+    let cursor = startIndex + 1;
+    let inCharacterClass = false;
+    while (cursor < source.length) {
+      const character = source[cursor];
+      if (character === "\\") cursor += 2;
+      else if (character === "[") {
+        inCharacterClass = true;
+        cursor += 1;
+      } else if (character === "]" && inCharacterClass) {
+        inCharacterClass = false;
+        cursor += 1;
+      } else if (character === "/" && !inCharacterClass) {
+        cursor += 1;
+        while (/[A-Za-z]/.test(source[cursor] || "")) cursor += 1;
+        return cursor;
+      } else cursor += 1;
+    }
+    return source.length;
+  }
+
+  function skipTrivia(startIndex) {
+    let cursor = startIndex;
+    while (cursor < source.length) {
+      if (/\s/.test(source[cursor])) {
+        cursor += 1;
+        continue;
+      }
+      if (source.startsWith("//", cursor)) {
+        cursor = skipLineComment(cursor);
+        continue;
+      }
+      if (source.startsWith("/*", cursor)) {
+        cursor = skipBlockComment(cursor);
+        continue;
+      }
+      break;
+    }
+    return cursor;
+  }
+
+  function scanTemplateLiteral(startIndex) {
+    let cursor = startIndex + 1;
+    while (cursor < source.length) {
+      if (source[cursor] === "\\") cursor += 2;
+      else if (source[cursor] === "`") return cursor + 1;
+      else if (source[cursor] === "$" && source[cursor + 1] === "{") cursor = scanCode(cursor + 2, "}");
+      else cursor += 1;
+    }
+    return source.length;
+  }
+
+  function scanCode(startIndex = 0, closingCharacter = "") {
+    let cursor = startIndex;
+    let previousToken = "";
+    let canStartRegex = true;
+    const regexPrefixKeywords = new Set([
+      "await", "case", "delete", "do", "else", "in", "instanceof", "new", "return", "throw", "typeof", "void", "yield"
+    ]);
+
+    while (cursor < source.length) {
+      const character = source[cursor];
+      if (closingCharacter && character === closingCharacter) return cursor + 1;
+      if (/\s/.test(character)) {
+        cursor += 1;
+        continue;
+      }
+      if (source.startsWith("//", cursor)) {
+        cursor = skipLineComment(cursor);
+        continue;
+      }
+      if (source.startsWith("/*", cursor)) {
+        cursor = skipBlockComment(cursor);
+        continue;
+      }
+      if (character === '"' || character === "'") {
+        cursor = skipQuotedString(cursor, character);
+        previousToken = "literal";
+        canStartRegex = false;
+        continue;
+      }
+      if (character === "`") {
+        cursor = scanTemplateLiteral(cursor);
+        previousToken = "literal";
+        canStartRegex = false;
+        continue;
+      }
+      if (isIdentifierStart(character)) {
+        const identifierStart = cursor;
+        cursor += 1;
+        while (isIdentifierPart(source[cursor] || "")) cursor += 1;
+        const identifier = source.slice(identifierStart, cursor);
+        if (identifier === "import" && previousToken !== ".") {
+          const callStart = skipTrivia(cursor);
+          if (source[callStart] === "(") imports.push({ index: identifierStart, reference: source.slice(identifierStart, callStart + 1) });
+        }
+        previousToken = identifier;
+        canStartRegex = regexPrefixKeywords.has(identifier);
+        continue;
+      }
+      if (/[0-9]/.test(character)) {
+        cursor += 1;
+        while (/[A-Za-z0-9._]/.test(source[cursor] || "")) cursor += 1;
+        previousToken = "number";
+        canStartRegex = false;
+        continue;
+      }
+      if (character === "/" && canStartRegex) {
+        cursor = skipRegexLiteral(cursor);
+        previousToken = "literal";
+        canStartRegex = false;
+        continue;
+      }
+      if (character === "{") {
+        cursor = scanCode(cursor + 1, "}");
+        previousToken = "}";
+        canStartRegex = false;
+        continue;
+      }
+      previousToken = character;
+      cursor += 1;
+      canStartRegex = ![")", "]", "}"].includes(character);
+    }
+    return cursor;
+  }
+
+  scanCode();
+  return imports;
+}
+
+function hasAdminRemoteShellInlineDynamicImport(html = "") {
+  const sourceHtml = String(html || "");
+  for (const openingTag of iterateAdminHtmlOpeningTags(sourceHtml)) {
+    if (openingTag.tagName !== "script" || !openingTag.contentClosed) continue;
+    if (openingTag.attributes.get("src")?.value) continue;
+    const scriptType = String(openingTag.attributes.get("type")?.value || "").trim().toLowerCase().split(";")[0];
+    if (scriptType && !["module", "text/javascript", "application/javascript", "text/ecmascript", "application/ecmascript"].includes(scriptType)) continue;
+    const scriptBody = sourceHtml.slice(openingTag.contentStart, openingTag.contentEnd);
+    if (collectAdminInlineDynamicImports(scriptBody).length > 0) return true;
+  }
+  return false;
+}
+
 function getAdminRemoteShellAssetPolicyViolations(html = "", baseUrl = "") {
   const assetDescriptors = extractAdminRemoteShellAssetDescriptors(html, baseUrl);
   const violations = [];
@@ -25899,23 +25454,33 @@ function getAdminRemoteShellAssetPolicyViolations(html = "", baseUrl = "") {
   if (hasAdminRemoteShellImportMap(html)) {
     violations.push("远端 index.html 不允许 importmap；所有运行时依赖必须通过显式 script/link 标签交付");
   }
+  if (hasAdminRemoteShellInlineDynamicImport(html)) {
+    violations.push("index.html 不允许 inline 动态 import()；所有运行时依赖必须通过显式 script/link 标签交付");
+  }
 
   for (const descriptor of assetDescriptors) {
     const rawAssetUrl = String(descriptor?.rawValue || "").trim();
     const assetUrl = String(descriptor?.normalizedUrl || "").trim();
+    let assetHostname = "";
+    let assetPathname = "";
+    try {
+      const parsedAssetUrl = new URL(assetUrl);
+      assetHostname = parsedAssetUrl.hostname.replace(/\.+$/, "").toLowerCase();
+      assetPathname = parsedAssetUrl.pathname;
+    } catch {}
     if (!/^(?:https?:)?\/\//i.test(rawAssetUrl)) {
       violations.push(`远端 index.html 不允许相对或本地 bundle 资源：${rawAssetUrl}`);
       continue;
     }
-    if (/^https?:\/\/(?:[^/]+\.)?esm\.sh\//i.test(assetUrl)) {
+    if (assetHostname === "esm.sh" || assetHostname.endsWith(".esm.sh")) {
       violations.push(`esm.sh 资产不再允许：${assetUrl}`);
       continue;
     }
-    if (/^https?:\/\/raw\.githubusercontent\.com\//i.test(assetUrl)) {
+    if (assetHostname === "raw.githubusercontent.com") {
       violations.push(`raw.githubusercontent.com 资产不再允许：${assetUrl}`);
       continue;
     }
-    if (/^https?:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//i.test(assetUrl)) {
+    if (assetHostname === "github.com" && /^\/[^/]+\/[^/]+\/releases\/download\//i.test(assetPathname)) {
       violations.push(`浏览器直连 GitHub Release 资产不再允许：${assetUrl}`);
       continue;
     }
@@ -26210,7 +25775,125 @@ function shouldRevalidateAdminRemoteShell(response) {
   return nowMs() - cachedAt >= ADMIN_REMOTE_SHELL_REVALIDATE_MS;
 }
 
+function validateAdminShellHtmlSource(html = "", sourceUrl = "", options = {}) {
+  const sourceHtml = String(html || "");
+  const sourceLabel = String(options.sourceLabel || "admin shell").trim() || "admin shell";
+  const contentType = String(options.contentType || "").trim().toLowerCase();
+  const htmlBytes = new TextEncoder().encode(sourceHtml).length;
+  if (!sourceHtml || htmlBytes > ADMIN_REMOTE_SHELL_MAX_BYTES) {
+    throw new Error(`${sourceLabel} payload invalid: ${htmlBytes} bytes`);
+  }
+  const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(sourceHtml);
+  if (!isAcceptedAdminHtmlDocumentContentType(contentType, htmlDocumentDetected)) {
+    throw new Error(`${sourceLabel} content-type invalid: ${contentType}`);
+  }
+  if (!htmlDocumentDetected) {
+    throw new Error(`${sourceLabel} payload invalid: html document expected`);
+  }
+  if (!hasAdminRemoteShellAppRoot(sourceHtml)) {
+    throw new Error(`${sourceLabel} missing #app root`);
+  }
+  const assetPolicyViolations = getAdminRemoteShellAssetPolicyViolations(sourceHtml, sourceUrl);
+  if (assetPolicyViolations.length > 0) {
+    throw new Error(`${sourceLabel} asset policy invalid: ${assetPolicyViolations.slice(0, 3).join(" | ")}`);
+  }
+  return { html: sourceHtml, bytes: htmlBytes };
+}
+
+function buildAdminShellStoredPayloadFromHtml(html = "", bootstrap = {}, initHealth = {}, sourceUrl = "", options = {}) {
+  const validated = validateAdminShellHtmlSource(html, sourceUrl, options);
+  const assetRevision = normalizeGithubReleaseRefValue(options.assetRevision || options.releaseTag);
+  const vendorManifest = assetRevision
+    ? normalizeAdminReleaseVendorManifestRecord(buildAdminReleaseVendorManifest(validated.html, {
+      releaseTag: assetRevision,
+      sourceUrl
+    }))
+    : null;
+  const proxyRewrittenHtml = vendorManifest?.entries?.length
+    ? rewriteAdminRemoteShellAssetUrlsToProxy(validated.html, vendorManifest, {
+      adminPath: String(options.adminPath || bootstrap?.adminPath || "/admin").trim() || "/admin",
+      releaseTag: assetRevision,
+      sourceUrl
+    })
+    : validated.html;
+  const renderedHtml = applyAdminRemoteBootstrapMarkup(proxyRewrittenHtml, serializeInlineJson(bootstrap));
+  const lastModified = normalizeAdminHttpDateHeader(options.lastModified || "") || new Date().toUTCString();
+  const originEtag = String(options.originEtag || "").trim();
+  return {
+    storedResponse: buildAdminRemoteShellStoredResponse(renderedHtml, {
+      variantEtag: buildAdminRemoteShellVariantEtag({
+        html: renderedHtml,
+        bootstrap,
+        initHealth,
+        sourceUrl,
+        originEtag,
+        originLastModified: lastModified
+      }),
+      lastModified,
+      originEtag,
+      originLastModified: lastModified,
+      sourceUrl
+    }),
+    vendorManifest
+  };
+}
+
+async function buildAdminLocalIndexUploadRecord(html = "", fileName = "index.html") {
+  const sourceHtml = String(html || "");
+  const revision = await sha256HexText(sourceHtml);
+  const sourceUrl = buildAdminLocalIndexSourceUrl(revision);
+  let validated;
+  try {
+    validated = validateAdminShellHtmlSource(sourceHtml, sourceUrl, {
+      sourceLabel: "local admin index",
+      contentType: "text/html"
+    });
+  } catch (error) {
+    if (error && typeof error === "object") {
+      error.code = String(error.code || "ADMIN_INDEX_UPLOAD_INVALID");
+      error.status = normalizeErrorStatus(error.status, 400);
+    }
+    throw error;
+  }
+  const assetRevision = buildAdminLocalIndexAssetRevision(revision);
+  const manifest = normalizeAdminReleaseVendorManifestRecord(buildAdminReleaseVendorManifest(validated.html, {
+    releaseTag: assetRevision,
+    sourceUrl
+  }));
+  const normalizedFileName = String(fileName || "index.html").trim().replace(/^.*[\\/]/, "") || "index.html";
+  return {
+    version: 1,
+    revision,
+    assetRevision,
+    sourceUrl,
+    fileName: normalizedFileName.slice(0, 180),
+    uploadedAt: new Date().toISOString(),
+    bytes: validated.bytes,
+    html: validated.html,
+    manifest
+  };
+}
+
 async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstrap, initHealth, previousResponse = null, releaseOptions = {}) {
+  if (parseAdminLocalIndexSourceUrl(remoteShellIndexUrl)) {
+    const localRecord = typeof releaseOptions.loadLocalIndexRecord === "function"
+      ? await releaseOptions.loadLocalIndexRecord()
+      : null;
+    if (!localRecord?.html) throw new Error("local admin index upload is missing");
+    return buildAdminShellStoredPayloadFromHtml(
+      localRecord.html,
+      bootstrap,
+      initHealth,
+      remoteShellIndexUrl,
+      {
+        sourceLabel: "local admin index",
+        contentType: "text/html",
+        adminPath: releaseOptions.adminPath,
+        assetRevision: releaseOptions.assetRevision || localRecord.assetRevision,
+        lastModified: localRecord.uploadedAt
+      }
+    );
+  }
   const requestHeaders = new Headers();
   const previousOriginEtag = normalizeEtagToken(previousResponse?.headers?.get?.(ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER) || "");
   const previousOriginLastModified = normalizeAdminHttpDateHeader(previousResponse?.headers?.get?.(ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER) || "");
@@ -26254,56 +25937,15 @@ async function fetchAdminRemoteShellStoredResponse(remoteShellIndexUrl, bootstra
   if (remoteBody.exceeded || !remoteHtml || remoteHtmlSize > ADMIN_REMOTE_SHELL_MAX_BYTES) {
     throw new Error(`remote admin shell payload invalid: ${remoteHtmlSize} bytes`);
   }
-  const htmlDocumentDetected = hasAdminRemoteShellHtmlDocument(remoteHtml);
-  if (!isAcceptedAdminHtmlDocumentContentType(contentType, htmlDocumentDetected)) {
-    throw new Error(`remote admin shell content-type invalid: ${contentType}`);
-  }
-  if (!htmlDocumentDetected) {
-    throw new Error("remote admin shell payload invalid: html document expected");
-  }
-  if (!hasAdminRemoteShellAppRoot(remoteHtml)) {
-    throw new Error("remote admin shell missing #app root");
-  }
-
-  const assetPolicyViolations = getAdminRemoteShellAssetPolicyViolations(remoteHtml, remoteShellIndexUrl);
-  if (assetPolicyViolations.length > 0) {
-    throw new Error(`remote admin shell asset policy invalid: ${assetPolicyViolations.slice(0, 3).join(" | ")}`);
-  }
-
-  const normalizedReleaseTag = normalizeGithubReleaseRefValue(releaseOptions.releaseTag);
-  const vendorManifest = normalizedReleaseTag
-    ? normalizeAdminReleaseVendorManifestRecord(buildAdminReleaseVendorManifest(remoteHtml, {
-      releaseTag: normalizedReleaseTag,
-      sourceUrl: remoteShellIndexUrl
-    }))
-    : null;
-  const proxyRewrittenHtml = vendorManifest?.entries?.length
-    ? rewriteAdminRemoteShellAssetUrlsToProxy(remoteHtml, vendorManifest, {
-      adminPath: String(releaseOptions.adminPath || bootstrap?.adminPath || "/admin").trim() || "/admin",
-      releaseTag: normalizedReleaseTag,
-      sourceUrl: remoteShellIndexUrl
-    })
-    : remoteHtml;
-  const bootstrapJson = serializeInlineJson(bootstrap);
-  const renderedHtml = applyAdminRemoteBootstrapMarkup(proxyRewrittenHtml, bootstrapJson);
   const lastModified = normalizeAdminHttpDateHeader(remoteResponse.headers.get("Last-Modified") || "") || new Date().toUTCString();
-  return {
-    storedResponse: buildAdminRemoteShellStoredResponse(renderedHtml, {
-      variantEtag: buildAdminRemoteShellVariantEtag({
-        html: renderedHtml,
-        bootstrap,
-        initHealth,
-        sourceUrl: remoteShellIndexUrl,
-        originEtag: remoteResponse.headers.get("ETag") || "",
-        originLastModified: lastModified
-      }),
-      lastModified,
-      originEtag: remoteResponse.headers.get("ETag") || "",
-      originLastModified: lastModified,
-      sourceUrl: remoteShellIndexUrl
-    }),
-    vendorManifest
-  };
+  return buildAdminShellStoredPayloadFromHtml(remoteHtml, bootstrap, initHealth, remoteShellIndexUrl, {
+    sourceLabel: "remote admin shell",
+    contentType,
+    adminPath: releaseOptions.adminPath,
+    assetRevision: releaseOptions.assetRevision || releaseOptions.releaseTag,
+    lastModified,
+    originEtag: remoteResponse.headers.get("ETag") || ""
+  });
 }
 
 async function revalidateAdminRemoteShellCache(request, edgeCache, cacheKey, remoteShellIndexUrl, bootstrap, initHealth, cachedResponse, releaseOptions = {}, ctx = null) {
@@ -26430,6 +26072,19 @@ async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHe
   const shellState = buildAdminShellState(env, initHealth, config);
   const bootstrap = buildAdminBootstrapPayload(env, initHealth, config);
   const indexState = buildResolvedAdminIndexState(env, config);
+  const shellSourceOptions = {
+    releaseTag: indexState.assetRevision || indexState.releaseTag,
+    assetRevision: indexState.assetRevision || indexState.releaseTag,
+    adminPath: bootstrap.adminPath,
+    ...(indexState.isLocalUpload
+      ? {
+          loadLocalIndexRecord: () => Database.getAdminIndexUploadRecord(
+            Database.getKV(env),
+            indexState.localUploadRevision
+          )
+        }
+      : {})
+  };
   const cacheKey = buildAdminRemoteShellCacheKeyRequest(request, remoteShellIndexUrl, bootstrap);
   const legacyCacheKey = buildAdminRemoteShellLegacyCacheKeyRequest(request, remoteShellIndexUrl);
   const requestPath = new URL(request.url).pathname;
@@ -26497,10 +26152,7 @@ async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHe
                 bootstrap,
                 initHealth,
                 revalidationSourceResponse,
-                {
-                  releaseTag: indexState.releaseTag,
-                  adminPath: bootstrap.adminPath
-                },
+                shellSourceOptions,
                 ctx
               )
             ),
@@ -26547,10 +26199,7 @@ async function renderRemoteAdminPage(request, env, ctx, initHealth = buildInitHe
     remoteShellIndexUrl,
     bootstrap,
     initHealth,
-    {
-      releaseTag: indexState.releaseTag,
-      adminPath: bootstrap.adminPath
-    }
+    shellSourceOptions
   );
   const remoteShellPayload = sharedRemoteShellPayload?.storedResponse
     ? { ...sharedRemoteShellPayload, storedResponse: sharedRemoteShellPayload.storedResponse.clone() }
@@ -26601,12 +26250,30 @@ async function renderAdminReleaseVendorAsset(request, env, ctx, routeMatch = nul
   }
 
   const edgeCache = typeof caches === "undefined" ? null : caches.default;
-  const releaseIndexUrl = buildGithubFrontendIndexUrl(FIXED_GITHUB_RELEASE_REPO, releaseTag);
+  const localRevision = parseAdminLocalIndexAssetRevision(releaseTag);
+  if (!localRevision) {
+    return buildAdminReleaseVendorErrorResponse("Local index vendor asset not found", 404);
+  }
+  const localRecord = localRevision
+    ? await Database.getAdminIndexUploadRecord(Database.getKV(env), localRevision)
+    : null;
+  if (localRevision && !localRecord) {
+    return buildAdminReleaseVendorErrorResponse("Local index vendor asset not found", 404);
+  }
+  const releaseIndexUrl = localRecord?.sourceUrl || "";
   if (!releaseIndexUrl) {
     return buildAdminReleaseVendorErrorResponse("Release vendor asset not found", 404);
   }
 
-  const manifest = await getOrCreateAdminReleaseVendorManifest(edgeCache, releaseTag, releaseIndexUrl, ctx);
+  let manifest = null;
+  if (localRecord?.manifest) {
+    manifest = await readAdminReleaseVendorManifestFromCache(edgeCache, releaseTag, releaseIndexUrl);
+    if (!manifest) {
+      manifest = await cacheAdminReleaseVendorManifest(edgeCache, localRecord.manifest, ctx);
+    }
+  } else {
+    manifest = await getOrCreateAdminReleaseVendorManifest(edgeCache, releaseTag, releaseIndexUrl, ctx);
+  }
   const manifestEntry = resolveAdminReleaseVendorManifestEntry(manifest, assetKey);
   if (!manifestEntry?.upstreamUrl) {
     return buildAdminReleaseVendorErrorResponse("Release vendor asset not found", 404);
@@ -26777,7 +26444,7 @@ async function renderAdminWarmResponse(request, env, initHealth = buildInitHealt
   const runtimeConfig = isPlainObject(config) ? sanitizeRuntimeConfig(config) : sanitizeRuntimeConfig(await getRuntimeConfigStrict(env));
   const indexState = buildResolvedAdminIndexState(env, runtimeConfig);
   if (!indexState.indexUrl) {
-    return jsonError("ADMIN_INDEX_NOT_CONFIGURED", "管理台 Release index.html 尚未配置", 409);
+    return jsonError("ADMIN_INDEX_NOT_CONFIGURED", "管理台 index.html 尚未配置", 409);
   }
 
   const backgroundTasks = [];
@@ -26801,11 +26468,21 @@ async function renderAdminWarmResponse(request, env, initHealth = buildInitHealt
   await Promise.all(backgroundTasks.splice(0));
 
   const edgeCache = typeof caches === "undefined" ? null : caches.default;
-  const manifest = await getOrCreateAdminReleaseVendorManifest(edgeCache, indexState.releaseTag, indexState.indexUrl, warmContext);
+  const assetRevision = indexState.assetRevision || indexState.releaseTag;
+  const localRecord = indexState.isLocalUpload
+    ? await Database.getAdminIndexUploadRecord(Database.getKV(env), indexState.localUploadRevision)
+    : null;
+  let manifest = null;
+  if (localRecord?.manifest) {
+    manifest = await readAdminReleaseVendorManifestFromCache(edgeCache, assetRevision, indexState.indexUrl);
+    if (!manifest) manifest = await cacheAdminReleaseVendorManifest(edgeCache, localRecord.manifest, warmContext);
+  } else {
+    manifest = await getOrCreateAdminReleaseVendorManifest(edgeCache, assetRevision, indexState.indexUrl, warmContext);
+  }
   const immutableEntries = (Array.isArray(manifest?.entries) ? manifest.entries : [])
     .filter(entry => entry?.assetKey && !isMutableJsdelivrGithubAssetUrl(entry.upstreamUrl));
   const assetResponses = await warmAdminReleaseVendorEntries(immutableEntries, async (entry) => {
-    const assetPath = buildAdminReleaseVendorProxyPath(adminPath, indexState.releaseTag, entry.assetKey);
+    const assetPath = buildAdminReleaseVendorProxyPath(adminPath, assetRevision, entry.assetKey);
     const assetUrl = new URL(request.url);
     assetUrl.pathname = assetPath;
     assetUrl.search = "";
@@ -26813,7 +26490,7 @@ async function renderAdminWarmResponse(request, env, initHealth = buildInitHealt
       buildAdminWarmSubrequest(assetUrl),
       env,
       warmContext,
-      { releaseTag: indexState.releaseTag, assetKey: entry.assetKey },
+      { releaseTag: assetRevision, assetKey: entry.assetKey },
       runtimeConfig
     );
   });
@@ -26843,7 +26520,7 @@ function renderLandingPage(env, initHealth = buildInitHealth(env)) {
   const initBanner = initHealth.ok
     ? ''
     : `<div class="landing-banner"><div class="landing-banner-title">系统未初始化</div><div class="landing-banner-text">缺少关键环境变量：${initHealth.missing.map(item => escapeHtml(item)).join('、')}</div></div>`;
-  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.2</title>${LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.2</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 拉取远端 \`index.html\` 返回。</p><p class="landing-text landing-text-muted">该入口默认服务于 \`#dashboard -> #nodes -> #logs -> #dns -> #settings\` 五视图链，Settings 继续遵守 8 个视觉分区与 5 个保存分区契约。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
+  const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.3</title>${LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.3</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
   const headers = new Headers({ 'Content-Type': 'text/html;charset=UTF-8', 'Cache-Control': 'public, max-age=3600, s-maxage=86400' });
   applySecurityHeaders(headers);
   headers.set('X-Frame-Options', 'DENY');
@@ -27545,6 +27222,9 @@ const RuntimeEntry = {
       ? resolveAdminReleaseVendorRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
       : null;
     if (adminReleaseVendorRoute) {
+      if (!(await Auth.verifyRequest(request, env))) {
+        return buildAdminReleaseVendorErrorResponse("Unauthorized", 401);
+      }
       return renderAdminReleaseVendorAsset(request, env, ctx, adminReleaseVendorRoute, runtimeConfig);
     }
 
@@ -27976,12 +27656,13 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     buildWorkerMetadataCacheLookupRequest,
     hasWorkerMetadataPrivateIdentity,
     buildProxyAccessRuleProfile,
-    fetchGithubApiJson,
     serializeBoundedLogDetailJson,
     runSingleFlight,
     getRuntimeConfig,
     invalidateRuntimeConfigCache,
     invalidateNodesRevisionCache,
+    buildResolvedAdminIndexState,
+    buildAdminLocalIndexUploadRecord,
     buildAdminRemoteShellErrorContent,
     renderAdminRemoteShellErrorPage,
     isAdminIndexSetupForced,

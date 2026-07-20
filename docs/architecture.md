@@ -11,7 +11,7 @@
 ```mermaid
 flowchart LR
   browser["Browser"] -->|"GET /admin"| worker["Cloudflare Worker"]
-  worker -->|"拉取 index.html"| release["GitHub Release"]
+  worker -->|"读取 index.html"| localIndex["KV 本地版本"]
   browser -->|"同源 vendor 请求"| worker
   worker -->|"重写后的依赖请求"| vendor["上游 vendor 源"]
   browser -->|"POST /admin"| api["Worker API / Proxy"]
@@ -28,11 +28,13 @@ flowchart LR
 | 路由 | 职责 |
 | --- | --- |
 | `GET /` | 返回静态说明页，不承载后台实时数据 |
-| `GET ADMIN_PATH` | 返回管理台壳，从固定 GitHub Release 获取 `index.html` |
+| `GET ADMIN_PATH` | 返回管理台壳，从 KV 内容寻址版本获取已上传的 `index.html` |
 | `GET/HEAD ${ADMIN_PATH}/__warm` | 鉴权后显式预热管理台 HTML、vendor manifest 与可缓存 JS/CSS |
 | `POST ADMIN_PATH/login` | 校验登录并签发 `auth_token` |
 | `POST ADMIN_PATH` | 登录后的统一管理 API 入口 |
-| `${ADMIN_PATH}/__release/<tag>/vendor/*` | Worker 同源 vendor 代理与缓存入口 |
+| `${ADMIN_PATH}` `uploadAdminIndex` | 登录后校验并保存本地 `index.html`，再切换当前壳来源 |
+| `${ADMIN_PATH}` `updateWorkerAndAdminIndex` | 登录后同时校验并上传 `worker.js` 与 `index.html`，缺一不可；Worker 部署失败时补偿恢复旧 HTML 配置 |
+| `${ADMIN_PATH}/__release/<local-revision>/vendor/*` | 已认证的 Worker 同源 vendor 代理与缓存入口；路径段沿用兼容命名，但只接受本地内容版本 |
 | 节点代理中的 `/web`、`/web/**` | 固定返回 `404`，不访问节点上游 |
 | 其他节点代理路径 | 保持现有 Emby API、WebSocket、图片、字幕和媒体流代理 |
 
@@ -58,12 +60,13 @@ flowchart LR
 ## Worker 壳
 
 - `worker.js` 保留 API、鉴权、代理、KV/D1、日志、scheduled 和资源交付能力。
-- `/admin` 默认只拉取并返回 Release 顶层 `index.html`，不再内嵌完整管理台。
-- Worker 优先替换远端 HTML 中已有的 `#admin-bootstrap` JSON。只有远端壳缺少 bootstrap 或 loader 时才回退到注入模式。
-- 远端壳只有在真实 inline script 中包含 `tailwind.config` 且不存在 `id="admin-tailwind-prelude"` 的 script 时，才在配置脚本前注入 `window.tailwind` 初始化；`data-id`、`data-src` 和其他属性值中的同名文本不参与判断。该定向变换用于兼容历史 Release，不对其他 HTML 执行通用兼容注入。
-- Worker 按 HTML 标签语义识别并改写外部资源：`script[src]`、stylesheet/modulepreload，以及 `preload`/`prefetch` 中的 script/style；URL 是否带 `.js`/`.css` 后缀不影响识别。远端壳禁止 importmap 和任何 inline 动态 `import()`，浏览器不直接访问发布源或 vendor 源；禁止源和可变 ref 的判断必须先规范化绝对 URL，协议相对及尾点主机名写法不能绕过发布门禁。
-- Release 源首次加载失败且没有缓存时返回降级页；已有 stale HTML 时优先使用 stale 内容。
-- 同一 isolate 内并发冷加载把缓存复查、一次 Release `index.html` 拉取及 HTML/manifest 提交合并为一个完整操作；`${ADMIN_PATH}/__warm` 可在登录后或运维探测中显式填充 HTML 与不可变 vendor 资源缓存。
+- `/admin` 只从 KV 读取内容寻址的本地 `index.html`；未上传时进入启动门，不再读取 Release、环境 `INDEX_URL` 或内嵌完整管理台。
+- 本地上传版本保存为 `sys:admin_index_upload:v1:<sha256>`，配置中的 `indexUrl` 使用 `https://admin-local-index.invalid/<sha256>/index.html` 作为内部版本标识。该地址不会被浏览器直接请求。
+- Worker 优先替换上传 HTML 中已有的 `#admin-bootstrap` JSON。只有壳缺少 bootstrap 或 loader 时才回退到注入模式。
+- 上传 HTML 只有在真实 inline script 中包含 `tailwind.config` 且不存在 `id="admin-tailwind-prelude"` 的 script 时，才在配置脚本前注入 `window.tailwind` 初始化；`data-id`、`data-src` 和其他属性值中的同名文本不参与判断。
+- Worker 按 HTML 标签语义识别并改写外部资源：`script[src]`、stylesheet/modulepreload，以及 `preload`/`prefetch` 中的 script/style；URL 是否带 `.js`/`.css` 后缀不影响识别。上传壳禁止 importmap 和任何 inline 动态 `import()`，浏览器不直接访问 vendor 源；禁止源和可变 ref 的判断必须先规范化绝对 URL，协议相对及尾点主机名写法不能绕过门禁。
+- 本地版本首次加载失败且没有缓存时返回降级页；已有 stale HTML 时优先使用 stale 内容。
+- 同一 isolate 内并发冷加载把缓存复查、一次源 HTML 读取及 HTML/manifest 提交合并为一个完整操作；`${ADMIN_PATH}/__warm` 可在登录后或运维探测中显式填充 HTML 与不可变 vendor 资源缓存。
 
 ## 前端运行时链
 
@@ -96,7 +99,7 @@ frontend/admin-runtime.template.html
 - `VITE_VENDOR_MODE`
 - `VITE_DEV_PROXY_TARGET`
 
-本地开发服务器按 `VITE_ADMIN_PATH` 把管理台请求代理到 Worker 目标地址。正式 Worker 壳使用的 `INDEX_URL` 及其推导规则见 [构建与发布](release.md)。
+本地开发服务器按 `VITE_ADMIN_PATH` 把管理台请求代理到 Worker 目标地址。正式 Worker 壳只使用 KV 中的本地 HTML 内容版本；Release 资产与发布校验见 [构建与发布](release.md)。
 
 ## Isolate 内存读缓存
 
@@ -143,7 +146,7 @@ frontend/admin-runtime.template.html
 - 热缓存命中的运行状态记录通过 `ctx.waitUntil()` 后台提交，不阻塞 HTML 响应；相同稳定状态在同一 isolate、同一 D1 binding 上最多每 5 分钟写一次，状态指纹变化、冷加载、setup gate 和错误状态仍立即写入。显式预热请求会等待本次 HTML 与 vendor 缓存写入完成后再返回结果。vendor 按远端 HTML 出现顺序、最多 3 路并发预热，避免无界子请求和内存峰值。
 - 每次当前缓存键 miss 时只查找一次旧格式缓存键。命中的旧 stale HTML 先完成当前 bootstrap 与定向 Tailwind 兼容变换；获得写入权后再次读取当前键，只有仍为 miss 才写入迁移表示，若重验证已经写入则直接使用当前表示。当前键命中后不再读取旧键，旧缓存键也不再原地回写或参与后台更新。
 - 上游返回 `304 Not Modified` 时沿用当前缓存表示的 `ETag`、`Last-Modified` 和上游验证器，只刷新缓存时间，不重复执行兼容变换或重算表示 ETag。
-- 设置恢复页和远端壳错误页使用 `Cache-Control: no-store, max-age=0`，不写入 Cache API。
+- 设置恢复页和本地 HTML 错误页使用 `Cache-Control: no-store, max-age=0`，不写入 Cache API。
 - 节点图片、字幕和白名单 manifest 使用独立 metadata 缓存键。键必须同时包含节点派生 revision、SHA-256 媒体身份分区、显式 metadata transform revision 和当前 TTL 策略 revision；原始 Token、Cookie、用户或会话值不得出现在缓存 URL。每个预热目标必须用目标 URL 的敏感 query 与请求鉴权 header/Cookie 单独计算身份分区，不能复用父 JSON 请求的分区。缺少身份或策略分区时跳过缓存，配置调低或关闭 TTL 会生成新键，不继续命中旧策略对象。
 - metadata lookup 把 `Range`、`If-None-Match` 和 `If-Modified-Since` 传给 `cache.match()`，由 Cache API 返回对应 `206`/`304`；携带 `If-Range` 时绕过 Cache API 并交由上游完整处理。metadata 上游 `fetch()` 固定使用 `cache: no-store`，不得再叠加未按身份分区的 `cf.cacheEverything` 缓存。
 - 刷新由请求触发，不绑定 CRON。
@@ -151,7 +154,7 @@ frontend/admin-runtime.template.html
 
 ### 可变上游引用
 
-如果远端壳引用 jsDelivr GitHub 可变 ref，或 `/gh/<owner>/<repo>/...` URL 省略 `@ref`，Worker 仍需改写为同源 vendor 路径。响应使用 `Cache-Control: no-store, max-age=0`，并跳过 `caches.default` 的读取和写入。
+如果上传的 HTML 引用 jsDelivr GitHub 可变 ref，或 `/gh/<owner>/<repo>/...` URL 省略 `@ref`，Worker 仍需改写为同源 vendor 路径。响应使用 `Cache-Control: no-store, max-age=0`，并跳过 `caches.default` 的读取和写入。
 
 7 到 40 位十六进制 Git commit hash 和完整语义化版本号按不可变引用处理。完整版本号必须包含 major、minor、patch，可带 `v` 前缀、预发布标识或构建标识。省略 ref、分支名、`latest`、`1.2`、`^1.2.3` 和其他 ref 按上述 no-store 策略处理。可变 ref 与不可变 Release tag 不得共用缓存策略。
 
@@ -169,8 +172,6 @@ frontend/admin-runtime.template.html
 - `ADMIN_PATH`
 - `HOST`
 - `LEGACY_HOST`
-- `GITHUB_TOKEN`
-- `INDEX_URL`
 
 ### 兼容旧命名
 
@@ -179,14 +180,13 @@ frontend/admin-runtime.template.html
 - `EMBY_PROXY`
 - `D1`
 - `PROXY_LOGS`
-- `GITHUB_API_TOKEN`
 
 ### 部署与 CI
 
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_API_TOKEN`
 
-`INDEX_URL` 只在没有 Release tag 派生 URL 和已保存 `indexUrl` 时作为回退。`WORKER_SOURCE_URL` 不是 Worker 运行时环境变量，发布脚本中的同名参数见 [构建与发布](release.md)。
+`INDEX_URL`、`WORKER_SOURCE_URL`、`GITHUB_TOKEN` 和 `GITHUB_API_TOKEN` 都不是 Worker 运行时绑定。发布脚本中的同名 URL 参数只用于校验 Release 资产，见 [构建与发布](release.md)。
 
 `wrangler.toml` 当前声明的绑定只有 `ENI_KV` 和 `DB`，并启用了 `enable_request_signal`。`cfAccountId`、`cfZoneId`、`cfApiToken`、`tgBotToken`、`tgChatId` 是保存到 KV 的后台设置项，不是 Worker 环境变量。
 

@@ -372,7 +372,7 @@ try {
 }
 
 if (builtAssetFiles.length) {
-  console.error('[check:release] Release-only 发布禁止输出 dist/assets 运行时文件，但检测到了以下文件：');
+  console.error('[check:release] 单文件管理台禁止输出 dist/assets 运行时文件，但检测到了以下文件：');
   for (const filename of builtAssetFiles) {
     console.error(`- ${filename}`);
   }
@@ -434,7 +434,7 @@ if (!assetMatches.length) {
 
 const invalidAssets = assetMatches.filter((url) => isForbiddenRuntimeAsset(url));
 if (invalidAssets.length) {
-  console.error('[check:release] 发现不符合 Release-only 远端壳策略的资源：');
+  console.error('[check:release] 发现不符合外部资源 + Worker 同源代理策略的资源：');
   for (const assetUrl of invalidAssets) {
     console.error(`- ${assetUrl}`);
   }
@@ -442,7 +442,7 @@ if (invalidAssets.length) {
 }
 
 console.log(`[check:release] 已确认 ${assetMatches.length} 个 JS/CSS 资源为可代理的外部绝对 URL。`);
-console.log('[check:release] dist/index.html 满足 Release-only + Worker proxy 远端壳约束。');
+console.log('[check:release] dist/index.html 满足单文件管理台 + Worker 同源代理约束。');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -55,7 +55,7 @@ python scripts/extract-ui-from-js.py --help
 
 1. 对齐正式路径和当前事实。
 2. 收口前端入口与同步约定。
-3. 核对 `/admin -> Release index.html -> Worker 壳返回` 契约。
+3. 核对 `/admin -> KV 本地 index.html -> Worker 壳返回` 契约。
 4. 校准 Cache API SWR、vendor 路径和发布变量。
 5. 完成本地调试与回归。
 6. 最后处理 GitHub 发布。
@@ -69,12 +69,6 @@ python scripts/extract-ui-from-js.py --help
 ```dotenv
 JWT_SECRET=<secret>
 ADMIN_PASS=<password>
-```
-
-需要稳定读取固定仓库的分支或 Tag 时，可增加：
-
-```dotenv
-GITHUB_TOKEN=<token>
 ```
 
 在第一个 Windows PowerShell 终端启动 Worker：
@@ -133,7 +127,7 @@ node scripts/check-project.mjs
 node --check worker.js
 ```
 
-涉及管理台防御边界、全局设置、KV 整理、D1 schema、远端壳缓存、isolate 内存缓存或 OpsStatus 读取收口时，还要运行聚焦回归：
+涉及管理台防御边界、全局设置、KV 整理、D1 schema、HTML 壳缓存、isolate 内存缓存或 OpsStatus 读取收口时，还要运行聚焦回归：
 
 ```bash
 node --test tests/worker-defensive-boundaries.test.mjs tests/config-kv-safety.test.mjs tests/d1-migrations.test.mjs tests/frontend-runtime-enhancements.test.mjs
@@ -144,7 +138,7 @@ Dashboard 月流量回归必须确认三点：连续读取由 single-flight/内�
 
 涉及 isolate 内存边界时，聚焦回归必须确认：PlaybackInfo 超过 256 KiB 不进入缓存、总响应体预算不超过 4 MiB；未知长度控制请求保持流式；节点/路由/故障状态/进度会话/日志与限流默认上限不被放大；轮转清理覆盖 PlaybackInfo、故障转移、进度转发和月流量 Map。媒体反代响应不得新增 `text()` 或 `arrayBuffer()` 整包读取，相关优化不得通过提高 D1 flush 或查询频率换取内存下降。
 
-远端 GitHub 成功 JSON 超过 4 MiB 或解析失败时必须 fail-closed；日志 `detail_json` 超过 8 KiB 时仍必须保持可 `JSON.parse` 的合法值。
+日志 `detail_json` 超过 8 KiB 时仍必须保持可 `JSON.parse` 的合法值。
 
 聚焦回归需要保持以下 I/O 边界：同代配置与节点 revision 并发刷新各只访问一次 KV；同节点、同失效代次的代理冷读取只访问一次节点实体，代理热节点和有效期内的短期负缓存不重复读取节点实体；一次完整 OpsStatus 聚合只读取一次 root 和每个 section 一次。D1 频率回归还要确认同 binding 的 schema 热调用只执行一轮 DDL、显式失效后会重新检查，OpsStatus 在 15 秒窗口复用 root/section 读取且写后不全量反读，Dashboard/runtime stale fallback 只查询一次缓存表，相同管理壳热命中状态只写一次而状态变化立即写。并发节点摘要 upsert 必须合并而不丢项，索引重建必须串行覆盖实体加载与提交，旧 revision 候选不得覆盖当前 meta。节点 `/web` 子树必须在上游请求前固定拒绝，Playback relay、同节点重定向和 `__pb_abs` 回退不得绕过；同时不能误伤 `/websocket`、`/webhooks`、普通 API 或媒体路径。
 
@@ -179,16 +173,17 @@ npm run build:cdn
 重点检查：
 
 - `GET /` 仍返回静态说明页。
-- `GET ADMIN_PATH` 只返回管理台壳和 Release `index.html`。
-- 已认证的 `GET/HEAD ADMIN_PATH?setup=1` 返回 `no-store` 设置恢复页，`HEAD` body 为空。
-- 浏览器侧依赖使用 `${ADMIN_PATH}/__release/<tag>/vendor/*` 同源路径。
+- `GET ADMIN_PATH` 只返回管理台壳和 KV 中已上传的 `index.html`；未上传时进入本地上传启动门。
+- 已认证的 `GET/HEAD ADMIN_PATH?setup=1` 返回 `no-store` 本地上传页，`HEAD` body 为空，页面不含 Release 选择和 `INDEX_URL` 配置。
+- 浏览器侧依赖使用 `${ADMIN_PATH}/__release/<local-revision>/vendor/*` 同源路径。
 - `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch 都能被识别；无扩展脚本不能漏检，协议相对及尾点主机名禁止源不能绕过，正式 HTML 不含 importmap、任何 inline 动态 `import()` 或 `dnsAutoUpload*`。
 - `frontend/index.html` 与 `frontend/dist/index.html` 字节一致，证明同步输入已进入正式 Release 资产。
 - 上游引用符合不可变规则的 vendor 资源使用 `immutable`；可变或省略 jsDelivr GitHub ref 的资源使用 `no-store` 并跳过 Cache API。
 - HTML 保留 `ETag` 或 `Last-Modified` 协商缓存。
 - stale HTML 可在后台刷新。
 - 已认证的 `GET/HEAD ${ADMIN_PATH}/__warm` 能完成 HTML、vendor manifest 与不可变 JS/CSS 预热，未认证请求不能触发上游加载。
-- 同一 isolate 内并发冷 miss 只执行一次缓存复查、Release `index.html` 拉取和缓存提交，热命中不等待 OpsStatus 写入。
+- 同一 isolate 内并发冷 miss 只执行一次缓存复查、KV 本地 `index.html` 读取和缓存提交，热命中不等待 OpsStatus 写入。
+- 备份与恢复中的更新面板只有同时选择 `worker.js` 与 `index.html` 才能提交，并调用 `updateWorkerAndAdminIndex`。
 - 登录成功不等待完整预热；vendor 预热最多保持 3 路并发。
 - `scheduled()` 不参与前端刷新。
 

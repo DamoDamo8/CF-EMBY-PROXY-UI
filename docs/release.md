@@ -7,24 +7,13 @@
 ## 发布模型
 
 - 正式发布仓库固定为 `axuitomo/CF-EMBY-PROXY-UI`。
-- `releaseRepo` 只保留为固定仓库的兼容镜像字段，不能用来选择其他仓库。
-- 正式版本只认 GitHub Release，唯一版本锚点是 `releaseTag`。
-- `releaseBranch` 只保留为 `target_commitish` 兼容镜像字段。
-- `effectiveRef = releaseTag`。
+- 正式发布版本以 GitHub Release tag 为锚点，但 `releaseRepo`、`releaseBranch`、`releaseTag` 不再是 Worker 运行时配置字段。
+- 管理台启动门只接受本地 `index.html`；备份与恢复中的更新动作只接受同一批次的 `worker.js` 与 `index.html` 双文件上传，缺一不可。
+- Worker 运行时不读取 Release 列表，不使用环境 `INDEX_URL`，也不从 GitHub 拉取管理台或 Worker 更新内容。
 - Release 顶层资产固定为 `index.html` 与 `worker.js`，不依赖 `dist/` 目录或额外资产包。
 - `prompts/`、`banker/` 和历史构建副本不进入发布链。
 
-## URL 推导
-
-`getGithubReleaseSourceOptions` 返回：
-
-- `repo`
-- `releases[]`
-- `selectedBranch`
-- `selectedTag`
-- `effectiveRef`
-- `indexUrl`
-- `workerSourceUrl`
+## 发布校验 URL
 
 两个资产 URL 必须由同一个 Release tag 派生：
 
@@ -33,11 +22,7 @@ indexUrl = https://github.com/<repo>/releases/download/<releaseTag>/index.html
 workerSourceUrl = https://github.com/<repo>/releases/download/<releaseTag>/worker.js
 ```
 
-Worker 壳使用解析后的 `indexUrl` 读取入口 HTML；内部 `workerSourceUrl` 指向同一 tag 的 `worker.js`。
-
-`indexUrl` 的来源优先级是 Release tag 派生 URL、已保存的 `indexUrl`、Worker 环境变量 `INDEX_URL`。`WORKER_SOURCE_URL` 不是 Worker 运行时环境变量；发布校验脚本的命令行参数是 `--index-url` 和 `--worker-url`，对应的 CI 环境变量别名是 `INDEX_URL` 和 `WORKER_SOURCE_URL`。
-
-固定仓库的 Release 列表默认匿名读取 GitHub API。遇到 `403` 或 `429` 时，为 Worker 配置 `GITHUB_TOKEN`；兼容旧名 `GITHUB_API_TOKEN`。请求必须携带明确的 `User-Agent`。
+这两个 URL 只属于发布前校验和 CI，不进入 Worker 运行时来源选择。发布校验脚本的命令行参数是 `--index-url` 和 `--worker-url`，对应的 CI 环境变量别名是 `INDEX_URL` 和 `WORKER_SOURCE_URL`。
 
 ## 构建
 
@@ -49,7 +34,7 @@ npm run build
 npm run build:cdn
 ```
 
-Windows PowerShell 环境要求见 [开发与验证](development.md#正式前端)。`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合 Release-only + Worker proxy 约束。
+Windows PowerShell 环境要求见 [开发与验证](development.md#正式前端)。`build:cdn` 必须通过 `frontend/scripts/check-cdn-paths.mjs`，确认入口占位符、bootstrap、`#app` 和外部资源策略符合顶层资产 + Worker proxy 约束。
 
 ### Release 资产来源
 
@@ -78,8 +63,8 @@ node scripts/check-publish-cdn.mjs \
 - `WORKER_SOURCE_URL` 与同一 Release tag 一致。
 - `frontend/dist/index.html` 的资源引用符合 Worker 同源代理策略。
 - 构建产物不引用 `dist/assets/**` 或浏览器直连发布源的资源。
-- 远端壳中的 `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch 可被 Worker 重写，单双引号与无扩展 URL 均纳入检查。
-- 正式 HTML 不含 importmap 或任何 inline 动态 `import()`；发布门禁拒绝无法安全改写的依赖形式，Worker 运行时额外拒绝 importmap 壳。禁止源与 jsDelivr GitHub 可变 ref 在绝对 URL 规范化后判断，协议相对及尾点主机名写法不能绕过发布门禁。
+- 上传 HTML 中的 `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch 可被 Worker 重写，单双引号与无扩展 URL 均纳入检查。
+- 正式 HTML 不含 importmap 或任何 inline 动态 `import()`；发布门禁与 Worker 上传门都拒绝无法安全改写的依赖形式。禁止源与 jsDelivr GitHub 可变 ref 在绝对 URL 规范化后判断，协议相对及尾点主机名写法不能绕过发布门禁。
 - 发布检查先通过 `sync-admin-runtime.mjs --check`，并要求 `frontend/dist/index.html` 与同步后的 `frontend/index.html` 字节一致，陈旧 dist 不得发布。
 
 ## Push 与 Release 门禁
@@ -87,4 +72,4 @@ node scripts/check-publish-cdn.mjs \
 1. 在推送具体 tag 或创建 Release 前完成构建与 URL 校验。
 2. Release 中的 `index.html`、`worker.js` 与目标 tag 必须一致。
 3. 任一 URL、ref 或构建引用不一致时停止发布。
-4. 发布后按 [开发与验证](development.md) 的检查项验证 `/admin`、vendor 路径、缓存头和 stale 回退。
+4. 发布后如需部署到现有站点，使用“Worker 和 HTML 更新”同时上传该 Release 的两个顶层资产，再按 [开发与验证](development.md) 验证 `/admin`、vendor 路径、缓存头和 stale 回退。

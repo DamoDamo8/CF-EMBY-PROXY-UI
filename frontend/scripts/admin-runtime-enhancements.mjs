@@ -116,15 +116,13 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-settings .settings-block,
 #view-settings .settings-list-shell{background:var(--settings-surface) !important;border-color:var(--settings-border) !important;background-image:none !important;box-shadow:none !important}
 #view-settings .settings-summary-tile{border:1px solid var(--settings-border) !important;border-radius:max(16px,calc(var(--ui-control-radius-px) + 4px)) !important;background:var(--settings-soft) !important;padding:.875rem 1rem;box-shadow:none !important}
-#view-settings [data-admin-release-source-card="1"] [data-admin-settings-summary="1"],
-#view-settings .settings-worker-quick-card [data-admin-settings-summary="1"]{grid-template-columns:repeat(3,minmax(0,1fr))}
-#view-settings [data-admin-release-source-card="1"] [data-admin-settings-fields="1"]{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
-#view-settings [data-admin-release-source-card="1"] [data-admin-settings-derived-field="1"],
-#view-settings .settings-worker-quick-card [data-admin-settings-derived-field="1"]{min-width:0}
-#view-settings [data-admin-settings-derived-field="1"] input{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:.75rem;line-height:1.25rem;text-overflow:ellipsis}
-#view-settings .settings-worker-quick-card [data-admin-worker-source-grid="1"]{grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}
-#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"]{display:flex;align-items:center;justify-content:flex-end;gap:.5rem;padding-top:.25rem}
-#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"] button{min-height:2.5rem}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-grid="1"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-file="1"]{display:grid;gap:.5rem;min-width:0;padding:1rem;border:1px solid var(--settings-border);border-radius:max(14px,var(--ui-control-radius-px));background:var(--settings-soft)}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-file="1"] input{width:100%;min-width:0}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-file-meta="1"],
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-status="1"]{overflow-wrap:anywhere}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"]{display:flex;align-items:center;justify-content:flex-end;gap:.5rem;padding-top:.25rem}
+#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"] button{min-height:2.5rem}
 #view-settings .ui-block-head,
 #view-settings .settings-nav-shell .border-b,
 #view-settings #settings-forms>div>.ui-settings-panel+.ui-settings-panel{border-color:var(--settings-border) !important}
@@ -161,7 +159,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-settings button:disabled,
 #view-settings .settings-secondary-btn:disabled,
 #view-settings .set-tab:disabled{opacity:.65 !important;pointer-events:none}
-@media (max-width:767px){#view-nodes [data-admin-node-toolbar-row="1"],#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:minmax(0,1fr)}#view-nodes [data-admin-node-toolbar-row="1"]>*{width:100%}#view-settings .settings-view-layout{display:flex;flex-direction:column}#view-settings [data-admin-release-source-card="1"] [data-admin-settings-summary="1"],#view-settings [data-admin-release-source-card="1"] [data-admin-settings-fields="1"],#view-settings .settings-worker-quick-card [data-admin-settings-summary="1"],#view-settings .settings-worker-quick-card [data-admin-worker-source-grid="1"]{grid-template-columns:minmax(0,1fr)}#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"]{align-items:stretch;flex-direction:column}#view-settings .settings-worker-quick-card [data-admin-worker-actions="1"] button{width:100%}}
+@media (max-width:767px){#view-nodes [data-admin-node-toolbar-row="1"],#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:minmax(0,1fr)}#view-nodes [data-admin-node-toolbar-row="1"]>*{width:100%}#view-settings .settings-view-layout{display:flex;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-grid="1"]{grid-template-columns:minmax(0,1fr)}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"]{align-items:stretch;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"] button{width:100%}}
 @media (min-width:768px) and (max-width:1535px){#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:repeat(3,minmax(0,1fr));width:100%}#view-nodes [data-admin-node-toolbar-actions="1"]>*{width:100%}}
 @media (min-width:1536px){#view-nodes [data-admin-node-toolbar="1"]{grid-template-columns:minmax(0,1fr) max-content}#view-nodes [data-admin-node-toolbar-actions="1"]{justify-content:end}}
 @media (min-width:768px){#app-shell.settings-split-layout #content-area{overflow:hidden}#app-shell.settings-split-layout #view-settings{height:100%;min-height:0;overflow:hidden}#app-shell.settings-split-layout #view-settings .settings-view-layout{height:100%;min-height:0}#app-shell.settings-split-layout #view-settings .settings-nav-shell{position:sticky;top:0;max-height:100%;overflow-y:auto;flex:0 0 auto}#app-shell.settings-split-layout #view-settings #settings-forms{height:100%;min-height:0;overflow-y:auto;padding-right:.25rem;scrollbar-gutter:stable}}
@@ -204,6 +202,14 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     daily: null,
     monthly: null,
     pending: false
+  };
+  const workerHtmlUpdateState = {
+    root: null,
+    workerFile: null,
+    indexFile: null,
+    submitting: false,
+    status: '必须同时选择 worker.js 和 index.html。',
+    tone: ''
   };
 
   function canRenderIcons() {
@@ -347,35 +353,145 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     actionGroup?.setAttribute('data-admin-node-toolbar-actions', '1');
   }
 
-  function applySettingsLayout() {
-    const releaseRepoInput = document.querySelector('#cfg-release-repo');
-    const releaseCard = releaseRepoInput?.closest('.settings-block');
-    if (releaseCard) {
-      releaseCard.setAttribute('data-admin-release-source-card', '1');
-      const summaryGrid = releaseCard.querySelector('.settings-summary-tile')?.parentElement;
-      summaryGrid?.setAttribute('data-admin-settings-summary', '1');
-      const fieldsGrid = releaseRepoInput.parentElement?.parentElement;
-      fieldsGrid?.setAttribute('data-admin-settings-fields', '1');
-      for (const input of releaseCard.querySelectorAll('input[readonly]')) {
-        input.parentElement?.setAttribute('data-admin-settings-derived-field', '1');
-      }
-    }
+  function formatWorkerHtmlUploadBytes(bytes) {
+    const value = Math.max(0, Number(bytes) || 0);
+    return value >= 1024 * 1024
+      ? (value / (1024 * 1024)).toFixed(2) + ' MiB'
+      : Math.round(value / 1024) + ' KiB';
+  }
 
-    const workerCard = document.querySelector('.settings-worker-quick-card');
-    if (!workerCard) return;
-    const sourceShell = workerCard.querySelector('.border-dashed');
-    const sourceGrid = sourceShell?.firstElementChild;
-    sourceGrid?.setAttribute('data-admin-worker-source-grid', '1');
-    const summaryGrid = sourceGrid;
-    summaryGrid?.setAttribute('data-admin-settings-summary', '1');
-    for (const input of workerCard.querySelectorAll('input[readonly]')) {
-      input.parentElement?.setAttribute('data-admin-settings-derived-field', '1');
+  function validateWorkerHtmlUploadFiles(workerFile, indexFile) {
+    if (!workerFile || !indexFile) return '必须同时选择 worker.js 和 index.html。';
+    if (String(workerFile.name || '').trim().toLowerCase() !== 'worker.js') return 'Worker 文件名必须是 worker.js。';
+    if (String(indexFile.name || '').trim().toLowerCase() !== 'index.html') return 'HTML 文件名必须是 index.html。';
+    if (workerFile.size > 3 * 1024 * 1024) return 'worker.js 超过 3 MiB 上限。';
+    if (indexFile.size > 2 * 1024 * 1024) return 'index.html 超过 2 MiB 上限。';
+    return '';
+  }
+
+  function renderWorkerHtmlUpdateState() {
+    const state = workerHtmlUpdateState;
+    const root = state.root;
+    if (!root) return;
+    const workerMeta = root.querySelector('[data-admin-worker-file-meta="1"]');
+    const indexMeta = root.querySelector('[data-admin-index-file-meta="1"]');
+    const status = root.querySelector('[data-admin-worker-html-status="1"]');
+    const submitButton = root.querySelector('[data-admin-worker-html-submit="1"]');
+    const refreshButton = root.querySelector('[data-admin-worker-html-refresh="1"]');
+    const workerInput = root.querySelector('[data-admin-worker-file-input="1"]');
+    const indexInput = root.querySelector('[data-admin-index-file-input="1"]');
+    const validationError = validateWorkerHtmlUploadFiles(state.workerFile, state.indexFile);
+    if (workerMeta) workerMeta.textContent = state.workerFile ? state.workerFile.name + ' · ' + formatWorkerHtmlUploadBytes(state.workerFile.size) : '未选择';
+    if (indexMeta) indexMeta.textContent = state.indexFile ? state.indexFile.name + ' · ' + formatWorkerHtmlUploadBytes(state.indexFile.size) : '未选择';
+    if (status) {
+      status.textContent = state.status || validationError || '两个文件已就绪。';
+      status.classList.remove('border-rose-200', 'text-rose-700', 'border-emerald-200', 'text-emerald-700');
+      if (state.tone === 'error') status.classList.add('border-rose-200', 'text-rose-700');
+      if (state.tone === 'success') status.classList.add('border-emerald-200', 'text-emerald-700');
     }
-    const actionGroup = [...workerCard.querySelectorAll('div')].find((element) => {
-      const buttons = [...element.children].filter((child) => child.tagName === 'BUTTON');
-      return buttons.length === 2 && buttons.some((button) => String(button.textContent || '').includes('更新 Worker'));
-    });
-    actionGroup?.setAttribute('data-admin-worker-actions', '1');
+    if (submitButton) {
+      submitButton.disabled = state.submitting || Boolean(validationError);
+      const label = submitButton.querySelector('span');
+      if (label) label.textContent = state.submitting ? '更新中...' : '同时更新 Worker 和 HTML';
+    }
+    if (refreshButton) refreshButton.disabled = state.submitting;
+    if (workerInput) workerInput.disabled = state.submitting;
+    if (indexInput) indexInput.disabled = state.submitting;
+    root.setAttribute('aria-busy', state.submitting ? 'true' : 'false');
+  }
+
+  async function submitWorkerHtmlUpdate(app) {
+    const state = workerHtmlUpdateState;
+    const validationError = validateWorkerHtmlUploadFiles(state.workerFile, state.indexFile);
+    if (validationError || state.submitting) {
+      state.status = validationError || '更新正在执行中。';
+      state.tone = 'error';
+      renderWorkerHtmlUpdateState();
+      return;
+    }
+    const accepted = typeof app?.askConfirm === 'function'
+      ? await app.askConfirm('将同时更新当前 Worker 脚本和管理台 HTML。两个文件必须来自同一版本。', {
+          title: '确认 Worker 和 HTML 更新',
+          tone: 'warning',
+          confirmText: '开始更新'
+        })
+      : true;
+    if (!accepted) return;
+
+    state.submitting = true;
+    state.status = '正在读取并校验两个文件...';
+    state.tone = '';
+    renderWorkerHtmlUpdateState();
+    try {
+      const fileContents = await Promise.all([state.workerFile.text(), state.indexFile.text()]);
+      state.status = '正在更新 HTML 与 Worker...';
+      renderWorkerHtmlUpdateState();
+      const result = await app.apiCall('updateWorkerAndAdminIndex', {
+        workerFileName: state.workerFile.name,
+        workerScriptContent: fileContents[0],
+        indexFileName: state.indexFile.name,
+        indexHtml: fileContents[1]
+      });
+      if (result?.revisions && typeof app.applyAdminRevisions === 'function') app.applyAdminRevisions(result.revisions);
+      state.workerFile = null;
+      state.indexFile = null;
+      const workerInput = state.root?.querySelector('[data-admin-worker-file-input="1"]');
+      const indexInput = state.root?.querySelector('[data-admin-index-file-input="1"]');
+      if (workerInput) workerInput.value = '';
+      if (indexInput) indexInput.value = '';
+      state.status = 'Worker 和 index.html 已同时更新。';
+      state.tone = 'success';
+      app.showMessage?.('Worker 和 HTML 已更新。', { tone: 'success' });
+    } catch (error) {
+      state.status = '更新失败：' + (error?.message || '未知错误');
+      state.tone = 'error';
+      app.showMessage?.(state.status, { tone: 'error', modal: true });
+    } finally {
+      state.submitting = false;
+      renderWorkerHtmlUpdateState();
+    }
+  }
+
+  function syncWorkerHtmlUpdatePanel(app = window.App) {
+    const root = document.querySelector('#admin-worker-html-update-root');
+    if (!root || !app) return;
+    if (workerHtmlUpdateState.root !== root) {
+      workerHtmlUpdateState.root = root;
+      workerHtmlUpdateState.workerFile = null;
+      workerHtmlUpdateState.indexFile = null;
+      workerHtmlUpdateState.status = '必须同时选择 worker.js 和 index.html。';
+      workerHtmlUpdateState.tone = '';
+    }
+    if (!root.dataset.adminWorkerHtmlReady) {
+      root.dataset.adminWorkerHtmlReady = '1';
+      root.innerHTML = '<div class="ui-block-head"><div><div class="ui-section-kicker">Runtime Update</div><div class="ui-section-title">Worker 和 HTML 更新</div></div><span class="ui-chip-muted">双文件</span></div>'
+        + '<div data-admin-worker-html-grid="1">'
+        + '<label data-admin-worker-html-file="1"><span class="ui-field-label">worker.js</span><input data-admin-worker-file-input="1" type="file" accept=".js,text/javascript,application/javascript"><span data-admin-worker-file-meta="1" class="text-xs text-slate-500">未选择</span></label>'
+        + '<label data-admin-worker-html-file="1"><span class="ui-field-label">index.html</span><input data-admin-index-file-input="1" type="file" accept=".html,text/html"><span data-admin-index-file-meta="1" class="text-xs text-slate-500">未选择</span></label>'
+        + '</div>'
+        + '<div data-admin-worker-html-status="1" role="status" aria-live="polite" class="mt-4 rounded-control border border-slate-200 px-4 py-3 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"></div>'
+        + '<div data-admin-worker-html-actions="1" class="mt-4"><button data-admin-worker-html-refresh="1" type="button" class="settings-secondary-btn h-10 w-10" title="刷新当前页面" aria-label="刷新当前页面"><i data-lucide="refresh-cw" class="w-4 h-4" aria-hidden="true"></i></button><button data-admin-worker-html-submit="1" type="button" class="inline-flex items-center justify-center gap-2 px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white rounded-xl text-sm transition disabled:opacity-50 disabled:pointer-events-none"><i data-lucide="upload-cloud" class="w-4 h-4" aria-hidden="true"></i><span>同时更新 Worker 和 HTML</span></button></div>';
+      root.querySelector('[data-admin-worker-file-input="1"]')?.addEventListener('change', (event) => {
+        workerHtmlUpdateState.workerFile = event.currentTarget.files?.[0] || null;
+        workerHtmlUpdateState.status = validateWorkerHtmlUploadFiles(workerHtmlUpdateState.workerFile, workerHtmlUpdateState.indexFile) || '两个文件已就绪。';
+        workerHtmlUpdateState.tone = validateWorkerHtmlUploadFiles(workerHtmlUpdateState.workerFile, workerHtmlUpdateState.indexFile) ? '' : 'success';
+        renderWorkerHtmlUpdateState();
+      });
+      root.querySelector('[data-admin-index-file-input="1"]')?.addEventListener('change', (event) => {
+        workerHtmlUpdateState.indexFile = event.currentTarget.files?.[0] || null;
+        workerHtmlUpdateState.status = validateWorkerHtmlUploadFiles(workerHtmlUpdateState.workerFile, workerHtmlUpdateState.indexFile) || '两个文件已就绪。';
+        workerHtmlUpdateState.tone = validateWorkerHtmlUploadFiles(workerHtmlUpdateState.workerFile, workerHtmlUpdateState.indexFile) ? '' : 'success';
+        renderWorkerHtmlUpdateState();
+      });
+      root.querySelector('[data-admin-worker-html-refresh="1"]')?.addEventListener('click', () => window.location.reload());
+      root.querySelector('[data-admin-worker-html-submit="1"]')?.addEventListener('click', () => submitWorkerHtmlUpdate(app));
+      scheduleIconRefresh(root);
+    }
+    renderWorkerHtmlUpdateState();
+  }
+
+  function applySettingsLayout() {
+    syncWorkerHtmlUpdatePanel(window.App);
   }
 
   function applyNodeAdvancedSettingsLayout() {
