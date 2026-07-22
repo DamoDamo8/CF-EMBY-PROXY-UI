@@ -138,32 +138,34 @@ function normalizeWorkerPlacementStatus(rawPayload = {}) {
   };
 }
 
-function normalizeWorkerScriptUpdatePayload(rawPayload = {}) {
+function normalizeWorkerAndAdminIndexUpdatePayload(rawPayload = {}) {
   const payload = isPlainObject(rawPayload) ? rawPayload : {};
+  const worker = isPlainObject(payload.worker) ? payload.worker : {};
+  const html = isPlainObject(payload.html) ? payload.html : {};
 
   return {
     success: payload.success === true,
     scriptName: String(payload.scriptName || '').trim(),
     requestHost: String(payload.requestHost || '').trim(),
-    uploadedFileName: String(payload.uploadedFileName || '').trim(),
-    syntax: String(payload.syntax || '').trim(),
-    modifiedOn: String(payload.modifiedOn || '').trim(),
-    etag: String(payload.etag || '').trim(),
-    handlers: (Array.isArray(payload.handlers) ? payload.handlers : [])
-      .map((handler) => String(handler || '').trim())
-      .filter(Boolean),
-    hasModules: payload.hasModules === true,
-    compatibilityDate: String(payload.compatibilityDate || '').trim(),
-    compatibilityFlags: (Array.isArray(payload.compatibilityFlags) ? payload.compatibilityFlags : [])
-      .map((flag) => String(flag || '').trim())
-      .filter(Boolean),
-    lastDeployedFrom: String(payload.lastDeployedFrom || '').trim(),
-    sourceUrl: String(payload.sourceUrl || '').trim(),
-    effectiveRef: String(payload.effectiveRef || '').trim(),
-    releaseRepo: String(payload.releaseRepo || '').trim(),
-    releaseBranch: String(payload.releaseBranch || '').trim(),
-    releaseTag: String(payload.releaseTag || '').trim(),
-    compatibilityFallbackUsed: payload.compatibilityFallbackUsed === true
+    worker: {
+      fileName: String(worker.fileName || '').trim(),
+      bytes: Math.max(0, Number(worker.bytes) || 0),
+      syntax: String(worker.syntax || '').trim(),
+      modifiedOn: String(worker.modifiedOn || '').trim(),
+      etag: String(worker.etag || '').trim(),
+      handlers: (Array.isArray(worker.handlers) ? worker.handlers : [])
+        .map((handler) => String(handler || '').trim())
+        .filter(Boolean),
+      hasModules: worker.hasModules === true
+    },
+    html: {
+      fileName: String(html.fileName || '').trim(),
+      bytes: Math.max(0, Number(html.bytes) || 0),
+      revision: String(html.revision || '').trim(),
+      uploadedAt: String(html.uploadedAt || '').trim()
+    },
+    config: isPlainObject(payload.config) ? payload.config : {},
+    revisions: isPlainObject(payload.revisions) ? payload.revisions : {}
   };
 }
 
@@ -171,8 +173,8 @@ function createEmptyWorkerPlacementStatus() {
   return normalizeWorkerPlacementStatus({});
 }
 
-function createEmptyWorkerScriptUpdateState() {
-  return normalizeWorkerScriptUpdatePayload({});
+function createEmptyWorkerAndAdminIndexUpdateState() {
+  return normalizeWorkerAndAdminIndexUpdatePayload({});
 }
 
 function normalizeTidyPreviewGroup(rawGroup = {}, index = 0) {
@@ -1359,7 +1361,7 @@ export function useAdminConsole() {
       runtimeStatus: false,
       workerPlacementStatus: false,
       saveWorkerPlacement: false,
-      updateWorkerScriptContent: false,
+      updateWorkerAndAdminIndex: false,
       settings: false,
       loadConfig: false,
       previewConfig: false,
@@ -1401,7 +1403,7 @@ export function useAdminConsole() {
       runtimeStatus: '',
       workerPlacementStatus: '',
       saveWorkerPlacement: '',
-      updateWorkerScriptContent: '',
+      updateWorkerAndAdminIndex: '',
       settings: '',
       loadConfig: '',
       previewConfig: '',
@@ -1441,7 +1443,7 @@ export function useAdminConsole() {
     },
     settingsBootstrap: null,
     workerPlacementStatus: createEmptyWorkerPlacementStatus(),
-    lastWorkerScriptUpdate: createEmptyWorkerScriptUpdateState(),
+    lastWorkerAndAdminIndexUpdate: createEmptyWorkerAndAdminIndexUpdateState(),
     lastConfigSavedAt: '',
     lastNodeSavedAt: '',
     lastLogsClearedAt: '',
@@ -1484,10 +1486,10 @@ export function useAdminConsole() {
         ? state.workerPlacementStatus
         : createEmptyWorkerPlacementStatus();
     },
-    get lastWorkerScriptUpdate() {
-      return isPlainObject(state.lastWorkerScriptUpdate)
-        ? state.lastWorkerScriptUpdate
-        : createEmptyWorkerScriptUpdateState();
+    get lastWorkerAndAdminIndexUpdate() {
+      return isPlainObject(state.lastWorkerAndAdminIndexUpdate)
+        ? state.lastWorkerAndAdminIndexUpdate
+        : createEmptyWorkerAndAdminIndexUpdateState();
     },
     get connectionState() {
       if (state.loading.hydrate) return 'loading';
@@ -2181,42 +2183,40 @@ export function useAdminConsole() {
         state.loading.saveWorkerPlacement = false;
       }
     },
-    async updateWorkerScriptContent(payload = {}) {
-      if (state.loading.updateWorkerScriptContent) return null;
+    async updateWorkerAndAdminIndex(payload = {}) {
+      if (state.loading.updateWorkerAndAdminIndex) return null;
 
-      const fileName = String(payload?.fileName || 'worker.js').trim() || 'worker.js';
-      const scriptContent = typeof payload?.scriptContent === 'string' ? payload.scriptContent : '';
-      const releaseRepo = String(payload?.releaseRepo || '').trim();
-      const releaseBranch = String(payload?.releaseBranch || '').trim();
-      const releaseTag = String(payload?.releaseTag || '').trim();
+      const workerFileName = String(payload?.workerFileName || 'worker.js').trim() || 'worker.js';
+      const workerScriptContent = typeof payload?.workerScriptContent === 'string' ? payload.workerScriptContent : '';
+      const indexFileName = String(payload?.indexFileName || 'index.html').trim() || 'index.html';
+      const indexHtml = typeof payload?.indexHtml === 'string' ? payload.indexHtml : '';
 
-      state.loading.updateWorkerScriptContent = true;
-      state.errors.updateWorkerScriptContent = '';
+      state.loading.updateWorkerAndAdminIndex = true;
+      state.errors.updateWorkerAndAdminIndex = '';
 
       try {
-        const response = normalizeWorkerScriptUpdatePayload(await callAdminAction('updateWorkerScriptContent', {
-          fileName,
-          scriptContent,
-          releaseRepo,
-          releaseBranch,
-          releaseTag
+        const response = normalizeWorkerAndAdminIndexUpdatePayload(await callAdminAction('updateWorkerAndAdminIndex', {
+          workerFileName,
+          workerScriptContent,
+          indexFileName,
+          indexHtml
         }, {
           seedBootstrap: state.seedBootstrap
         }));
 
-        state.lastWorkerScriptUpdate = response;
+        state.lastWorkerAndAdminIndexUpdate = response;
         state.authRequired = false;
         return response;
       } catch (error) {
         if (isAuthError(error)) {
           state.authRequired = true;
-          state.errors.updateWorkerScriptContent = '';
+          state.errors.updateWorkerAndAdminIndex = '';
         } else {
-          state.errors.updateWorkerScriptContent = getErrorMessage(error, 'Worker 脚本快捷更新失败');
+          state.errors.updateWorkerAndAdminIndex = getErrorMessage(error, 'Worker 与 HTML 更新失败');
         }
         return null;
       } finally {
-        state.loading.updateWorkerScriptContent = false;
+        state.loading.updateWorkerAndAdminIndex = false;
       }
     },
     async previewTidyData(options = {}) {

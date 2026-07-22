@@ -1053,6 +1053,9 @@ function createEmptyForm() {
     tgAlertD1UsageEnabled: false,
     tgAlertD1UsageThresholdPercent: '80',
     tgAlertCooldownMinutes: '30',
+    serverRecordExpiryDays: '30',
+    tgServerExpiryWarningEnabled: false,
+    tgServerExpiryWarningDays: '7\n3\n1\n0',
     cfQuotaPlanOverride: '',
     cfQuotaPlanCacheMinutes: '60',
     cfAccountId: '',
@@ -1156,6 +1159,9 @@ function buildFormFromConfig(rawConfig = {}) {
     tgAlertD1UsageEnabled: currentConfig.tgAlertD1UsageEnabled === true,
     tgAlertD1UsageThresholdPercent: formatIntegerInput(currentConfig.tgAlertD1UsageThresholdPercent, 80),
     tgAlertCooldownMinutes: formatIntegerInput(currentConfig.tgAlertCooldownMinutes, 30),
+    serverRecordExpiryDays: formatIntegerInput(currentConfig.serverRecordExpiryDays, 30),
+    tgServerExpiryWarningEnabled: currentConfig.tgServerExpiryWarningEnabled === true,
+    tgServerExpiryWarningDays: joinTextList(currentConfig.tgServerExpiryWarningDays || [7, 3, 1, 0]),
     cfQuotaPlanOverride: resolveSelectValue(currentConfig.cfQuotaPlanOverride, ''),
     cfQuotaPlanCacheMinutes: formatIntegerInput(currentConfig.cfQuotaPlanCacheMinutes, 60),
     cfAccountId: String(currentConfig.cfAccountId || '').trim(),
@@ -1249,6 +1255,9 @@ function buildConfigPayload(currentConfig = {}, currentForm = {}) {
     tgAlertD1UsageEnabled: currentForm.tgAlertD1UsageEnabled === true,
     tgAlertD1UsageThresholdPercent: parseIntegerValue(currentForm.tgAlertD1UsageThresholdPercent, fallbackConfig.tgAlertD1UsageThresholdPercent, 80),
     tgAlertCooldownMinutes: parseIntegerValue(currentForm.tgAlertCooldownMinutes, fallbackConfig.tgAlertCooldownMinutes, 30),
+    serverRecordExpiryDays: parseIntegerValue(currentForm.serverRecordExpiryDays, fallbackConfig.serverRecordExpiryDays, 30),
+    tgServerExpiryWarningEnabled: currentForm.tgServerExpiryWarningEnabled === true,
+    tgServerExpiryWarningDays: parseTextList(currentForm.tgServerExpiryWarningDays).map(value => Number(value)).filter(value => [7, 3, 1, 0].includes(value)),
     cfQuotaPlanOverride: resolveSelectValue(currentForm.cfQuotaPlanOverride, ''),
     cfQuotaPlanCacheMinutes: parseIntegerValue(currentForm.cfQuotaPlanCacheMinutes, fallbackConfig.cfQuotaPlanCacheMinutes, 60),
     cfAccountId: String(currentForm.cfAccountId || '').trim(),
@@ -2147,6 +2156,28 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
             <span class="field-label">告警冷却 (分钟)</span>
             <input v-model="form.tgAlertCooldownMinutes" type="number" min="1" max="1440" class="field-input" />
           </label>
+
+          <label class="field-shell">
+            <span class="field-label">新记录默认滚动天数</span>
+            <input v-model="form.serverRecordExpiryDays" type="number" min="1" max="3650" class="field-input" />
+            <span class="field-hint">未设置固定日期时，从最后一次播放起计算。</span>
+          </label>
+
+          <div class="field-shell">
+            <span class="field-label">服务器预警里程碑</span>
+            <div class="flex flex-wrap gap-3 pt-2">
+              <label v-for="day in [7, 3, 1, 0]" :key="day" class="inline-flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  :checked="parseTextList(form.tgServerExpiryWarningDays).map(Number).includes(day)"
+                  @change="form.tgServerExpiryWarningDays = $event.target.checked
+                    ? [...new Set([...parseTextList(form.tgServerExpiryWarningDays).map(Number), day])].sort((a, b) => b - a).join('\n')
+                    : parseTextList(form.tgServerExpiryWarningDays).map(Number).filter(value => value !== day).join('\n')"
+                />
+                <span>{{ day === 0 ? '到期当天' : `${day} 天` }}</span>
+              </label>
+            </div>
+          </div>
         </div>
 
         <div class="mt-5 grid gap-3 md:grid-cols-2">
@@ -2177,6 +2208,10 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
           <label class="toggle-card md:col-span-2">
             <input v-model="form.tgAlertD1UsageEnabled" type="checkbox" class="h-4 w-4 rounded" />
             <span>启用 D1 用量告警</span>
+          </label>
+          <label class="toggle-card md:col-span-2">
+            <input v-model="form.tgServerExpiryWarningEnabled" type="checkbox" class="h-4 w-4 rounded" />
+            <span>启用 Telegram 服务器过期预警</span>
           </label>
         </div>
       </article>

@@ -221,12 +221,14 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   const previousConfig = {
     rateLimitRpm: 10,
     cfApiToken: "previous-cf-secret",
-    tgBotToken: "previous-tg-secret"
+    tgBotToken: "previous-tg-secret",
+    mediaAggregationEmbyPassword: "previous-emby-secret"
   };
   const currentConfig = {
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret"
+    tgBotToken: "current-tg-secret",
+    mediaAggregationEmbyPassword: "current-emby-secret"
   };
   const { kv } = createKv({
     [Database.CONFIG_KEY]: currentConfig,
@@ -242,6 +244,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   const [snapshot] = JSON.parse(snapshotsMutation.value);
   assert.equal(snapshot.config.cfApiToken, undefined);
   assert.equal(snapshot.config.tgBotToken, undefined);
+  assert.equal(snapshot.config.mediaAggregationEmbyPassword, undefined);
 
   const env = {
     ENI_KV: kv,
@@ -257,6 +260,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     assert.equal(restoredConfig.rateLimitRpm, 5);
     assert.equal(restoredConfig.cfApiToken, "current-cf-secret");
     assert.equal(restoredConfig.tgBotToken, "current-tg-secret");
+    assert.equal(restoredConfig.mediaAggregationEmbyPassword, "current-emby-secret");
 
     const restoredFromRollback = await Database.restoreTidyKvMigrationSnapshot({
       id: "snapshot-2",
@@ -334,9 +338,19 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     tgBotToken: "current-tg-secret",
     indexUrl: adminIndexRecord.sourceUrl
   };
+  const currentNode = {
+    name: "backup",
+    target: "https://backup.test",
+    lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
+    activeLineId: "main",
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: "node-password"
+  };
   const uploadKey = Database.buildAdminIndexUploadKey(adminIndexRecord.revision);
   const { kv } = createKv({
     [Database.CONFIG_KEY]: currentConfig,
+    [Database.NODES_INDEX_KEY]: ["backup"],
+    [`${Database.PREFIX}backup`]: currentNode,
     [uploadKey]: adminIndexRecord
   });
   const env = {
@@ -354,6 +368,9 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     assert.equal(backup.secretsRedacted, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.nodes.length, 1);
+    assert.equal(backup.nodes[0].mediaAggregationEmbyUsername, undefined);
+    assert.equal(backup.nodes[0].mediaAggregationEmbyPassword, undefined);
     assert.equal(backup.adminIndexUpload.revision, adminIndexRecord.revision);
     assert.equal(backup.adminIndexUpload.html, adminIndexRecord.html);
 
@@ -362,7 +379,193 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    const restoredNode = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    assert.equal(restoredNode.mediaAggregationEmbyUsername, "node-user");
+    assert.equal(restoredNode.mediaAggregationEmbyPassword, "node-password");
     assert.equal((await Database.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("media aggregation shortcut rejects selected nodes without effective credentials", async () => {
+  const primaryNode = {
+    name: "primary",
+    target: "https://primary.test",
+    lines: [{ id: "main", target: "https://primary.test" }],
+    activeLineId: "main",
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: "node-password"
+  };
+  const backupNode = {
+    name: "backup",
+    target: "https://backup.test",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main"
+  };
+  const { kv } = createKv({
+    [Database.CONFIG_KEY]: {},
+    [Database.NODES_INDEX_KEY]: ["primary", "backup"],
+    [`${Database.PREFIX}primary`]: primaryNode,
+    [`${Database.PREFIX}backup`]: backupNode
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-media-aggregation-credentials"
+  };
+  invalidateRuntimeConfigCache();
+  try {
+    const response = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+      selectedNodeNames: ["primary", "backup"],
+      username: "",
+      password: ""
+    }, { env, ctx: null, kv });
+    const payload = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED");
+    assert.deepEqual(payload.error.details.nodeNames, ["backup"]);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("full backup export rejects payloads that cannot fit the import request limit", async () => {
+  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 30 } });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-full-export-limit"
+  };
+  const originalLoadAllNodeEntitiesFromKvStrict = Database.loadAllNodeEntitiesFromKvStrict;
+  Database.loadAllNodeEntitiesFromKvStrict = async () => [{
+    name: "oversized",
+    target: "https://origin.test",
+    remark: "x".repeat(12 * 1024 * 1024)
+  }];
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await Database.ApiHandlers.exportConfig({}, {
+      env,
+      ctx: null,
+      request: new Request("https://worker.test/admin")
+    });
+    const payload = await response.json();
+    assert.equal(response.status, 413);
+    assert.equal(payload.error.code, "FULL_BACKUP_TOO_LARGE");
+    assert.ok(payload.error.details.importRequestBytes > payload.error.details.maxBytes);
+    assert.equal(payload.error.details.nodeCount, 1);
+  } finally {
+    Database.loadAllNodeEntitiesFromKvStrict = originalLoadAllNodeEntitiesFromKvStrict;
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("Worker HTML rollback preserves settings saved after activation", async () => {
+  const previousIndex = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">previous</div></body></html>',
+    "index.html"
+  );
+  const activatedIndex = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">activated</div></body></html>',
+    "index.html"
+  );
+  const previousConfig = { uiRadiusPx: 8, indexUrl: previousIndex.sourceUrl };
+  const activatedConfig = { uiRadiusPx: 8, indexUrl: activatedIndex.sourceUrl };
+  const concurrentlySavedConfig = { uiRadiusPx: 33, indexUrl: activatedIndex.sourceUrl };
+  const { kv } = createKv({
+    [Database.CONFIG_KEY]: concurrentlySavedConfig,
+    [Database.buildAdminIndexUploadKey(previousIndex.revision)]: previousIndex,
+    [Database.buildAdminIndexUploadKey(activatedIndex.revision)]: activatedIndex
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-worker-html-rollback"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const rollback = await Database.rollbackAdminIndexUploadActivation(
+      previousConfig,
+      activatedConfig,
+      { env, kv, ctx: null }
+    );
+    const finalConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    assert.equal(rollback.skipped, false);
+    assert.equal(finalConfig.uiRadiusPx, 33);
+    assert.equal(finalConfig.indexUrl, previousIndex.sourceUrl);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("local HTML activation retains only versions referenced by config and snapshots", async () => {
+  const { kv, values } = createKv({ [Database.CONFIG_KEY]: {} });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-admin-index-retention"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    for (let index = 0; index < 8; index += 1) {
+      const record = await buildAdminLocalIndexUploadRecord(
+        `<!doctype html><html><body><div id="app">version-${index}</div></body></html>`,
+        "index.html"
+      );
+      await Database.persistAdminIndexUpload(record, { env, kv, ctx: null });
+    }
+
+    const config = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const snapshots = await Database.getConfigSnapshotsForRead(kv, { withConfig: true });
+    const referencedRevisions = Database.collectReferencedAdminIndexUploadRevisions(config, snapshots);
+    const storedUploadKeys = [...values.keys()]
+      .filter(key => key.startsWith(Database.ADMIN_INDEX_UPLOAD_PREFIX));
+    assert.equal(snapshots.length, 5);
+    assert.equal(referencedRevisions.size, 6);
+    assert.equal(storedUploadKeys.length, 6);
+    assert.deepEqual(
+      new Set(storedUploadKeys),
+      new Set([...referencedRevisions].map(revision => Database.buildAdminIndexUploadKey(revision)))
+    );
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("KV tidy removes orphaned local HTML records and preserves referenced versions", async () => {
+  const referencedIndex = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">referenced</div></body></html>',
+    "index.html"
+  );
+  const orphanedIndex = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">orphaned</div></body></html>',
+    "index.html"
+  );
+  const referencedKey = Database.buildAdminIndexUploadKey(referencedIndex.revision);
+  const orphanedKey = Database.buildAdminIndexUploadKey(orphanedIndex.revision);
+  const { kv } = createKv({
+    [Database.CONFIG_KEY]: { indexUrl: referencedIndex.sourceUrl },
+    [referencedKey]: referencedIndex,
+    [orphanedKey]: orphanedIndex
+  });
+  const env = {
+    ENI_KV: kv,
+    JWT_SECRET: "tidy-admin-index-secret",
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-admin-index-tidy"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const plan = await Database.buildKvTidyPlan(env, { kv });
+    const deletedKeys = plan.mutationPlan
+      .filter(mutation => mutation.type === "delete")
+      .map(mutation => mutation.key);
+    const uploadDeleteGroup = plan.preview.deleteGroups.find(group => group.key === "admin_index_uploads");
+    assert.ok(deletedKeys.includes(orphanedKey));
+    assert.ok(!deletedKeys.includes(referencedKey));
+    assert.equal(plan.summary.deletedAdminIndexUploadCount, 1);
+    assert.equal(uploadDeleteGroup?.count, 1);
+    assert.deepEqual(uploadDeleteGroup?.samples, [orphanedKey]);
   } finally {
     invalidateRuntimeConfigCache();
   }

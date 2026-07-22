@@ -50,9 +50,15 @@ const CACHE_DEFAULTS = Object.freeze({
   PlaybackInfoCacheMax: 64,
   PlaybackInfoCacheEntryMaxBytes: 256 * 1024,
   PlaybackInfoCacheTotalMaxBytes: 4 * 1024 * 1024,
+  MediaAggregationAuthTtlMs: 10 * 60 * 1000,
+  MediaAggregationAuthCacheMax: 32,
+  MediaAggregationBackupMax: 8,
+  MediaAggregationResponseMaxBytes: 256 * 1024,
   VideoProgressForwardIntervalSec: 3,
   VideoProgressForwardSessionMax: 128,
   VideoProgressSnapshotMaxBytes: 32 * 1024,
+  ServerRecordsSnapshotTtlMs: 60 * 1000,
+  ServerRecordsSnapshotMax: 512,
   RateLimitCacheMax: 4096,
   D1SchemaReadyTtlMs: 10 * 60 * 1000,
   OpsStatusReadCacheTtlMs: 15 * 1000,
@@ -94,6 +100,9 @@ const LOG_DEFAULTS = Object.freeze({
   TgAlertKvUsageThresholdPercent: 80,
   TgAlertD1UsageEnabled: false,
   TgAlertD1UsageThresholdPercent: 80,
+  TgServerExpiryWarningEnabled: false,
+  TgServerExpiryWarningDays: [7, 3, 1, 0],
+  ServerRecordExpiryDays: 30,
   LogQueueMax: 512,
   LogQueueOverflowDropCount: 256,
   LogDedupeMax: 2048,
@@ -189,14 +198,22 @@ const DEFAULT_PLAYBACK_INFO_MODE = PROXY_DEFAULTS.DefaultPlaybackInfoMode;
 const DEFAULT_PLAYBACK_INFO_CACHE_TTL_SEC = CACHE_DEFAULTS.PlaybackInfoCacheTtlSec;
 const DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheEntryMaxBytes;
 const DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheTotalMaxBytes;
+const MEDIA_AGGREGATION_AUTH_TTL_MS = CACHE_DEFAULTS.MediaAggregationAuthTtlMs;
+const MEDIA_AGGREGATION_AUTH_CACHE_MAX = CACHE_DEFAULTS.MediaAggregationAuthCacheMax;
+const MEDIA_AGGREGATION_BACKUP_MAX = CACHE_DEFAULTS.MediaAggregationBackupMax;
+const MEDIA_AGGREGATION_RESPONSE_MAX_BYTES = CACHE_DEFAULTS.MediaAggregationResponseMaxBytes;
 const DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgressForwardIntervalSec;
 const DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES = CACHE_DEFAULTS.VideoProgressSnapshotMaxBytes;
+const DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnapshotTtlMs;
+const SERVER_RECORDS_PROBE_TIMEOUT_MS = 8000;
+const SERVER_RECORDS_PROBE_CONCURRENCY = 4;
 const DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
 const REMOTE_JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 const REMOTE_ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
 const ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
+const ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES = ADMIN_JSON_REQUEST_MAX_BYTES - (64 * 1024);
 const LOGIN_JSON_REQUEST_MAX_BYTES = 16 * 1024;
 const METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
 const ADMIN_LOCAL_INDEX_SOURCE_ORIGIN = "https://admin-local-index.invalid";
@@ -254,7 +271,9 @@ const GLOBAL_CACHE_STATE = {
   NodesRevisionCache: null,
   NodesIndexCache: null,
   PlaybackInfoResponseCache: new Map(),
+  MediaAggregationAuthCache: new Map(),
   PlaybackProgressRelay: new Map(),
+  ServerRecordsSnapshotCache: new Map(),
   DashboardMonthlyTrafficCache: new Map(),
   SingleFlightTasks: new Map(),
   RuntimeConfigCacheGeneration: 0,
@@ -302,6 +321,7 @@ const GLOBAL_DB_READY_STATE = {
   D1SchemaReadyState: new WeakMap(),
   LogsBaseDbReady: new WeakMap(),
   StatsHourlyDbReady: new WeakMap(),
+  ServerLastWatchDbReady: new WeakMap(),
   DnsIpWorkspaceDbReady: new WeakMap(),
   OpsStatusDbReady: new WeakMap(),
   OpsStatusShadowCache: new WeakMap(),
@@ -1457,6 +1477,122 @@ function decodeBase64UrlUtf8(value = "") {
   return new TextDecoder().decode(bytes);
 }
 
+const MEDIA_AGGREGATION_SOURCE_ID_PREFIX = "AGG1";
+
+function readMediaAggregationCredentialPair(source = {}) {
+  const username = String(source?.mediaAggregationEmbyUsername ?? "").trim();
+  const password = String(source?.mediaAggregationEmbyPassword ?? "");
+  return {
+    username,
+    password,
+    configured: Boolean(username && password.length > 0),
+    partial: Boolean(username) !== Boolean(password.length > 0)
+  };
+}
+
+function resolveMediaAggregationCredentials(node = {}, runtimeConfig = {}) {
+  const nodeCredentials = readMediaAggregationCredentialPair(node);
+  if (nodeCredentials.configured) {
+    return { ...nodeCredentials, source: "node" };
+  }
+  const globalCredentials = readMediaAggregationCredentialPair(runtimeConfig);
+  if (globalCredentials.configured) {
+    return { ...globalCredentials, source: "global" };
+  }
+  return { username: "", password: "", configured: false, partial: false, source: "none" };
+}
+
+function hasConfiguredMediaAggregationNodeCredentials(node = {}) {
+  const credentials = readMediaAggregationCredentialPair(node);
+  return credentials.configured || node?.mediaAggregationEmbyCredentialsConfigured === true;
+}
+
+function redactMediaAggregationNodeCredentials(node = {}) {
+  if (!isPlainObject(node)) return node;
+  const redacted = { ...node };
+  delete redacted.mediaAggregationEmbyUsername;
+  delete redacted.mediaAggregationEmbyPassword;
+  delete redacted.mediaAggregationEmbyCredentialsConfigured;
+  return redacted;
+}
+
+function getMediaAggregationNodeCredentialValidationError(node = {}) {
+  const credentials = readMediaAggregationCredentialPair(node);
+  if (!credentials.partial) return null;
+  return {
+    code: "MEDIA_AGGREGATION_NODE_CREDENTIALS_INCOMPLETE",
+    message: "节点聚合账号和密码必须同时填写，或同时留空使用全局账号密码"
+  };
+}
+
+function buildMediaAggregationSourceId(nodeName = "", itemId = "", mediaSourceId = "") {
+  const normalizedNodeName = String(nodeName || "").trim().toLowerCase();
+  const normalizedItemId = String(itemId || "").trim();
+  const normalizedMediaSourceId = String(mediaSourceId || "").trim();
+  if (!normalizedNodeName || !normalizedItemId || !normalizedMediaSourceId) return "";
+  return [
+    MEDIA_AGGREGATION_SOURCE_ID_PREFIX,
+    encodeBase64UrlUtf8(normalizedNodeName),
+    encodeBase64UrlUtf8(normalizedItemId),
+    encodeBase64UrlUtf8(normalizedMediaSourceId)
+  ].join("*");
+}
+
+function parseMediaAggregationSourceId(value = "") {
+  const text = String(value || "").trim();
+  const parts = text.split("*");
+  if (parts.length !== 4 || parts[0] !== MEDIA_AGGREGATION_SOURCE_ID_PREFIX) return null;
+  try {
+    const nodeName = decodeBase64UrlUtf8(parts[1]).trim().toLowerCase();
+    const itemId = decodeBase64UrlUtf8(parts[2]).trim();
+    const mediaSourceId = decodeBase64UrlUtf8(parts[3]).trim();
+    if (!nodeName || !itemId || !mediaSourceId) return null;
+    if (nodeName.length > 128 || itemId.length > 512 || mediaSourceId.length > 1024) return null;
+    return { nodeName, itemId, mediaSourceId };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeMediaAggregationProviderIds(providerIds = {}) {
+  const normalized = {};
+  if (!isPlainObject(providerIds)) return normalized;
+  for (const [rawKey, rawValue] of Object.entries(providerIds)) {
+    const key = String(rawKey || "").trim().toLowerCase();
+    if (key !== "tmdb" && key !== "imdb") continue;
+    const value = String(rawValue || "").trim().toLowerCase();
+    if (value) normalized[key] = value;
+  }
+  return normalized;
+}
+
+function mediaAggregationProviderIdsMatch(primaryProviderIds = {}, candidateProviderIds = {}) {
+  const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
+  const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
+  return ["tmdb", "imdb"].some(key => primary[key] && candidate[key] === primary[key]);
+}
+
+function extractPlaybackInfoItemPathState(proxyPath = "") {
+  const normalizedPath = sanitizeProxyPath(proxyPath);
+  const match = /^(.*?\/items\/)([^/]+)(\/playbackinfo\/?$)/i.exec(normalizedPath);
+  if (!match) return { itemId: "", rewritePath: () => normalizedPath };
+  let itemId = String(match[2] || "").trim();
+  try { itemId = decodeURIComponent(itemId); } catch {}
+  return {
+    itemId,
+    rewritePath(nextItemId = "") {
+      const safeItemId = encodeURIComponent(String(nextItemId || "").trim());
+      return safeItemId ? `${match[1]}${safeItemId}${match[3]}` : normalizedPath;
+    }
+  };
+}
+
+function resolveMediaAggregationApiPrefix(proxyPath = "") {
+  const normalizedPath = sanitizeProxyPath(proxyPath);
+  const index = normalizedPath.toLowerCase().lastIndexOf("/items/");
+  return index > 0 ? normalizedPath.slice(0, index) : "";
+}
+
 function normalizeAdminPath(value) {
   const fallback = "/admin";
   const raw = String(value || "").trim();
@@ -2037,6 +2173,119 @@ function normalizeNodeMainVideoStreamMode(value = "") {
 
 function readNodeMainVideoStreamMode(node = {}) {
   return normalizeNodeMainVideoStreamMode(node?.mainVideoStreamMode ?? node?.wangpanDirectMode ?? node?.wangpanMode);
+}
+
+function normalizeNodeTags(tags = [], legacyTag = "") {
+  const source = Array.isArray(tags) ? tags : String(tags || "").split(/[,，\r\n]+/);
+  const normalized = [];
+  const seen = new Set();
+  for (const value of [...source, legacyTag]) {
+    const tag = String(value || "").trim().slice(0, 24);
+    const key = tag.toLowerCase();
+    if (!tag || seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(tag);
+    if (normalized.length >= 20) break;
+  }
+  return normalized;
+}
+
+function normalizeServerRecordExpiry(value = "") {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+    ? text
+    : null;
+}
+
+function normalizeServerRecordExpiryMode(value = "", expiresAt = null) {
+  const mode = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["rolling", "days", "last_watched"].includes(mode)) return "rolling";
+  if (["fixed", "date", "manual"].includes(mode)) return "fixed";
+  return expiresAt ? "fixed" : "rolling";
+}
+
+function normalizeServerRecordSettings(value = {}, options = {}) {
+  const source = isPlainObject(value) ? value : {};
+  const normalizedExpiresAt = normalizeServerRecordExpiry(source.expiresAt);
+  const expiryEnabled = typeof source.expiryEnabled === "boolean"
+    ? source.expiryEnabled
+    : Boolean(normalizedExpiresAt);
+  const expiryMode = normalizeServerRecordExpiryMode(source.expiryMode, normalizedExpiresAt);
+  const expiryDays = clampIntegerConfig(
+    source.expiryDays,
+    clampIntegerConfig(options?.defaultExpiryDays, Config.Defaults.ServerRecordExpiryDays, 1, 3650),
+    1,
+    3650
+  );
+  return {
+    enabled: source.enabled === true,
+    expiryEnabled,
+    expiryMode,
+    expiresAt: expiryMode === "fixed" ? normalizedExpiresAt : null,
+    expiryDays
+  };
+}
+
+function buildServerRecordExpiry(record = {}, lastWatchedAt = "", config = {}, now = new Date()) {
+  const settings = normalizeServerRecordSettings(record, {
+    defaultExpiryDays: config?.serverRecordExpiryDays
+  });
+  const watched = String(lastWatchedAt || "").trim();
+  const utcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config?.scheduleUtcOffsetMinutes);
+  if (!settings.expiryEnabled) {
+    return {
+      enabled: false,
+      state: "disabled",
+      daysRemaining: null,
+      expiresAt: "",
+      source: "disabled",
+      mode: settings.expiryMode,
+      expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
+    };
+  }
+  let expiresAt = settings.expiryMode === "fixed" ? settings.expiresAt : null;
+  let source = expiresAt ? "fixed" : "unset";
+  if (settings.expiryMode === "rolling" && watched) {
+    const watchedDate = new Date(watched);
+    if (!Number.isNaN(watchedDate.getTime())) {
+      expiresAt = buildOffsetClockParts(
+        new Date(watchedDate.getTime() + settings.expiryDays * 86400000),
+        utcOffsetMinutes
+      ).dateKey;
+      source = "last_watched";
+    }
+  }
+  if (!expiresAt) {
+    return {
+      enabled: true,
+      state: "unset",
+      daysRemaining: null,
+      expiresAt: "",
+      source,
+      mode: settings.expiryMode,
+      expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
+    };
+  }
+  const todayKey = buildOffsetClockParts(now, utcOffsetMinutes).dateKey;
+  const daysRemaining = Math.round(
+    (Date.parse(`${expiresAt}T00:00:00Z`) - Date.parse(`${todayKey}T00:00:00Z`)) / 86400000
+  );
+  return {
+    enabled: true,
+    state: daysRemaining < 0 ? "expired" : (daysRemaining <= 7 ? "expiring" : "valid"),
+    daysRemaining,
+    expiresAt,
+    source,
+    mode: settings.expiryMode,
+    expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
+  };
 }
 
 const NODE_LEGACY_DIRECT_MODE_KEYS = ["proxyMode", "mode"];
@@ -3053,6 +3302,8 @@ function buildNodeDerivedCacheRevision(nodeName = "", nodeData = {}) {
     nodeName: normalizedName,
     entryMode: normalizedEntryMode,
     secret: normalizedEntryMode === "host_prefix" ? "" : String(nodeData?.secret || "").trim(),
+    tags: normalizeNodeTags(nodeData?.tags, nodeData?.tag),
+    remark: String(nodeData?.remark || "").trim(),
     activeLineId: String(nodeData?.activeLineId || "").trim(),
     orderedTargets: buildOrderedNodeTargetList(nodeData),
     headers: headerEntries,
@@ -3083,6 +3334,13 @@ function invalidatePlaybackInfoResponseCacheForNodes(nodeNames = []) {
     const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
     if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
     cache.delete(cacheKey);
+  }
+  const authCache = GLOBALS.MediaAggregationAuthCache;
+  if (authCache instanceof Map) {
+    for (const [cacheKey, entry] of authCache.entries()) {
+      const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+      if (entryNodeName && normalizedNames.has(entryNodeName)) authCache.delete(cacheKey);
+    }
   }
 }
 
@@ -3761,7 +4019,7 @@ function isNodeDirectSourceEnabled(node, currentConfig = null, nodeNameHint = ""
   const proxyMode = String(node?.proxyMode || node?.mode || "").trim().toLowerCase();
   if (["direct", "source-direct", "origin-direct", "node-direct"].includes(proxyMode)) return true;
   if (node?.direct === true || node?.sourceDirect === true || node?.directSource === true || node?.direct2xx === true) return true;
-  const explicitText = `${node?.tag || ""} ${node?.remark || ""}`;
+  const explicitText = `${normalizeNodeTags(node?.tags, node?.tag).join(" ")} ${node?.remark || ""}`;
   return /(?:^|[\s\[(【])(?:直连|source-direct|origin-direct|node-direct)(?:$|[\s\])】])/i.test(explicitText);
 }
 
@@ -3867,9 +4125,13 @@ function isPlaybackSessionStoppedPath(proxyPath = "") {
   return /\/sessions\/playing\/stopped(?:$|[/?])/i.test(String(proxyPath || ""));
 }
 
+function isPlaybackSessionPingPath(proxyPath = "") {
+  return /\/sessions\/playing\/ping(?:$|[/?])/i.test(String(proxyPath || ""));
+}
+
 function isPlaybackSessionStartedPath(proxyPath = "") {
   const text = String(proxyPath || "");
-  if (isPlaybackSessionProgressPath(text) || isPlaybackSessionStoppedPath(text)) return false;
+  if (isPlaybackSessionProgressPath(text) || isPlaybackSessionStoppedPath(text) || isPlaybackSessionPingPath(text)) return false;
   return /\/sessions\/playing(?:\/started)?(?:$|[/?])/i.test(text);
 }
 
@@ -6428,7 +6690,7 @@ function sanitizeRuntimeConfig(input = {}) {
   return sanitized;
 }
 
-const CONFIG_SECRET_FIELDS = ["cfApiToken", "tgBotToken"];
+const CONFIG_SECRET_FIELDS = ["cfApiToken", "tgBotToken", "mediaAggregationEmbyPassword"];
 
 function redactRuntimeConfigSecrets(input = {}) {
   const config = sanitizeRuntimeConfig(input);
@@ -6440,7 +6702,7 @@ function preserveRuntimeConfigSecrets(input = {}, currentConfig = {}) {
   const nextConfig = sanitizeRuntimeConfig(input);
   const current = sanitizeRuntimeConfig(currentConfig);
   for (const field of CONFIG_SECRET_FIELDS) {
-    if (String(current[field] || "").trim()) nextConfig[field] = current[field];
+    if (String(current[field] || "").length > 0) nextConfig[field] = current[field];
     else delete nextConfig[field];
   }
   return nextConfig;
@@ -6451,7 +6713,7 @@ function mergeMissingRuntimeConfigSecrets(input = {}, currentConfig = {}) {
   const current = sanitizeRuntimeConfig(currentConfig);
   for (const field of CONFIG_SECRET_FIELDS) {
     if (Object.prototype.hasOwnProperty.call(importedConfig, field)) continue;
-    if (String(current[field] || "").trim()) importedConfig[field] = current[field];
+    if (String(current[field] || "").length > 0) importedConfig[field] = current[field];
   }
   return importedConfig;
 }
@@ -7524,6 +7786,10 @@ const CONFIG_ALLOWED_FIELDS = [
   "dashboardShowD1WriteHotspot",
   "dashboardShowKvD1Status",
   "sourceDirectNodes",
+  "mediaAggregationNodes",
+  "mediaAggregationEmbyUsername",
+  "mediaAggregationEmbyPassword",
+  "mediaAggregationBidirectionalProgressEnabled",
   "dnsDefaultFallbackCname",
   "defaultHostPrefixCnameTarget",
   "pingTimeout",
@@ -7579,6 +7845,9 @@ const CONFIG_ALLOWED_FIELDS = [
   "tgAlertD1UsageEnabled",
   "tgAlertD1UsageThresholdPercent",
   "tgAlertCooldownMinutes",
+  "tgServerExpiryWarningEnabled",
+  "tgServerExpiryWarningDays",
+  "serverRecordExpiryDays",
   "jwtExpiryDays",
   "cfAccountId",
   "cfZoneId",
@@ -7606,6 +7875,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
   "tgAlertOnScheduledFailure",
   "tgAlertKvUsageEnabled",
   "tgAlertD1UsageEnabled",
+  "tgServerExpiryWarningEnabled",
   "tgDailyReportEnabled",
   "tgDailyReportSummaryEnabled",
   "tgDailyReportKvEnabled",
@@ -7619,15 +7889,18 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
   "hedgeFailoverEnabled",
   "disablePrewarmPrefetch",
   "logWriteImagePoster",
-  "logWriteMediaMetadata"
+  "logWriteMediaMetadata",
+  "mediaAggregationBidirectionalProgressEnabled"
 ];
 
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: {},
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "tgDailyReportTime"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "mediaAggregationEmbyUsername", "tgDailyReportTime"],
   arrayNormalizers: {
-    sourceDirectNodes: "nodeNameList"
+    sourceDirectNodes: "nodeNameList",
+    mediaAggregationNodes: "nodeNameList",
+    tgServerExpiryWarningDays: "expiryWarningDays"
   },
   integerFields: {
     logRetentionDays: { fallback: Config.Defaults.LogRetentionDays, min: 1, max: Config.Defaults.LogRetentionDaysMax },
@@ -7642,6 +7915,7 @@ const CONFIG_SANITIZE_RULES = {
     tgAlertKvUsageThresholdPercent: { fallback: Config.Defaults.TgAlertKvUsageThresholdPercent, min: 1, max: 100 },
     tgAlertD1UsageThresholdPercent: { fallback: Config.Defaults.TgAlertD1UsageThresholdPercent, min: 1, max: 100 },
     tgAlertCooldownMinutes: { fallback: Config.Defaults.TgAlertCooldownMinutes, min: 1, max: 1440 },
+    serverRecordExpiryDays: { fallback: Config.Defaults.ServerRecordExpiryDays, min: 1, max: 3650 },
     cacheTtlImages: { fallback: DEFAULT_IMAGE_CACHE_TTL_DAYS, min: 0, max: 365 },
     pingTimeout: { fallback: DEFAULT_PING_TIMEOUT_MS, min: 1000, max: 180000 },
     pingCacheMinutes: { fallback: Config.Defaults.PingCacheMinutes, min: 0, max: 1440 },
@@ -7701,7 +7975,11 @@ function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, help
   }
   for (const [key, normalizerName] of Object.entries(rules.arrayNormalizers || {})) {
     if (!Array.isArray(config[key])) continue;
-    if (normalizerName === "nodeNameList" && typeof helpers.normalizeNodeNameList === "function") {
+    if (normalizerName === "expiryWarningDays") {
+      config[key] = [...new Set((Array.isArray(config[key]) ? config[key] : String(config[key] || "").split(/[,\s]+/))
+        .map(value => Number(value)).filter(value => Number.isInteger(value) && value >= 0 && value <= 365))]
+        .sort((left, right) => right - left);
+    } else if (normalizerName === "nodeNameList" && typeof helpers.normalizeNodeNameList === "function") {
       config[key] = helpers.normalizeNodeNameList(config[key]);
     }
   }
@@ -9106,7 +9384,7 @@ const Auth = {
         const bodyResult = await readResponseTextWithLimit(request, LOGIN_JSON_REQUEST_MAX_BYTES);
         if (bodyResult.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
         const body = JSON.parse(bodyResult.text || "{}");
-        password = (body.password || "").trim();
+        password = typeof body.password === "string" ? body.password : "";
       }
       if (!env.JWT_SECRET) return jsonError("SERVER_MISCONFIGURED", "JWT_SECRET 未配置", 503);
       if (!env.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
@@ -9260,6 +9538,7 @@ const CacheManager = {
       state.phase = 5;
     } else if (state.phase === 5) {
       cleanMap(GLOBALS.PlaybackInfoResponseCache, v => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
+      cleanMap(GLOBALS.MediaAggregationAuthCache, v => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationAuth");
       state.phase = 6;
     } else if (state.phase === 6) {
       cleanMap(GLOBALS.ProxyFailoverStateCache, v => {
@@ -9951,6 +10230,7 @@ const Database = {
   LOGS_FTS_TABLE: "proxy_logs_fts",
   LOGS_FTS_INSERT_TRIGGER: "proxy_logs_fts_ai",
   STATS_HOURLY_TABLE: "proxy_stats_hourly",
+  SERVER_LAST_WATCH_TABLE: "server_last_watch",
   AUTH_FAILURES_TABLE: "auth_failures",
   CF_DASH_CACHE_TABLE: "cf_dashboard_cache",
   CF_RUNTIME_CACHE_TABLE: "cf_runtime_cache",
@@ -9958,12 +10238,13 @@ const Database = {
   DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
   DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
   DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
-  D1_SCHEMA_VERSION: 5,
+  D1_SCHEMA_VERSION: 6,
   D1_MIGRATIONS_TABLE: "d1_migrations",
   D1_REQUIRED_MIGRATIONS: [
     "0001_d1_fresh_baseline",
     "0002_d1_historical_compatibility",
-    "0003_d1_schema_v5_indexes"
+    "0003_d1_schema_v5_indexes",
+    "0004_server_watch_stats"
   ],
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
@@ -10431,7 +10712,8 @@ const Database = {
       this.DNS_IP_POOL_FETCH_CACHE_TABLE,
       this.DNS_IP_PROBE_CACHE_TABLE,
       this.LOGS_TABLE,
-      this.STATS_HOURLY_TABLE
+      this.STATS_HOURLY_TABLE,
+      this.SERVER_LAST_WATCH_TABLE
     ];
     const requiredIndexes = {
       idx_sys_locks_expires_at: { table: this.SCHEDULED_LOCKS_TABLE, columns: ["expires_at"] },
@@ -10459,7 +10741,8 @@ const Database = {
       [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature", "items_json", "source_results_json", "imported_count", "enabled_source_count", "cached_at", "expires_at", "created_at", "updated_at"],
       [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo", "probe_status", "latency_ms", "cf_ray", "colo_code", "city_name", "country_code", "country_name", "probed_at", "expires_at"],
       [this.LOGS_TABLE]: ["id", "timestamp", "node_name", "request_path", "request_method", "status_code", "response_time", "client_ip", "inbound_colo", "outbound_colo", "user_agent", "referer", "category", "error_detail", "detail_json", "created_at", "inbound_ip", "outbound_ip"],
-      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"]
+      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"],
+      [this.SERVER_LAST_WATCH_TABLE]: ["node_name", "last_watched_at", "updated_at"]
     };
     const requiredPrimaryKeys = {
       [this.SYS_STATUS_TABLE]: ["scope"],
@@ -10472,7 +10755,8 @@ const Database = {
       [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature"],
       [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
       [this.LOGS_TABLE]: ["id"],
-      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"]
+      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
+      [this.SERVER_LAST_WATCH_TABLE]: ["node_name"]
     };
     const issues = [];
     const tableStatus = Object.fromEntries(requiredTables.map(name => [name, tableNames.has(name)]));
@@ -10731,6 +11015,74 @@ const Database = {
       if (GLOBALS.StatsHourlyDbReady.get(db) === initTask) GLOBALS.StatsHourlyDbReady.delete(db);
     }
   },
+  async ensureServerLastWatchSchema(db) {
+    if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "serverLastWatchSchema")) return true;
+    let initTask = GLOBALS.ServerLastWatchDbReady.get(db);
+    if (!initTask) {
+      initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SERVER_LAST_WATCH_TABLE} (
+        node_name TEXT PRIMARY KEY,
+        last_watched_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      )`).run().then(() => {
+        this.markD1SchemaReady(db, "serverLastWatchSchema");
+        return true;
+      }).catch(error => {
+        GLOBALS.ServerLastWatchDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.ServerLastWatchDbReady.set(db, initTask);
+    }
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.ServerLastWatchDbReady.get(db) === initTask) GLOBALS.ServerLastWatchDbReady.delete(db);
+    }
+  },
+  async upsertServerLastWatch(db, nodeName = "", lastWatchedAt = "") {
+    const normalizedName = String(nodeName || "").trim().toLowerCase();
+    if (!db || !normalizedName) return false;
+    const watchedAtMs = Date.parse(String(lastWatchedAt || "").trim());
+    if (!Number.isFinite(watchedAtMs)) return false;
+    const watchedAt = new Date(watchedAtMs).toISOString();
+    await this.ensureServerLastWatchSchema(db);
+    const updatedAt = new Date().toISOString();
+    await db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+      node_name, last_watched_at, updated_at
+    ) VALUES (?, ?, ?)
+    ON CONFLICT(node_name) DO UPDATE SET
+      last_watched_at = CASE
+        WHEN excluded.last_watched_at > ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at THEN excluded.last_watched_at
+        ELSE ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at
+      END,
+      updated_at = CASE
+        WHEN excluded.last_watched_at > ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at THEN excluded.updated_at
+        ELSE ${this.SERVER_LAST_WATCH_TABLE}.updated_at
+      END`).bind(normalizedName, watchedAt, updatedAt).run();
+    return true;
+  },
+  async getServerLastWatch(db, nodeNames = []) {
+    const names = this.normalizeNodeIndex(nodeNames);
+    const result = new Map();
+    if (!db || names.length === 0) return result;
+    await this.ensureServerLastWatchSchema(db);
+    for (let offset = 0; offset < names.length; offset += 90) {
+      const chunk = names.slice(offset, offset + 90);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = await db.prepare(`SELECT node_name, last_watched_at, updated_at
+        FROM ${this.SERVER_LAST_WATCH_TABLE}
+        WHERE node_name IN (${placeholders})`).bind(...chunk).all();
+      for (const row of rows?.results || []) {
+        const name = String(row?.node_name || "").trim().toLowerCase();
+        if (!name) continue;
+        result.set(name, {
+          lastWatchedAt: String(row?.last_watched_at || "").trim(),
+          updatedAt: String(row?.updated_at || "").trim()
+        });
+      }
+    }
+    return result;
+  },
   normalizeD1SchemaProfile(profile = "") {
     const normalizedProfile = String(profile || "").trim().toLowerCase();
     if (normalizedProfile === "runtime-core" || normalizedProfile === "logs-core" || normalizedProfile === "logs-fts") {
@@ -10758,6 +11110,7 @@ const Database = {
       GLOBALS.AuthFailuresDbReady.delete(db);
       GLOBALS.CfDashboardCacheDbReady.delete(db);
       GLOBALS.CfRuntimeCacheDbReady.delete(db);
+      GLOBALS.ServerLastWatchDbReady.delete(db);
     }
   },
   async bootstrapD1Schema(db, profile = "logs-core") {
@@ -10779,7 +11132,8 @@ const Database = {
       { name: "ensureDnsIpWorkspaceSchema", run: () => this.ensureDnsIpWorkspaceSchema(db) },
       { name: "ensureAuthFailuresTable", run: () => this.ensureAuthFailuresTable(db) },
       { name: "ensureCfDashboardCacheTable", run: () => this.ensureCfDashboardCacheTable(db) },
-      { name: "ensureCfRuntimeCacheTable", run: () => this.ensureCfRuntimeCacheTable(db) }
+      { name: "ensureCfRuntimeCacheTable", run: () => this.ensureCfRuntimeCacheTable(db) },
+      { name: "ensureServerLastWatchSchema", run: () => this.ensureServerLastWatchSchema(db) }
     ];
     const logSteps = [
       { name: "ensureLogsBaseSchema", run: () => this.ensureLogsBaseSchema(db) },
@@ -12274,25 +12628,39 @@ const Database = {
       });
     }
 
-    const startIso = new Date(monthWindow.startTs).toISOString();
-    const endIso = new Date(monthWindow.endTs).toISOString();
-    const query = `
+    const buildQuery = (startTs, endTs) => `
       query {
         viewer {
           zones(filter: { zoneTag: ${toGraphQLString(cfZoneId)} }) {
-            series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(startIso)}, datetime_leq: ${toGraphQLString(endIso)} }) {
+            series: httpRequestsAdaptiveGroups(limit: 10000, filter: { datetime_geq: ${toGraphQLString(new Date(startTs).toISOString())}, datetime_leq: ${toGraphQLString(new Date(endTs).toISOString())} }) {
               sum { edgeResponseBytes }
             }
           }
         }
       }`;
-    const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, query);
-    if (!zoneData) throw new Error("cf_graphql_empty_zone");
-    const seriesData = Array.isArray(zoneData.series) ? zoneData.series : [];
-    const totalBytes = seriesData.reduce(
-      (sum, item) => sum + Math.max(0, Number(item?.sum?.edgeResponseBytes) || 0),
-      0
-    );
+    const readWindowBytes = async (startTs, endTs) => {
+      const zoneData = await fetchCloudflareGraphQLZone(cfZoneId, cfApiToken, buildQuery(startTs, endTs));
+      if (!zoneData) throw new Error("cf_graphql_empty_zone");
+      return (Array.isArray(zoneData.series) ? zoneData.series : []).reduce(
+        (sum, item) => sum + Math.max(0, Number(item?.sum?.edgeResponseBytes) || 0),
+        0
+      );
+    };
+    let totalBytes;
+    try {
+      totalBytes = await readWindowBytes(monthWindow.startTs, monthWindow.endTs);
+    } catch (error) {
+      const message = String(error?.message || error || "").toLowerCase();
+      const rangeLimited = message.includes("cannot request a time range wider than 1d")
+        || (message.includes("time range") && message.includes("1d"));
+      if (!rangeLimited) throw error;
+      totalBytes = 0;
+      const dayMs = 24 * 60 * 60 * 1000;
+      for (let cursor = monthWindow.startTs; cursor <= monthWindow.endTs; cursor += dayMs) {
+        const dayEnd = Math.min(monthWindow.endTs, cursor + dayMs - 1);
+        totalBytes += await readWindowBytes(cursor, dayEnd);
+      }
+    }
     return normalizeDashboardMonthlyTrafficPayload({
       ...basePayload,
       traffic: formatBytes(totalBytes),
@@ -12454,7 +12822,7 @@ const Database = {
     const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
     const nowTimestamp = Math.max(0, Number(options.nowMs) || nowMs());
     const dayWindow = options?.dayWindow || buildOffsetDayWindow(new Date(nowTimestamp), config.scheduleUtcOffsetMinutes);
-    const skipD1WriteHotspot = options?.skipD1WriteHotspot === true;
+    const skipD1WriteHotspot = options?.skipD1WriteHotspot !== false;
     const d1WriteHotspotPromise = skipD1WriteHotspot
       ? null
       : this.buildDashboardD1WriteHotspotPayload(env, {
@@ -12800,6 +13168,29 @@ const Database = {
       }
       throw error;
     }
+  },
+  async getDashboardCachedSnapshotPayload(env, options = {}) {
+    const db = options?.db || this.getDB(env);
+    if (!db) return null;
+    const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
+    const nowTimestamp = Math.max(0, Number(options.nowMs) || nowMs());
+    const dayWindow = buildOffsetDayWindow(new Date(nowTimestamp), config.scheduleUtcOffsetMinutes);
+    const zoneId = String(config.cfZoneId || "").trim();
+    const cacheKey = makeCfDashCacheDbKey(zoneId, dayWindow.dateKey);
+    const cachedEntry = await this.getCfDashboardCacheEntry(db, cacheKey, { nowMs: nowTimestamp, includeExpired: true });
+    if (!cachedEntry || cachedEntry.version !== CF_DASH_CACHE_VERSION) return null;
+    return withDashboardSnapshotCacheStatus(
+      cachedEntry.payload,
+      cachedEntry.expiresAt > nowTimestamp ? "cache" : "stale",
+      {
+        cachedAt: cachedEntry.cachedAt,
+        expiresAt: cachedEntry.expiresAt,
+        updatedAt: cachedEntry.updatedAt,
+        generatedAt: cachedEntry.payload?.cacheMeta?.generatedAt || cachedEntry.payload?.stats?.generatedAt || "",
+        warning: cachedEntry.expiresAt > nowTimestamp ? "" : "dashboard_cache_expired",
+        partial: cachedEntry.expiresAt <= nowTimestamp
+      }
+    );
   },
   async getCloudflareRuntimeQuotaStatus(env, options = {}) {
     const db = options?.db || this.getDB(env);
@@ -13270,9 +13661,11 @@ const Database = {
         ? normalizeHostPrefixCnameTarget(rawNode.hostPrefixCnameTarget)
         : "",
       secret: entryMode === "host_prefix" ? "" : String(rawNode.secret ?? ""),
-      tag: String(rawNode.tag ?? ""),
+      tag: normalizeNodeTags(rawNode.tags, rawNode.tag)[0] || "",
+      tags: normalizeNodeTags(rawNode.tags, rawNode.tag),
       tagColor: String(rawNode.tagColor ?? ""),
       remark: String(rawNode.remark ?? ""),
+      serverRecord: normalizeServerRecordSettings(rawNode.serverRecord),
       lines: normalizedLines.map((line) => ({
         id: String(line.id || "").trim(),
         name: String(line.name || "").trim(),
@@ -13281,6 +13674,7 @@ const Database = {
       activeLineId,
       playbackInfoMode: normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode),
       mediaAuthMode: normalizeNodeMediaAuthMode(rawNode.mediaAuthMode),
+      mediaAggregationEmbyCredentialsConfigured: hasConfiguredMediaAggregationNodeCredentials(rawNode),
       realClientIpMode: normalizeNodeRealClientIpMode(rawNode.realClientIpMode),
       hedgeProbePath: normalizeNodeHedgeProbePath(rawNode.hedgeProbePath),
       routingDecisionMode: normalizeNodeRoutingDecisionMode(rawNode.routingDecisionMode),
@@ -13745,6 +14139,7 @@ const Database = {
       normalizedNames.push(name);
       GLOBALS.NodeCache.delete(name);
       GLOBALS.PlaybackRouteHotCache.delete(name);
+      GLOBALS.ServerRecordsSnapshotCache.delete(name);
     }
     if (normalizedNames.length > 0) {
       invalidateNodeCacheTokens(normalizedNames);
@@ -14548,6 +14943,7 @@ const Database = {
     if (!kv) throw new Error("KV not configured");
 
     const allKeys = (await this.listKvKeysStrict(kv)).sort();
+    const adminIndexUploadKeys = allKeys.filter(key => key.startsWith(this.ADMIN_INDEX_UPLOAD_PREFIX));
     const {
       rawStoredSummaryIndexText,
       storedSummaryIndexState,
@@ -14683,6 +15079,13 @@ const Database = {
       nextSnapshots.push(migrationSnapshot);
       nextSnapshots.push(...rewrittenSnapshots);
     }
+    const retainedSnapshots = nextSnapshots.length > 0 ? nextSnapshots : rawSnapshots;
+    const unreferencedAdminIndexUploadKeys = this.collectUnreferencedAdminIndexUploadKeys(
+      nextTidyConfig,
+      retainedSnapshots,
+      adminIndexUploadKeys
+    );
+    for (const key of unreferencedAdminIndexUploadKeys) removableKeys.add(key);
 
     const rebuiltNodeSummaries = this.normalizeNodeSummaryIndex(fullEntityNodes).nodes;
     const rebuiltNodeIndex = this.normalizeNodeIndex(rebuiltNodeSummaries.map(node => node?.name));
@@ -14765,6 +15168,7 @@ const Database = {
       deletedOpsStatusKeyCount: opsStatusKeyCount,
       deletedTelegramAlertStateKeyCount: telegramAlertStateKeyCount,
       deletedDnsFetchLockKeyCount: dnsFetchLockKeyCount,
+      deletedAdminIndexUploadCount: unreferencedAdminIndexUploadKeys.length,
       untouchedOtherKeyCount,
       rawSnapshotCount: rawSnapshots.length,
       previousFullIndexBytes,
@@ -14789,6 +15193,7 @@ const Database = {
     const telegramAlertStateKeys = removableKeyList.filter(key => key === this.LEGACY_TELEGRAM_ALERT_STATE_KEY);
     const scheduledLockKeys = removableKeyList.filter(key => key === this.LEGACY_SCHEDULED_LOCK_KEY);
     const dnsFetchLockKeys = removableKeyList.filter(key => key.startsWith(LEGACY_DNS_IP_POOL_FETCH_LOCK_KV_KEY_PREFIX));
+    const staleAdminIndexUploadKeys = removableKeyList.filter(key => key.startsWith(this.ADMIN_INDEX_UPLOAD_PREFIX));
     const rewrittenSnapshotIds = rewrittenSnapshots.map(snapshot => snapshot?.id);
     const rewrittenNodeNames = rewrittenNodes.map(node => node.name);
     pushTidyPreviewGroup(deleteGroups, staleCfCacheKeys.length > 0, "cf_dash_cache", "Cloudflare 仪表盘缓存", staleCfCacheKeys, staleCfCacheKeys.length, "会删除遗留的 sys:cf_dash_cache 及其按日期 / Zone 生成的缓存键。");
@@ -14798,6 +15203,7 @@ const Database = {
     pushTidyPreviewGroup(deleteGroups, telegramAlertStateKeys.length > 0, "telegram_alert_state", "旧版 Telegram 告警冷却状态", telegramAlertStateKeys, telegramAlertStateKeys.length, "会删除 sys:telegram_alert_state:v1，后续只保留 D1 sys_status scope。");
     pushTidyPreviewGroup(deleteGroups, scheduledLockKeys.length > 0, "scheduled_lock", "旧版定时租约键", scheduledLockKeys, scheduledLockKeys.length, "会删除 sys:scheduled_lock:v1，后续只保留 D1 sys_locks。");
     pushTidyPreviewGroup(deleteGroups, dnsFetchLockKeys.length > 0, "dns_fetch_lock", "旧版 DNS 抓取锁键", dnsFetchLockKeys, dnsFetchLockKeys.length, "会删除 sys:dns_ip_pool_fetch_lock:v1:*，后续只保留 D1 sys_locks。");
+    pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只删除当前配置和保留快照都不再引用的内容寻址 index.html。");
 
     const rewriteGroups = [];
     if (configRewriteNeeded) {
@@ -15416,20 +15822,14 @@ const Database = {
     }
     return revisions;
   },
-  async pruneUnreferencedAdminIndexUploads(kv, config = {}) {
-    if (!kv) return [];
-    const [snapshots, keys] = await Promise.all([
-      this.getConfigSnapshotsForRead(kv, { withConfig: true }),
-      this.listKvKeysStrict(kv, { prefix: this.ADMIN_INDEX_UPLOAD_PREFIX })
-    ]);
+  collectUnreferencedAdminIndexUploadKeys(config = {}, snapshots = [], keys = []) {
     const referencedRevisions = this.collectReferencedAdminIndexUploadRevisions(config, snapshots);
-    const removableKeys = keys.filter((key) => {
+    return (Array.isArray(keys) ? keys : []).filter((key) => {
       const keyName = String(key || "").trim();
+      if (!keyName.startsWith(this.ADMIN_INDEX_UPLOAD_PREFIX)) return false;
       const revision = normalizeAdminLocalIndexRevision(keyName.slice(this.ADMIN_INDEX_UPLOAD_PREFIX.length));
       return revision && !referencedRevisions.has(revision);
     });
-    await Promise.all(removableKeys.map(key => kv.delete(key)));
-    return removableKeys;
   },
   async persistAdminIndexUpload(record = {}, options = {}) {
     const { env, kv, ctx } = options;
@@ -15475,7 +15875,7 @@ const Database = {
             note: persistedRecord.fileName
           }
         });
-        return { config: savedConfig, record: persistedRecord };
+        return { config: savedConfig, previousConfig: currentConfig, record: persistedRecord };
       } catch (error) {
         if (!existingRecord) {
           await withNonCriticalFallback(
@@ -15489,6 +15889,45 @@ const Database = {
         }
         throw error;
       }
+    });
+  },
+  async rollbackAdminIndexUploadActivation(previousConfig = {}, activatedConfig = {}, options = {}) {
+    const { env, kv, ctx } = options;
+    if (!kv) {
+      const error = new Error("KV namespace is required to roll back the local admin index");
+      error.code = "KV_NOT_CONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    return await runKvDataMutation(async () => {
+      const currentConfig = env
+        ? await getRuntimeConfigStrict(env)
+        : sanitizeRuntimeConfig(await kvGetStrict(kv, this.CONFIG_KEY, { type: "json" }) || {});
+      const activatedRevision = parseAdminLocalIndexSourceUrl(activatedConfig?.indexUrl || "");
+      const currentRevision = parseAdminLocalIndexSourceUrl(currentConfig?.indexUrl || "");
+      if (!activatedRevision || currentRevision !== activatedRevision) {
+        return {
+          config: currentConfig,
+          skipped: true,
+          reason: currentRevision ? "superseded_by_newer_admin_index" : "admin_index_already_restored"
+        };
+      }
+      const previousIndexRevision = parseAdminLocalIndexSourceUrl(previousConfig?.indexUrl || "");
+      const restoredConfig = await this.commitRuntimeConfig({
+        ...currentConfig,
+        indexUrl: previousIndexRevision ? buildAdminLocalIndexSourceUrl(previousIndexRevision) : ""
+      }, {
+        env,
+        kv,
+        ctx,
+        snapshotMeta: {
+          reason: "rollback_worker_html_update",
+          section: "static_assets_policy",
+          source: "worker_html_upload",
+          actor: "system"
+        }
+      });
+      return { config: restoredConfig, skipped: false, reason: "" };
     });
   },
   async clearConfigSnapshots(kv) {
@@ -15748,6 +16187,12 @@ const Database = {
     for (const key of this.buildLegacyConfigCacheKeys(prevConfig, nextConfig)) {
       mutationPlan.push({ type: "delete", key, value: "" });
     }
+    const previouslyReferencedRevisions = this.collectReferencedAdminIndexUploadRevisions(prevConfig, currentSnapshots);
+    const retainedRevisions = this.collectReferencedAdminIndexUploadRevisions(nextConfig, nextSnapshots);
+    for (const revision of previouslyReferencedRevisions) {
+      if (retainedRevisions.has(revision)) continue;
+      mutationPlan.push({ type: "delete", key: this.buildAdminIndexUploadKey(revision), value: "" });
+    }
     return mutationPlan;
   },
   async commitRuntimeConfig(rawConfig, options = {}) {
@@ -15778,6 +16223,13 @@ const Database = {
       await this.applyKvMutationsWithRollback(kv, mutationPlan);
       if (env) primeRuntimeConfigCache(env, nextConfig);
       else invalidateRuntimeConfigCache();
+      if (
+        String(prevConfig.mediaAggregationEmbyUsername || "") !== String(nextConfig.mediaAggregationEmbyUsername || "")
+        || String(prevConfig.mediaAggregationEmbyPassword || "") !== String(nextConfig.mediaAggregationEmbyPassword || "")
+        || serializeConfigValue(prevConfig.mediaAggregationNodes || []) !== serializeConfigValue(nextConfig.mediaAggregationNodes || [])
+      ) {
+        GLOBALS.MediaAggregationAuthCache.clear();
+      }
       await this.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig, nextConfig });
       return nextConfig;
     } catch (error) {
@@ -15833,13 +16285,26 @@ const Database = {
       removedNames: options.removedNames,
       allowedNames: options.allowedNames
     });
-    if (serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection)) return currentConfig;
-    return this.commitRuntimeConfig({ ...currentConfig, sourceDirectNodes: nextSelection }, {
+    const currentAggregationSelection = normalizeNodeNameList(currentConfig.mediaAggregationNodes || []);
+    const nextAggregationSelection = reconcileNamedNodeSelection(currentAggregationSelection, {
+      renameMap: options.renameMap,
+      removedNames: options.removedNames,
+      allowedNames: options.allowedNames
+    });
+    if (
+      serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection)
+      && serializeConfigValue(currentAggregationSelection) === serializeConfigValue(nextAggregationSelection)
+    ) return currentConfig;
+    return this.commitRuntimeConfig({
+      ...currentConfig,
+      sourceDirectNodes: nextSelection,
+      mediaAggregationNodes: nextAggregationSelection
+    }, {
       env,
       kv,
       ctx,
       snapshotMeta: {
-        reason: "sync_source_direct_nodes",
+        reason: "sync_node_shortcut_selections",
         section: "proxy",
         source: String(options.source || "node_mutation"),
         actor: "admin",
@@ -15983,6 +16448,48 @@ const Database = {
         reportKinds,
         messages: sentMessages
       };
+  },
+  async maybeSendServerExpiryWarnings(env, options = {}) {
+    const db = this.getDB(env);
+    const kv = this.getKV(env);
+    const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
+    if (!db || !kv) return { sent: false, reason: "storage_unavailable" };
+    const snapshot = await this.getServerRecordsSnapshotPayload(env, {
+      db,
+      kv,
+      ctx: options?.ctx,
+      config,
+      skipProbe: true,
+      now: options?.now
+    });
+    const refreshedCount = Array.isArray(snapshot.records) ? snapshot.records.length : 0;
+    if (config.tgServerExpiryWarningEnabled !== true) return { sent: false, reason: "disabled", refreshedCount };
+    const tgBotToken = String(config.tgBotToken || "").trim();
+    const tgChatId = String(config.tgChatId || "").trim();
+    if (!tgBotToken || !tgChatId) return { sent: false, reason: "telegram_not_configured", refreshedCount };
+    const warningDays = Array.isArray(config.tgServerExpiryWarningDays) && config.tgServerExpiryWarningDays.length
+      ? config.tgServerExpiryWarningDays : Config.Defaults.TgServerExpiryWarningDays;
+    const due = (snapshot.records || []).map(record => {
+      const days = record?.expiry?.daysRemaining;
+      if (!Number.isInteger(days) || !warningDays.includes(days)) return null;
+      const lastWatchedAt = record?.expiry?.mode === "rolling"
+        ? String(record?.watch?.lastWatchedAt || "").trim()
+        : "";
+      return { record, days, signature: `${record.nodeName}|${lastWatchedAt}|${record.expiry.expiresAt}|${days}` };
+    }).filter(Boolean);
+    if (!due.length) return { sent: false, reason: "no_due_warnings", refreshedCount };
+    const state = await this.getOpsStatusPayloadFromDb(db, "telegram_server_expiry_warnings");
+    const sentSignatures = new Set(Array.isArray(state?.signatures) ? state.signatures : []);
+    const pending = due.filter(item => !sentSignatures.has(item.signature));
+    if (!pending.length) return { sent: false, reason: "already_sent", refreshedCount };
+    const lines = ["⚠️ Emby 服务器过期预警", "", ...pending.map(({ record, days }) => {
+      const label = days < 0 ? `已过期 ${Math.abs(days)} 天` : (days === 0 ? "今天到期" : `${days} 天后到期`);
+      return `- ${record.displayName || record.nodeName}：${label}`;
+    }), "", "#Emby #Expiry"];
+    await this.sendTelegramMessage({ tgBotToken, tgChatId, text: lines.join("\n") });
+    const nextSignatures = [...new Set([...sentSignatures, ...pending.map(item => item.signature)])].slice(-256);
+    await this.putOpsStatusPayloadToDb(db, "telegram_server_expiry_warnings", { signatures: nextSignatures, updatedAt: new Date().toISOString() }, Date.now());
+    return { sent: true, issueCount: pending.length, refreshedCount, reason: "warning_sent" };
   },
   async maybeSendRuntimeAlerts(env, scheduledState = null, options = {}) {
       const db = this.getDB(env);
@@ -16300,6 +16807,314 @@ const Database = {
     if (ttlMs <= 0) return false;
     return nowMs() - checkedAt < ttlMs;
   },
+  buildServerRecordAccessUrl(nodeName = "", node = {}, env = null, request = null) {
+    const name = String(nodeName || node?.name || "").trim().toLowerCase();
+    if (!name) return "";
+    if (isHostPrefixEntryMode(node?.entryMode)) {
+      const hostRoot = resolveConfiguredHost(env);
+      return hostRoot ? `https://${name}.${hostRoot}` : "";
+    }
+    let origin = "";
+    try { origin = new URL(request?.url || "").origin; } catch {}
+    if (!origin) return "";
+    const secret = String(node?.secret || "").trim();
+    return `${origin}/${encodeURIComponent(name)}${secret ? `/${encodeURIComponent(secret)}` : ""}`;
+  },
+  buildServerRecordRequestHeaders(node = {}) {
+    const headers = new Headers();
+    for (const [name, value] of normalizeLooseHeaderEntries(this.sanitizeHeaders(node?.headers))) {
+      const normalizedName = String(name || "").trim();
+      if (!normalizedName || DROP_REQUEST_HEADER_SET.has(normalizedName.toLowerCase())) continue;
+      headers.set(normalizedName, String(value ?? ""));
+    }
+    headers.set("Accept", "application/json");
+    return headers;
+  },
+  async fetchServerRecordEndpoint(targetRecord, path = "/", headers = new Headers(), options = {}) {
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs) || SERVER_RECORDS_PROBE_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort("server_record_timeout"), timeoutMs);
+    const startedAt = nowMs();
+    try {
+      const url = buildUpstreamProxyUrl(targetRecord, path);
+      if (options.query && typeof options.query === "object") {
+        for (const [name, value] of Object.entries(options.query)) url.searchParams.set(name, String(value));
+      }
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        headers: new Headers(headers),
+        cache: "no-store",
+        signal: controller.signal
+      });
+      let json = null;
+      let parseError = false;
+      if (options.expectJson === true && response.status !== 204) {
+        const body = await readResponseTextWithLimit(response, 512 * 1024);
+        if (body.exceeded) parseError = true;
+        else if (body.text.trim()) {
+          try { json = JSON.parse(body.text); } catch { parseError = true; }
+        }
+      } else {
+        try { response.body?.cancel?.(); } catch {}
+      }
+      return {
+        ok: response.ok,
+        status: response.status,
+        json,
+        parseError,
+        latencyMs: Math.max(0, nowMs() - startedAt)
+      };
+    } catch (error) {
+      const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
+      const wrapped = new Error(timedOut ? "server_record_timeout" : "server_record_network_error");
+      wrapped.code = timedOut ? "SERVER_RECORD_TIMEOUT" : "SERVER_RECORD_NETWORK_ERROR";
+      throw wrapped;
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+  normalizeServerRecordRuntimeError(error = null, status = 0) {
+    if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
+    if (status === 401 || status === 403) return "unauthorized";
+    return "offline";
+  },
+  async probeServerRecord(nodeName = "", node = {}) {
+    const checkedAt = new Date().toISOString();
+    const fallback = {
+      runtime: {
+        state: "offline",
+        latencyMs: null,
+        serverId: "",
+        version: "",
+        detailsLimited: false,
+        checkedAt,
+        errorCode: "upstream_unavailable"
+      },
+      counts: {
+        movies: null,
+        series: null,
+        episodes: null,
+        state: "unavailable",
+        errors: { movies: "not_checked", series: "not_checked", episodes: "not_checked" }
+      }
+    };
+    const headers = this.buildServerRecordRequestHeaders(node);
+    const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
+    if (!targetRecords.length) return fallback;
+
+    let selectedTarget = null;
+    let systemInfo = null;
+    let runtimeState = "offline";
+    let runtimeErrorCode = "upstream_unavailable";
+    let latencyMs = null;
+    let detailsLimited = false;
+    let unauthorizedTarget = null;
+    for (const targetRecord of targetRecords) {
+      try {
+        const ping = await this.fetchServerRecordEndpoint(targetRecord, "/System/Ping", headers);
+        latencyMs = ping.latencyMs;
+        if (ping.ok) {
+          selectedTarget = targetRecord;
+          runtimeState = "online";
+          runtimeErrorCode = "";
+          break;
+        }
+        if (ping.status === 401 || ping.status === 403) {
+          if (!unauthorizedTarget) {
+            unauthorizedTarget = { targetRecord, latencyMs: ping.latencyMs, status: ping.status };
+          }
+          continue;
+        }
+        runtimeState = "offline";
+        runtimeErrorCode = `http_${ping.status || 0}`;
+      } catch (error) {
+        runtimeState = this.normalizeServerRecordRuntimeError(error);
+        runtimeErrorCode = String(error?.code || "upstream_unavailable").toLowerCase();
+      }
+    }
+
+    if (!selectedTarget && unauthorizedTarget) {
+      selectedTarget = unauthorizedTarget.targetRecord;
+      latencyMs = unauthorizedTarget.latencyMs;
+      runtimeState = "unauthorized";
+      runtimeErrorCode = `http_${unauthorizedTarget.status}`;
+      detailsLimited = true;
+    }
+
+    if (!selectedTarget) {
+      return {
+        ...fallback,
+        runtime: { ...fallback.runtime, state: runtimeState, latencyMs, checkedAt, errorCode: runtimeErrorCode }
+      };
+    }
+
+    if (runtimeState !== "online") {
+      return {
+        ...fallback,
+        runtime: {
+          ...fallback.runtime,
+          state: runtimeState,
+          latencyMs,
+          detailsLimited,
+          checkedAt,
+          errorCode: runtimeErrorCode
+        },
+        counts: {
+          ...fallback.counts,
+          errors: { movies: "unauthorized", series: "unauthorized", episodes: "unauthorized" }
+        }
+      };
+    }
+
+    const countTypes = [["movies", "Movie"], ["series", "Series"], ["episodes", "Episode"]];
+    const [infoResult, countResults] = await Promise.all([
+      this.fetchServerRecordEndpoint(selectedTarget, "/System/Info", headers, { expectJson: true })
+        .catch(error => ({
+          ok: false,
+          status: 0,
+          json: null,
+          parseError: true,
+          errorCode: String(error?.code || "upstream_unavailable").toLowerCase()
+        })),
+      Promise.all(countTypes.map(async ([key, itemType]) => {
+        try {
+          const result = await this.fetchServerRecordEndpoint(selectedTarget, "/Items", headers, {
+            expectJson: true,
+            query: { IncludeItemTypes: itemType, Recursive: "true", Limit: "1" }
+          });
+          const total = Number(result?.json?.TotalRecordCount);
+          if (!result.ok) return { key, value: null, error: `http_${result.status || 0}` };
+          if (result.parseError || !Number.isFinite(total) || total < 0) return { key, value: null, error: "invalid_response" };
+          return { key, value: Math.trunc(total), error: "" };
+        } catch (error) {
+          return { key, value: null, error: String(error?.code || "upstream_unavailable").toLowerCase() };
+        }
+      }))
+    ]);
+    if (infoResult.ok && !infoResult.parseError && isPlainObject(infoResult.json)) {
+      systemInfo = infoResult.json;
+    } else {
+      detailsLimited = true;
+    }
+    const counts = { movies: null, series: null, episodes: null };
+    const errors = {};
+    let successCount = 0;
+    for (const result of countResults) {
+      counts[result.key] = result.value;
+      if (result.error) errors[result.key] = result.error;
+      else successCount += 1;
+    }
+    return {
+      runtime: {
+        state: runtimeState,
+        latencyMs,
+        serverId: String(systemInfo?.Id || "").trim(),
+        version: String(systemInfo?.Version || "").trim(),
+        detailsLimited,
+        checkedAt,
+        errorCode: runtimeErrorCode
+      },
+      counts: {
+        ...counts,
+        state: successCount === countTypes.length ? "ok" : (successCount > 0 ? "partial" : "unavailable"),
+        errors
+      }
+    };
+  },
+  async getServerRecordProbe(nodeName = "", node = {}, options = {}) {
+    const name = String(nodeName || "").trim().toLowerCase();
+    const revision = String(node?.cacheRevision || buildNodeDerivedCacheRevision(name, node)).trim();
+    const cached = GLOBALS.ServerRecordsSnapshotCache.get(name);
+    if (options.forceRefresh !== true && cached && cached.revision === revision && Number(cached.expiresAt) > nowMs()) {
+      touchMapEntry(GLOBALS.ServerRecordsSnapshotCache, name);
+      return cached.value;
+    }
+    const value = await this.probeServerRecord(name, node);
+    setBoundedMapEntry(GLOBALS.ServerRecordsSnapshotCache, name, {
+      revision,
+      expiresAt: nowMs() + DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
+      value
+    }, Config.Defaults.ServerRecordsSnapshotMax);
+    return value;
+  },
+  async getServerRecordsSnapshotPayload(env, options = {}) {
+    const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
+    const summaries = await CacheManager.getNodesListStrict(env, options.ctx);
+    const availableNodes = (Array.isArray(summaries) ? summaries : []).map(node => {
+      const settings = normalizeServerRecordSettings(node?.serverRecord, {
+        defaultExpiryDays: config.serverRecordExpiryDays
+      });
+      return {
+        nodeName: String(node?.name || "").trim().toLowerCase(),
+        displayName: String(node?.displayName || node?.name || "").trim(),
+        accessUrl: this.buildServerRecordAccessUrl(node?.name, node, env, options.request),
+        tags: normalizeNodeTags(node?.tags, node?.tag),
+        enabled: settings.enabled,
+        expiryEnabled: settings.expiryEnabled,
+        expiryMode: settings.expiryMode,
+        expiresAt: settings.expiresAt,
+        expiryDays: settings.expiryDays
+      };
+    }).filter(node => node.nodeName);
+    const enabledNodes = availableNodes.filter(node => node.enabled);
+    const probes = new Map();
+    const refreshNodeName = String(options?.refreshNodeName || "").trim().toLowerCase();
+    const recordNodes = refreshNodeName
+      ? enabledNodes.filter(node => node.nodeName === refreshNodeName)
+      : enabledNodes;
+    const probeNodes = options.skipProbe === true
+      ? []
+      : recordNodes;
+    const probedNodeNames = new Set(probeNodes.map(node => node.nodeName));
+    if (options.skipProbe !== true) {
+      const fullNodes = new Map();
+      await runWithConcurrency(probeNodes, SERVER_RECORDS_PROBE_CONCURRENCY, async (summary) => {
+        const node = await this.getNodeForRead(summary.nodeName, env);
+        if (node) fullNodes.set(summary.nodeName, node);
+      });
+      await runWithConcurrency(probeNodes, SERVER_RECORDS_PROBE_CONCURRENCY, async (summary) => {
+        const node = fullNodes.get(summary.nodeName);
+        probes.set(summary.nodeName, node
+          ? await this.getServerRecordProbe(summary.nodeName, node, { forceRefresh: options.forceRefresh === true })
+          : await this.probeServerRecord(summary.nodeName, {}));
+      });
+    }
+
+    let lastWatchByNode = new Map();
+    let watchState = options.db ? "ok" : "unavailable";
+    if (options.db && recordNodes.length > 0) {
+      try {
+        lastWatchByNode = await this.getServerLastWatch(options.db, recordNodes.map(node => node.nodeName));
+      } catch (error) {
+        watchState = "unavailable";
+        console.error("server last watch read failed", error);
+      }
+    }
+    return {
+      records: recordNodes.map((summary) => {
+        const probe = probes.get(summary.nodeName) || {};
+        const watch = lastWatchByNode.get(summary.nodeName) || {};
+        const probeRequested = probedNodeNames.has(summary.nodeName);
+        return {
+          ...summary,
+          runtime: probe.runtime || {
+            state: probeRequested ? "offline" : "not_checked",
+            checkedAt: "",
+            errorCode: probeRequested ? "node_not_found" : "manual_refresh_required"
+          },
+          counts: probe.counts || { movies: null, series: null, episodes: null, state: "unavailable", errors: {} },
+          watch: {
+            lastWatchedAt: String(watch.lastWatchedAt || ""),
+            state: watchState
+          },
+          expiry: buildServerRecordExpiry(summary, watch.lastWatchedAt, config, options?.now || new Date())
+        };
+      }),
+      availableNodes,
+      refreshedAt: new Date().toISOString(),
+      cacheTtlMs: DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS
+    };
+  },
   async pingTarget(target, timeoutMs, options = {}) {
     const controller = new AbortController();
     const startedAt = nowMs();
@@ -16340,7 +17155,15 @@ const Database = {
       changed = true;
     }
     if (n.secret === undefined) { n.secret = ""; changed = true; }
-    if (n.tag === undefined) { n.tag = ""; changed = true; }
+    const normalizedTags = normalizeNodeTags(n.tags, n.tag);
+    const legacyTag = normalizedTags[0] || "";
+    if (JSON.stringify(normalizedTags) !== JSON.stringify(Array.isArray(n.tags) ? n.tags : [])) changed = true;
+    if (String(n.tag || "") !== legacyTag) changed = true;
+    n.tags = normalizedTags;
+    n.tag = legacyTag;
+    const normalizedServerRecord = normalizeServerRecordSettings(n.serverRecord);
+    if (JSON.stringify(normalizedServerRecord) !== JSON.stringify(isPlainObject(n.serverRecord) ? n.serverRecord : {})) changed = true;
+    n.serverRecord = normalizedServerRecord;
     if (n.remark === undefined) { n.remark = ""; changed = true; }
     if (n.tagColor === undefined) { n.tagColor = ""; changed = true; }
     if (n.remarkColor === undefined) { n.remarkColor = ""; changed = true; }
@@ -16363,6 +17186,21 @@ const Database = {
     const normalizedMediaAuthMode = normalizeNodeMediaAuthMode(n.mediaAuthMode);
     if (String(n.mediaAuthMode || "") !== normalizedMediaAuthMode) changed = true;
     n.mediaAuthMode = normalizedMediaAuthMode;
+    const inheritedMediaAggregationCredentialFlag = n.mediaAggregationEmbyCredentialsConfigured === true
+      && !Object.prototype.hasOwnProperty.call(n, "mediaAggregationEmbyUsername")
+      && !Object.prototype.hasOwnProperty.call(n, "mediaAggregationEmbyPassword");
+    const normalizedMediaAggregationEmbyUsername = String(n.mediaAggregationEmbyUsername ?? "").trim();
+    const normalizedMediaAggregationEmbyPassword = String(n.mediaAggregationEmbyPassword ?? "");
+    const normalizedMediaAggregationCredentialsConfigured = Boolean(
+      (normalizedMediaAggregationEmbyUsername && normalizedMediaAggregationEmbyPassword.length > 0)
+      || inheritedMediaAggregationCredentialFlag
+    );
+    if (String(n.mediaAggregationEmbyUsername ?? "") !== normalizedMediaAggregationEmbyUsername) changed = true;
+    if (String(n.mediaAggregationEmbyPassword ?? "") !== normalizedMediaAggregationEmbyPassword) changed = true;
+    if (n.mediaAggregationEmbyCredentialsConfigured !== normalizedMediaAggregationCredentialsConfigured) changed = true;
+    n.mediaAggregationEmbyUsername = normalizedMediaAggregationEmbyUsername;
+    n.mediaAggregationEmbyPassword = normalizedMediaAggregationEmbyPassword;
+    n.mediaAggregationEmbyCredentialsConfigured = normalizedMediaAggregationCredentialsConfigured;
     const normalizedRealClientIpMode = normalizeNodeRealClientIpMode(n.realClientIpMode);
     if (String(n.realClientIpMode || "") !== normalizedRealClientIpMode) changed = true;
     n.realClientIpMode = normalizedRealClientIpMode;
@@ -16401,7 +17239,7 @@ const Database = {
     n.headers = normalizedHeaders;
     delete n.videoThrottling;
     delete n.interceptMs;
-    if (n.schemaVersion !== 5) { n.schemaVersion = 5; changed = true; }
+    if (n.schemaVersion !== 6) { n.schemaVersion = 6; changed = true; }
     if (Object.prototype.hasOwnProperty.call(n, "createdAt")) { delete n.createdAt; changed = true; }
     if (Object.prototype.hasOwnProperty.call(n, "updatedAt")) { delete n.updatedAt; changed = true; }
     return { data: n, changed };
@@ -16473,12 +17311,25 @@ const Database = {
         : existingNode.hostPrefixCnameTarget,
       secret: rawNode?.secret !== undefined ? rawNode.secret : (existingNode.secret || ""),
       tag: rawNode?.tag !== undefined ? rawNode.tag : (existingNode.tag || ""),
+      tags: rawNode?.tags !== undefined
+        ? rawNode.tags
+        : (rawNode?.tag !== undefined
+            ? [rawNode.tag, ...normalizeNodeTags(existingNode.tags, existingNode.tag)
+                .filter(tag => tag.toLowerCase() !== String(existingNode.tag || "").trim().toLowerCase())]
+            : existingNode.tags),
       remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
+      serverRecord: rawNode?.serverRecord !== undefined ? rawNode.serverRecord : existingNode.serverRecord,
       tagColor: rawNode?.tagColor !== undefined ? String(rawNode.tagColor || "").trim() : (existingNode.tagColor || ""),
       remarkColor: rawNode?.remarkColor !== undefined ? String(rawNode.remarkColor || "").trim() : (existingNode.remarkColor || ""),
       displayName: rawNode?.displayName !== undefined ? String(rawNode.displayName || "").trim() : (existingNode.displayName || ""),
       playbackInfoMode: rawNode?.playbackInfoMode !== undefined ? normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode) : normalizeNodePlaybackInfoMode(existingNode.playbackInfoMode),
       mediaAuthMode: rawNode?.mediaAuthMode !== undefined ? normalizeNodeMediaAuthMode(rawNode.mediaAuthMode) : normalizeNodeMediaAuthMode(existingNode.mediaAuthMode),
+      mediaAggregationEmbyUsername: rawNode?.mediaAggregationEmbyUsername !== undefined
+        ? String(rawNode.mediaAggregationEmbyUsername || "").trim()
+        : String(existingNode.mediaAggregationEmbyUsername || "").trim(),
+      mediaAggregationEmbyPassword: rawNode?.mediaAggregationEmbyPassword !== undefined
+        ? String(rawNode.mediaAggregationEmbyPassword || "")
+        : String(existingNode.mediaAggregationEmbyPassword || ""),
       realClientIpMode: rawNode?.realClientIpMode !== undefined ? normalizeNodeRealClientIpMode(rawNode.realClientIpMode) : normalizeNodeRealClientIpMode(existingNode.realClientIpMode),
       hedgeProbePath: rawNode?.hedgeProbePath !== undefined ? normalizeNodeHedgeProbePath(rawNode.hedgeProbePath) : normalizeNodeHedgeProbePath(existingNode.hedgeProbePath),
       routingDecisionMode: rawNode?.routingDecisionMode !== undefined
@@ -16488,7 +17339,7 @@ const Database = {
         ? normalizeNodeMainVideoStreamMode(rawMainVideoStreamMode)
         : readNodeMainVideoStreamMode(existingNode),
       headers: this.sanitizeHeaders(parsedHeaders),
-      schemaVersion: 5
+      schemaVersion: 6
     }).data;
     const normalizedExistingNode = this.normalizeNode(name, existingNode || {}).data;
     return nextNode;
@@ -16904,7 +17755,7 @@ const Database = {
   // 读取导航：
   // - 面板统计 / 运行状态：getDashboardStats / getMonthlyTrafficStats / getRuntimeStatus
   // - 配置与备份：loadConfig / previewConfig / saveConfig / uploadAdminIndex / updateWorkerAndAdminIndex / exportConfig / exportSettings / importSettings / importFull
-  // - 节点治理：list / saveOrImport / delete / pingNode
+  // - 节点治理：list / saveOrImport / delete / pingNode / getServerRecordsSnapshot / saveServerRecordSettings
   // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
   // 设计意图：
   // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
@@ -17380,20 +18231,18 @@ const Database = {
         );
       } catch (error) {
         let rollbackSucceeded = false;
+        let rollbackSkipped = false;
+        let rollbackReason = "";
         let rollbackError = "";
         try {
-          await Database.commitRuntimeConfig(config, {
-            env,
-            kv,
-            ctx,
-            snapshotMeta: {
-              reason: "rollback_worker_html_update",
-              section: "static_assets_policy",
-              source: "worker_html_upload",
-              actor: "system"
-            }
-          });
+          const rollbackResult = await Database.rollbackAdminIndexUploadActivation(
+            persistedIndex.previousConfig,
+            persistedIndex.config,
+            { env, kv, ctx }
+          );
           rollbackSucceeded = true;
+          rollbackSkipped = rollbackResult.skipped === true;
+          rollbackReason = String(rollbackResult.reason || "").trim();
         } catch (restoreError) {
           rollbackError = getErrorMessage(restoreError, "rollback_failed");
         }
@@ -17405,6 +18254,8 @@ const Database = {
             ...(isPlainObject(error?.details) ? error.details : {}),
             htmlRollbackAttempted: true,
             htmlRollbackSucceeded: rollbackSucceeded,
+            htmlRollbackSkipped: rollbackSkipped,
+            htmlRollbackReason: rollbackReason,
             htmlRollbackError: rollbackError
           }
         );
@@ -17504,10 +18355,11 @@ const Database = {
       const adminIndexUpload = kv && indexState.localUploadRevision
         ? await Database.getAdminIndexUploadRecord(kv, indexState.localUploadRevision)
         : null;
-      return jsonResponse({ 
+      const storedNodes = kv ? (await Database.loadAllNodeEntitiesFromKvStrict(kv, { ctx })).filter(Boolean) : [];
+      const backupPayload = {
         version: Config.Defaults.Version, 
         exportTime: new Date().toISOString(), 
-        nodes: kv ? (await Database.loadAllNodeEntitiesFromKvStrict(kv, { ctx })).filter(Boolean) : [],
+        nodes: includeSecrets ? storedNodes : storedNodes.map(redactMediaAggregationNodeCredentials),
         config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
         adminIndexUpload: adminIndexUpload
           ? {
@@ -17521,7 +18373,25 @@ const Database = {
           : null,
         secretsRedacted: includeSecrets !== true,
         containsSecrets: includeSecrets === true
-      });
+      };
+      const importRequestBytes = new TextEncoder().encode(JSON.stringify({
+        action: "importFull",
+        ...backupPayload
+      })).length;
+      if (importRequestBytes > ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES) {
+        return jsonError(
+          "FULL_BACKUP_TOO_LARGE",
+          "完整备份超过安全回导上限，请先分别导出节点与设置并精简超大节点字段",
+          413,
+          {
+            importRequestBytes,
+            maxBytes: ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES,
+            nodeCount: backupPayload.nodes.length,
+            adminIndexBytes: Number(adminIndexUpload?.bytes) || 0
+          }
+        );
+      }
+      return jsonResponse(backupPayload);
     },
 
     async exportSettings(data, { env, request }) {
@@ -17675,14 +18545,126 @@ const Database = {
       }
     },
 
+    async getServerRecordsSnapshot(data, { env, ctx, db, request }) {
+      try {
+        return jsonResponse(await Database.getServerRecordsSnapshotPayload(env, {
+          ctx,
+          db,
+          request,
+          forceRefresh: data?.forceRefresh === true,
+          skipProbe: data?.forceRefresh !== true,
+          refreshNodeName: String(data?.nodeName || "").trim().toLowerCase()
+        }));
+      } catch (error) {
+        throw remapAdminReadKvError(error, "SERVER_RECORDS_READ_FAILED", "服务器记录读取失败：节点数据不可用", "admin.read.server_records");
+      }
+    },
+    async getDashboardD1WriteHotspot(data, { env, ctx }) {
+      const config = await getRuntimeConfigStrict(env);
+      return jsonResponse(await Database.buildDashboardD1WriteHotspotPayload(env, { config, nowMs: nowMs() }));
+    },
+    async getDashboardCoreStats(data, { env, ctx, kv, db }) {
+      const config = await getRuntimeConfigStrict(env);
+      return jsonResponse(await Database.buildDashboardStatsPayload(env, {
+        ctx,
+        kv,
+        db,
+        config,
+        skipD1WriteHotspot: true
+      }));
+    },
+    async getDashboardCachedSnapshot(data, { env, db }) {
+      const config = await getRuntimeConfigStrict(env);
+      return jsonResponse({
+        snapshot: await Database.getDashboardCachedSnapshotPayload(env, { db, config })
+      });
+    },
+
+    async saveServerRecordSettings(data, { env, ctx, kv, db }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+      const nodeName = String(data?.nodeName || "").trim().toLowerCase();
+      if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请选择服务器节点", 400);
+      const rawExpiresAt = String(data?.expiresAt || "").trim();
+      const expiresAt = normalizeServerRecordExpiry(rawExpiresAt);
+      if (rawExpiresAt && !expiresAt) return jsonError("SERVER_RECORD_EXPIRY_INVALID", "预计过期日期无效", 400);
+      const expiryEnabled = typeof data?.expiryEnabled === "boolean"
+        ? data.expiryEnabled
+        : Boolean(expiresAt);
+      const expiryMode = normalizeServerRecordExpiryMode(data?.expiryMode, expiresAt);
+      const rawExpiryDays = String(data?.expiryDays ?? "").trim();
+      const expiryDays = Number.parseInt(rawExpiryDays, 10);
+      const storedExpiryDays = /^\d+$/.test(rawExpiryDays) && Number.isInteger(expiryDays) && expiryDays >= 1 && expiryDays <= 3650
+        ? expiryDays
+        : Config.Defaults.ServerRecordExpiryDays;
+      if (expiryEnabled && expiryMode === "fixed" && !expiresAt) {
+        return jsonError("SERVER_RECORD_EXPIRY_REQUIRED", "固定日期模式必须填写预计过期日期", 400);
+      }
+      if (expiryEnabled && expiryMode === "rolling" && (!/^\d+$/.test(rawExpiryDays) || !Number.isInteger(expiryDays) || expiryDays < 1 || expiryDays > 3650)) {
+        return jsonError("SERVER_RECORD_EXPIRY_DAYS_INVALID", "滚动模式天数必须在 1 到 3650 之间", 400);
+      }
+      const tags = normalizeNodeTags(data?.tags, "");
+      return await runKvDataMutation(async () => {
+        const existingNode = await kv.get(`${Database.PREFIX}${nodeName}`, { type: "json" });
+        if (!existingNode) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
+        const mutation = Database.buildPreparedNodeMutation({
+          name: nodeName,
+          originalName: nodeName,
+          tags,
+          tag: tags[0] || "",
+          serverRecord: {
+            enabled: data?.enabled === true,
+            expiryEnabled,
+            expiryMode,
+            expiresAt: expiryMode === "fixed" ? expiresAt : null,
+            expiryDays: storedExpiryDays
+          }
+        }, existingNode, { previousName: nodeName, nextName: nodeName });
+        if (!mutation) return jsonError("INVALID_TARGET", "节点目标无效", 400);
+        let mutationCommitted = false;
+        try {
+          await Database.applyPreparedNodeMutations([mutation], { env, kv, ctx });
+          mutationCommitted = mutation.nodeChanged === true;
+          const rebuilt = mutationCommitted
+            ? await Database.rebuildNodeIndexesFromKv(kv, { ctx, syncLegacyIndex: false })
+            : null;
+          const nodes = Array.isArray(rebuilt?.summaries)
+            ? rebuilt.summaries
+            : await CacheManager.getNodesListStrict(env, ctx);
+          const node = nodes.find(item => String(item?.name || "").trim().toLowerCase() === nodeName) || null;
+          return jsonResponse({
+            success: true,
+            node,
+            revisions: await Database.getAdminRevisions(env, { ctx, nodes }),
+            watchState: db ? "ok" : "unavailable"
+          });
+        } catch (error) {
+          if (mutationCommitted) {
+            try {
+              await Database.rollbackPreparedNodeMutations([mutation], { env, kv, ctx, rebuildIndexes: true });
+            } catch (rollbackError) {
+              error.details = {
+                ...(isPlainObject(error?.details) ? error.details : {}),
+                rollbackError: getErrorMessage(rollbackError, "rollback_failed")
+              };
+            }
+          }
+          throw error;
+        }
+      });
+    },
+
     async getNode(data, { env, ctx, kv, db }) {
       const nodeName = String(data?.name || "").trim();
       if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请提供节点路径");
       const node = await Database.getNodeForRead(nodeName, env);
       if (!node) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
+      const nodeCredentialsConfigured = readMediaAggregationCredentialPair(node).configured;
+      const adminNode = { name: nodeName.toLowerCase(), ...node };
+      delete adminNode.mediaAggregationEmbyPassword;
+      adminNode.mediaAggregationEmbyCredentialsConfigured = nodeCredentialsConfigured;
       return jsonResponse({
         success: true,
-        node: { name: nodeName.toLowerCase(), ...node },
+        node: adminNode,
         revisions: await Database.getAdminRevisionsForRead({ env, kv, db }, { ctx })
       });
     },
@@ -17727,6 +18709,15 @@ const Database = {
           nextName: name
         });
         if (!mutation) continue;
+        const credentialValidationError = getMediaAggregationNodeCredentialValidationError(mutation.nextNode);
+        if (credentialValidationError) {
+          return jsonError(
+            credentialValidationError.code,
+            credentialValidationError.message,
+            400,
+            { name }
+          );
+        }
         mutation.dnsPlan = Database.buildHostPrefixDnsSyncPlan(
           mutation.previousName,
           mutation.previousNode,
@@ -17968,6 +18959,136 @@ const Database = {
       });
     },
 
+    async saveMediaAggregationPolicyShortcuts(data, { env, ctx, kv }) {
+      if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
+      return await runKvDataMutation(async () => {
+        const currentNodes = await Database.loadAllNodeEntitiesFromKv(kv, { ctx });
+        const allowedNames = Array.isArray(currentNodes) ? currentNodes.map(node => node?.name) : [];
+        const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], { allowedNames });
+        const selectedKeys = new Set(selectedNodeNames.map(name => String(name || "").trim().toLowerCase()).filter(Boolean));
+        const configuredHost = resolveConfiguredHost(env);
+        const currentConfig = await getRuntimeConfigStrict(env);
+        const nextAggregationUsername = Object.prototype.hasOwnProperty.call(data || {}, "username")
+          ? String(data.username || "").trim()
+          : String(currentConfig.mediaAggregationEmbyUsername || "").trim();
+        const nextAggregationPassword = Object.prototype.hasOwnProperty.call(data || {}, "password")
+          ? String(data.password || "")
+          : String(currentConfig.mediaAggregationEmbyPassword || "");
+        const nextBidirectionalProgressEnabled = Object.prototype.hasOwnProperty.call(data || {}, "bidirectionalProgressEnabled")
+          ? data.bidirectionalProgressEnabled === true
+          : currentConfig.mediaAggregationBidirectionalProgressEnabled === true;
+        const nextAggregationConfig = {
+          ...currentConfig,
+          mediaAggregationNodes: selectedNodeNames,
+          mediaAggregationEmbyUsername: nextAggregationUsername,
+          mediaAggregationEmbyPassword: nextAggregationPassword,
+          mediaAggregationBidirectionalProgressEnabled: nextBidirectionalProgressEnabled
+        };
+        const missingCredentialNames = selectedNodeNames.filter((nodeName) => {
+          const node = (Array.isArray(currentNodes) ? currentNodes : [])
+            .find(item => String(item?.name || "").trim().toLowerCase() === nodeName);
+          return !resolveMediaAggregationCredentials(node || {}, nextAggregationConfig).configured;
+        });
+        if (missingCredentialNames.length > 0) {
+          return jsonError(
+            "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED",
+            "已勾选节点没有可用的完整 Emby 账号和密码，请填写节点账号密码或全局账号密码",
+            400,
+            { nodeNames: missingCredentialNames }
+          );
+        }
+        const preparedMutations = [];
+
+        for (const rawNode of Array.isArray(currentNodes) ? currentNodes : []) {
+          if (!isPlainObject(rawNode)) continue;
+          const nodeName = String(rawNode.name || "").trim().toLowerCase();
+          if (!nodeName) continue;
+          const currentMode = normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode);
+          const nextMode = selectedKeys.has(nodeName)
+            ? "rewrite"
+            : (currentMode === "rewrite" ? "inherit" : currentMode);
+          if (nextMode === currentMode) continue;
+          const { name: _ignoredName, ...nodeData } = rawNode;
+          const mutation = Database.buildPreparedNodeMutation({
+            name: nodeName,
+            ...nodeData,
+            playbackInfoMode: nextMode
+          }, rawNode, { previousName: nodeName, nextName: nodeName });
+          if (!mutation) continue;
+          mutation.nextNode = Database.normalizeNode(nodeName, mutation.nextNode || {}, { dropLegacyDirectRouting: true }).data;
+          mutation.dnsPlan = Database.buildHostPrefixDnsSyncPlan(
+            mutation.previousName,
+            mutation.previousNode,
+            mutation.nextName,
+            mutation.nextNode,
+            configuredHost,
+            { config: currentConfig, forceUpsert: true }
+          );
+          preparedMutations.push(mutation);
+        }
+
+        const shouldSyncConfig = serializeConfigValue(currentConfig) !== serializeConfigValue(sanitizeRuntimeConfig(nextAggregationConfig));
+        const configRollbackState = (preparedMutations.length > 0 || shouldSyncConfig)
+          ? await Database.captureRuntimeConfigRollbackState(env, kv)
+          : null;
+        let savedConfig = currentConfig;
+        try {
+          if (preparedMutations.length > 0) {
+            await Database.applyPreparedNodeMutations(preparedMutations, { env, kv, ctx, requestHost: configuredHost });
+            await Database.rebuildNodeIndexesFromKv(kv, { ctx });
+          }
+          if (shouldSyncConfig) {
+            savedConfig = await Database.commitRuntimeConfig(nextAggregationConfig, {
+              env,
+              kv,
+              ctx,
+              snapshotMeta: {
+                reason: "sync_media_aggregation_shortcuts",
+                section: "proxy",
+                source: "ui_shortcut",
+                actor: "admin",
+                note: selectedNodeNames.join(",")
+              }
+            });
+          }
+        } catch (error) {
+          let configRollbackError = "";
+          let nodeRollbackError = "";
+          if (configRollbackState) {
+            try { await Database.restoreCapturedRuntimeConfigState(configRollbackState, { env, kv, ctx }); }
+            catch (restoreError) { configRollbackError = getErrorMessage(restoreError, "config_restore_failed"); }
+          }
+          if (preparedMutations.length > 0) {
+            try {
+              await Database.rollbackPreparedNodeMutations(preparedMutations, {
+                env, kv, ctx, requestHost: configuredHost, rebuildIndexes: true
+              });
+            } catch (rollbackError) { nodeRollbackError = getErrorMessage(rollbackError, "rollback_failed"); }
+          }
+          if (error && typeof error === "object") {
+            error.code = String(error.code || "NODE_MUTATION_FAILED");
+            error.status = normalizeErrorStatus(error.status, 500);
+            error.details = {
+              ...(isPlainObject(error.details) ? error.details : {}),
+              rollbackAttempted: true,
+              configRollbackError,
+              nodeRollbackError
+            };
+          }
+          throw error;
+        }
+        const summaryNodes = await CacheManager.getNodesList(env, ctx);
+        return jsonResponse({
+          success: true,
+          selectedNodeNames,
+          updatedNodeCount: preparedMutations.length,
+          config: savedConfig,
+          nodes: summaryNodes,
+          revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig, nodes: summaryNodes })
+        });
+      });
+    },
+
     async importFull(data, { env, ctx, kv }) {
       const reservedNodeConflict = findReservedNodeNameConflict(data?.nodes, env);
       if (reservedNodeConflict) {
@@ -18039,6 +19160,15 @@ const Database = {
               nextName: name
             });
             if (!mutation) continue;
+            const credentialValidationError = getMediaAggregationNodeCredentialValidationError(mutation.nextNode);
+            if (credentialValidationError) {
+              return jsonError(
+                credentialValidationError.code,
+                credentialValidationError.message,
+                400,
+                { name }
+              );
+            }
             mutation.dnsPlan = Database.buildHostPrefixDnsSyncPlan(
               mutation.previousName,
               mutation.previousNode,
@@ -21011,6 +22141,257 @@ const Proxy = {
       rewriteState: "applied"
     };
   },
+  buildMediaAggregationRequestHeaders(execution, node, targetUrl, auth = null) {
+    const headers = buildMutableHeadersFromLoose(execution?.request?.headers || {});
+    DROP_REQUEST_HEADER_SET.forEach(headerName => headers.delete(headerName));
+    let customCookie = null;
+    for (const [rawName, rawValue] of Object.entries(node?.headers || {})) {
+      const name = String(rawName || "").trim();
+      const lowerName = name.toLowerCase();
+      if (!name || DROP_REQUEST_HEADER_SET.has(lowerName)) continue;
+      if (lowerName === "cookie") customCookie = String(rawValue || "");
+      else headers.set(name, String(rawValue ?? ""));
+    }
+    const mergedCookie = mergeAndSanitizeCookieHeaders(
+      headers.get("Cookie"),
+      customCookie,
+      ["auth_token", ...INTERNAL_PROXY_COOKIE_NAMES]
+    );
+    if (mergedCookie) headers.set("Cookie", mergedCookie);
+    else headers.delete("Cookie");
+    normalizeMediaAuthHeaders(headers, node?.mediaAuthMode);
+    if (targetUrl instanceof URL) {
+      headers.set("X-Forwarded-Host", execution?.requestUrl?.host || targetUrl.host);
+      headers.set("X-Forwarded-Proto", execution?.requestUrl?.protocol?.replace(":", "") || "https");
+    }
+    if (auth?.token) {
+      stripSensitiveProxyAuthHeaders(headers);
+      headers.set("X-Emby-Token", auth.token);
+      headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
+    }
+    return headers;
+  },
+  async fetchMediaAggregationJson(execution, node, proxyPath, search = "", options = {}) {
+    const { targetRecords } = this.parseTargetRecords(node, execution?.finalOrigin || "*");
+    const targetRecord = targetRecords[0];
+    if (!targetRecord) return null;
+    const targetUrl = buildUpstreamProxyUrl(targetRecord, proxyPath);
+    targetUrl.search = String(search || "");
+    const headers = this.buildMediaAggregationRequestHeaders(execution, node, targetUrl, options.auth || null);
+    const method = String(options.method || "GET").toUpperCase();
+    const body = options.body === undefined ? null : options.body;
+    const fetchOptions = {
+      method,
+      headers,
+      redirect: "manual"
+    };
+    if (body !== null && body !== undefined) {
+      fetchOptions.body = body;
+      headers.set("Content-Type", "application/json");
+    }
+    let upstream;
+    try {
+      upstream = await this.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
+        timeoutMs: Math.min(
+          Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS),
+          10000
+        ),
+        requestLifecycle: null
+      });
+      const response = upstream.response;
+      if (!response.ok) {
+        try { await response.body?.cancel?.(); } catch {}
+        return null;
+      }
+      const bodyResult = await readResponseTextWithLimit(response, MEDIA_AGGREGATION_RESPONSE_MAX_BYTES);
+      if (bodyResult.exceeded) return null;
+      let payload = null;
+      try { payload = JSON.parse(bodyResult.text || ""); } catch { return null; }
+      return { payload, targetRecord, finalUrl: upstream.finalUrl };
+    } catch {
+      return null;
+    } finally {
+      try { upstream?.releaseFetchController?.(); } catch {}
+    }
+  },
+  async getMediaAggregationAuth(execution, nodeName, node, apiPrefix = "") {
+    const credentials = resolveMediaAggregationCredentials(node, execution?.currentConfig || {});
+    const username = credentials.username;
+    const password = credentials.password;
+    if (!credentials.configured || !nodeName || !node) return null;
+    const nodeRevision = buildNodeDerivedCacheRevision(nodeName, node);
+    const cacheKey = `media-aggregation-auth:${hashStableText(serializeConfigValue({
+      nodeName,
+      nodeRevision,
+      apiPrefix: String(apiPrefix || ""),
+      credentialSource: credentials.source,
+      username: hashStableText(username),
+      password: hashStableText(password)
+    }))}`;
+    const now = nowMs();
+    const cached = GLOBALS.MediaAggregationAuthCache.get(cacheKey);
+    if (cached && Number(cached.expiresAt) > now && cached.token) {
+      touchMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey);
+      return cached;
+    }
+    const { targetRecords } = this.parseTargetRecords(node, "*");
+    const targetRecord = targetRecords[0];
+    if (!targetRecord) return null;
+    const loginUrl = buildUpstreamProxyUrl(targetRecord, `${String(apiPrefix || "")}/Users/AuthenticateByName`);
+    const headers = this.buildMediaAggregationRequestHeaders(execution, node, loginUrl, null);
+    stripSensitiveProxyAuthHeaders(headers);
+    headers.delete("Cookie");
+    headers.set("Content-Type", "application/json");
+    headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
+    let upstream;
+    try {
+      upstream = await this.performFetchWithTimeout(loginUrl, async () => ({
+        method: "POST",
+        headers,
+        body: JSON.stringify({ Username: username, Pw: password }),
+        redirect: "manual"
+      }), {
+        timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+        requestLifecycle: null
+      });
+      const bodyResult = await readResponseTextWithLimit(upstream.response, 64 * 1024);
+      if (!upstream.response.ok || bodyResult.exceeded) return null;
+      const payload = JSON.parse(bodyResult.text || "{}");
+      const token = String(payload?.AccessToken || payload?.accessToken || payload?.SessionInfo?.AccessToken || "").trim();
+      if (!token) return null;
+      const entry = {
+        nodeName,
+        nodeRevision,
+        token,
+        userId: String(payload?.User?.Id || payload?.user?.Id || "").trim(),
+        expiresAt: now + MEDIA_AGGREGATION_AUTH_TTL_MS
+      };
+      setBoundedMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey, entry, MEDIA_AGGREGATION_AUTH_CACHE_MAX);
+      return entry;
+    } catch {
+      return null;
+    } finally {
+      try { upstream?.releaseFetchController?.(); } catch {}
+    }
+  },
+  async resolveMediaAggregationPrimaryProviderIds(execution, payload, upstreamState) {
+    const directProviderIds = normalizeMediaAggregationProviderIds(payload?.ProviderIds || payload?.providerIds);
+    if (Object.keys(directProviderIds).length) return directProviderIds;
+    const itemPathState = extractPlaybackInfoItemPathState(execution?.proxyPath || "");
+    const itemId = String(execution?.mediaAggregationItemId || itemPathState.itemId || "").trim();
+    if (!itemId) return {};
+    const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
+    const itemPath = `${prefix}/Items/${encodeURIComponent(itemId)}`;
+    const metadataParams = new URLSearchParams();
+    for (const [key, value] of execution?.requestUrl?.searchParams?.entries?.() || []) {
+      if (MEDIA_REDIRECT_AUTH_QUERY_KEYS.has(normalizeWorkerCacheParamName(key))) metadataParams.set(key, value);
+    }
+    metadataParams.set("Fields", "ProviderIds");
+    metadataParams.set("UserData", "false");
+    const targetBase = upstreamState?.activeTargetBase instanceof URL ? upstreamState.activeTargetBase : null;
+    if (!targetBase) return {};
+    const itemUrl = buildUpstreamProxyUrl(targetBase, itemPath);
+    itemUrl.search = metadataParams.toString();
+    const fetchOptions = {
+      method: "GET",
+      headers: this.buildMediaAggregationRequestHeaders(execution, execution.node, itemUrl, null),
+      redirect: "manual"
+    };
+    try {
+      const response = await this.performFetchWithTimeout(itemUrl, async () => fetchOptions, {
+        timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+        requestLifecycle: null
+      });
+      const bodyResult = await readResponseTextWithLimit(response.response, 64 * 1024);
+      const parsed = bodyResult.exceeded ? null : JSON.parse(bodyResult.text || "{}");
+      try { response.response.body?.cancel?.(); } catch {}
+      return normalizeMediaAggregationProviderIds(parsed?.ProviderIds || parsed?.providerIds || parsed?.Items?.[0]?.ProviderIds);
+    } catch {
+      return {};
+    }
+  },
+  async aggregateMediaSources(execution, payload, upstreamState) {
+    const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
+    const currentName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (selectedNames.length < 2 || !selectedNames.includes(currentName)) return { payload, state: "disabled" };
+    const providerIds = await this.resolveMediaAggregationPrimaryProviderIds(execution, payload, upstreamState);
+    if (!Object.keys(providerIds).length) return { payload, state: "provider_ids_missing" };
+    const backupNames = selectedNames.filter(name => name !== currentName).slice(0, MEDIA_AGGREGATION_BACKUP_MAX);
+    const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
+    const providerKey = providerIds.tmdb ? "tmdb" : "imdb";
+    const providerValue = providerIds[providerKey];
+    const results = await Promise.allSettled(backupNames.map(async (backupName) => {
+      const backupNode = await Database.getNode(backupName, execution.env, execution.ctx);
+      if (!backupNode) return null;
+      const auth = await this.getMediaAggregationAuth(execution, backupName, backupNode, prefix);
+      if (!auth) return null;
+      const query = new URLSearchParams({
+        Recursive: "true",
+        IncludeItemTypes: "Movie,Series,Episode",
+        Fields: "ProviderIds,MediaSources",
+        AnyProviderIdEquals: `${providerKey}.${providerValue}`,
+        Limit: "10",
+        UserData: "false"
+      }).toString();
+      const listResult = await this.fetchMediaAggregationJson(execution, backupNode, `${prefix}/Items`, query, { auth });
+      const items = Array.isArray(listResult?.payload?.Items) ? listResult.payload.Items : [];
+      const match = items.find(item => mediaAggregationProviderIdsMatch(providerIds, item?.ProviderIds || item?.providerIds));
+      if (!match?.Id) return null;
+      let sourcePayload = match;
+      if (!Array.isArray(sourcePayload.MediaSources) || !sourcePayload.MediaSources.length) {
+        const playbackQuery = new URLSearchParams({ UserId: auth.userId, AutoOpenLiveStream: "false" }).toString();
+        const playbackResult = await this.fetchMediaAggregationJson(
+          execution,
+          backupNode,
+          `${prefix}/Items/${encodeURIComponent(String(match.Id))}/PlaybackInfo`,
+          playbackQuery,
+          { auth }
+        );
+        sourcePayload = playbackResult?.payload || sourcePayload;
+      }
+      const sources = Array.isArray(sourcePayload.MediaSources) ? sourcePayload.MediaSources : [];
+      if (!sources.length) return null;
+      const backupTargetBase = listResult?.targetRecord?.targetUrl || null;
+      const backupExecution = {
+        ...execution,
+        node: backupNode,
+        nodeName: backupName,
+        nodeKey: backupNode.secret || "",
+        entryMode: normalizeNodeEntryMode(backupNode.entryMode),
+        proxyPath: `${prefix}/Items/${encodeURIComponent(String(match.Id))}/PlaybackInfo`,
+        playbackInfoRewriteUrlMode: "relative",
+        requestUrl: new URL(execution.requestUrl.toString()),
+        rawRequestUrl: new URL(execution.rawRequestUrl?.toString?.() || execution.requestUrl.toString())
+      };
+      const rewritten = this.rewritePlaybackInfoPayload(
+        backupExecution,
+        { MediaSources: sources },
+        backupTargetBase,
+        listResult?.finalUrl || backupTargetBase
+      ).payload;
+      const injected = (Array.isArray(rewritten?.MediaSources) ? rewritten.MediaSources : sources).map((source, index) => {
+        if (!isPlainObject(source)) return null;
+        const sourceId = String(sources[index]?.Id || source?.Id || "").trim();
+        const magicId = buildMediaAggregationSourceId(backupName, String(match.Id), sourceId);
+        if (!magicId) return null;
+        return {
+          ...source,
+          Id: magicId,
+          Name: `${String(backupNode.displayName || backupName).trim() || backupName} · ${String(source.Name || "版本").trim() || "版本"}`
+        };
+      }).filter(Boolean);
+      return injected;
+    }));
+    const injectedSources = results
+      .filter(result => result.status === "fulfilled" && Array.isArray(result.value))
+      .flatMap(result => result.value);
+    if (!injectedSources.length) return { payload, state: "no_backup_match" };
+    return {
+      payload: { ...payload, MediaSources: [...(Array.isArray(payload.MediaSources) ? payload.MediaSources : []), ...injectedSources] },
+      state: "applied",
+      count: injectedSources.length
+    };
+  },
   async maybeRewritePlaybackInfoResponse(execution, upstreamState) {
     if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
     if (normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) !== "rewrite") {
@@ -21061,12 +22442,33 @@ const Proxy = {
         })()
         || new URL(String(execution?.requestUrl || execution?.rawRequestUrl || ""));
       const rewriteResult = this.rewritePlaybackInfoPayload(execution, parsedPayload, upstreamState?.activeTargetBase, responseBaseUrl);
-      execution.playbackInfoRewrite = rewriteResult.rewriteState;
-      if (rewriteResult.rewriteState !== "applied") {
+      let routedPayload = rewriteResult.payload;
+      if (execution?.mediaAggregationRouted === true && execution?.mediaAggregationSource && Array.isArray(routedPayload?.MediaSources)) {
+        const routedSource = execution.mediaAggregationSource;
+        routedPayload = {
+          ...routedPayload,
+          MediaSources: routedPayload.MediaSources.map(source => {
+            if (!isPlainObject(source)) return source;
+            const rawId = String(source.Id || "").trim();
+            const rawParsed = parseMediaAggregationSourceId(rawId);
+            const sourceId = rawParsed?.mediaSourceId || rawId;
+            const magicId = buildMediaAggregationSourceId(routedSource.nodeName, routedSource.itemId, sourceId);
+            return magicId ? { ...source, Id: magicId } : source;
+          })
+        };
+      }
+      const aggregationResult = execution?.mediaAggregationRouted === true
+        ? { payload: routedPayload, state: "routed_playback" }
+        : await this.aggregateMediaSources(execution, routedPayload, upstreamState);
+      execution.mediaAggregationState = aggregationResult.state;
+      execution.playbackInfoRewrite = rewriteResult.rewriteState === "applied" || aggregationResult.state === "applied"
+        ? "applied"
+        : rewriteResult.rewriteState;
+      if (execution.playbackInfoRewrite !== "applied") {
         execution.playbackInfoCacheBody = { text: bodyText, bytes: bodyResult.bytes };
         return upstreamState;
       }
-      const serializedBodyText = JSON.stringify(rewriteResult.payload);
+      const serializedBodyText = JSON.stringify(aggregationResult.payload);
       const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
       execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
         ? { text: serializedBodyText, bytes: serializedBodyBytes }
@@ -22471,7 +23873,10 @@ const Proxy = {
       bodyHash: bodyText ? hashStableText(bodyText) : "",
       authHash: this.buildPlaybackInfoAuthSignature(execution, transport),
       playbackInfoMode: normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode),
-      playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative")
+      playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative"),
+      mediaAggregationNodes: normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []),
+      mediaAggregationAuthIdentity: hashStableText(`${String(execution?.currentConfig?.mediaAggregationEmbyUsername || "")}:${String(execution?.currentConfig?.mediaAggregationEmbyPassword || "")}`),
+      mediaAggregationRouted: execution?.mediaAggregationRouted === true
     };
     const cacheKey = `playback-info:${hashStableText(serializeConfigValue(payload))}`;
     execution.playbackInfoCacheKey = cacheKey;
@@ -22582,6 +23987,7 @@ const Proxy = {
     });
   },
   parsePlaybackSessionControlPayload(execution, transport = null) {
+    if (execution?.playbackSessionControlPayload) return execution.playbackSessionControlPayload;
     const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
     const queryPayload = {};
     if (requestUrl) {
@@ -22598,13 +24004,20 @@ const Proxy = {
       parseError: false
     };
     const requestMethod = execution.requestMethod;
-    if (requestMethod === "GET" || requestMethod === "HEAD") return result;
+    if (requestMethod === "GET" || requestMethod === "HEAD") {
+      if (execution) execution.playbackSessionControlPayload = result;
+      return result;
+    }
     if (transport?.preparedBodyMode === "stream") {
       result.parseError = true;
+      if (execution) execution.playbackSessionControlPayload = result;
       return result;
     }
     const rawBodyText = String(transport?.preparedBodyText || decodeBufferedBodyText(transport?.preparedBody));
-    if (!rawBodyText.trim()) return result;
+    if (!rawBodyText.trim()) {
+      if (execution) execution.playbackSessionControlPayload = result;
+      return result;
+    }
     const contentType = String(transport?.newHeaders?.get("Content-Type") || execution?.request?.headers?.get("Content-Type") || "").toLowerCase();
     try {
       if (contentType.includes("application/json")) {
@@ -22621,6 +24034,7 @@ const Proxy = {
     } catch {
       result.parseError = true;
     }
+    if (execution) execution.playbackSessionControlPayload = result;
     return result;
   },
   resolvePlaybackProgressSessionKey(execution, transport = null) {
@@ -22635,15 +24049,46 @@ const Proxy = {
     const playSessionId = pickValue(["PlaySessionId"]);
     const deviceId = pickValue(["DeviceId"]);
     const itemId = pickValue(["ItemId"]);
+    const nodeName = String(execution?.nodeName || "unknown").trim().toLowerCase() || "unknown";
     let sessionKey = "";
     if (sessionId) sessionKey = `session:${sessionId}`;
     else if (playSessionId) sessionKey = `play:${playSessionId}`;
     else if (deviceId && itemId) sessionKey = `device-item:${deviceId}:${itemId}`;
-    else sessionKey = `fallback:${String(execution?.clientIp || "unknown").trim()}:${String(execution?.proxyPath || "/").trim()}`;
+    else {
+      const requestHeaders = execution?.request?.headers;
+      const credentialIdentity = [
+        requestHeaders?.get?.("Authorization"),
+        requestHeaders?.get?.("X-Emby-Token"),
+        requestHeaders?.get?.("X-MediaBrowser-Token"),
+        requestHeaders?.get?.("X-Emby-Device-Id"),
+        deviceId,
+        execution?.clientIp,
+        itemId
+      ].map(value => String(value || "").trim()).join("|");
+      sessionKey = `fallback:${hashStableText(credentialIdentity)}`;
+    }
     return {
-      sessionKey,
+      sessionKey: `${nodeName}|${sessionKey}`,
       parseError: parsedPayload.parseError === true
     };
+  },
+  scheduleServerLastWatch(execution) {
+    if (execution?.requestTraits?.isPlaybackStoppedRequest !== true) return false;
+    if (String(execution?.requestMethod || "").toUpperCase() !== "POST") return false;
+    if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+    const db = Database.getDB(execution?.env);
+    if (!db) return false;
+    if (!execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
+    const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (!nodeName) return false;
+    const requestStartedAt = Number(execution?.startTime);
+    const eventAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
+    const task = Database.upsertServerLastWatch(db, nodeName, new Date(eventAtMs).toISOString())
+      .catch((error) => {
+        console.error("server last watch write failed", error);
+      });
+    execution.ctx.waitUntil(task);
+    return true;
   },
   buildPlaybackProgressRelayEntry(intervalMs = 0, waitUntilCtx = null) {
     return {
@@ -23756,6 +25201,188 @@ const Proxy = {
       headers: modifiedHeaders
     });
   },
+  applyMediaAggregationAuthToTransport(transport, auth) {
+    if (!transport || !auth?.token) return transport;
+    const headers = new Headers(transport.newHeaders || {});
+    stripSensitiveProxyAuthHeaders(headers);
+    headers.set("X-Emby-Token", auth.token);
+    headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
+    transport.newHeaders = headers;
+    if (transport.transportTemplate) transport.transportTemplate.baseHeaderEntries = [...headers.entries()];
+    return transport;
+  },
+  buildMediaAggregationRoutedBody(transport, source) {
+    if (!transport || transport.preparedBodyMode !== "buffered") return { body: null, bodyText: "" };
+    const contentType = String(transport.newHeaders?.get("Content-Type") || "").toLowerCase();
+    const rawBodyText = String(transport.preparedBodyText || decodeBufferedBodyText(transport.preparedBody));
+    if (!rawBodyText.trim()) return { body: null, bodyText: "" };
+    try {
+      if (contentType.includes("application/json")) {
+        const payload = JSON.parse(rawBodyText);
+        if (!isPlainObject(payload)) return { body: null, bodyText: "" };
+        const keys = Object.keys(payload);
+        const setField = (name, value) => {
+          const existing = keys.find(key => key.toLowerCase() === name.toLowerCase());
+          payload[existing || name] = value;
+        };
+        setField("ItemId", source.itemId);
+        setField("MediaSourceId", source.mediaSourceId);
+        const bodyText = JSON.stringify(payload);
+        return { body: new TextEncoder().encode(bodyText), bodyText };
+      }
+      if (contentType.includes("application/x-www-form-urlencoded")) {
+        const params = new URLSearchParams(rawBodyText);
+        params.set("ItemId", source.itemId);
+        params.set("MediaSourceId", source.mediaSourceId);
+        const bodyText = params.toString();
+        return { body: new TextEncoder().encode(bodyText), bodyText };
+      }
+    } catch {}
+    return { body: null, bodyText: "" };
+  },
+  async maybeScheduleMediaAggregationProgressMirror(execution, transport) {
+    if (execution?.currentConfig?.mediaAggregationBidirectionalProgressEnabled !== true) return;
+    if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true || !execution?.ctx?.waitUntil) return;
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    if (parsedPayload.parseError) return;
+    const mediaSourceId = String(
+      getCaseInsensitivePayloadValue(parsedPayload.query, ["MediaSourceId"])
+      || getCaseInsensitivePayloadValue(parsedPayload.body, ["MediaSourceId"])
+      || ""
+    ).trim();
+    const source = parseMediaAggregationSourceId(mediaSourceId);
+    if (!source) return;
+    const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
+    const currentName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (!selectedNames.includes(currentName) || !selectedNames.includes(source.nodeName) || source.nodeName === currentName) return;
+    if (transport?.preparedBodyMode !== "buffered" && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") return;
+    const task = (async () => {
+      const backupNode = await Database.getNode(source.nodeName, execution.env, execution.ctx);
+      if (!backupNode) return;
+      const apiPrefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
+      const auth = await this.getMediaAggregationAuth(execution, source.nodeName, backupNode, apiPrefix);
+      if (!auth) return;
+      const { targetRecords } = this.parseTargetRecords(backupNode, execution.finalOrigin || "*");
+      const targetRecord = targetRecords[0];
+      if (!targetRecord) return;
+      const targetUrl = buildUpstreamProxyUrl(targetRecord, execution.proxyPath || "/");
+      targetUrl.search = execution.requestUrl.search;
+      targetUrl.searchParams.set("ItemId", source.itemId);
+      targetUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
+      if (auth.userId) targetUrl.searchParams.set("UserId", auth.userId);
+      const headers = this.buildMediaAggregationRequestHeaders(execution, backupNode, targetUrl, auth);
+      const bodyState = this.buildMediaAggregationRoutedBody(transport, source);
+      const fetchOptions = {
+        method: execution.requestMethod,
+        headers,
+        redirect: "manual"
+      };
+      if (bodyState.bodyText && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") {
+        fetchOptions.body = bodyState.bodyText;
+        headers.set("Content-Type", String(transport.newHeaders?.get("Content-Type") || "application/json"));
+      }
+      let upstream;
+      try {
+        upstream = await this.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
+          timeoutMs: Math.min(Math.max(1000, Number(execution.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+          requestLifecycle: null
+        });
+        try { await upstream.response.body?.cancel?.(); } catch {}
+      } catch {
+        // Progress mirroring is best effort and never changes the primary response.
+      } finally {
+        try { upstream?.releaseFetchController?.(); } catch {}
+      }
+    })();
+    execution.ctx.waitUntil(task.catch(() => {}));
+  },
+  async resolveMediaAggregationPlaybackRoute(execution, transport) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return null;
+    if (execution?.mediaAggregationRouted === true) return null;
+    if (normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) !== "rewrite") return null;
+    const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
+    const currentName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (selectedNames.length < 2 || !selectedNames.includes(currentName)) return null;
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    if (parsedPayload.parseError) return null;
+    const itemPathState = extractPlaybackInfoItemPathState(execution?.proxyPath || "");
+    const itemId = String(
+      itemPathState.itemId
+      || getCaseInsensitivePayloadValue(parsedPayload.query, ["ItemId"])
+      || getCaseInsensitivePayloadValue(parsedPayload.body, ["ItemId"])
+      || ""
+    ).trim();
+    const mediaSourceId = String(
+      getCaseInsensitivePayloadValue(parsedPayload.query, ["MediaSourceId"])
+      || getCaseInsensitivePayloadValue(parsedPayload.body, ["MediaSourceId"])
+      || ""
+    ).trim();
+    const source = parseMediaAggregationSourceId(mediaSourceId);
+    if (!source || !itemId || source.nodeName === currentName || !selectedNames.includes(source.nodeName)) return null;
+    if (execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD" && transport?.preparedBodyMode !== "buffered") return null;
+    const targetNode = await Database.getNode(source.nodeName, execution.env, execution.ctx);
+    if (!targetNode) return null;
+    const auth = await this.getMediaAggregationAuth(
+      execution,
+      source.nodeName,
+      targetNode,
+      resolveMediaAggregationApiPrefix(execution?.proxyPath || "")
+    );
+    if (!auth) return null;
+    const routedPath = itemPathState.rewritePath(source.itemId);
+    const routedUrl = new URL(execution.requestUrl.toString());
+    routedUrl.searchParams.set("ItemId", source.itemId);
+    routedUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
+    if (auth.userId) routedUrl.searchParams.set("UserId", auth.userId);
+    const routedBody = this.buildMediaAggregationRoutedBody(transport, source);
+    const headers = new Headers(execution.request.headers);
+    headers.delete("Content-Length");
+    if (routedBody.bodyText) headers.set("Content-Length", String(new TextEncoder().encode(routedBody.bodyText).byteLength));
+    const routedRequest = new Request(routedUrl, {
+      method: execution.requestMethod,
+      headers,
+      body: execution.requestMethod === "GET" || execution.requestMethod === "HEAD"
+        ? undefined
+        : (routedBody.bodyText || undefined)
+    });
+    const routedExecution = await this.prepareExecutionContext(
+      routedRequest,
+      targetNode,
+      routedPath,
+      source.nodeName,
+      targetNode.secret || "",
+      execution.env,
+      execution.ctx,
+      {
+        runtimeConfig: execution.currentConfig,
+        requestUrl: routedUrl,
+        entryMode: targetNode.entryMode,
+        targetHotCacheState: "hit"
+      }
+    );
+    if (routedExecution.invalidResponse) return null;
+    routedExecution.mediaAggregationRouted = true;
+    routedExecution.mediaAggregationItemId = source.itemId;
+    routedExecution.mediaAggregationSource = source;
+    const { targetRecords, invalidResponse } = this.parseTargetRecords(routedExecution.node, routedExecution.finalOrigin);
+    if (invalidResponse) return null;
+    const routedTransport = await this.buildProxyRequestState(
+      routedExecution.request,
+      routedExecution.node,
+      routedExecution.proxyPath,
+      routedExecution.requestUrl,
+      routedExecution.clientIp,
+      routedExecution.requestTraits,
+      routedExecution.forceH1,
+      targetRecords,
+      {
+        effectiveRealClientIpMode: routedExecution.effectiveRealClientIpMode,
+        effectiveMediaAuthMode: routedExecution.effectiveMediaAuthMode
+      }
+    );
+    this.applyMediaAggregationAuthToTransport(routedTransport, auth);
+    return { execution: routedExecution, transport: routedTransport, targetRecords };
+  },
   buildErrorResponse(execution, err) {
     const errorMessage = err?.message || String(err || "网关或 CF Workers 内部崩溃");
     const errorCode = String(err?.code || "").toUpperCase();
@@ -23855,21 +25482,23 @@ const Proxy = {
     // Phase E. 媒体 30x 决策：直下发 Location 或继续由 Worker 跟随
     // Phase F. 响应整形：缓存头、CORS、Location 改写
     // Phase G. 观测记录：分类、状态码、错误细节、耗时
-    const execution = await this.prepareExecutionContext(request, node, path, name, key, env, ctx, options);
+    let execution = await this.prepareExecutionContext(request, node, path, name, key, env, ctx, options);
     if (execution.invalidResponse) return execution.invalidResponse;
 
     const earlyResponse = await this.resolveEarlyResponse(execution);
     if (earlyResponse) return earlyResponse;
 
-    const { targetRecords, invalidResponse } = this.parseTargetRecords(execution.node, execution.finalOrigin, {
+    let { targetRecords, invalidResponse } = this.parseTargetRecords(execution.node, execution.finalOrigin, {
       cachedTargetRecords: execution.playbackRouteHotTargetRecords
     });
     if (invalidResponse) return invalidResponse;
-    const failoverTargetRecords = this.prepareFailoverOverlay(execution, targetRecords);
+    this.scheduleServerLastWatch(execution);
+    let failoverTargetRecords = this.prepareFailoverOverlay(execution, targetRecords);
     execution.defaultOutboundColo = "";
 
+    let transport = null;
     try {
-      const transport = await this.buildProxyRequestState(
+      transport = await this.buildProxyRequestState(
         execution.request,
         execution.node,
         execution.proxyPath,
@@ -23883,6 +25512,14 @@ const Proxy = {
           effectiveMediaAuthMode: execution.effectiveMediaAuthMode
         }
       );
+      const aggregationRoute = await this.resolveMediaAggregationPlaybackRoute(execution, transport);
+      if (aggregationRoute) {
+        execution = aggregationRoute.execution;
+        transport = aggregationRoute.transport;
+        targetRecords = aggregationRoute.targetRecords;
+        failoverTargetRecords = this.prepareFailoverOverlay(execution, targetRecords);
+        transport.retryTargetRecords = failoverTargetRecords;
+      }
       const playbackInfoCachedResponse = await this.tryServePlaybackInfoResponseCache(execution, transport);
       if (playbackInfoCachedResponse) return playbackInfoCachedResponse;
       const buildFetchOptions = this.createBuildFetchOptions(execution, transport);
@@ -23890,9 +25527,11 @@ const Proxy = {
       if (entryDirectResponse) return entryDirectResponse;
       const progressRelayResponse = await this.maybeHandlePlaybackProgressRelay(execution, transport, buildFetchOptions, transport.retryTargetRecords);
       if (progressRelayResponse) return progressRelayResponse;
+      await this.maybeScheduleMediaAggregationProgressMirror(execution, transport);
       execution.requestLifecycle = createProxyRequestLifecycle(execution.request?.signal);
       const upstreamState = await this.executeUpstreamFlow(execution, transport, buildFetchOptions);
-      return await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState);
+      const response = await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState);
+      return response;
     } catch (err) {
       return this.buildErrorResponse(execution, err);
     }
@@ -26770,7 +28409,7 @@ async function renderAdminLoginPage(request, env, initHealth = buildInitHealth(e
 
     form?.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const password = String(passwordInput?.value || "").trim();
+      const password = String(passwordInput?.value || "");
       if (!password) {
         updateStatus("请输入管理密码。", "error");
         passwordInput?.focus();
@@ -26791,7 +28430,7 @@ async function renderAdminLoginPage(request, env, initHealth = buildInitHealth(e
         const payload = await response.json().catch(() => ({}));
         if (response.ok && payload && payload.ok === true) {
           updateStatus("登录成功，正在进入控制台...", "success");
-          void fetch((ADMIN_LOGIN_RUNTIME.adminPath || "/admin").replace(/\/+$/, "") + "/__warm", {
+          void fetch((ADMIN_LOGIN_RUNTIME.adminPath || "/admin").replace(/\\/+$/, "") + "/__warm", {
             method: "HEAD",
             credentials: "same-origin",
             cache: "no-store",
@@ -26800,7 +28439,15 @@ async function renderAdminLoginPage(request, env, initHealth = buildInitHealth(e
           window.location.assign(ADMIN_LOGIN_RUNTIME.adminPath || "/admin");
           return;
         }
-        const errorMessage = payload?.error?.message || payload?.message || (response.status ? ("登录失败（HTTP " + response.status + "）") : "登录失败");
+        const baseErrorMessage = payload?.error?.message || payload?.message || (response.status ? ("登录失败（HTTP " + response.status + "）") : "登录失败");
+        const remainingAttempts = Number.isFinite(Number(payload?.remain))
+          ? Math.max(0, Number(payload.remain))
+          : null;
+        const errorMessage = remainingAttempts === null
+          ? baseErrorMessage
+          : remainingAttempts > 0
+            ? baseErrorMessage + "，还可尝试 " + remainingAttempts + " 次。"
+            : baseErrorMessage + "，已达到失败次数上限，请稍后重试。";
         updateStatus(errorMessage, "error");
       } catch (error) {
         updateStatus(error?.message ? ("登录请求失败：" + error.message) : "登录请求失败，请稍后重试。", "error");
@@ -27645,6 +29292,13 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     RuntimeEntry,
     createTargetRecord,
     isTargetRecord,
+    buildMediaAggregationSourceId,
+    parseMediaAggregationSourceId,
+    normalizeMediaAggregationProviderIds,
+    mediaAggregationProviderIdsMatch,
+    readMediaAggregationCredentialPair,
+    resolveMediaAggregationCredentials,
+    hasConfiguredMediaAggregationNodeCredentials,
     buildUpstreamProxyUrl,
     buildFastSegmentUpstreamUrlText,
     shouldUseSegmentFastUpstreamBuilder,
@@ -27675,6 +29329,7 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     fetchAdminRemoteShellStoredResponse,
     patchAdminShellRuntimeStatus,
     renderRemoteAdminPage,
+    renderAdminLoginPage,
     renderAdminPage,
     isAcceptedAdminHtmlDocumentContentType,
     isAcceptedAdminReleaseVendorContentType,
@@ -27686,6 +29341,8 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     buildAdminWarmSubrequest,
     isAdminWarmResponseSuccessful,
     buildDailyTelegramSummaryMessage,
+    buildServerRecordExpiry,
+    getDueScheduledClockSlots,
     ADMIN_REMOTE_SHELL_TRANSFORM_REVISION,
     ADMIN_RELEASE_VENDOR_CACHE_CONTROL,
     ADMIN_RELEASE_VENDOR_MUTABLE_CACHE_CONTROL
@@ -27768,6 +29425,7 @@ export default {
         cleanup: {},
         kvTidy: {},
         tgDailyReport: {},
+        serverExpiryWarnings: {},
         alerts: {}
       };
       const nowIso = () => makeScheduledIso(new Date());
@@ -27869,6 +29527,7 @@ export default {
         const { tgBotToken, tgChatId } = config;
         const previousTgDailyReportState = RuntimeSchedule.getStatusSection(previousScheduledStatus, "tgDailyReport", "report");
         const previousAlertsState = RuntimeSchedule.getStatusSection(previousScheduledStatus, "alerts");
+        const previousServerExpiryState = RuntimeSchedule.getStatusSection(previousScheduledStatus, "serverExpiryWarnings");
         const tgDailyReportClockTimes = normalizeScheduleClockTimeList(config.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
 
         const dailyReportDueState = getDueScheduledClockSlots(previousTgDailyReportState, tgDailyReportClockTimes, scheduleUtcOffsetMinutes, scheduledNow);
@@ -27951,6 +29610,55 @@ export default {
             "disabled",
             { fixedQueue: dailyReportDueState.fixedQueue }
           );
+        }
+
+        const expiryDueState = getDueScheduledClockSlots(
+          previousServerExpiryState,
+          ["00:00"],
+          scheduleUtcOffsetMinutes,
+          scheduledNow
+        );
+        try {
+          if (expiryDueState.due !== true) {
+            scheduledState.serverExpiryWarnings = RuntimeSchedule.buildSkippedState(
+              previousServerExpiryState,
+              nowIso(),
+              expiryDueState.reason || "daily_refresh_not_due",
+              { fixedQueue: RuntimeSchedule.normalizeFixedQueueState(expiryDueState.fixedQueue) }
+            );
+          } else {
+            await ensureLeaseActive();
+            const expiryWarningResult = await Database.maybeSendServerExpiryWarnings(env, {
+              config,
+              db,
+              kv,
+              ctx,
+              now: scheduledNow
+            });
+            const fixedQueue = RuntimeSchedule.appendFixedQueueSlot(
+              RuntimeSchedule.normalizeFixedQueueState(expiryDueState.fixedQueue),
+              expiryDueState.context.dateKey,
+              "00:00"
+            );
+            const stateMeta = {
+              fixedQueue,
+              refreshedCount: Number(expiryWarningResult.refreshedCount) || 0,
+              issueCount: Number(expiryWarningResult.issueCount) || 0,
+              reason: expiryWarningResult.reason || "no_due_warnings"
+            };
+            scheduledState.serverExpiryWarnings = expiryWarningResult.sent === true
+              ? RuntimeSchedule.buildSuccessState(previousServerExpiryState, nowIso(), stateMeta)
+              : RuntimeSchedule.buildSkippedState(previousServerExpiryState, nowIso(), stateMeta.reason, stateMeta);
+          }
+        } catch (expiryWarningError) {
+          scheduledState.status = RuntimeSchedule.markPartialFailure(scheduledState.status);
+          scheduledState.serverExpiryWarnings = RuntimeSchedule.buildFailedState(
+            previousServerExpiryState,
+            nowIso(),
+            expiryWarningError?.message || String(expiryWarningError),
+            { fixedQueue: RuntimeSchedule.normalizeFixedQueueState(expiryDueState.fixedQueue) }
+          );
+          console.error("Scheduled Server Expiry Warning Error: ", expiryWarningError);
         }
 
         try {

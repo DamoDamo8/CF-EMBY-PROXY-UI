@@ -108,9 +108,12 @@ frontend/admin-runtime.template.html
 - 代理 CORS、IP 黑名单和地域 allow/block 规则按运行配置对象派生一个 `WeakMap` profile；原始规则字符串变化时 profile 自动失效，热请求复用已去重的 `Set`，不在每次请求中重复 `split/map/filter`。
 - 代理节点读取路径的正缓存使用 60 秒 TTL，确认不存在的节点使用 1 秒负缓存，二者共用 512 条有界 LRU；同一节点、同一失效代次的并发冷读取通过 single-flight 合并。管理台严格节点读取不使用负缓存。播放路由热快照使用 24 小时 TTL 和 256 条上限，并复用快照中的节点派生 revision。
 - PlaybackInfo 成功 JSON 使用同 isolate 的短期响应缓存，TTL 最长 60 秒、最多 64 条；单条响应体最多 256 KiB，所有条目的响应体合计最多 4 MiB，超过任一预算时不缓存或按 LRU 淘汰。重写路径只物化一次有界 body，后续缓存写入复用该快照，不重复 `clone()`/读取。缓存键覆盖节点派生 revision、请求方法/路径/查询/body、鉴权身份和重写模式。节点写入会清除对应条目，缓存响应不保留 `Set-Cookie` 或失效的实体校验头。
+- 影视资源版本聚合使用配置中的 `mediaAggregationNodes` 组成无状态节点池。请求任一池内节点的 `PlaybackInfo` 时，Worker 先读取主服 `ProviderIds`，再按“节点 `mediaAggregationEmbyUsername` / `mediaAggregationEmbyPassword` > 全局 `mediaAggregationEmbyUsername` / `mediaAggregationEmbyPassword`”解析有效凭据，登录其他池节点，按 TMDB 或 IMDB 精确匹配并追加备服 `MediaSources`。节点账号和密码必须成对配置；无节点凭据且无全局完整凭据的节点不能加入聚合池。固定账号令牌只在 isolate 内缓存 10 分钟，不写入 KV/D1；最多并发读取 8 个备服，任一备服失败不影响主服响应。
+- 聚合来源 ID 使用 `AGG1*<base64url 节点名>*<base64url ItemId>*<base64url MediaSourceId>` 无状态编码。客户端再次请求带该 ID 的 `PlaybackInfo` 时，Worker 校验目标仍属于同一池，改写 ItemId/MediaSourceId 后转发到备服并使用固定账号；非法或不在池内的 ID 按普通主服请求处理。返回的备服播放地址始终改写为对应备服节点代理链接。
+- 播放进度默认仍由主服记录。显式开启 `mediaAggregationBidirectionalProgressEnabled` 后，携带聚合 MediaSourceId 的 Playing/Progress/Stopped 请求在主服正常处理之外，以固定账号向目标备服静默镜像；镜像失败不改变主请求状态或响应。
 - isolate 常驻读优化必须给反代数据面留出余量：节点实体最多 512 条，播放路由快照与故障转移状态各最多 256 条，进度转发会话最多 128 条且待转发 body 最多 32 KiB；会话淘汰、停止和节点失效会主动释放待转发 body 与请求上下文；日志队列最多 512 条、日志去重表最多 2048 条，字段在入队前截断。限流表最多 4096 个客户端。超过条数上限时淘汰最旧项，不通过增加 D1 读写维持这些内存状态。
 - 非幂等请求只有在可信 `Content-Length` 不超过 256 KiB 时才复制 body；未知长度或更大的 body 保持流式透传，并跳过依赖可重放 body 的 PlaybackInfo 缓存与进度合并。进度转发只取消并释放不需要的上游响应体，不得用 `text()`/`arrayBuffer()` 整包读取。媒体响应继续以 `ReadableStream` 直通或受控流转发，不进入上述 isolate 响应缓存。
-- 必须物化的非媒体请求和远端响应统一通过有界流读取：管理 API JSON body 最多 4 MiB、登录 JSON body 最多 16 KiB、metadata 预热解析最多 512 KiB；Cloudflare/GitHub/DNS/Telegram、远端管理壳、Worker 更新脚本和 vendor 资产分别使用其业务上限，未知 `Content-Length` 也必须在读取中止于上限。GitHub 成功响应超限或无法解析为 JSON 时直接失败，不把原始 body 交给无界 `response.json()`；日志详情超出 8 KiB 时写入合法的截断标记，避免破坏 D1 JSON 查询。
+- 必须物化的非媒体请求和远端响应统一通过有界流读取：管理 API JSON body 最多 12 MiB、登录 JSON body 最多 16 KiB、metadata 预热解析最多 512 KiB；Cloudflare/GitHub/DNS/Telegram、远端管理壳、Worker 更新脚本和 vendor 资产分别使用其业务上限，未知 `Content-Length` 也必须在读取中止于上限。完整备份导出按带 `action: importFull` 的 UTF-8 JSON 请求大小预检，并在 12 MiB 上限内保留 64 KiB 包装余量；超限时不生成不可回导备份。GitHub 成功响应超限或无法解析为 JSON 时直接失败，不把原始 body 交给无界 `response.json()`；日志详情超出 8 KiB 时写入合法的截断标记，避免破坏 D1 JSON 查询。
 - 每次代理准备只执行有 1 ms 时间预算的轮转增量清理；除节点、路由、密钥、限流和日志去重外，还覆盖 PlaybackInfo、故障转移、进度转发和月流量缓存。清理不能扫描无界集合或阻塞媒体首包。
 - 节点 revision 使用 1 秒 TTL 并合并同一 isolate 内的并发 KV 读取。节点写入会失效或预填 revision 及关联节点/播放缓存；单节点失效只推进该节点的读取代次，不会中断其他节点正在进行的冷读取，因此热节点命中不再逐请求强制读取 KV，但跨 isolate 可见性仍受 KV 与该短 TTL 约束。
 - 节点摘要、轻量索引和 revision meta 的读取—合并—提交在同一 isolate 内共用 mutation chain；重建操作把实体加载与索引提交作为一个完整操作，旧读取不能在较新提交后回填缓存或覆盖 KV。内容写入成功后才提交 meta，链内失败不会阻断后续 mutation。该顺序不提供跨 isolate 的强一致事务。
@@ -121,6 +124,8 @@ frontend/admin-runtime.template.html
 
 - KV 是运行配置、节点实体和配置快照的真相源。缺少 KV binding 时，`saveConfig`、`importSettings` 等持久化入口以 `KV_NOT_CONFIGURED`、HTTP `503` fail-closed；不得退化成仅在当前 isolate 生效的“临时成功”。
 - 设置写入在单 isolate 内通过共享 mutation chain 串行，并把配置、配置 meta、设置快照、快照 meta 与遗留键删除作为一个条件补偿单元。完整导入、普通节点保存/导入、节点删除和主视频流快捷策略也从读取旧配置与节点起进入同一条链，直到索引提交、配置影子同步或失败补偿结束；后发配置或节点写入必须等待前序操作提交或回滚。KV 不提供事务，因此补偿前必须比较当前值与本操作的写入值；并发值已变化时保留新值并返回 `KV_MUTATION_ROLLBACK_CONFLICT`，不以旧快照覆盖它。
+- 双文件更新调用 Cloudflare 时会释放 KV mutation chain。部署失败后的 HTML 补偿重新读取当前配置，只在当前本地 revision 仍等于本次激活 revision 时替换 `indexUrl`，并保留并发写入的其他配置字段；激活前 revision 必须取自激活事务内的配置读数，而不是更新请求开始时的陈旧读数。
+- `sys:admin_index_upload:v1:<sha256>` 的存活集合由当前配置及最多 5 个保留快照引用的本地 revision 决定。配置/快照提交淘汰旧引用时，对应内容删除进入同一条件补偿 mutation；KV tidy 负责扫描并回收旧版本遗留的无引用键，引用中的内容不得删除。
 - 配置快照、默认 `exportSettings` 和默认 `exportConfig` 不持久化或下发 `cfApiToken`、`tgBotToken`。两个导出动作的显式含密钥模式分别使用匹配 action 名的敏感操作确认头；导入中缺少密钥字段表示沿用当前值，显式提供字段才允许覆盖或清空，快照恢复同样将当前密钥合并到目标配置后再保存。
 - KV tidy 的 key list、配置、节点实体、节点索引与配置快照读取全部 fail-closed。分页只有在 `list_complete: true` 时视为完成；缺失/重复游标或 1000 页保护上限触发 `KV_SCAN_INCOMPLETE`，本轮不得写入。
 - KV tidy 预览以现有 `JWT_SECRET` 对 scope、计划哈希、签发时间和过期时间签名。执行必须携带 `planToken`，在 tidy chain 与通用 KV mutation chain 内重新生成计划并校验哈希；令牌无效返回 `TIDY_PLAN_INVALID`，过期或数据变化返回 `TIDY_PLAN_STALE`，均为 HTTP `409`。
@@ -158,6 +163,15 @@ frontend/admin-runtime.template.html
 
 7 到 40 位十六进制 Git commit hash 和完整语义化版本号按不可变引用处理。完整版本号必须包含 major、minor、patch，可带 `v` 前缀、预发布标识或构建标识。省略 ref、分支名、`latest`、`1.2`、`^1.2.3` 和其他 ref 按上述 no-store 策略处理。可变 ref 与不可变 Release tag 不得共用缓存策略。
 
+## 服务器最后观看记录
+
+- 只有通过节点、安全和路由前置检查的 `POST /Sessions/Playing/Stopped` 会触发记录；同路径的 GET、HEAD 或其他方法不得写入。Worker 使用请求进入时的 `startTime`，通过 `ctx.waitUntil()` 直接写 D1；不读取请求体、会话 ID、用户、Token、`PositionTicks` 或 Emby 响应，Playing、Progress 与 Ping 不参与记录。
+- D1 `server_last_watch` 以 `node_name` 为唯一主键保存最后 STOP 时间。UPSERT 只接受更晚的 `last_watched_at`，重复、乱序和并发 STOP 不得回拨时间；仅已启用的服务器记录会写入，关闭记录不会删除已有时间。
+- D1 未配置或异步写入失败时只输出错误，不能改变 Emby 代理响应。服务器记录读取失败时返回 `watch.state: unavailable`；D1 可用但没有记录时返回空时间和 `watch.state: ok`。
+- 服务器探测只在管理动作中执行：活动线路优先，每条线路先请求 `/System/Ping`，只有 Ping 成功才选定为在线目标；HTTP 错误、超时或网络失败继续沿节点线路顺序回退，所有线路仅返回 401/403 时状态为 `unauthorized`。选定在线目标后，三项 `/Items` 与可选 `/System/Info` 并行；System Info 只补充版本与 ServerId，不能参与状态判断。单请求 8 秒超时、最多 4 节点并发。探测结果按 `nodeName` 在 isolate 内缓存 60 秒，缓存值不含上游地址或认证头，节点写入立即失效本 isolate 条目。
+- `wrangler.toml` 每小时触发 scheduled。Worker 按 `scheduleUtcOffsetMinutes` 在每天第一个 00:00 后时隙读取一次启用记录与 D1 最后观看时间，计算过期状态时跳过 Emby 探测；同一日期通过 scheduled `fixedQueue` 幂等跳过后续小时触发。只有 `serverRecord.expiryEnabled` 为真（或旧记录存在合法固定日期）时才计算：固定模式始终使用 KV 中的日期，滚动模式使用 `lastWatchedAt + expiryDays`，两种模式都不在播放请求中写入计算后的到期日。
+- Telegram 服务器过期预警默认关闭。启用后只处理同时开启节点级到期功能且命中配置的 7、3、1、0 天精确里程碑，并在 D1 `sys_status` 的 `telegram_server_expiry_warnings` scope 保存签名。滚动模式签名包含 `nodeName + lastWatchedAt + expiresAt + milestone`，新播放时间会生成新签名；固定模式签名不包含最后观看时间，只在固定日期被修改后生成新签名。相同里程碑只发送一次。节点级到期功能关闭、无到期日、滚动模式无有效最后观看时间或记录已关闭时不发送；Telegram 失败只把 scheduled 标记为部分失败，不影响代理或管理 API。
+
 ## 运行时绑定
 
 ### 必需
@@ -188,18 +202,20 @@ frontend/admin-runtime.template.html
 
 `INDEX_URL`、`WORKER_SOURCE_URL`、`GITHUB_TOKEN` 和 `GITHUB_API_TOKEN` 都不是 Worker 运行时绑定。发布脚本中的同名 URL 参数只用于校验 Release 资产，见 [构建与发布](release.md)。
 
-`wrangler.toml` 当前声明的绑定只有 `ENI_KV` 和 `DB`，并启用了 `enable_request_signal`。`cfAccountId`、`cfZoneId`、`cfApiToken`、`tgBotToken`、`tgChatId` 是保存到 KV 的后台设置项，不是 Worker 环境变量。
+`wrangler.toml` 当前声明 `ENI_KV`、`DB` 和每小时 Cron，并启用了 `enable_request_signal`。服务器最后观看记录与过期预警去重直接复用 `DB`，不需要 Durable Object。`cfAccountId`、`cfZoneId`、`cfApiToken`、`tgBotToken`、`tgChatId` 是保存到 KV 的后台设置项，不是 Worker 环境变量。
 
 ## D1 schema
 
-- 根 `migrations/` 是 D1 schema 的正式真相源，Wrangler 使用 `d1_migrations` 记录已应用版本。v5 升级链依次为新库基础表 `0001_d1_fresh_baseline.sql`、历史库兼容表 `0002_d1_historical_compatibility.sql` 和索引收口 `0003_d1_schema_v5_indexes.sql`。SQLite migration 不猜测任意旧表缺失列；历史库必须先由运行时兼容初始化确认并补齐 `category` 等列，再应用创建 `idx_proxy_logs_category_time` 的 v5 索引 migration；新库可直接顺序应用全部 migration。
+- 根 `migrations/` 是 D1 schema 的正式真相源，Wrangler 使用 `d1_migrations` 记录已应用版本。v6 升级链依次为新库基础表 `0001_d1_fresh_baseline.sql`、历史库兼容表 `0002_d1_historical_compatibility.sql`、索引收口 `0003_d1_schema_v5_indexes.sql` 和节点最后观看表 `0004_server_watch_stats.sql`。SQLite migration 不猜测任意旧表缺失列；历史库必须先由运行时兼容初始化确认并补齐 `category` 等列，再应用依赖现有结构的后续 migration；新库可直接顺序应用全部 migration。
 - `worker.js` 保留运行时 `CREATE TABLE IF NOT EXISTS` 与逐列 `ALTER TABLE`，仅用于旧库兼容和首次启动兜底。`initD1Schema` 会先失效当前 binding 的初始化状态，再按运行时表、日志表和小时统计逐步执行；`PRAGMA table_info` 失败返回 `D1_SCHEMA_INSPECTION_FAILED`，不得按“零列”继续猜测结构。
 - `initLogsDb` 只负责日志基础表、旧日志列、日志索引和小时统计，不依赖 DNS IP、鉴权或 Cloudflare cache 表就绪；`initLogsFts` 只在日志基础结构上重建派生 FTS。`proxy_logs_fts` 不进入基础 migration，FTS 创建或重建失败不得报告 `ftsReady: true`。
-- `getD1SchemaStatus` 直接复检 `sqlite_master`、11 张运行时表的完整必需列、主键、`dns_ip_pool_items.ip` 唯一键、命名索引所属表与完整键列顺序，以及 `d1_migrations`；不以同名错误索引、partial index、夹带 expression key 的索引或此前初始化成功缓存代替结构检查。状态分别报告 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 与 `issues`。为兼容历史库，不把通用列类型、默认值、非空约束或索引升降序作为 readiness 门槛；仅 `proxy_logs.id` 要求 SQLite `INTEGER PRIMARY KEY` 语义。
-- `runtimeCompatibilityReady` 只表示当前结构满足 Worker v5 兼容读取；`migrationReady` 还要求 `d1_migrations` 表有效且三个要求 migration 均已记录。只有二者条件满足时 `schemaVersion` 才返回 `5`，运行时兜底不得伪造正式 migration 版本。
+- `getD1SchemaStatus` 直接复检 `sqlite_master`、12 张运行时表的完整必需列、主键、`dns_ip_pool_items.ip` 唯一键、命名索引所属表与完整键列顺序，以及 `d1_migrations`；不以同名错误索引、partial index、夹带 expression key 的索引或此前初始化成功缓存代替结构检查。状态分别报告 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 与 `issues`。为兼容历史库，不把通用列类型、默认值、非空约束或索引升降序作为 readiness 门槛；仅 `proxy_logs.id` 要求 SQLite `INTEGER PRIMARY KEY` 语义。
+- `runtimeCompatibilityReady` 只表示当前结构满足 Worker v6 兼容读取；`migrationReady` 还要求 `d1_migrations` 表有效且四个要求 migration 均已记录。只有二者条件满足时 `schemaVersion` 才返回 `6`，运行时兜底不得伪造正式 migration 版本。
 - 运行时表、日志、小时统计和 DNS IP 工作区初始化在同一 isolate、同一 D1 binding 上合并进行中的 single-flight，并把成功 readiness 缓存 10 分钟，避免普通热调用重复执行 DDL/PRAGMA。`getD1SchemaStatus` 每次显式检查仍直接复检实际结构；`initD1Schema` 显式初始化会先失效 readiness 与 OpsStatus 热读缓存，不能用缓存掩盖 binding 漂移。
 - OpsStatus 的 root/section D1 读取使用 15 秒、每 binding 最多 8 项的 read-through/write-through 缓存，包含不存在结果；写入完成后直接更新缓存并返回合并结果，不再反读 root 与全部 section。其他 isolate 的状态变化最多可能延迟 15 秒可见；安全鉴权、scheduled 租约和显式 schema 检查不使用这层弱一致缓存。
 - Dashboard snapshot 与 Cloudflare runtime cache 的 fresh/stale 判定共用一次包含过期项的 D1 查询，miss、强制刷新或 live loader 失败时不再为 stale fallback 重复 SELECT。默认日志队列累计 100 条或达到 20 分钟窗口后刷盘；日志行与小时统计分别按最多 50 条 statement 使用 `db.batch()`。这只降低查询/事务频率，不减少应持久化的日志行，也不改变显式错误日志模式。
+- Dashboard 主快照默认不查询 D1 写入热点。实时统计、运行状态和 `getDashboardD1WriteHotspot` 在管理台分别更新；热点失败只能更新热点卡片，Cloudflare 统计失败也不得清空 KV/D1/scheduled 等运行状态。
 - 索引必须对应正式查询：日志保留时间游标、客户端 IP + 时间、状态 + 时间、分类 + 时间；DNS IP 项按更新时间与 IP 排序，探测缓存覆盖 `entry_colo + ip + expires_at` 批量读取；过期清理索引继续保留。
 - 与复合主键或现有复合索引重复、且正式查询没有消费者的索引不属于基线，避免增加 D1 `rowsWritten` 和单库写队列压力。
 - DNS IP 来源列表的全量替换必须把清空与新记录写入放在同一个 D1 batch 中；任一语句失败时不得提交空列表或部分列表。
+Cloudflare 月流量查询若 Zone GraphQL 拒绝超过 1 天的时间范围，会自动降级为逐日窗口并汇总 `edgeResponseBytes`，避免整月请求失败。

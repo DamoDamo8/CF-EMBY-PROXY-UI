@@ -100,12 +100,13 @@ function createD1Adapter(database) {
   };
 }
 
-test("D1 migrations build the fresh v5 baseline in order", async () => {
+test("D1 migrations build the fresh v6 baseline in order", async () => {
   const migrations = await loadMigrations();
   assert.deepEqual(migrations.map(migration => migration.filename), [
     "0001_d1_fresh_baseline.sql",
     "0002_d1_historical_compatibility.sql",
-    "0003_d1_schema_v5_indexes.sql"
+    "0003_d1_schema_v5_indexes.sql",
+    "0004_server_watch_stats.sql"
   ]);
   assert.ok(migrations.every(migration => !/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i.test(executableSql(migration.sql))));
 
@@ -125,7 +126,8 @@ test("D1 migrations build the fresh v5 baseline in order", async () => {
       "dns_ip_pool_fetch_cache",
       "dns_ip_probe_cache",
       "proxy_logs",
-      "proxy_stats_hourly"
+      "proxy_stats_hourly",
+      "server_last_watch"
     ]) {
       assert.ok(tables.has(tableName), `missing table ${tableName}`);
     }
@@ -133,15 +135,16 @@ test("D1 migrations build the fresh v5 baseline in order", async () => {
     for (const columnName of REQUIRED_LOG_COLUMNS.keys()) {
       assert.ok(getColumns(database, "proxy_logs").has(columnName), `missing fresh column ${columnName}`);
     }
+    assert.deepEqual([...getColumns(database, "server_last_watch")].sort(), ["last_watched_at", "node_name", "updated_at"]);
     assert.ok(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_time"));
     assert.ok(getIndexes(database, "dns_ip_probe_cache").has("idx_dns_ip_probe_cache_colo_ip_expires"));
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 3);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 4);
 
     const d1 = createD1Adapter(database);
     const status = await Database.getD1SchemaStatus(d1);
     assert.equal(status.runtimeCompatibilityReady, true);
     assert.equal(status.migrationReady, true);
-    assert.equal(status.schemaVersion, 5);
+    assert.equal(status.schemaVersion, 6);
   } finally {
     database.close();
   }
@@ -328,13 +331,23 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
   }
 });
 
-test("runtime D1 SQL executes against the fresh v5 schema", async () => {
+test("runtime D1 SQL executes against the fresh v6 schema", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     applyMigrations(database, await loadMigrations());
     const d1 = createD1Adapter(database);
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
+
+    await Database.upsertServerLastWatch(d1, "server-a", new Date(now + 2000).toISOString());
+    await Database.upsertServerLastWatch(d1, "server-a", new Date(now + 1000).toISOString());
+    await Promise.all([
+      Database.upsertServerLastWatch(d1, "server-a", nowIso),
+      Database.upsertServerLastWatch(d1, "server-a", new Date(now + 3000).toISOString())
+    ]);
+    const lastWatch = await Database.getServerLastWatch(d1, ["server-a", "server-b"]);
+    assert.equal(lastWatch.get("server-a")?.lastWatchedAt, new Date(now + 3000).toISOString());
+    assert.equal(lastWatch.has("server-b"), false);
 
     const bootstrap = await Database.bootstrapD1Schema(d1, "logs-core");
     assert.equal(bootstrap.runtimeTablesReady, true);

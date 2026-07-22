@@ -19,7 +19,7 @@
 
 - 先读根 `worker.md` 和任务对应的专题文档。
 - 优先检查根 `worker.js` 与根 `frontend/`，不要从历史目录推断当前行为。
-- 涉及管理台边界时，先核对页面入口、启动动作、五个主视图、八个设置视觉分区和五个保存分组。
+- 涉及管理台边界时，先核对页面入口、启动动作、六个主视图、八个设置视觉分区和五个保存分组。
 - 涉及 Cache API、`ctx.waitUntil()`、Request/Response、`compatibility_flags` 或平台限制时，先查 `developers.cloudflare.com`，重点核对 Workers Cache API、缓存工作方式、Runtime Context 和平台限制。
 
 ## Windows 开发环境
@@ -95,7 +95,7 @@ npm run dev
 ## D1 schema 迁移
 
 - 正式 migration 位于根 `migrations/`，由 `wrangler.toml` 的 `migrations_dir` 与 `migrations_table` 管理。不要只修改 `worker.js` 的运行时兜底 DDL；schema 或索引契约变化必须同时新增 migration。
-- 当前 v5 migration 顺序固定为 `0001_d1_fresh_baseline.sql`（新库基础表）、`0002_d1_historical_compatibility.sql`（历史库兼容表）和 `0003_d1_schema_v5_indexes.sql`（索引收口）。先发布能够同时读取旧、新 schema 的 expand 代码，在预发执行 `initD1Schema` 并检查 `getD1SchemaStatus`，再应用远端 migration。基础 migration 不包含可重建的 `proxy_logs_fts`。
+- 当前 v6 migration 顺序固定为 `0001_d1_fresh_baseline.sql`（新库基础表）、`0002_d1_historical_compatibility.sql`（历史库兼容表）、`0003_d1_schema_v5_indexes.sql`（索引收口）和 `0004_server_watch_stats.sql`（节点最后观看）。先发布能够同时读取旧、新 schema 的 expand 代码，在预发执行 `initD1Schema` 并检查 `getD1SchemaStatus`，再应用远端 migration。基础 migration 不包含可重建的 `proxy_logs_fts`。
 - 历史库的未知列组合不得由静态 migration 猜测。运行时兼容初始化必须严格读取 `sqlite_master`/`PRAGMA table_info`，逐项补齐已知列后再创建依赖索引；PRAGMA 失败、半初始化结构或未知结构均 fail-closed。
 - 本地验证由用户在已配置 Wrangler 的环境中执行，代理不得自动安装依赖或直接应用远端 migration：
 
@@ -106,6 +106,14 @@ npx wrangler@latest d1 execute <DATABASE_NAME> --local --command="SELECT name, t
 ```
 
 - 生产应用前先记录 D1 Time Travel bookmark，并检查远端 migration 列表；应用后复查表、索引、日志查询、DNS IP 工作区、scheduled 租约和 tidy。Wrangler migration 不提供 down 流程，普通回滚采用 forward-fix，灾难恢复使用 Time Travel。
+
+## 服务器最后观看记录
+
+- 服务器记录不使用 Durable Object。通过前置检查的 `POST /Sessions/Playing/Stopped` 使用 Worker 请求进入时间直接异步 UPSERT 到 D1 `server_last_watch`；Playing、Progress、Ping、请求体字段和上游响应不参与判定。
+- 本地/预发必须验证不同 `nodeName` 独立写入、GET/HEAD Stopped 不写、重复或乱序 STOP 只保留最新时间、禁用记录不写、D1 缺失或失败不改变 Emby 播放请求的响应与转发行为。
+- 探测回归必须覆盖 Ping 成功但 System Info 失败仍为在线、活动线路 Ping 返回 HTTP 错误后继续回退、全部线路 Ping 无权限、普通页面读取零 Emby 请求、单卡片刷新只探测目标节点、全部刷新探测所有启用节点，以及重新启用节点保留标签/完整到期策略和待关联旧记录可选择已启用节点。
+- 首次上线只需应用 D1 migration 后部署 Worker；`wrangler.toml` 不需要服务器观看相关的 Durable Object binding 或 class migration。
+- 过期回归必须覆盖新增记录默认关闭、关闭时卡片不展示到期区且不告警、固定日期不随播放变化、滚动模式使用每节点 `expiryDays`、跨月/跨年/当天/已过期计算、旧合法日期记录兼容为启用固定模式、无效或缺失日期不告警、7/3/1/0 天签名去重、滚动模式播放时间变化或固定日期变化后可再次告警，以及 Telegram 失败只造成 scheduled 部分失败。每日时隙重复执行不得再次探测 Emby、刷新或发送。
 
 ## 验证
 
@@ -136,7 +144,11 @@ git diff --check
 
 Dashboard 月流量回归必须确认三点：连续读取由 single-flight/内存缓存合并，清空 isolate 缓存后可命中 Cache API，并且传入任何访问都会失败的 D1 binding 时 `getMonthlyTrafficStats` 仍成功。前端增强回归同时检查 `repeat-2` 切换图标、按需动作名及今日/本月文案。
 
+Dashboard 分层刷新回归还要确认：当前卡片在后台请求期间保持可见，统计与运行状态分别完成，D1 热点只按需加载；热点或 Cloudflare 查询失败不能覆盖其他已成功层。服务器记录回归检查顶部全部刷新与单卡片刷新各自的 loading、未手动刷新时的“未检测”状态机、默认未勾选的到期功能、Worker `expiry.daysRemaining` 文案和不触发 Dashboard 刷新。
+
 涉及 isolate 内存边界时，聚焦回归必须确认：PlaybackInfo 超过 256 KiB 不进入缓存、总响应体预算不超过 4 MiB；未知长度控制请求保持流式；节点/路由/故障状态/进度会话/日志与限流默认上限不被放大；轮转清理覆盖 PlaybackInfo、故障转移、进度转发和月流量 Map。媒体反代响应不得新增 `text()` 或 `arrayBuffer()` 整包读取，相关优化不得通过提高 D1 flush 或查询频率换取内存下降。
+
+影视资源版本聚合回归还应覆盖：节点固定账号优先于全局账号，节点账号密码必须成对且无有效凭据的节点不能被快捷勾选；固定 Emby 账号登录请求不会把密码写入日志、缓存键或备份；TMDB/IMDB ProviderIds 精确匹配；备服失败时主服 PlaybackInfo 仍成功；注入 ID 可被解析且目标节点不在聚合池时拒绝回源；聚合并发最多 8 个备服、每个远端 JSON 不超过 256 KiB；备服播放地址改写为备服节点链接，不被主服节点再次改写。
 
 日志 `detail_json` 超过 8 KiB 时仍必须保持可 `JSON.parse` 的合法值。
 
@@ -146,13 +158,13 @@ Dashboard 月流量回归必须确认三点：连续读取由 single-flight/内�
 
 域名前缀 CNAME 自动化覆盖三层目标优先级、主机名清洗、非法值拒绝、计划前向/回滚、全局 active plan 补偿、真实 CNAME 分步失败与 history 写失败的完整 host snapshot 恢复、手动单记录创建/更新的 history 失败补偿、DNS 失败后节点 KV 仍回滚，以及 rename 的部分 KV 写补偿。节点新建、清空覆盖、删除、批量导入和管理台回显仍需预发 smoke；DNS 断言必须确认记录名仍为 `<节点名>.<HOST>`，记录为 `ttl: 1`、`proxied: false`。
 
-D1 schema 自动化覆盖 fresh/旧日志 migration、完整必需列、主键/唯一键、同名错误索引、partial/expression 索引、畸形 FTS、v5 索引与正式查询、DNS 来源 batch、100 参数上限和稳定 IP `id`。D1 实例上的配额、Time Travel 和远端 migration apply 仍为人工发布检查。
+D1 schema 自动化覆盖 fresh/旧日志 migration、完整必需列、主键/唯一键、同名错误索引、partial/expression 索引、畸形 FTS、v5 索引、v6 节点最后观看与正式查询、DNS 来源 batch、100 参数上限和稳定 IP `id`。D1 实例上的配额、Time Travel 和远端 migration apply 仍为人工发布检查。
 
-全局设置与备份自动化覆盖无 KV fail-closed、条件补偿与并发冲突、完整导入失败回滚、后发设置与节点保存串行、快照脱敏、settings/full 默认脱敏备份往返保留当前密钥，以及显式字段覆盖/清空。含密钥导出的浏览器确认交互和真实文件导入下载仍需管理台 smoke。
+全局设置与备份自动化覆盖无 KV fail-closed、条件补偿与并发冲突、完整导入失败回滚、后发设置与节点保存串行、Worker 部署失败时保留后发设置并只补偿 HTML revision、快照脱敏、settings/full 默认脱敏备份往返保留当前密钥、不可回导完整备份的导出门禁，以及显式字段覆盖/清空。含密钥导出的浏览器确认交互和真实文件导入下载仍需管理台 smoke。
 
-KV tidy 自动化覆盖缺失/重复游标、签名篡改、过期与计划变化、配置/快照 revision 绑定、条件补偿冲突和最坏补偿配额。1000 页上限、所有 truth-source 读取失败点、每个 mutation 位置、与设置保存并发及结果分组 UI 对照仍需补充自动化；涉及这些边界的发布必须人工验证零写入失败语义。
+KV tidy 自动化覆盖缺失/重复游标、签名篡改、过期与计划变化、配置/快照 revision 绑定、条件补偿冲突、最坏补偿配额，以及本地 HTML 内容随配置/快照引用淘汰和整理遗留孤立键。1000 页上限、所有 truth-source 读取失败点、每个 mutation 位置、与设置保存并发及结果分组 UI 对照仍需补充自动化；涉及这些边界的发布必须人工验证零写入失败语义。
 
-D1 migration fixture 当前使用 `node:sqlite` 实际执行三个 migration，覆盖新库、缺少兼容日志列的旧库、缺列、错误索引、错误主键/唯一键和畸形 FTS，不需要新增 npm 依赖。migration 表缺失/落后、PRAGMA 失败、逐 step 失败重试、同 binding 结构漂移及 FTS 创建失败仍需补充自动化；修改这些路径时以预发检查兜底。
+D1 migration fixture 当前使用 `node:sqlite` 实际执行四个 migration，覆盖新库、缺少兼容日志列的旧库、节点最后观看、缺列、错误索引、错误主键/唯一键和畸形 FTS，不需要新增 npm 依赖。migration 表缺失/落后、PRAGMA 失败、逐 step 失败重试、同 binding 结构漂移及 FTS 创建失败仍需补充自动化；修改这些路径时以预发检查兜底。
 
 D1 管理动作的职责边界保持不变：`initLogsDb` 只补日志与小时统计，`initD1Schema` 不伪造 migration 记录，`initLogsFts` 失败不得返回 ready，显式状态检查必须复检实际结构。当前自动化只覆盖其中的初始化 single-flight 与 FTS 重建成功路径，其余在预发逐项验证。
 

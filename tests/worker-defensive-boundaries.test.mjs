@@ -39,6 +39,7 @@ const {
   buildAdminRemoteShellStoredResponse,
   patchAdminShellRuntimeStatus,
   renderRemoteAdminPage,
+  renderAdminLoginPage,
   renderAdminPage,
   isAcceptedAdminHtmlDocumentContentType,
   isMutableJsdelivrGithubAssetUrl,
@@ -47,10 +48,442 @@ const {
   warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
   isAdminWarmResponseSuccessful,
-  buildDailyTelegramSummaryMessage
+  buildDailyTelegramSummaryMessage,
+  buildMediaAggregationSourceId,
+  parseMediaAggregationSourceId,
+  mediaAggregationProviderIdsMatch,
+  resolveMediaAggregationCredentials,
+  buildServerRecordExpiry,
+  getDueScheduledClockSlots
 } = hooks;
 
 assert.ok(RuntimeEntry && typeof RuntimeEntry === "object", "missing Node test hook: RuntimeEntry");
+
+test("media aggregation source IDs are stateless and provider matching is exact", () => {
+  const sourceId = buildMediaAggregationSourceId("backup-2", "98765", "abc_4k");
+  assert.match(sourceId, /^AGG1\*/);
+  assert.deepEqual(parseMediaAggregationSourceId(sourceId), {
+    nodeName: "backup-2",
+    itemId: "98765",
+    mediaSourceId: "abc_4k"
+  });
+  assert.equal(parseMediaAggregationSourceId("AGG1*bad*id"), null);
+  assert.equal(mediaAggregationProviderIdsMatch({ TMDB: "123" }, { tmdb: "123", imdb: "tt1" }), true);
+  assert.equal(mediaAggregationProviderIdsMatch({ imdb: "tt1" }, { imdb: "tt2" }), false);
+});
+
+test("media aggregation credentials prefer a complete node pair and otherwise fall back globally", () => {
+  assert.deepEqual(
+    resolveMediaAggregationCredentials({
+      mediaAggregationEmbyUsername: "node-user",
+      mediaAggregationEmbyPassword: "node-password"
+    }, {
+      mediaAggregationEmbyUsername: "global-user",
+      mediaAggregationEmbyPassword: "global-password"
+    }),
+    {
+      username: "node-user",
+      password: "node-password",
+      configured: true,
+      partial: false,
+      source: "node"
+    }
+  );
+  assert.equal(resolveMediaAggregationCredentials({
+    mediaAggregationEmbyUsername: "partial-node"
+  }, {
+    mediaAggregationEmbyUsername: "global-user",
+    mediaAggregationEmbyPassword: "global-password"
+  }).source, "global");
+  assert.equal(resolveMediaAggregationCredentials({}, {}).configured, false);
+});
+
+test("node summaries expose only whether aggregation credentials are configured", () => {
+  const summary = Database.buildNodeSummary("backup", {
+    displayName: "Backup",
+    target: "https://backup.test",
+    lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
+    activeLineId: "main",
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: "node-password"
+  }).summary;
+  assert.equal(summary.mediaAggregationEmbyCredentialsConfigured, true);
+  assert.equal(summary.mediaAggregationEmbyUsername, undefined);
+  assert.equal(summary.mediaAggregationEmbyPassword, undefined);
+  const normalizedSummary = Database.normalizeNodeSummaryIndex([summary]).nodes[0];
+  assert.equal(normalizedSummary.mediaAggregationEmbyCredentialsConfigured, true);
+});
+
+test("admin node reads expose the aggregation username and password state without the password", async () => {
+  const originalGetNodeForRead = Database.getNodeForRead;
+  const originalGetAdminRevisionsForRead = Database.getAdminRevisionsForRead;
+  Database.getNodeForRead = async () => ({
+    target: "https://backup.test",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main",
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: "node-password"
+  });
+  Database.getAdminRevisionsForRead = async () => ({});
+  try {
+    const response = await Database.ApiHandlers.getNode({ name: "backup" }, {
+      env: {},
+      ctx: null,
+      kv: null,
+      db: null
+    });
+    const payload = await response.json();
+    assert.equal(payload.node.mediaAggregationEmbyUsername, "node-user");
+    assert.equal(payload.node.mediaAggregationEmbyPassword, undefined);
+    assert.equal(payload.node.mediaAggregationEmbyCredentialsConfigured, true);
+  } finally {
+    Database.getNodeForRead = originalGetNodeForRead;
+    Database.getAdminRevisionsForRead = originalGetAdminRevisionsForRead;
+  }
+});
+
+test("media aggregation appends matched backup sources without a database mapping", async () => {
+  const originalGetNode = Database.getNode;
+  const originalAuth = Proxy.getMediaAggregationAuth;
+  const originalFetchJson = Proxy.fetchMediaAggregationJson;
+  const originalRewrite = Proxy.rewritePlaybackInfoPayload;
+  const backupNode = {
+    name: "backup",
+    secret: "backup-secret",
+    entryMode: "kv_route",
+    displayName: "备服",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main"
+  };
+  Database.getNode = async () => backupNode;
+  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  Proxy.fetchMediaAggregationJson = async (_execution, _node, proxyPath) => {
+    if (String(proxyPath).endsWith("/Items")) {
+      return {
+        payload: {
+          Items: [{
+            Id: "98765",
+            ProviderIds: { Tmdb: "123" },
+            MediaSources: [{ Id: "abc", Path: "https://backup.test/Videos/98765/stream" }]
+          }]
+        },
+        targetRecord: { targetUrl: new URL("https://backup.test") },
+        finalUrl: new URL("https://backup.test/Items")
+      };
+    }
+    return null;
+  };
+  Proxy.rewritePlaybackInfoPayload = (execution, payload) => ({
+    payload: {
+      ...payload,
+      MediaSources: payload.MediaSources.map(source => ({
+        ...source,
+        DirectStreamUrl: `/backup/${execution.nodeKey}/Videos/98765/stream`
+      }))
+    },
+    rewriteState: "applied"
+  });
+  try {
+    const execution = {
+      nodeName: "primary",
+      env: { ENI_KV: {} },
+      ctx: null,
+      finalOrigin: "*",
+      currentConfig: {
+        mediaAggregationNodes: ["primary", "backup"],
+        mediaAggregationEmbyUsername: "fixed-user",
+        mediaAggregationEmbyPassword: "fixed-password"
+      },
+      proxyPath: "/Items/1/PlaybackInfo",
+      requestUrl: new URL("https://worker.test/primary/Items/1/PlaybackInfo"),
+      rawRequestUrl: new URL("https://worker.test/primary/Items/1/PlaybackInfo")
+    };
+    const result = await Proxy.aggregateMediaSources(
+      execution,
+      { ProviderIds: { Tmdb: "123" }, MediaSources: [{ Id: "main" }] },
+      { activeTargetBase: new URL("https://primary.test") }
+    );
+    assert.equal(result.state, "applied");
+    assert.equal(result.payload.MediaSources.length, 2);
+    assert.deepEqual(parseMediaAggregationSourceId(result.payload.MediaSources[1].Id), {
+      nodeName: "backup",
+      itemId: "98765",
+      mediaSourceId: "abc"
+    });
+  } finally {
+    Database.getNode = originalGetNode;
+    Proxy.getMediaAggregationAuth = originalAuth;
+    Proxy.fetchMediaAggregationJson = originalFetchJson;
+    Proxy.rewritePlaybackInfoPayload = originalRewrite;
+  }
+});
+
+test("media aggregation logs into a backup with the fixed Emby account", async () => {
+  GLOBALS.MediaAggregationAuthCache.clear();
+  const requests = [];
+  const node = {
+    name: "backup",
+    target: "https://backup.test",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main",
+    headers: {}
+  };
+  const execution = {
+    currentConfig: {
+      mediaAggregationEmbyUsername: "fixed-user",
+      mediaAggregationEmbyPassword: " fixed-password "
+    },
+    upstreamTimeoutMs: 1000,
+    request: new Request("https://worker.test/Items/1/PlaybackInfo", {
+      headers: { "X-Emby-Token": "client-token" }
+    }),
+    requestUrl: new URL("https://worker.test/Items/1/PlaybackInfo")
+  };
+  await withWorkerGlobals({
+    fetch: async (input, init = {}) => {
+      requests.push({ url: String(input), init });
+      return new Response(JSON.stringify({ AccessToken: "backup-token", User: { Id: "backup-user" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, async () => {
+    const auth = await Proxy.getMediaAggregationAuth(execution, "backup", node, "");
+    assert.equal(auth.token, "backup-token");
+    assert.equal(auth.userId, "backup-user");
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "https://backup.test/Users/AuthenticateByName");
+  assert.deepEqual(JSON.parse(String(requests[0].init.body)), {
+    Username: "fixed-user",
+    Pw: " fixed-password "
+  });
+  assert.equal(new Headers(requests[0].init.headers).get("X-Emby-Token"), null);
+  GLOBALS.MediaAggregationAuthCache.clear();
+});
+
+test("media aggregation login prefers fixed credentials stored on the backup node", async () => {
+  GLOBALS.MediaAggregationAuthCache.clear();
+  const requests = [];
+  const node = {
+    name: "backup",
+    target: "https://backup.test",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main",
+    headers: {},
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: " node-password "
+  };
+  const execution = {
+    currentConfig: {
+      mediaAggregationEmbyUsername: "global-user",
+      mediaAggregationEmbyPassword: "global-password"
+    },
+    upstreamTimeoutMs: 1000,
+    request: new Request("https://worker.test/Items/1/PlaybackInfo"),
+    requestUrl: new URL("https://worker.test/Items/1/PlaybackInfo")
+  };
+  await withWorkerGlobals({
+    fetch: async (input, init = {}) => {
+      requests.push({ url: String(input), init });
+      return new Response(JSON.stringify({ AccessToken: "backup-token", User: { Id: "backup-user" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, async () => {
+    assert.ok(await Proxy.getMediaAggregationAuth(execution, "backup", node, ""));
+  });
+  assert.deepEqual(JSON.parse(String(requests[0].init.body)), {
+    Username: "node-user",
+    Pw: " node-password "
+  });
+  GLOBALS.MediaAggregationAuthCache.clear();
+});
+
+test("media aggregation routes a magic PlaybackInfo source to the backup item", async () => {
+  const originalGetNode = Database.getNode;
+  const originalAuth = Proxy.getMediaAggregationAuth;
+  const originalPrepareExecutionContext = Proxy.prepareExecutionContext;
+  const originalParseTargetRecords = Proxy.parseTargetRecords;
+  const originalBuildProxyRequestState = Proxy.buildProxyRequestState;
+  const backupNode = {
+    name: "backup",
+    secret: "backup-secret",
+    entryMode: "kv_route",
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main"
+  };
+  const magicId = buildMediaAggregationSourceId("backup", "98765", "abc");
+  const requestUrl = new URL("https://worker.test/primary/Items/123/PlaybackInfo");
+  requestUrl.searchParams.set("ItemId", "123");
+  requestUrl.searchParams.set("MediaSourceId", magicId);
+  const request = new Request(requestUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Emby-Token": "client-token"
+    },
+    body: JSON.stringify({ ItemId: "123", MediaSourceId: magicId })
+  });
+  let preparedRequest = null;
+  let preparedPath = "";
+  let routedBodyText = "";
+  Database.getNode = async () => backupNode;
+  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  Proxy.prepareExecutionContext = async (nextRequest, node, proxyPath, nodeName, nodeKey, env, ctx, options) => {
+    preparedRequest = nextRequest;
+    preparedPath = proxyPath;
+    return {
+      request: nextRequest,
+      requestUrl: options.requestUrl,
+      rawRequestUrl: options.requestUrl,
+      requestMethod: nextRequest.method,
+      node,
+      nodeName,
+      nodeKey,
+      proxyPath,
+      env,
+      ctx,
+      finalOrigin: "*",
+      clientIp: "127.0.0.1",
+      requestTraits: { isPlaybackInfoRequest: true },
+      forceH1: false,
+      effectiveRealClientIpMode: "forward",
+      effectiveMediaAuthMode: "auto"
+    };
+  };
+  Proxy.parseTargetRecords = () => ({
+    targetRecords: [{
+      targetUrl: new URL("https://backup.test"),
+      originText: "https://backup.test",
+      normalizedBasePath: "",
+      absoluteBasePrefix: "https://backup.test"
+    }],
+    invalidResponse: null
+  });
+  Proxy.buildProxyRequestState = async (nextRequest) => {
+    routedBodyText = await nextRequest.clone().text();
+    return {
+      newHeaders: new Headers(nextRequest.headers),
+      transportTemplate: {}
+    };
+  };
+  try {
+    const route = await Proxy.resolveMediaAggregationPlaybackRoute({
+      request,
+      requestUrl,
+      rawRequestUrl: requestUrl,
+      requestMethod: "POST",
+      requestTraits: { isPlaybackInfoRequest: true },
+      effectivePlaybackInfoMode: "rewrite",
+      currentConfig: { mediaAggregationNodes: ["primary", "backup"] },
+      nodeName: "primary",
+      proxyPath: "/Items/123/PlaybackInfo",
+      env: {},
+      ctx: null,
+      finalOrigin: "*"
+    }, {
+      preparedBodyMode: "buffered",
+      preparedBodyText: JSON.stringify({ ItemId: "123", MediaSourceId: magicId }),
+      newHeaders: new Headers({ "Content-Type": "application/json" })
+    });
+    assert.ok(route);
+    assert.equal(preparedPath, "/Items/98765/PlaybackInfo");
+    assert.equal(preparedRequest.url.includes("ItemId=98765"), true);
+    assert.equal(preparedRequest.url.includes("MediaSourceId=abc"), true);
+    assert.deepEqual(JSON.parse(routedBodyText), { ItemId: "98765", MediaSourceId: "abc" });
+    assert.equal(route.execution.mediaAggregationRouted, true);
+    assert.equal(route.transport.newHeaders.get("X-Emby-Token"), "backup-token");
+  } finally {
+    Database.getNode = originalGetNode;
+    Proxy.getMediaAggregationAuth = originalAuth;
+    Proxy.prepareExecutionContext = originalPrepareExecutionContext;
+    Proxy.parseTargetRecords = originalParseTargetRecords;
+    Proxy.buildProxyRequestState = originalBuildProxyRequestState;
+  }
+});
+
+test("media aggregation mirrors progress to the backup with real source IDs", async () => {
+  const originalGetNode = Database.getNode;
+  const originalAuth = Proxy.getMediaAggregationAuth;
+  const originalParseTargetRecords = Proxy.parseTargetRecords;
+  const originalFetch = Proxy.performFetchWithTimeout;
+  const backupNode = {
+    name: "backup",
+    headers: {},
+    lines: [{ id: "main", target: "https://backup.test" }],
+    activeLineId: "main"
+  };
+  const magicId = buildMediaAggregationSourceId("backup", "98765", "abc");
+  const bodyText = JSON.stringify({ ItemId: "123", MediaSourceId: magicId, PositionTicks: 42 });
+  const pending = [];
+  let mirroredRequest = null;
+  Database.getNode = async () => backupNode;
+  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  Proxy.parseTargetRecords = () => ({
+    targetRecords: [{
+      targetUrl: new URL("https://backup.test"),
+      originText: "https://backup.test",
+      normalizedBasePath: "",
+      absoluteBasePrefix: "https://backup.test"
+    }]
+  });
+  Proxy.performFetchWithTimeout = async (targetUrl, buildOptions) => {
+    mirroredRequest = { url: targetUrl.toString(), options: await buildOptions() };
+    return {
+      response: new Response(null, { status: 204 }),
+      finalUrl: targetUrl,
+      releaseFetchController() {}
+    };
+  };
+  try {
+    const requestUrl = new URL("https://worker.test/primary/Sessions/Playing/Progress");
+    const request = new Request(requestUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Emby-Token": "client-token" },
+      body: bodyText
+    });
+    await Proxy.maybeScheduleMediaAggregationProgressMirror({
+      request,
+      requestUrl,
+      requestMethod: "POST",
+      requestTraits: { isPlaybackSessionControlRequest: true },
+      currentConfig: {
+        mediaAggregationNodes: ["primary", "backup"],
+        mediaAggregationBidirectionalProgressEnabled: true
+      },
+      nodeName: "primary",
+      proxyPath: "/Sessions/Playing/Progress",
+      env: {},
+      ctx: { waitUntil(task) { pending.push(task); } },
+      finalOrigin: "*",
+      upstreamTimeoutMs: 1000
+    }, {
+      preparedBodyMode: "buffered",
+      preparedBodyText: bodyText,
+      newHeaders: new Headers({ "Content-Type": "application/json" })
+    });
+    await Promise.all(pending);
+    assert.ok(mirroredRequest);
+    const mirroredUrl = new URL(mirroredRequest.url);
+    assert.equal(mirroredUrl.pathname, "/Sessions/Playing/Progress");
+    assert.equal(mirroredUrl.searchParams.get("ItemId"), "98765");
+    assert.equal(mirroredUrl.searchParams.get("MediaSourceId"), "abc");
+    assert.equal(mirroredUrl.searchParams.get("UserId"), "backup-user");
+    assert.equal(new Headers(mirroredRequest.options.headers).get("X-Emby-Token"), "backup-token");
+    assert.deepEqual(JSON.parse(mirroredRequest.options.body), {
+      ItemId: "98765",
+      MediaSourceId: "abc",
+      PositionTicks: 42
+    });
+  } finally {
+    Database.getNode = originalGetNode;
+    Proxy.getMediaAggregationAuth = originalAuth;
+    Proxy.parseTargetRecords = originalParseTargetRecords;
+    Proxy.performFetchWithTimeout = originalFetch;
+  }
+});
 
 const requiredFunctionHooks = {
   runSingleFlight,
@@ -78,6 +511,7 @@ const requiredFunctionHooks = {
   buildAdminRemoteShellStoredResponse,
   patchAdminShellRuntimeStatus,
   renderRemoteAdminPage,
+  renderAdminLoginPage,
   renderAdminPage,
   isAcceptedAdminHtmlDocumentContentType,
   isMutableJsdelivrGithubAssetUrl,
@@ -86,7 +520,9 @@ const requiredFunctionHooks = {
   warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
   isAdminWarmResponseSuccessful,
-  buildDailyTelegramSummaryMessage
+  buildDailyTelegramSummaryMessage,
+  buildServerRecordExpiry,
+  getDueScheduledClockSlots
 };
 
 for (const [name, value] of Object.entries(requiredFunctionHooks)) {
@@ -126,6 +562,155 @@ async function withWorkerGlobals(overrides, callback) {
 function countOccurrences(value, fragment) {
   return String(value).split(fragment).length - 1;
 }
+
+test("server record expiry prefers manual dates and derives calendar-safe automatic dates", () => {
+  const config = { serverRecordExpiryDays: 30, scheduleUtcOffsetMinutes: 480 };
+
+  assert.deepEqual(
+    buildServerRecordExpiry(
+      { expiresAt: "2027-02-01" },
+      "2026-12-31T20:00:00.000Z",
+      config,
+      new Date("2027-01-01T04:00:00.000Z")
+    ),
+    { enabled: true, state: "valid", daysRemaining: 31, expiresAt: "2027-02-01", source: "fixed", mode: "fixed", expiryDays: null }
+  );
+
+  assert.deepEqual(
+    buildServerRecordExpiry(
+      { expiryEnabled: true, expiryMode: "rolling", expiryDays: 30 },
+      "2026-12-31T20:00:00.000Z",
+      config,
+      new Date("2027-01-01T04:00:00.000Z")
+    ),
+    { enabled: true, state: "valid", daysRemaining: 30, expiresAt: "2027-01-31", source: "last_watched", mode: "rolling", expiryDays: 30 }
+  );
+
+  assert.deepEqual(
+    buildServerRecordExpiry({ expiresAt: "2027-01-01" }, "", config, new Date("2027-01-01T04:00:00.000Z")),
+    { enabled: true, state: "expiring", daysRemaining: 0, expiresAt: "2027-01-01", source: "fixed", mode: "fixed", expiryDays: null }
+  );
+  assert.equal(
+    buildServerRecordExpiry({ expiresAt: "2026-12-31" }, "", config, new Date("2027-01-01T04:00:00.000Z")).daysRemaining,
+    -1
+  );
+  assert.deepEqual(
+    buildServerRecordExpiry({ expiryEnabled: true, expiresAt: "invalid" }, "not-a-date", config, new Date("2027-01-01T04:00:00.000Z")),
+    { enabled: true, state: "unset", daysRemaining: null, expiresAt: "", source: "unset", mode: "rolling", expiryDays: 30 }
+  );
+  assert.deepEqual(
+    buildServerRecordExpiry({ expiryMode: "rolling", expiryDays: 30 }, "2026-12-31T20:00:00.000Z", config),
+    { enabled: false, state: "disabled", daysRemaining: null, expiresAt: "", source: "disabled", mode: "rolling", expiryDays: 30 }
+  );
+
+  const rolling45 = buildServerRecordExpiry(
+    { expiryEnabled: true, expiryMode: "rolling", expiryDays: 45, expiresAt: "2027-01-02" },
+    "2026-12-31T20:00:00.000Z",
+    config,
+    new Date("2027-01-01T04:00:00.000Z")
+  );
+  assert.equal(rolling45.expiresAt, "2027-02-15");
+  assert.equal(rolling45.expiryDays, 45);
+
+  const fixedAfterLaterPlayback = buildServerRecordExpiry(
+    { expiryMode: "fixed", expiresAt: "2027-02-01" },
+    "2027-01-20T20:00:00.000Z",
+    config,
+    new Date("2027-01-21T04:00:00.000Z")
+  );
+  assert.equal(fixedAfterLaterPlayback.expiresAt, "2027-02-01");
+  assert.equal(fixedAfterLaterPlayback.mode, "fixed");
+});
+
+test("daily server expiry slot is due once per configured local day", () => {
+  const now = new Date("2026-07-21T16:00:00.000Z");
+  const first = getDueScheduledClockSlots({}, ["00:00"], 480, now);
+  assert.equal(first.due, true);
+  assert.deepEqual(first.dueSlots, ["00:00"]);
+
+  const repeated = getDueScheduledClockSlots({
+    fixedQueue: { localDateKey: first.context.dateKey, executedSlots: ["00:00"] }
+  }, ["00:00"], 480, new Date("2026-07-22T03:00:00.000Z"));
+  assert.equal(repeated.due, false);
+  assert.equal(repeated.reason, "slot_already_processed");
+});
+
+test("server expiry Telegram milestones are deduplicated and playback changes renew signatures", async () => {
+  const originalMethods = {
+    getServerRecordsSnapshotPayload: Database.getServerRecordsSnapshotPayload,
+    getOpsStatusPayloadFromDb: Database.getOpsStatusPayloadFromDb,
+    putOpsStatusPayloadToDb: Database.putOpsStatusPayloadToDb,
+    sendTelegramMessage: Database.sendTelegramMessage
+  };
+  let storedState = null;
+  let sendCount = 0;
+  let rollingWatchedRevision = "2026-06-28T00:00:00.000Z";
+  let fixedWatchedRevision = "2026-06-27T00:00:00.000Z";
+  try {
+    Database.getServerRecordsSnapshotPayload = async () => ({
+      records: [7, 3, 1, 0].map((days, index) => ({
+        nodeName: `node-${days}`,
+        displayName: `Node ${days}`,
+        watch: {
+          lastWatchedAt: index === 0
+            ? fixedWatchedRevision
+            : (index === 1 ? rollingWatchedRevision : `2026-06-${20 + index}T00:00:00.000Z`)
+        },
+        expiry: {
+          daysRemaining: days,
+          expiresAt: `2026-07-${String(29 - index).padStart(2, "0")}`,
+          source: index === 0 ? "fixed" : "last_watched",
+          mode: index === 0 ? "fixed" : "rolling"
+        }
+      }))
+    });
+    Database.getOpsStatusPayloadFromDb = async () => storedState;
+    Database.putOpsStatusPayloadToDb = async (_db, _scope, payload) => {
+      storedState = payload;
+      return true;
+    };
+    Database.sendTelegramMessage = async () => {
+      sendCount += 1;
+      return { ok: true };
+    };
+
+    const env = { DB: {}, ENI_KV: {} };
+    const config = {
+      tgServerExpiryWarningEnabled: true,
+      tgServerExpiryWarningDays: [7, 3, 1, 0],
+      tgBotToken: "token",
+      tgChatId: "chat"
+    };
+    const first = await Database.maybeSendServerExpiryWarnings(env, { config });
+    assert.equal(first.sent, true);
+    assert.equal(first.issueCount, 4);
+    assert.equal(sendCount, 1);
+
+    const repeated = await Database.maybeSendServerExpiryWarnings(env, { config });
+    assert.equal(repeated.sent, false);
+    assert.equal(repeated.reason, "already_sent");
+    assert.equal(sendCount, 1);
+
+    fixedWatchedRevision = "2026-06-29T00:00:00.000Z";
+    rollingWatchedRevision = "2026-06-29T00:00:00.000Z";
+    const renewed = await Database.maybeSendServerExpiryWarnings(env, { config });
+    assert.equal(renewed.sent, true);
+    assert.equal(renewed.issueCount, 1);
+    assert.equal(sendCount, 2);
+
+    Database.sendTelegramMessage = async () => {
+      throw new Error("telegram unavailable");
+    };
+    rollingWatchedRevision = "2026-06-30T00:00:00.000Z";
+    await assert.rejects(
+      Database.maybeSendServerExpiryWarnings(env, { config }),
+      /telegram unavailable/
+    );
+    assert.equal(storedState.signatures.some((signature) => signature.includes(rollingWatchedRevision)), false);
+  } finally {
+    Object.assign(Database, originalMethods);
+  }
+});
 
 function createInMemoryKvStore(initialValues = {}) {
   const storedValues = new Map(
@@ -488,6 +1073,48 @@ test("setup query accepts only 1 and true", () => {
   assert.equal(isAdminIndexSetupForced(new Request("https://worker.test/admin?setup=0")), false);
   assert.equal(isAdminIndexSetupForced(new Request("https://worker.test/admin?setup=false")), false);
   assert.equal(isAdminIndexSetupForced(new Request("https://worker.test/admin")), false);
+});
+
+test("admin login page emits valid submit interception script", async () => {
+  const response = await renderAdminLoginPage(
+    new Request("https://worker.test/console/login"),
+    {
+      ADMIN_PATH: "/console/",
+      ADMIN_PASS: "test-password",
+      JWT_SECRET: "test-secret"
+    },
+    { ok: true, missing: [] }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Cache-Control"), "no-store, max-age=0");
+  const html = await response.text();
+  const loginScript = html.match(/<script>\s*(const ADMIN_LOGIN_RUNTIME[\s\S]*?)<\/script>/)?.[1] || "";
+  assert.ok(loginScript, "login submit script must be present");
+  assert.match(loginScript, /\.replace\(\/\\\/\+\$\/, ""\)/);
+  assert.match(loginScript, /payload\?\.remain/);
+  assert.match(loginScript, /还可尝试/);
+  assert.doesNotThrow(() => new Function(loginScript));
+});
+
+test("admin login preserves leading and trailing password whitespace", async () => {
+  const response = await RuntimeEntry.handleFetch(
+    new Request("https://worker.test/console/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password: "  exact password  " })
+    }),
+    {
+      ADMIN_PATH: "/console",
+      ADMIN_PASS: "  exact password  ",
+      JWT_SECRET: "test-secret"
+    },
+    { waitUntil() {} }
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).ok, true);
+  assert.match(response.headers.get("Set-Cookie") || "", /auth_token=/);
 });
 
 test("admin warm route is exact and follows the configured admin path", () => {
@@ -3863,4 +4490,379 @@ test("D1 probe cache bulk reads stay within the 100 binding limit", async () => 
   assert.equal(bulkQueries.length, 2);
   assert.ok(bulkQueries.every(record => record.bindings.length <= 100));
   assert.equal(Math.max(...bulkQueries.map(record => record.bindings.length)), 100);
+});
+
+test("playback session keys are partitioned by node even when Emby session ids match", () => {
+  const makeExecution = (nodeName) => ({
+    nodeName,
+    requestMethod: "POST",
+    requestUrl: new URL("https://proxy.test/Sessions/Playing/Progress"),
+    proxyPath: "/Sessions/Playing/Progress",
+    clientIp: "203.0.113.10",
+    request: new Request("https://proxy.test/Sessions/Playing/Progress", { method: "POST" }),
+    requestTraits: { isPlaybackProgressRequest: true }
+  });
+  const transport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: JSON.stringify({ SessionId: "shared-session", PlaySessionId: "shared-play", ItemId: "movie-1" }),
+    newHeaders: new Headers({ "Content-Type": "application/json" })
+  };
+  const first = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-a"), transport);
+  const second = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-b"), transport);
+  assert.equal(first.sessionKey, "server-a|session:shared-session");
+  assert.equal(second.sessionKey, "server-b|session:shared-session");
+  assert.notEqual(first.sessionKey, second.sessionKey);
+
+  const makeFallbackExecution = (proxyPath) => ({
+    ...makeExecution("server-a"),
+    proxyPath,
+    requestUrl: new URL(`https://proxy.test${proxyPath}`),
+    request: new Request(`https://proxy.test${proxyPath}`, {
+      method: "POST",
+      headers: { Authorization: "MediaBrowser Token=private", "X-Emby-Device-Id": "device-1" }
+    })
+  });
+  const fallbackTransport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: JSON.stringify({ ItemId: "movie-1" }),
+    newHeaders: new Headers({ "Content-Type": "application/json" })
+  };
+  const started = Proxy.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing"), fallbackTransport);
+  const stopped = Proxy.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing/Stopped"), fallbackTransport);
+  assert.equal(started.sessionKey, stopped.sessionKey);
+  assert.doesNotMatch(started.sessionKey, /private|device-1|movie-1/);
+});
+
+test("only enabled-node Stopped requests schedule the last-watch write", async () => {
+  const tasks = [];
+  const writes = [];
+  const originalUpsert = Database.upsertServerLastWatch;
+  Database.upsertServerLastWatch = async (_db, nodeName, lastWatchedAt) => {
+    writes.push({ nodeName, lastWatchedAt });
+    return true;
+  };
+  const makeExecution = (nodeName, traits, options = {}) => ({
+    nodeName,
+    node: { serverRecord: { enabled: options.enabled !== false } },
+    startTime: options.startTime || 123_456,
+    requestMethod: options.requestMethod || "POST",
+    requestTraits: traits,
+    env: options.withDb === false ? {} : { DB: {} },
+    ctx: { waitUntil(task) { tasks.push(task); } }
+  });
+  try {
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStartedRequest: true })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackProgressRequest: true })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackPingRequest: true })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { requestMethod: "GET" })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { requestMethod: "HEAD" })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { enabled: false })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { withDb: false })), false);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true })), true);
+    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-b", { isPlaybackStoppedRequest: true }, { startTime: 234_567 })), true);
+    await Promise.all(tasks);
+    assert.deepEqual(writes, [
+      { nodeName: "server-a", lastWatchedAt: new Date(123_456).toISOString() },
+      { nodeName: "server-b", lastWatchedAt: new Date(234_567).toISOString() }
+    ]);
+    const handleSource = Proxy.handle.toString();
+    assert.ok(handleSource.indexOf("this.scheduleServerLastWatch(execution)") < handleSource.indexOf("this.executeUpstreamFlow"));
+  } finally {
+    Database.upsertServerLastWatch = originalUpsert;
+  }
+});
+
+test("last-watch D1 failures stay detached from the proxy response path", async () => {
+  const tasks = [];
+  const originalUpsert = Database.upsertServerLastWatch;
+  const originalConsoleError = console.error;
+  Database.upsertServerLastWatch = async () => { throw new Error("d1 unavailable"); };
+  console.error = () => {};
+  try {
+    const scheduled = Proxy.scheduleServerLastWatch({
+      nodeName: "server-a",
+      node: { serverRecord: { enabled: true } },
+      startTime: 123_456,
+      requestMethod: "POST",
+      requestTraits: { isPlaybackStoppedRequest: true },
+      env: { DB: {} },
+      ctx: { waitUntil(task) { tasks.push(task); } }
+    });
+    assert.equal(scheduled, true);
+    await assert.doesNotReject(Promise.all(tasks));
+  } finally {
+    Database.upsertServerLastWatch = originalUpsert;
+    console.error = originalConsoleError;
+  }
+});
+
+test("server record probes keep node tokens isolated and report partial counts", async () => {
+  const requests = [];
+  await withWorkerGlobals({
+    fetch: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const token = new Headers(options.headers).get("X-Emby-Token") || "";
+      requests.push({ url: parsed.toString(), token });
+      if (/\/System\/Ping$/i.test(parsed.pathname)) return new Response("pong", { status: 200 });
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        return new Response(JSON.stringify({ Id: parsed.hostname === "a.example" ? "server-a-id" : "server-b-id", Version: "4.9.5", IsInMaintenanceMode: false }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (/\/Items$/i.test(parsed.pathname)) {
+        const itemType = parsed.searchParams.get("IncludeItemTypes");
+        if (token === "token-b" && itemType === "Episode") return new Response("failed", { status: 503 });
+        const totals = { Movie: 10, Series: 20, Episode: 30 };
+        return new Response(JSON.stringify({ Items: [], TotalRecordCount: totals[itemType] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const first = await Database.probeServerRecord("server-a", {
+      target: "https://a.example/emby",
+      headers: { "X-Emby-Token": "token-a" }
+    });
+    const second = await Database.probeServerRecord("server-b", {
+      target: "https://b.example/emby",
+      headers: { "X-Emby-Token": "token-b" }
+    });
+    assert.equal(first.runtime.state, "online");
+    assert.deepEqual(first.counts, { movies: 10, series: 20, episodes: 30, state: "ok", errors: {} });
+    assert.equal(second.counts.state, "partial");
+    assert.equal(second.counts.episodes, null);
+    assert.equal(second.counts.errors.episodes, "http_503");
+    assert.ok(requests.filter(request => request.url.includes("a.example")).every(request => request.token === "token-a"));
+    assert.ok(requests.filter(request => request.url.includes("b.example")).every(request => request.token === "token-b"));
+    assert.doesNotMatch(JSON.stringify(first), /token-a|a\.example/);
+    assert.doesNotMatch(JSON.stringify(second), /token-b|b\.example/);
+  });
+});
+
+test("server record probes derive status from Ping without using System Info flags or authorization", async () => {
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      const parsed = new URL(url);
+      if (/\/System\/Ping$/i.test(parsed.pathname)) {
+        if (parsed.hostname === "ping-forbidden.example") return new Response(null, { status: 403 });
+        return new Response("pong", { status: 200 });
+      }
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        if (parsed.hostname === "unauthorized.example") return new Response(null, { status: 401 });
+        return new Response(JSON.stringify({
+          IsInMaintenanceMode: parsed.hostname === "maintenance.example",
+          IsShuttingDown: parsed.hostname === "shutdown.example"
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (/\/Items$/i.test(parsed.pathname)) {
+        if (parsed.hostname === "unauthorized.example") return new Response(null, { status: 401 });
+        return new Response(JSON.stringify({ TotalRecordCount: 1 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const maintenance = await Database.probeServerRecord("maintenance", { target: "https://maintenance.example" });
+    const shutdown = await Database.probeServerRecord("shutdown", { target: "https://shutdown.example" });
+    const unauthorized = await Database.probeServerRecord("unauthorized", { target: "https://unauthorized.example" });
+    const pingForbidden = await Database.probeServerRecord("ping-forbidden", { target: "https://ping-forbidden.example" });
+    assert.equal(maintenance.runtime.state, "online");
+    assert.equal(shutdown.runtime.state, "online");
+    assert.equal(unauthorized.runtime.state, "online");
+    assert.equal(unauthorized.runtime.detailsLimited, true);
+    assert.equal(unauthorized.counts.state, "unavailable");
+    assert.equal(pingForbidden.runtime.state, "unauthorized");
+  });
+});
+
+test("server record probes follow active-line fallback order after Ping HTTP failures", async () => {
+  const hosts = [];
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      const parsed = new URL(url);
+      hosts.push(parsed.hostname);
+      if (/\/System\/Ping$/i.test(parsed.pathname)) {
+        return parsed.hostname === "active.example"
+          ? new Response(null, { status: 503 })
+          : new Response("pong", { status: 200 });
+      }
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (/\/Items$/i.test(parsed.pathname)) {
+        return new Response(JSON.stringify({ TotalRecordCount: 2 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const result = await Database.probeServerRecord("fallback", {
+      activeLineId: "active",
+      lines: [
+        { id: "backup", target: "https://backup.example" },
+        { id: "active", target: "https://active.example" }
+      ]
+    });
+    assert.equal(result.runtime.state, "online");
+    assert.deepEqual(hosts.slice(0, 2), ["active.example", "backup.example"]);
+    assert.ok(hosts.slice(1).every(host => host === "backup.example"));
+    assert.equal(Database.normalizeServerRecordRuntimeError({ code: "SERVER_RECORD_TIMEOUT" }), "timeout");
+  });
+});
+
+test("server record probe cache is reused unless forceRefresh is requested", async () => {
+  let requestCount = 0;
+  GLOBALS.ServerRecordsSnapshotCache.clear();
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      requestCount += 1;
+      const parsed = new URL(url);
+      if (/\/System\/Ping$/i.test(parsed.pathname)) return new Response("pong", { status: 200 });
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        return new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ TotalRecordCount: 3 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    }
+  }, async () => {
+    const node = { target: "https://cache.example", headers: { "X-Emby-Token": "private-token" } };
+    await Database.getServerRecordProbe("cached-node", node);
+    await Database.getServerRecordProbe("cached-node", node);
+    assert.equal(requestCount, 5);
+    await Database.getServerRecordProbe("cached-node", node, { forceRefresh: true });
+    assert.equal(requestCount, 10);
+    assert.doesNotMatch(JSON.stringify(GLOBALS.ServerRecordsSnapshotCache.get("cached-node")?.value), /private-token|cache\.example/);
+  });
+  GLOBALS.ServerRecordsSnapshotCache.clear();
+});
+
+test("server record snapshots expose only last-watch time and distinguish unavailable D1", async () => {
+  const nodes = [
+    {
+      name: "server-a",
+      displayName: "Server A",
+      target: "https://origin-a.example/emby",
+      headers: { "X-Emby-Token": "private-token-a" },
+      serverRecord: { enabled: true, expiresAt: "2027-01-31" }
+    },
+    {
+      name: "server-b",
+      displayName: "Server B",
+      target: "https://origin-b.example/emby",
+      headers: { "X-Emby-Token": "private-token-b" },
+      serverRecord: { enabled: true, expiresAt: null }
+    }
+  ];
+  const probedNodeNames = [];
+  const originals = {
+    getNodesListStrict: CacheManager.getNodesListStrict,
+    getNodeForRead: Database.getNodeForRead,
+    getServerRecordProbe: Database.getServerRecordProbe,
+    getServerLastWatch: Database.getServerLastWatch,
+    consoleError: console.error
+  };
+  CacheManager.getNodesListStrict = async () => nodes;
+  Database.getNodeForRead = async (name) => nodes.find(node => node.name === name) || null;
+  Database.getServerRecordProbe = async (name) => {
+    probedNodeNames.push(name);
+    return {
+    runtime: { state: "online", checkedAt: "2026-07-21T00:00:00.000Z" },
+    counts: { movies: 1, series: 2, episodes: 3, state: "ok", errors: {} }
+    };
+  };
+  Database.getServerLastWatch = async () => new Map([
+    ["server-a", { lastWatchedAt: "2026-07-21T12:34:56.000Z" }]
+  ]);
+  console.error = () => {};
+  try {
+    const options = {
+      db: {},
+      ctx: {},
+      request: new Request("https://admin.example/admin")
+    };
+    const available = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
+    assert.deepEqual(probedNodeNames, ["server-a", "server-b"]);
+    assert.deepEqual(available.records.map(record => record.watch), [
+      { lastWatchedAt: "2026-07-21T12:34:56.000Z", state: "ok" },
+      { lastWatchedAt: "", state: "ok" }
+    ]);
+    assert.deepEqual(available.availableNodes.map(record => record.expiryEnabled), [true, false]);
+    assert.doesNotMatch(JSON.stringify(available), /totalSeconds|private-token|origin-[ab]\.example/);
+
+    probedNodeNames.length = 0;
+    const metadataOnly = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
+    assert.deepEqual(probedNodeNames, []);
+    assert.ok(metadataOnly.records.every(record => record.runtime.state === "not_checked"));
+    assert.ok(metadataOnly.records.every(record => record.runtime.errorCode === "manual_refresh_required"));
+
+    const targeted = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, refreshNodeName: "server-b" });
+    assert.deepEqual(probedNodeNames, ["server-b"]);
+    assert.deepEqual(targeted.records.map(record => record.nodeName), ["server-b"]);
+    assert.deepEqual(targeted.records.map(record => record.runtime.state), ["online"]);
+
+    Database.getServerLastWatch = async () => { throw new Error("d1 unavailable"); };
+    const unavailable = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
+    assert.ok(unavailable.records.every(record => record.watch.state === "unavailable"));
+    assert.ok(unavailable.records.every(record => record.watch.lastWatchedAt === ""));
+  } finally {
+    CacheManager.getNodesListStrict = originals.getNodesListStrict;
+    Database.getNodeForRead = originals.getNodeForRead;
+    Database.getServerRecordProbe = originals.getServerRecordProbe;
+    Database.getServerLastWatch = originals.getServerLastWatch;
+    console.error = originals.consoleError;
+  }
+});
+
+test("server record settings preserve node routes and credentials while normalizing legacy tags", () => {
+  const existingNode = {
+    target: "https://origin.example/emby",
+    lines: [{ id: "primary", target: "https://origin.example/emby" }],
+    activeLineId: "primary",
+    headers: { "X-Emby-Token": "private-token", "X-Custom-Route": "route-a" },
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: " node-password ",
+    tag: "高码服"
+  };
+  const normalized = Database.normalizeNode("server-a", existingNode).data;
+  assert.deepEqual(normalized.tags, ["高码服"]);
+  assert.equal(normalized.tag, "高码服");
+
+  const updated = Database.buildNodeRecord("server-a", {
+    tags: ["低码服", "低码服", " 备用服 "],
+    tag: "低码服",
+    serverRecord: { enabled: true, expiresAt: "2027-01-31" }
+  }, existingNode);
+  assert.deepEqual(updated.tags, ["低码服", "备用服"]);
+  assert.equal(updated.tag, "低码服");
+  assert.deepEqual(updated.lines, normalized.lines);
+  assert.deepEqual(updated.headers, normalized.headers);
+  assert.equal(updated.mediaAggregationEmbyUsername, "node-user");
+  assert.equal(updated.mediaAggregationEmbyPassword, " node-password ");
+  assert.deepEqual(updated.serverRecord, {
+    enabled: true,
+    expiryEnabled: true,
+    expiryMode: "fixed",
+    expiresAt: "2027-01-31",
+    expiryDays: 30
+  });
+
+  const rolling = Database.buildNodeRecord("server-a", {
+    serverRecord: { enabled: true, expiryEnabled: true, expiryMode: "rolling", expiresAt: "2027-01-31", expiryDays: 45 }
+  }, existingNode);
+  assert.deepEqual(rolling.serverRecord, {
+    enabled: true,
+    expiryEnabled: true,
+    expiryMode: "rolling",
+    expiresAt: null,
+    expiryDays: 45
+  });
 });

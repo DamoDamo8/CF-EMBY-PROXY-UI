@@ -8,6 +8,7 @@
 
 - `GET ADMIN_PATH` 返回管理台壳。
 - `POST ADMIN_PATH/login` 登录并签发 `auth_token`。
+- 登录壳必须用内嵌脚本拦截表单并以 JSON 调用登录接口；密码按原始字符串精确比较，不得静默裁剪首尾空白。密码错误、剩余尝试次数和锁定状态在页内展示，不得退化为浏览器表单提交后直接显示 JSON 响应。
 - `POST ADMIN_PATH` 是登录后的统一管理 API 入口。
 - `GET/HEAD ${ADMIN_PATH}/__warm` 仅对已认证请求开放，用于显式预热管理台壳和可缓存依赖；登录成功后立即跳转，并通过 `keepalive` 尽力触发该路径，不等待完整 vendor 预热。
 - `GET ADMIN_PATH?setup=1` 的 `Index Source` 启动门只提供本地 `index.html` 上传；文件名必须是 `index.html`，上限 2 MiB，由 Worker 重新校验后写入 KV 并切换当前壳来源。
@@ -28,6 +29,7 @@
 | --- | --- | --- |
 | `#dashboard` | Dashboard | 仪表盘统计、运行状态、趋势图、D1 热点 |
 | `#nodes` | Nodes | 节点列表、搜索筛选、编辑、导入导出、HEAD 测试 |
+| `#server-records` | 服务器记录 | 按节点独立展示 Emby 运行状态、媒体库数量、上次观看、到期状态与访问入口；节点元数据写入 KV，最后观看时间写入 D1 |
 | `#logs` | Logs | 日志查询、初始化 DB、初始化 FTS、清空日志 |
 | `#dns` | DNS | DNS 草稿、Zone 预览、CNAME 历史、推荐域名、优选 IP 工作台 |
 | `#settings` | Settings | 系统 UI、代理与网络、静态资源策略、安全防护、日志设置、监控告警、账号设置、备份与恢复 |
@@ -35,6 +37,18 @@
 管理台保持现有 SaaS 控制台结构，不新增第二套首页。
 
 Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上角的切换图标按需调用 `getMonthlyTrafficStats`，在今日与本月累计之间切换；本月数据不会随首屏自动加载，也不会刷新其他仪表盘卡片。月累计窗口按 `scheduleUtcOffsetMinutes` 从当月 1 日 00:00 计算到当前时刻，统计口径继续使用 Cloudflare `edgeResponseBytes`。
+
+Dashboard 先按需调用 `getDashboardCachedSnapshot` 应用已有快照，再在后台分别调用 `getDashboardCoreStats` 与 `getRuntimeStatus`；统计或 Cloudflare 查询失败不得覆盖仍可用的运行状态。D1 写入热点仅在启用该卡片并进入 Dashboard 时调用 `getDashboardD1WriteHotspot`，拥有独立的 loading/error 状态，不阻塞主状态与统计卡片。
+
+### 服务器记录
+
+- 记录以 `nodeName` 为唯一主键并严格按节点隔离；不同节点即使 Emby `ServerId`、会话 ID 或上游地址相同也不得合并，不建立跨服用户映射。名称使用节点 `displayName || name`，访问地址沿用节点公开入口，Emby 返回的服务器名称只作为探测信息。
+- 节点字段 `tags: string[]` 是标签真相源，最多 20 项、每项最多 24 字符；旧 `tag` 继续作为首项兼容镜像。`serverRecord.enabled` 控制是否出现在页面。到期功能由 `serverRecord.expiryEnabled` 显式启用，新记录默认关闭；旧记录未声明该字段但已有合法 `expiresAt` 时兼容为启用固定日期，其余记录按关闭处理。启用后由节点自己的 `serverRecord.expiryMode` 选择策略：`fixed` 保存可编辑的 `expiresAt`，不会随最后播放变化；`rolling` 保存 1 到 3650 的 `expiryDays`，按最后观看时间滚动计算日期。Worker 返回 `expiry.enabled`、`expiry.state`、`expiry.daysRemaining`、`expiry.expiresAt`、`expiry.source`、`expiry.mode` 与 `expiry.expiryDays`；前端只在启用时展示预计到期日期和“XX 天过期”“今天到期”或“已过期 XX 天”，不使用浏览器时间重新推导。移除记录只关闭 `enabled`，不删除节点或已有最后观看时间。
+- `getServerRecordsSnapshot` 的普通读取只返回节点元数据、D1 最后观看与 Worker 到期计算，不请求 Emby。只有显式提交 `forceRefresh: true` 时 Worker 才使用节点自己的活动线路与自定义认证头探测 Emby；可附带 `nodeName` 只读取并返回该卡片的刷新结果，不附带时刷新全部卡片。浏览器只接收公开访问地址、安全运行状态、媒体计数和最后观看时间，不接收上游地址或认证头。运行状态与到期状态是两个独立维度。
+- 媒体数分别请求 Emby 官方 [`GET /Items`](https://dev.emby.media/reference/RestAPI/ItemsService/getItems.html)，使用 `IncludeItemTypes=Movie|Series|Episode&Recursive=true&Limit=1` 并读取 `TotalRecordCount`；运行状态和线路选择只使用 [`GET /System/Ping`](https://dev.emby.media/reference/RestAPI/SystemService/getSystemPing.html)。[`GET /System/Info`](https://dev.emby.media/reference/RestAPI/SystemService/getSystemInfo.html) 仅补充版本与 ServerId，失败、无权限或响应中的维护/关机字段都不得改变 Ping 得出的状态。三项计数允许部分成功，手动刷新绕过 60 秒 isolate 缓存。
+- 标签编辑器提供搜索、多选及自由输入；到期区域先提供默认未勾选的“启用预计过期”复选框，勾选后再使用“固定日期 / 滚动天数”分段模式控件，并只显示当前模式对应的日期或天数输入。新增记录只能选择尚未启用的节点，选择节点后必须载入其现有标签与完整到期策略，重新启用不得用空值覆盖保留配置。旧 `cf-emby-proxy-ui:server-records:v1` 本地记录按唯一节点名或访问地址迁移，无法唯一匹配的记录保留为“待关联”；人工关联允许选择已启用节点，并把旧标签合并到节点现有标签中。
+- 上次观看仅由节点代理收到的 `POST /Sessions/Playing/Stopped` 更新，不累计时长；D1 写入与降级语义见 [运行时架构](architecture.md#服务器最后观看记录)。
+- “新增记录”旁的刷新按钮显式刷新全部卡片的节点探测、媒体数量、最后观看与预计过期；每张卡片编辑按钮左侧另有单节点刷新按钮。两类按钮分别维护全局和卡片 loading，不触发整页 Dashboard 刷新。进入页面、保存、移除或重新进入路由只读取记录，不自动访问 Emby；卡片状态机在手动刷新前显示“未检测”。
 
 ## 设置页
 
@@ -49,7 +63,16 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 7. 账号设置
 8. 备份与恢复
 
+“监控告警”提供新记录默认滚动天数 `serverRecordExpiryDays`、`tgServerExpiryWarningEnabled` 和 `tgServerExpiryWarningDays`。里程碑固定为 7、3、1、0 天，可逐项启用；预警总开关默认关闭。
+
 保存分组固定为五类：`ui`、`proxy`、`security`、`logs`、`account`。
+
+### 影视资源版本聚合
+
+- 设置页在主视频流快捷勾选附近提供“影视资源版本聚合”区。勾选的节点组成聚合池；保存动作调用 `saveMediaAggregationPolicyShortcuts`，原子保存池成员、全局默认 Emby 账号并把勾选节点的 `playbackInfoMode` 设为 `rewrite`。节点编辑弹窗的高级设置提供节点固定账号/密码，节点凭据优先于全局凭据；关闭节点凭据后回退全局。取消勾选会清除由该快捷入口设置的 `rewrite`，恢复节点继承全局模式。
+- 聚合节点选择器只允许勾选具备节点完整凭据或全局完整凭据的节点；节点账号和密码必须同时填写。账号密码属于敏感字段，普通设置/完整备份默认脱敏；Worker 只在 isolate 内缓存短期令牌，不写入 KV/D1。至少选择两个节点才会产生聚合。
+- Worker 在 `PlaybackInfo` 响应中按 TMDB/IMDB `ProviderIds` 匹配池内其他节点并注入多版本；魔改 MediaSource ID 使用无状态编码，二次 `PlaybackInfo` 请求会校验目标节点仍在池内后回源。备服故障不阻断主服版本响应。
+- “双向同步播放进度”默认关闭；开启后保存 `mediaAggregationBidirectionalProgressEnabled: true`，主服照常记录，Worker 对携带聚合 MediaSourceId 的播放事件使用固定账号向备服静默镜像。镜像失败不向客户端报错。
 
 ### 域名前缀代理与 CNAME
 
@@ -63,11 +86,12 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 
 - `previewConfig`、`saveConfig` 和 `importSettings` 共用字段清洗与完整校验链。预览必须执行本地 HTML 内部版本、Host Prefix CNAME、DNS 同步前置条件等正式保存校验，不得把预览成功但保存必然失败的配置交给用户确认。
 - `saveConfig` 和 `importSettings` 必须有 KV binding；缺少 `ENI_KV`/兼容 KV binding 时返回 `KV_NOT_CONFIGURED`、HTTP `503`，不得以仅保存在 isolate 内存中的配置返回成功。
-- 一次设置写入同时提交配置、配置 meta、设置快照、快照 meta 和遗留键删除，并在单 isolate 的 KV mutation chain 中串行。节点保存/导入、删除、主视频流快捷策略和完整导入共用该链，后发写入等待前序索引提交或补偿完成。失败补偿只恢复仍等于本次写入结果的键；若检测到并发新值，返回 `KV_MUTATION_ROLLBACK_CONFLICT`、HTTP `409`，并通过 `rollbackConflicts`/`rollbackFailures` 说明未覆盖的新值或补偿失败。
+- 一次设置写入同时提交配置、配置 meta、设置快照、快照 meta 和遗留键删除，并在单 isolate 的 KV mutation chain 中串行。节点保存/导入、删除、主视频流快捷策略、影视资源版本聚合快捷策略和完整导入共用该链，后发写入等待前序索引提交或补偿完成。失败补偿只恢复仍等于本次写入结果的键；若检测到并发新值，返回 `KV_MUTATION_ROLLBACK_CONFLICT`、HTTP `409`，并通过 `rollbackConflicts`/`rollbackFailures` 说明未覆盖的新值或补偿失败。
 - `importFull` 将导入前快照、配置和节点读取、DNS 计划、配置/节点提交及失败补偿作为同一个串行操作。节点阶段失败时先恢复节点和导入前 CNAME，再恢复旧配置及其 DNS；同 isolate 内后发设置保存必须等待导入完成，不能被旧快照覆盖。
-- `exportSettings` 默认移除 `cfApiToken`、`tgBotToken`，返回 `secretsRedacted: true`、`containsSecrets: false`。完整设置导出必须同时提交 `includeSecrets: true` 和 `X-Admin-Confirm: exportSettings`；缺少确认头时返回 `CONFIRMATION_REQUIRED`、HTTP `428`，成功结果标记 `containsSecrets: true`。
-- `exportConfig` 的默认响应同样脱敏，节点导出不得把配置密钥带回浏览器。只有提交 `includeSecrets: true` 且携带 `X-Admin-Confirm: exportConfig` 时才允许生成包含密钥的完整配置备份；完整备份同时携带当前内容寻址 `index.html`，`importFull` 校验其 SHA-256 与配置版本一致后恢复。普通设置导出仍应调用 `exportSettings`。
-- 默认脱敏的 settings/full 备份回导时，缺少 `cfApiToken` 或 `tgBotToken` 表示保留当前密钥；备份显式包含字段时才允许覆盖，显式空字符串表示清空。配置快照及 KV 整理迁移快照只保存脱敏配置；恢复普通快照或整理迁移快照时同样沿用当前密钥。
+- 双文件更新在本地 HTML 激活后才请求 Cloudflare 部署 Worker。部署失败时，回滚重新进入 KV mutation chain，只有当前 `indexUrl` 仍指向本次激活 revision 才恢复激活前的 `indexUrl`；其他并发保存字段必须从当前配置保留，较新的 HTML 已接管时跳过回滚并返回 `htmlRollbackSkipped`/`htmlRollbackReason`，不得写回更新开始时读取的整份旧配置或触发无关 Host Prefix DNS 补偿。
+- `exportSettings` 默认移除 `cfApiToken`、`tgBotToken`、`mediaAggregationEmbyPassword`，返回 `secretsRedacted: true`、`containsSecrets: false`。完整设置导出必须同时提交 `includeSecrets: true` 和 `X-Admin-Confirm: exportSettings`；缺少确认头时返回 `CONFIRMATION_REQUIRED`、HTTP `428`，成功结果标记 `containsSecrets: true`。
+- `exportConfig` 的默认响应同样脱敏，并从节点实体移除 `mediaAggregationEmbyUsername` / `mediaAggregationEmbyPassword`。只有提交 `includeSecrets: true` 且携带 `X-Admin-Confirm: exportConfig` 时才允许生成包含全局及节点聚合凭据的完整配置备份；完整备份同时携带当前内容寻址 `index.html`，`importFull` 校验其 SHA-256 与配置版本一致后恢复。Worker 必须按加入 `action: importFull` 后的实际 UTF-8 JSON 字节数预检回导能力，并为前端 `meta` 等包装保留 64 KiB 余量；超过 12 MiB 管理请求上限的安全阈值时，`exportConfig` 返回 `FULL_BACKUP_TOO_LARGE`、HTTP `413`，不得下载一份自身无法恢复的完整备份。普通设置导出仍应调用 `exportSettings`。
+- 默认脱敏的 settings/full 备份回导时，缺少 `cfApiToken`、`tgBotToken` 或全局 `mediaAggregationEmbyPassword` 表示保留当前密钥；完整备份中的现有节点缺少节点聚合账号/密码时同样保留当前节点值。备份显式包含字段时才允许覆盖，显式空字符串表示清空。配置快照及 KV 整理迁移快照只保存脱敏配置；恢复普通快照或整理迁移快照时同样沿用当前密钥。
 - Worker 不保存也不消费 `dnsAutoUpload*`。正式模板、生成入口和 Vue 设置源均不得包含或展示这些设置；实现完整 scheduled 能力前不能用占位表单暗示功能已经生效。
 
 ### KV 整理确认契约
@@ -75,6 +99,7 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - `previewTidyData` 的 KV 预览返回 `planHash`、HMAC 签名的 `planToken` 和 `planExpiresAt`。`tidyKvData` 必须携带该 `planToken`；Worker 在同一 mutation chain 中重新扫描并重建计划，只有当前哈希与已确认哈希一致才执行。
 - 令牌缺失、格式错误、签名错误或 scope 不匹配返回 `TIDY_PLAN_INVALID`、HTTP `409`；令牌过期或预览后 KV 计划发生变化返回 `TIDY_PLAN_STALE`、HTTP `409`。管理台应提示用户重新预览，不得静默使用新计划继续整理。
 - 主配置 `sys:theme`、任一 `node:*`、配置快照、节点索引或 KV key list 读取异常时，预览与执行均为零写入失败。分页缺少游标、重复游标或超过 1000 页返回 `KV_SCAN_INCOMPLETE`，不得把未完成扫描解释为完整键集合。
+- 本地 HTML 内容键以当前配置和保留配置快照中的本地 revision 为引用根。配置提交使旧 revision 退出引用集时，必须在同一条件补偿 mutation 中删除对应 `sys:admin_index_upload:v1:<sha256>`；KV 整理还要列出并删除升级前已存在的未引用内容键，预览分组使用 `admin_index_uploads`。
 - 预览配额按前向 put/delete 与最坏补偿 put/delete 合计；超过安全写入额度返回 `KV_TIDY_WRITE_LIMIT_EXCEEDED`、HTTP `409`。执行结果继续返回实际 `fieldGroups`、`deleteGroups`、`rewriteGroups`、`preserveGroups`，用于和确认计划对照。
 
 ## 动作目录
@@ -90,6 +115,9 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - `getSettingsBootstrap`
 - `getDashboardSnapshot`
 - `getDashboardStats`
+- `getDashboardCoreStats`
+- `getDashboardCachedSnapshot`
+- `getDashboardD1WriteHotspot`
 - `getMonthlyTrafficStats`
 - `getRuntimeStatus`
 
@@ -126,6 +154,8 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - `delete`
 - `pingNode`
 - `saveMainVideoStreamPolicyShortcuts`
+- `getServerRecordsSnapshot`
+- `saveServerRecordSettings`
 
 `save` 与 `import` 在内部归一到 `saveOrImport`。
 
@@ -159,12 +189,13 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - `testTelegram`
 - `sendDailyReport`
 - `sendPredictedAlert`
+- `saveMediaAggregationPolicyShortcuts`
 
 `sendDailyReport` 的综合日报在今日 CF Zone 总流量后追加本月累计流量；月累计与 Dashboard 本月流量卡复用同一统计口径和缓存链。
 
 `initLogsDb` 只初始化日志基础表、日志兼容列/索引和小时统计，不因 DNS、鉴权或 Cloudflare cache 表状态阻断；`initLogsFts` 在日志基础结构上重建可派生的 FTS5 表，只有结构复检和重建都成功时才返回 `ftsReady: true`。`initD1Schema` 是显式的全库运行时兼容初始化动作，会逐步补齐运行时表、日志表和小时统计，但不写入 Wrangler migration 记录。
 
-`getD1SchemaStatus` 每次显式检查都重新读取 `sqlite_master` 与 PRAGMA，核对完整必需列、运行时 upsert 依赖的主键/唯一键、命名索引所属表与键列顺序，返回 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 和 `issues`。只有要求的 migration 已记录且结构校验通过时 `schemaVersion` 才为 `5`；运行时补齐成功但 migration 未应用时只允许 `runtimeCompatibilityReady: true`。`tidyD1Data` 只执行保留期清理、统计/FTS 维护和 `PRAGMA optimize`，不得被用作跳过正式 migration apply 的升级入口。
+`getD1SchemaStatus` 每次显式检查都重新读取 `sqlite_master` 与 PRAGMA，核对完整必需列、运行时 upsert 依赖的主键/唯一键、命名索引所属表与键列顺序，返回 `runtimeCompatibilityVersion`、`runtimeCompatibilityReady`、`appliedMigrations`、`latestRequiredMigration`、`missingMigrations`、`migrationReady`、`schemaVersion`、表/列/索引/约束/FTS readiness 和 `issues`。只有要求的 migration 已记录且结构校验通过时 `schemaVersion` 才为 `6`；运行时补齐成功但 migration 未应用时只允许 `runtimeCompatibilityReady: true`。`tidyD1Data` 只执行保留期清理、统计/FTS 维护和 `PRAGMA optimize`，不得被用作跳过正式 migration apply 的升级入口。
 
 ## 正式前端约定
 
@@ -181,6 +212,7 @@ Dashboard 的视频流量卡默认显示今日 CF Zone 总流量。卡片右上�
 - 静态资源策略不展示发布源、Release 或 `INDEX_URL` 配置，保存按钮文案固定为“保存静态资源策略”。备份与恢复中的“Worker 和 HTML 更新”必须同时选择 `worker.js` 与 `index.html`，任一缺失、文件名错误或超出上限时禁用提交；后端动作继续执行同样的双文件强制校验。
 - 默认“导出全局设置”必须明确提示结果已脱敏；专家模式才显示“导出含密钥设置”，并在请求前进行敏感操作确认。日志页专家模式显示“Schema 状态”和“初始化 Schema”，分别调用 `getD1SchemaStatus` 与 `initD1Schema`。
 - 视频流量卡的今日/本月切换由正式 runtime enhancement 挂载，使用 Lucide `repeat-2` 图标、固定点击区域和加载态；月统计只在用户首次切换时请求，切回今日直接恢复当前仪表盘快照。
+- 服务器记录页由正式 runtime enhancement 挂载在日志页之前；卡片数据来自 `getServerRecordsSnapshot`，编辑只提交节点、标签、到期功能开关与到期策略，不提供运行状态、媒体数量、名称、地址或上次观看的手工输入。
 - `App.vue`、`src/features/*`、`src/composables/*` 不是当前首屏启动链。
 - 不把 `banker/.admin-ui.html` 或构建副本当作正式模板。
 - `check-cdn-paths.mjs` 必须按标签语义检查 `script[src]`、stylesheet/modulepreload 和 script/style preload/prefetch，覆盖单双引号、协议相对写法与无扩展 URL；同时检查占位符清空、`admin-bootstrap`、`#app`、禁止 importmap、任何 inline 动态 `import()`、禁止 `dist/assets/**`，并确认 `dist/index.html` 与同步后的 `index.html` 字节一致。

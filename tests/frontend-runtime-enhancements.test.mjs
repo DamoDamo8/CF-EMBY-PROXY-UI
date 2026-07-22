@@ -16,7 +16,7 @@ function loadEnhancementTestHooks(documentOverrides = {}) {
   const closureEnd = inlineScript.lastIndexOf('})();');
   assert.notEqual(closureEnd, -1, 'enhancement script must use the expected closure');
   const instrumentedScript = inlineScript.slice(0, closureEnd)
-    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, patchSafetyContractMethods };\n'
+    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, patchSafetyContractMethods, getServerRecordSelectableNodes, buildServerRecordDialogDraft, normalizeServerRecord, getServerRecordExpiryStatus, formatServerRecordExpiry };\n'
     + inlineScript.slice(closureEnd);
   const window = {
     addEventListener() {},
@@ -39,6 +39,117 @@ test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
 });
 
+test('server records view is inserted before logs and uses node-backed admin actions', async () => {
+  const syncSource = await readFile(new URL('../frontend/scripts/sync-admin-runtime.mjs', import.meta.url), 'utf8');
+  assert.match(syncSource, /'nodes',\s*'server-records',\s*'logs'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /serverRecordsHash = '#server-records'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /insertBefore\(view, document\.getElementById\('view-logs'\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /insertBefore\(link, logsLink\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getServerRecordsSnapshot'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('saveServerRecordSettings'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /readLegacyServerRecords/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /高码服.*低码服/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /tagQuery[\s\S]*?\.filter\(\(tag\) => tag\.toLowerCase\(\)\.includes/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /serverRecordsUiState\.attempted = true/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /function activateServerRecordsRoute[\s\S]*?serverRecordsUiState\.attempted = false/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /if \(!serverRecordsUiState\.attempted\) void loadServerRecords\(app\)/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /name="(?:movies|series|episodes|lastWatched|url|state)"/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /累计观看|totalSeconds|formatServerRecordDuration/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /record\.watch\.state === 'ok' \? formatServerRecordDateTime\(record\.watch\.lastWatchedAt\) : '数据不可用'/);
+});
+
+test('server record dialog preserves node settings and allows legacy records to target enabled nodes', () => {
+  const { getServerRecordSelectableNodes, buildServerRecordDialogDraft } = loadEnhancementTestHooks();
+  const availableNodes = [
+    { nodeName: 'disabled-node', enabled: false, tags: ['high'], expiresAt: '2026-08-10' },
+    { nodeName: 'enabled-node', enabled: true, tags: ['low'], expiresAt: '2026-09-20' },
+    { nodeName: 'rolling-node', enabled: false, tags: [], expiryEnabled: true, expiryMode: 'rolling', expiryDays: 45, expiresAt: '' }
+  ];
+  const legacyRecord = { id: 'legacy-1', tags: ['legacy'], expiresAt: '2026-07-30' };
+
+  assert.deepEqual(
+    [...getServerRecordSelectableNodes(availableNodes, null, null)].map(node => node.nodeName),
+    ['disabled-node', 'rolling-node']
+  );
+  assert.deepEqual(
+    [...getServerRecordSelectableNodes(availableNodes, null, legacyRecord)].map(node => node.nodeName),
+    ['disabled-node', 'enabled-node', 'rolling-node']
+  );
+
+  const reenabledDraft = buildServerRecordDialogDraft(availableNodes, null, null, 'disabled-node');
+  assert.deepEqual([...reenabledDraft.tags], ['high']);
+  assert.equal(reenabledDraft.expiresAt, '2026-08-10');
+  assert.equal(reenabledDraft.expiryEnabled, false);
+  assert.equal(reenabledDraft.expiryMode, 'fixed');
+  assert.equal(reenabledDraft.expiryDays, 30);
+
+  const legacyDraft = buildServerRecordDialogDraft(availableNodes, null, legacyRecord, 'enabled-node');
+  assert.deepEqual([...legacyDraft.tags], ['low', 'legacy']);
+  assert.equal(legacyDraft.expiresAt, '2026-09-20');
+  assert.equal(legacyDraft.expiryMode, 'fixed');
+  assert.equal(legacyDraft.expiryEnabled, true);
+
+  const rollingDraft = buildServerRecordDialogDraft(availableNodes, null, null, 'rolling-node');
+  assert.equal(rollingDraft.expiryMode, 'rolling');
+  assert.equal(rollingDraft.expiryEnabled, true);
+  assert.equal(rollingDraft.expiryDays, 45);
+  assert.equal(rollingDraft.expiresAt, '');
+});
+
+test('server record cards use Worker expiry results and expose resource-only refresh state', () => {
+  const { normalizeServerRecord, getServerRecordExpiryStatus, formatServerRecordExpiry } = loadEnhancementTestHooks();
+  const record = normalizeServerRecord({
+    nodeName: 'alpha',
+    expiresAt: '',
+    watch: { lastWatchedAt: '2026-07-01T00:00:00.000Z', state: 'ok' },
+    expiryEnabled: true,
+    expiryMode: 'rolling',
+    expiryDays: 45,
+    expiry: { enabled: true, state: 'expiring', daysRemaining: 3, expiresAt: '2026-07-25', source: 'last_watched', mode: 'rolling', expiryDays: 45 }
+  });
+  const status = getServerRecordExpiryStatus(record);
+  assert.equal(status.days, 3);
+  assert.equal(formatServerRecordExpiry(record, status), '3 天过期');
+  assert.equal(status.mode, 'rolling');
+  assert.equal(status.expiryDays, 45);
+
+  const unset = normalizeServerRecord({ nodeName: 'unset', expiry: { state: 'unset', daysRemaining: null } });
+  assert.equal(unset.expiry.daysRemaining, null);
+  assert.equal(getServerRecordExpiryStatus(unset).key, 'disabled');
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-refresh title="刷新全部资源统计和预计过期" aria-label="刷新全部资源统计和预计过期"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-refresh-one=/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /refreshButton\?\.setAttribute\('aria-busy', 'true'\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getServerRecordsSnapshot', \{ forceRefresh \}\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getServerRecordsSnapshot', \{ forceRefresh: true, nodeName: normalizedNodeName \}\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /name="expiryEnabled" type="checkbox"/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /name="expiryEnabled" type="checkbox" checked/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-expiry-mode="fixed"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-expiry-mode="rolling"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /name="expiryDays" type="number"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /server-record-expiry-date/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /server-record-expiry-remaining/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-lucide="server-cog"/);
+});
+
+test('dashboard refresh separates stats, runtime status, and D1 hotspot failures', () => {
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getDashboardCachedSnapshot'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getDashboardCoreStats'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getRuntimeStatus'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getDashboardD1WriteHotspot'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /Promise\.allSettled\(\[statsTask, runtimeTask\]\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /已保留其余可用状态/);
+});
+
+test('formal settings enhancement exposes server expiry and Telegram milestone controls', () => {
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /id="cfg-server-record-expiry-days"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /id="cfg-tg-server-expiry-enabled"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /id="cfg-server-expiry-days-list"/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /\[7, 3, 1, 0\]\.map/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /settingsForm = \{ \.\.\.app\.settingsForm, serverRecordExpiryDays:/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /settingsForm = \{ \.\.\.app\.settingsForm, tgServerExpiryWarningEnabled:/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /tgServerExpiryWarningDays: selected/);
+});
+
 test('dashboard traffic card exposes an on-demand day and month toggle', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-dashboard-traffic-toggle/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-lucide="repeat-2"/);
@@ -47,10 +158,27 @@ test('dashboard traffic card exposes an on-demand day and month toggle', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /本月视频流量 \(CF Zone 总流量\)/);
 });
 
+test('media aggregation settings expose fixed credentials and shortcut action', () => {
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-panel/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-username/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-password/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-progress/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-admin-node-media-credentials/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /mediaAggregationEmbyCredentialsConfigured/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /checkbox\.disabled = !available/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /节点固定账号优先，全局账号作为默认兜底/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /节点固定 Emby 账号和密码必须同时填写/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('saveMediaAggregationPolicyShortcuts'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /改写模式/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /透传/);
+});
+
 test('backup view exposes only the paired Worker and HTML upload flow', async () => {
   const template = await readFile(new URL('../frontend/admin-runtime.template.html', import.meta.url), 'utf8');
   const adminConsoleDoc = await readFile(new URL('../docs/admin-console.md', import.meta.url), 'utf8');
   const cdnChecker = await readFile(new URL('../frontend/scripts/check-cdn-paths.mjs', import.meta.url), 'utf8');
+  const vueRuntimeConfig = await readFile(new URL('../frontend/src/config/runtime.js', import.meta.url), 'utf8');
+  const vueAdminConsole = await readFile(new URL('../frontend/src/composables/useAdminConsole.js', import.meta.url), 'utf8');
   assert.match(template, /id:"admin-worker-html-update-root"/);
   assert.doesNotMatch(template, /cfg-release-repo|cfg-release-branch|cfg-release-tag|cfg-index-url/);
   assert.doesNotMatch(template, /releaseRepo|releaseBranch|releaseTag|buildGithubReleaseSourceState/);
@@ -63,6 +191,11 @@ test('backup view exposes only the paired Worker and HTML upload flow', async ()
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /workerFileName: state\.workerFile\.name/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /indexFileName: state\.indexFile\.name/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /必须同时选择 worker\.js 和 index\.html/);
+  assert.doesNotMatch(vueRuntimeConfig, /VITE_INDEX_URL|VITE_RELEASE_INDEX_URL/);
+  assert.doesNotMatch(vueAdminConsole, /updateWorkerScriptContent|releaseRepo|releaseBranch|releaseTag/);
+  assert.match(vueAdminConsole, /callAdminAction\('updateWorkerAndAdminIndex'/);
+  assert.match(vueAdminConsole, /workerScriptContent/);
+  assert.match(vueAdminConsole, /indexHtml/);
 });
 
 test('DNS settings save includes changed preferred sources without redundant source writes', async () => {
