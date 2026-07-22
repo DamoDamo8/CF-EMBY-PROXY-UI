@@ -2171,13 +2171,15 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     const nodeModal = document.querySelector('#node-modal');
     const advancedContent = nodeModal?.querySelector('[data-admin-node-advanced-content="1"]');
     const playbackInfoField = nodeModal?.querySelector('#form-playback-info-mode');
-    if (!nodeModal || !advancedContent || !playbackInfoField) return;
+    const advancedFields = playbackInfoField?.closest('.grid');
+    if (!nodeModal || !playbackInfoField || !advancedFields) return;
     let panel = nodeModal.querySelector('[data-admin-node-media-credentials="1"]');
     if (!panel) {
       panel = document.createElement('section');
       panel.setAttribute('data-admin-node-media-credentials', '1');
       panel.innerHTML = '<div class="flex items-start justify-between gap-3"><div><div class="text-sm font-semibold text-slate-900 dark:text-white">节点聚合账号</div><p class="mt-1 text-xs leading-5 text-slate-500">节点固定账号优先于全局账号；关闭后使用全局聚合账号。</p></div><i data-lucide="key-round" class="mt-0.5 h-4 w-4 text-sky-600" aria-hidden="true"></i></div><label class="mt-1 flex items-start gap-2 text-sm text-slate-700 dark:text-slate-300"><input data-admin-node-media-credentials-enabled="1" type="checkbox" class="mt-0.5 h-4 w-4 rounded" /><span><strong class="font-medium">使用节点固定 Emby 账号</strong><span data-admin-node-media-credentials-status="1" class="mt-0.5 block text-xs text-slate-500"></span></span></label><div data-admin-node-media-credentials-grid="1"><label class="block text-xs text-slate-500">节点 Emby 账号<input data-admin-node-media-username="1" type="text" autocomplete="username" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><label class="block text-xs text-slate-500">节点 Emby 密码<input data-admin-node-media-password="1" type="password" autocomplete="new-password" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label></div>';
-      advancedContent.insertAdjacentElement('afterbegin', panel);
+      if (advancedContent) advancedContent.insertAdjacentElement('afterbegin', panel);
+      else advancedFields.insertAdjacentElement('beforebegin', panel);
       panel.querySelector('[data-admin-node-media-credentials-enabled="1"]')?.addEventListener('change', (event) => {
         const form = app.nodeModalForm && typeof app.nodeModalForm === 'object' ? app.nodeModalForm : {};
         app.nodeModalForm = {
@@ -2201,6 +2203,8 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
         };
       });
       scheduleIconRefresh(panel);
+    } else if (advancedContent && panel.parentElement !== advancedContent) {
+      advancedContent.insertAdjacentElement('afterbegin', panel);
     }
     const form = app?.nodeModalForm && typeof app.nodeModalForm === 'object' ? app.nodeModalForm : {};
     const credentialState = normalizeMediaAggregationNodeCredentialState(form);
@@ -2243,6 +2247,17 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
           result.form.mediaAggregationEmbyUseNodeCredentials = rawNode.mediaAggregationEmbyCredentialsConfigured === true
             || credentialState.configured;
         }
+        return result;
+      };
+    }
+    if (typeof app.applyNodeModalState === 'function') {
+      const applyNodeModalState = app.applyNodeModalState.bind(app);
+      app.applyNodeModalState = function applyNodeModalStateWithMediaCredentials(...args) {
+        const result = applyNodeModalState(...args);
+        enqueue(() => {
+          applyNodeAdvancedSettingsLayout();
+          syncNodeMediaAggregationCredentialFields(app);
+        });
         return result;
       };
     }
@@ -2564,6 +2579,12 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
           if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
           if (containsLucidePlaceholder(node)) shouldRefreshIcons = true;
           if (touchesShellHooks(node)) shouldRefreshShell = true;
+        }
+        for (const node of record.removedNodes) {
+          if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+          if (node.matches?.('[data-admin-node-media-credentials="1"]') || node.querySelector?.('[data-admin-node-media-credentials="1"]')) {
+            shouldRefreshShell = true;
+          }
         }
       }
       if (shouldRefreshIcons) scheduleIconRefresh(document.body);

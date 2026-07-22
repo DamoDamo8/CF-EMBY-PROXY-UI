@@ -165,6 +165,9 @@ test('media aggregation settings expose fixed credentials and shortcut action', 
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-progress/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-admin-node-media-credentials/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /mediaAggregationEmbyCredentialsConfigured/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /else advancedFields\.insertAdjacentElement\('beforebegin', panel\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /applyNodeModalStateWithMediaCredentials/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /record\.removedNodes/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /checkbox\.disabled = !available/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /节点固定账号优先，全局账号作为默认兜底/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /节点固定 Emby 账号和密码必须同时填写/);
