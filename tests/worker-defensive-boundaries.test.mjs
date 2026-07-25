@@ -40,6 +40,7 @@ const {
   patchAdminShellRuntimeStatus,
   renderRemoteAdminPage,
   renderAdminLoginPage,
+  createTargetRecord,
   renderAdminPage,
   isAcceptedAdminHtmlDocumentContentType,
   isMutableJsdelivrGithubAssetUrl,
@@ -72,7 +73,7 @@ test("media aggregation source IDs are stateless and provider matching is exact"
   assert.equal(mediaAggregationProviderIdsMatch({ imdb: "tt1" }, { imdb: "tt2" }), false);
 });
 
-test("media aggregation credentials prefer a complete node pair and otherwise fall back globally", () => {
+test("media aggregation credentials prefer node usernames and allow empty passwords", () => {
   assert.deepEqual(
     resolveMediaAggregationCredentials({
       mediaAggregationEmbyUsername: "node-user",
@@ -89,38 +90,73 @@ test("media aggregation credentials prefer a complete node pair and otherwise fa
       source: "node"
     }
   );
-  assert.equal(resolveMediaAggregationCredentials({
+  assert.deepEqual(resolveMediaAggregationCredentials({
     mediaAggregationEmbyUsername: "partial-node"
   }, {
     mediaAggregationEmbyUsername: "global-user",
     mediaAggregationEmbyPassword: "global-password"
+  }), {
+    username: "partial-node",
+    password: "",
+    configured: true,
+    partial: false,
+    source: "node"
+  });
+  assert.equal(resolveMediaAggregationCredentials({
+    mediaAggregationEmbyPassword: "orphan-password"
+  }, {
+    mediaAggregationEmbyUsername: "global-user"
   }).source, "global");
   assert.equal(resolveMediaAggregationCredentials({}, {}).configured, false);
 });
 
-test("node summaries expose only whether aggregation credentials are configured", () => {
+test("node summaries preserve credential state without exposing passwords", () => {
   const summary = Database.buildNodeSummary("backup", {
     displayName: "Backup",
     target: "https://backup.test",
     lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
     activeLineId: "main",
+    serverRecordEmbyUsername: "stats-user",
+    serverRecordEmbyPassword: "stats-password",
     mediaAggregationEmbyUsername: "node-user",
     mediaAggregationEmbyPassword: "node-password"
   }).summary;
   assert.equal(summary.mediaAggregationEmbyCredentialsConfigured, true);
   assert.equal(summary.mediaAggregationEmbyUsername, undefined);
   assert.equal(summary.mediaAggregationEmbyPassword, undefined);
+  assert.equal(summary.serverRecordEmbyUsername, "stats-user");
+  assert.equal(summary.serverRecordEmbyCredentialsConfigured, true);
+  assert.equal(summary.serverRecordEmbyCredentialSource, "record");
+  assert.equal(summary.serverRecordEmbyPassword, undefined);
   const normalizedSummary = Database.normalizeNodeSummaryIndex([summary]).nodes[0];
   assert.equal(normalizedSummary.mediaAggregationEmbyCredentialsConfigured, true);
+  assert.equal(normalizedSummary.serverRecordEmbyCredentialsConfigured, true);
+  assert.equal(normalizedSummary.serverRecordEmbyUsername, "stats-user");
+  assert.equal(normalizedSummary.serverRecordEmbyCredentialSource, "record");
+  assert.equal(normalizedSummary.serverRecordEmbyPassword, undefined);
+
+  const inheritedSummary = Database.buildNodeSummary("node-credentials", {
+    target: "https://node-credentials.test",
+    lines: [{ id: "main", target: "https://node-credentials.test" }],
+    activeLineId: "main",
+    mediaAggregationEmbyUsername: "node-user",
+    mediaAggregationEmbyPassword: "node-password"
+  }).summary;
+  assert.equal(inheritedSummary.serverRecordEmbyUsername, "node-user");
+  assert.equal(inheritedSummary.serverRecordEmbyCredentialsConfigured, true);
+  assert.equal(inheritedSummary.serverRecordEmbyCredentialSource, "node");
+  assert.equal(inheritedSummary.serverRecordEmbyPassword, undefined);
 });
 
-test("admin node reads expose the aggregation username and password state without the password", async () => {
+test("admin node reads expose credential usernames and password states without passwords", async () => {
   const originalGetNodeForRead = Database.getNodeForRead;
   const originalGetAdminRevisionsForRead = Database.getAdminRevisionsForRead;
   Database.getNodeForRead = async () => ({
     target: "https://backup.test",
     lines: [{ id: "main", target: "https://backup.test" }],
     activeLineId: "main",
+    serverRecordEmbyUsername: "stats-user",
+    serverRecordEmbyPassword: "stats-password",
     mediaAggregationEmbyUsername: "node-user",
     mediaAggregationEmbyPassword: "node-password"
   });
@@ -136,9 +172,80 @@ test("admin node reads expose the aggregation username and password state withou
     assert.equal(payload.node.mediaAggregationEmbyUsername, "node-user");
     assert.equal(payload.node.mediaAggregationEmbyPassword, undefined);
     assert.equal(payload.node.mediaAggregationEmbyCredentialsConfigured, true);
+    assert.equal(payload.node.serverRecordEmbyUsername, "stats-user");
+    assert.equal(payload.node.serverRecordEmbyPassword, undefined);
+    assert.equal(payload.node.serverRecordEmbyCredentialsConfigured, true);
   } finally {
     Database.getNodeForRead = originalGetNodeForRead;
     Database.getAdminRevisionsForRead = originalGetAdminRevisionsForRead;
+  }
+});
+
+test("server record password reveal returns only the requested effective credential", async () => {
+  const originalGetNodeForRead = Database.getNodeForRead;
+  Database.getNodeForRead = async nodeName => String(nodeName).toLowerCase() === "record-node"
+    ? {
+        serverRecordEmbyUsername: "record-user",
+        serverRecordEmbyPassword: "record-password",
+        mediaAggregationEmbyUsername: "node-user",
+        mediaAggregationEmbyPassword: "node-password"
+      }
+    : String(nodeName).toLowerCase() === "inherited-node"
+      ? {
+          mediaAggregationEmbyUsername: "node-user",
+          mediaAggregationEmbyPassword: "node-password"
+        }
+    : null;
+  try {
+    const context = { env: { ADMIN_PASS: "admin-password" }, ctx: null, request: null };
+    const requiredResponse = await Database.ApiHandlers.getServerRecordCredential({ nodeName: "record-node" }, context);
+    assert.equal(requiredResponse.status, 428);
+    assert.equal((await requiredResponse.json()).error.code, "RECENT_AUTH_REQUIRED");
+
+    const rejectedResponse = await Database.ApiHandlers.getServerRecordCredential({
+      nodeName: "record-node",
+      adminPassword: "incorrect"
+    }, context);
+    assert.equal(rejectedResponse.status, 401);
+    assert.equal((await rejectedResponse.json()).error.code, "RECENT_AUTH_FAILED");
+
+    const response = await Database.ApiHandlers.getServerRecordCredential({
+      nodeName: "record-node",
+      adminPassword: "admin-password"
+    }, context);
+    const payload = await response.json();
+    assert.deepEqual(payload, {
+      success: true,
+      credential: {
+        username: "record-user",
+        password: "record-password",
+        configured: true,
+        source: "record"
+      }
+    });
+
+    const inheritedResponse = await Database.ApiHandlers.getServerRecordCredential({
+      nodeName: "inherited-node",
+      adminPassword: "admin-password"
+    }, context);
+    assert.deepEqual(await inheritedResponse.json(), {
+      success: true,
+      credential: {
+        username: "node-user",
+        password: "node-password",
+        configured: true,
+        source: "node"
+      }
+    });
+
+    const missingResponse = await Database.ApiHandlers.getServerRecordCredential({
+      nodeName: "missing-node",
+      adminPassword: "admin-password"
+    }, context);
+    assert.equal(missingResponse.status, 404);
+    assert.equal((await missingResponse.json()).error.code, "NODE_NOT_FOUND");
+  } finally {
+    Database.getNodeForRead = originalGetNodeForRead;
   }
 });
 
@@ -218,7 +325,7 @@ test("media aggregation appends matched backup sources without a database mappin
   }
 });
 
-test("media aggregation logs into a backup with the fixed Emby account", async () => {
+test("media aggregation logs into a backup with an account-only global credential", async () => {
   GLOBALS.MediaAggregationAuthCache.clear();
   const requests = [];
   const node = {
@@ -230,8 +337,7 @@ test("media aggregation logs into a backup with the fixed Emby account", async (
   };
   const execution = {
     currentConfig: {
-      mediaAggregationEmbyUsername: "fixed-user",
-      mediaAggregationEmbyPassword: " fixed-password "
+      mediaAggregationEmbyUsername: "fixed-user"
     },
     upstreamTimeoutMs: 1000,
     request: new Request("https://worker.test/Items/1/PlaybackInfo", {
@@ -256,7 +362,7 @@ test("media aggregation logs into a backup with the fixed Emby account", async (
   assert.equal(requests[0].url, "https://backup.test/Users/AuthenticateByName");
   assert.deepEqual(JSON.parse(String(requests[0].init.body)), {
     Username: "fixed-user",
-    Pw: " fixed-password "
+    Pw: ""
   });
   assert.equal(new Headers(requests[0].init.headers).get("X-Emby-Token"), null);
   GLOBALS.MediaAggregationAuthCache.clear();
@@ -916,10 +1022,11 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
       db: d1
     });
     const firstPayload = await firstResponse.json();
-    assert.equal(firstPayload.traffic, "3 KB");
     assert.equal(firstPayload.cfAnalyticsLoaded, true);
     assert.equal(firstPayload.period, "month");
-    assert.equal(graphqlRequestCount, 1);
+    assert.ok(graphqlRequestCount > 1);
+    assert.equal(firstPayload.totalBytes, graphqlRequestCount * 3072);
+    const liveRequestCount = graphqlRequestCount;
     await Promise.all(backgroundTasks.splice(0));
 
     const memoryResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
@@ -929,7 +1036,7 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
       db: d1
     });
     assert.equal((await memoryResponse.json()).cacheStatus, "cache");
-    assert.equal(graphqlRequestCount, 1);
+    assert.equal(graphqlRequestCount, liveRequestCount);
 
     GLOBALS.DashboardMonthlyTrafficCache.clear();
     const edgeResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
@@ -939,8 +1046,58 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
       db: d1
     });
     assert.equal((await edgeResponse.json()).cacheStatus, "cache");
-    assert.equal(graphqlRequestCount, 1);
+    assert.equal(graphqlRequestCount, liveRequestCount);
   });
+});
+
+test("monthly traffic splits GraphQL windows to one day while preserving edge response bytes", async () => {
+  const dayMs = 24 * 60 * 60 * 1000;
+  const monthWindow = {
+    monthKey: "2026-07",
+    periodLabel: "2026年7月",
+    startTs: Date.parse("2026-07-01T00:00:00.000Z"),
+    endTs: Date.parse("2026-07-03T12:00:00.000Z")
+  };
+  const ranges = [];
+  const fetch = async (input, init = {}) => {
+    assert.equal(String(input), "https://api.cloudflare.com/client/v4/graphql");
+    const query = String(JSON.parse(String(init.body || "{}")).query || "");
+    const startMatch = /datetime_geq:\s*"([^"]+)"/.exec(query);
+    const endMatch = /datetime_leq:\s*"([^"]+)"/.exec(query);
+    assert.ok(startMatch);
+    assert.ok(endMatch);
+    const startTs = Date.parse(startMatch[1]);
+    const endTs = Date.parse(endMatch[1]);
+    assert.ok(endTs - startTs < dayMs);
+    ranges.push({ startTs, endTs });
+    return new Response(JSON.stringify({
+      data: {
+        viewer: {
+          zones: [{ series: [{ sum: { edgeResponseBytes: 1024 } }] }]
+        }
+      }
+    }), { headers: { "Content-Type": "application/json" } });
+  };
+
+  await withWorkerGlobals({ fetch }, async () => {
+    const payload = await Database.buildDashboardMonthlyTrafficPayload({}, {
+      config: {
+        cfZoneId: "monthly-zone",
+        cfApiToken: "monthly-token",
+        scheduleUtcOffsetMinutes: 0
+      },
+      monthWindow,
+      nowMs: monthWindow.endTs
+    });
+    assert.equal(payload.totalBytes, 3 * 1024);
+    assert.equal(payload.traffic, "3 KB");
+  });
+  assert.equal(ranges.length, 3);
+  assert.deepEqual(ranges.map(range => range.startTs), [
+    monthWindow.startTs,
+    monthWindow.startTs + dayMs,
+    monthWindow.startTs + 2 * dayMs
+  ]);
 });
 
 test("remote shell error responses are no-store and never expose saved secrets", async () => {
@@ -4642,6 +4799,254 @@ test("server record probes keep node tokens isolated and report partial counts",
   });
 });
 
+test("server record credentials authenticate before resource statistics and never leak", async () => {
+  const requests = [];
+  GLOBALS.ServerRecordAuthCache.clear();
+  await withWorkerGlobals({
+    fetch: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const headers = new Headers(options.headers);
+      const request = {
+        method: String(options.method || "GET"),
+        path: parsed.pathname,
+        token: headers.get("X-Emby-Token") || "",
+        body: String(options.body || "")
+      };
+      requests.push(request);
+      if (/\/System\/Ping$/i.test(parsed.pathname)) return new Response("pong", { status: 200 });
+      if (/\/Users\/AuthenticateByName$/i.test(parsed.pathname)) {
+        assert.equal(request.method, "POST");
+        const credentials = JSON.parse(request.body);
+        const token = credentials.Username === "node-user" ? "node-token" : "stats-token";
+        if (credentials.Username === "node-user") assert.deepEqual(credentials, { Username: "node-user", Pw: "node-password" });
+        else assert.deepEqual(credentials, { Username: "stats-user", Pw: "" });
+        return new Response(JSON.stringify({ AccessToken: token, User: { Id: "user-1" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        assert.match(request.token, /^(?:stats|node)-token$/);
+        return new Response(JSON.stringify({ Id: "server-id", Version: "4.9.5" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (/\/Items$/i.test(parsed.pathname)) {
+        assert.match(request.token, /^(?:stats|node)-token$/);
+        return new Response(JSON.stringify({ TotalRecordCount: 12 }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const result = await Database.probeServerRecord("credential-node", {
+      target: "https://credential.example/emby",
+      serverRecordEmbyUsername: "stats-user"
+    });
+    assert.equal(result.runtime.state, "online");
+    assert.deepEqual(result.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
+    const cachedResult = await Database.probeServerRecord("credential-node", {
+      target: "https://credential.example/emby",
+      serverRecordEmbyUsername: "stats-user"
+    });
+    assert.deepEqual(cachedResult.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
+    const inheritedResult = await Database.probeServerRecord("inherited-node", {
+      target: "https://inherited.example/emby",
+      mediaAggregationEmbyUsername: "node-user",
+      mediaAggregationEmbyPassword: "node-password"
+    });
+    assert.deepEqual(inheritedResult.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
+    assert.equal(requests.filter(request => /AuthenticateByName/i.test(request.path)).length, 2);
+    assert.ok([...GLOBALS.ServerRecordAuthCache.values()].some(entry => entry?.nodeName === "credential-node"));
+    assert.doesNotMatch(JSON.stringify([result, inheritedResult]), /stats-user|node-user|node-password|(?:stats|node)-token|(?:credential|inherited)\.example/);
+  });
+  GLOBALS.ServerRecordAuthCache.clear();
+});
+
+test("server record authentication failures do not reuse a node proxy token", async () => {
+  const requests = [];
+  GLOBALS.ServerRecordAuthCache.clear();
+  await withWorkerGlobals({
+    fetch: async (url, options = {}) => {
+      const parsed = new URL(url);
+      const headers = new Headers(options.headers);
+      const request = {
+        path: parsed.pathname,
+        token: headers.get("X-Emby-Token") || ""
+      };
+      requests.push(request);
+      if (/\/System\/Ping$/i.test(parsed.pathname)) {
+        assert.equal(request.token, "legacy-node-token");
+        return new Response("pong", { status: 200 });
+      }
+      if (/\/Users\/AuthenticateByName$/i.test(parsed.pathname)) {
+        assert.equal(request.token, "");
+        return new Response(null, { status: 401 });
+      }
+      if (/\/System\/Info$/i.test(parsed.pathname)) {
+        assert.equal(request.token, "");
+        return new Response(JSON.stringify({ Id: "server-id", Version: "4.9.5" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (/\/Items$/i.test(parsed.pathname)) {
+        assert.fail("failed dedicated authentication must skip resource statistics");
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const result = await Database.probeServerRecord("credential-node", {
+      target: "https://credential.example/emby",
+      headers: { "X-Emby-Token": "legacy-node-token" },
+      serverRecordEmbyUsername: "stats-user"
+    });
+    assert.equal(result.runtime.state, "online");
+    assert.equal(result.counts.state, "unavailable");
+    assert.deepEqual(result.counts.errors, {
+      movies: "http_401",
+      series: "http_401",
+      episodes: "http_401"
+    });
+    assert.equal(requests.filter(request => /\/Items$/i.test(request.path)).length, 0);
+    assert.doesNotMatch(JSON.stringify(result), /legacy-node-token|credential\.example/);
+  });
+  GLOBALS.ServerRecordAuthCache.clear();
+});
+
+test("dedicated server record authentication single-flights independently from aggregation", async () => {
+  GLOBALS.ServerRecordAuthCache.clear();
+  GLOBALS.MediaAggregationAuthCache.clear();
+  let loginCalls = 0;
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      const parsed = new URL(url);
+      if (/\/Users\/AuthenticateByName$/i.test(parsed.pathname)) {
+        loginCalls += 1;
+        return new Response(JSON.stringify({ AccessToken: "record-token", User: { Id: "record-user" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const node = {
+      target: "https://record-auth.example/emby",
+      serverRecordEmbyUsername: "record-user",
+      serverRecordEmbyPassword: "record-password"
+    };
+    const targetRecord = createTargetRecord(node.target);
+    const [first, second] = await Promise.all([
+      Database.authenticateServerRecord("record-auth", node, targetRecord),
+      Database.authenticateServerRecord("record-auth", node, targetRecord)
+    ]);
+    assert.equal(first?.token, "record-token");
+    assert.equal(second?.token, "record-token");
+    assert.equal(loginCalls, 1);
+    assert.equal(GLOBALS.ServerRecordAuthCache.size, 1);
+    assert.equal(GLOBALS.MediaAggregationAuthCache.size, 0);
+  });
+  GLOBALS.ServerRecordAuthCache.clear();
+  GLOBALS.MediaAggregationAuthCache.clear();
+});
+
+test("media aggregation authentication single-flights concurrent logins", async () => {
+  GLOBALS.MediaAggregationAuthCache.clear();
+  let loginCalls = 0;
+  await withWorkerGlobals({
+    fetch: async (url) => {
+      const parsed = new URL(url);
+      if (/\/Users\/AuthenticateByName$/i.test(parsed.pathname)) {
+        loginCalls += 1;
+        return new Response(JSON.stringify({ AccessToken: "aggregation-token", User: { Id: "aggregation-user" } }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      return new Response(null, { status: 404 });
+    }
+  }, async () => {
+    const node = { target: "https://aggregation-auth.example/emby" };
+    const execution = {
+      currentConfig: {
+        mediaAggregationEmbyUsername: "aggregation-user",
+        mediaAggregationEmbyPassword: "aggregation-password"
+      },
+      upstreamTimeoutMs: 1000,
+      request: new Request("https://worker.test/Items/1/PlaybackInfo"),
+      requestUrl: new URL("https://worker.test/Items/1/PlaybackInfo")
+    };
+    const [first, second] = await Promise.all([
+      Proxy.getMediaAggregationAuth(execution, "aggregation-auth", node),
+      Proxy.getMediaAggregationAuth(execution, "aggregation-auth", node)
+    ]);
+    assert.equal(first?.token, "aggregation-token");
+    assert.equal(second?.token, "aggregation-token");
+    assert.equal(loginCalls, 1);
+    assert.equal(GLOBALS.MediaAggregationAuthCache.size, 1);
+  });
+  GLOBALS.MediaAggregationAuthCache.clear();
+});
+
+test("server record probes coalesce concurrent refreshes and back off retryable failures", async () => {
+  const originalProbeServerRecord = Database.probeServerRecord;
+  const node = { target: "https://probe-backoff.example/emby" };
+  let probeCalls = 0;
+  GLOBALS.ServerRecordsSnapshotCache.clear();
+  GLOBALS.ServerRecordProbeBackoff.clear();
+  Database.probeServerRecord = async () => {
+    probeCalls += 1;
+    return {
+      runtime: { state: "offline", checkedAt: "", errorCode: "timeout" },
+      counts: { movies: null, series: null, episodes: null, state: "unavailable", errors: {} }
+    };
+  };
+  try {
+    const [first, second] = await Promise.all([
+      Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true }),
+      Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true })
+    ]);
+    assert.equal(first.probe.source, "live");
+    assert.equal(second.probe.source, "live");
+    assert.equal(probeCalls, 1);
+
+    const throttled = await Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
+    assert.equal(throttled.probe.source, "backoff");
+    assert.match(throttled.probe.retryAt, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(probeCalls, 1);
+
+    Database.invalidateNodeCaches("probe-backoff");
+    const afterInvalidation = await Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
+    assert.equal(afterInvalidation.probe.source, "live");
+    assert.equal(probeCalls, 2);
+  } finally {
+    Database.probeServerRecord = originalProbeServerRecord;
+    GLOBALS.ServerRecordsSnapshotCache.clear();
+    GLOBALS.ServerRecordProbeBackoff.clear();
+  }
+});
+
+test("node invalidation clears server record auth tokens without a PlaybackInfo cache entry", () => {
+  GLOBALS.PlaybackInfoResponseCache.clear();
+  GLOBALS.ServerRecordAuthCache.clear();
+  GLOBALS.ServerRecordAuthCache.set("server-record-auth:alpha", {
+    nodeName: "alpha",
+    token: "short-lived-token",
+    expiresAt: Date.now() + 60000
+  });
+  try {
+    Database.invalidateNodeCaches("alpha");
+    assert.equal(GLOBALS.ServerRecordAuthCache.has("server-record-auth:alpha"), false);
+  } finally {
+    GLOBALS.PlaybackInfoResponseCache.clear();
+    GLOBALS.ServerRecordAuthCache.clear();
+  }
+});
+
 test("server record probes derive status from Ping without using System Info flags or authorization", async () => {
   await withWorkerGlobals({
     fetch: async (url) => {
@@ -4828,6 +5233,8 @@ test("server record settings preserve node routes and credentials while normaliz
     lines: [{ id: "primary", target: "https://origin.example/emby" }],
     activeLineId: "primary",
     headers: { "X-Emby-Token": "private-token", "X-Custom-Route": "route-a" },
+    serverRecordEmbyUsername: "stats-user",
+    serverRecordEmbyPassword: "stats-password",
     mediaAggregationEmbyUsername: "node-user",
     mediaAggregationEmbyPassword: " node-password ",
     tag: "高码服"
@@ -4847,6 +5254,8 @@ test("server record settings preserve node routes and credentials while normaliz
   assert.deepEqual(updated.headers, normalized.headers);
   assert.equal(updated.mediaAggregationEmbyUsername, "node-user");
   assert.equal(updated.mediaAggregationEmbyPassword, " node-password ");
+  assert.equal(updated.serverRecordEmbyUsername, "stats-user");
+  assert.equal(updated.serverRecordEmbyPassword, "stats-password");
   assert.deepEqual(updated.serverRecord, {
     enabled: true,
     expiryEnabled: true,

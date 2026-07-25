@@ -52,6 +52,10 @@ const CACHE_DEFAULTS = Object.freeze({
   PlaybackInfoCacheTotalMaxBytes: 4 * 1024 * 1024,
   MediaAggregationAuthTtlMs: 10 * 60 * 1000,
   MediaAggregationAuthCacheMax: 32,
+  ServerRecordAuthCacheMax: 32,
+  ServerRecordProbeBackoffMax: 512,
+  ServerRecordProbeBackoffBaseMs: 1000,
+  ServerRecordProbeBackoffMaxMs: 60 * 1000,
   MediaAggregationBackupMax: 8,
   MediaAggregationResponseMaxBytes: 256 * 1024,
   VideoProgressForwardIntervalSec: 3,
@@ -110,6 +114,7 @@ const LOG_DEFAULTS = Object.freeze({
 });
 
 const KV_TIDY_PLAN_TOKEN_TTL_MS = 10 * 60 * 1000;
+const D1_TIDY_PLAN_TOKEN_TTL_MS = KV_TIDY_PLAN_TOKEN_TTL_MS;
 
 const SCHEDULE_DEFAULTS = Object.freeze({
   ScheduledLeaseMinMs: 30 * 1000,
@@ -200,6 +205,10 @@ const DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoC
 const DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheTotalMaxBytes;
 const MEDIA_AGGREGATION_AUTH_TTL_MS = CACHE_DEFAULTS.MediaAggregationAuthTtlMs;
 const MEDIA_AGGREGATION_AUTH_CACHE_MAX = CACHE_DEFAULTS.MediaAggregationAuthCacheMax;
+const SERVER_RECORD_AUTH_CACHE_MAX = CACHE_DEFAULTS.ServerRecordAuthCacheMax;
+const SERVER_RECORD_PROBE_BACKOFF_MAX = CACHE_DEFAULTS.ServerRecordProbeBackoffMax;
+const SERVER_RECORD_PROBE_BACKOFF_BASE_MS = CACHE_DEFAULTS.ServerRecordProbeBackoffBaseMs;
+const SERVER_RECORD_PROBE_BACKOFF_MAX_MS = CACHE_DEFAULTS.ServerRecordProbeBackoffMaxMs;
 const MEDIA_AGGREGATION_BACKUP_MAX = CACHE_DEFAULTS.MediaAggregationBackupMax;
 const MEDIA_AGGREGATION_RESPONSE_MAX_BYTES = CACHE_DEFAULTS.MediaAggregationResponseMaxBytes;
 const DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgressForwardIntervalSec;
@@ -272,6 +281,8 @@ const GLOBAL_CACHE_STATE = {
   NodesIndexCache: null,
   PlaybackInfoResponseCache: new Map(),
   MediaAggregationAuthCache: new Map(),
+  ServerRecordAuthCache: new Map(),
+  ServerRecordProbeBackoff: new Map(),
   PlaybackProgressRelay: new Map(),
   ServerRecordsSnapshotCache: new Map(),
   DashboardMonthlyTrafficCache: new Map(),
@@ -319,6 +330,7 @@ const GLOBAL_RUNTIME_STATE = {
 
 const GLOBAL_DB_READY_STATE = {
   D1SchemaReadyState: new WeakMap(),
+  D1DatabaseInitReady: new WeakMap(),
   LogsBaseDbReady: new WeakMap(),
   StatsHourlyDbReady: new WeakMap(),
   ServerLastWatchDbReady: new WeakMap(),
@@ -1485,8 +1497,8 @@ function readMediaAggregationCredentialPair(source = {}) {
   return {
     username,
     password,
-    configured: Boolean(username && password.length > 0),
-    partial: Boolean(username) !== Boolean(password.length > 0)
+    configured: Boolean(username),
+    partial: Boolean(!username && password.length > 0)
   };
 }
 
@@ -1507,13 +1519,44 @@ function hasConfiguredMediaAggregationNodeCredentials(node = {}) {
   return credentials.configured || node?.mediaAggregationEmbyCredentialsConfigured === true;
 }
 
-function redactMediaAggregationNodeCredentials(node = {}) {
-  if (!isPlainObject(node)) return node;
-  const redacted = { ...node };
-  delete redacted.mediaAggregationEmbyUsername;
-  delete redacted.mediaAggregationEmbyPassword;
-  delete redacted.mediaAggregationEmbyCredentialsConfigured;
-  return redacted;
+function readServerRecordCredentialPair(source = {}) {
+  const username = String(source?.serverRecordEmbyUsername ?? "").trim();
+  const password = String(source?.serverRecordEmbyPassword ?? "");
+  return {
+    username,
+    password,
+    configured: Boolean(username),
+    partial: Boolean(!username && password.length > 0)
+  };
+}
+
+function resolveServerRecordCredentials(node = {}) {
+  const recordCredentials = readServerRecordCredentialPair(node);
+  if (recordCredentials.configured) return { ...recordCredentials, source: "record" };
+  const nodeCredentials = readMediaAggregationCredentialPair(node);
+  if (nodeCredentials.username) {
+    return {
+      ...nodeCredentials,
+      configured: true,
+      partial: false,
+      source: "node"
+    };
+  }
+  return { username: "", password: "", configured: false, partial: false, source: "none" };
+}
+
+function hasConfiguredServerRecordCredentials(node = {}) {
+  const credentials = resolveServerRecordCredentials(node);
+  return credentials.configured || node?.serverRecordEmbyCredentialsConfigured === true;
+}
+
+function getServerRecordCredentialValidationError(node = {}) {
+  const credentials = readServerRecordCredentialPair(node);
+  if (!credentials.partial) return null;
+  return {
+    code: "SERVER_RECORD_CREDENTIALS_INCOMPLETE",
+    message: "填写服务器记录 EMBY 密码时必须同时填写账号"
+  };
 }
 
 function getMediaAggregationNodeCredentialValidationError(node = {}) {
@@ -1521,7 +1564,7 @@ function getMediaAggregationNodeCredentialValidationError(node = {}) {
   if (!credentials.partial) return null;
   return {
     code: "MEDIA_AGGREGATION_NODE_CREDENTIALS_INCOMPLETE",
-    message: "节点聚合账号和密码必须同时填写，或同时留空使用全局账号密码"
+    message: "填写节点聚合密码时必须同时填写账号；密码可以留空"
   };
 }
 
@@ -3329,17 +3372,25 @@ function invalidatePlaybackInfoResponseCacheForNodes(nodeNames = []) {
   const normalizedNames = normalizeNodeNameSet(nodeNames);
   if (!normalizedNames.size) return;
   const cache = GLOBALS.PlaybackInfoResponseCache;
-  if (!(cache instanceof Map) || cache.size <= 0) return;
-  for (const [cacheKey, entry] of cache.entries()) {
-    const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-    if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
-    cache.delete(cacheKey);
+  if (cache instanceof Map) {
+    for (const [cacheKey, entry] of cache.entries()) {
+      const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+      if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
+      cache.delete(cacheKey);
+    }
   }
-  const authCache = GLOBALS.MediaAggregationAuthCache;
-  if (authCache instanceof Map) {
+  for (const authCache of [GLOBALS.MediaAggregationAuthCache, GLOBALS.ServerRecordAuthCache]) {
+    if (!(authCache instanceof Map)) continue;
     for (const [cacheKey, entry] of authCache.entries()) {
       const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
       if (entryNodeName && normalizedNames.has(entryNodeName)) authCache.delete(cacheKey);
+    }
+  }
+  const probeBackoff = GLOBALS.ServerRecordProbeBackoff;
+  if (probeBackoff instanceof Map) {
+    for (const [cacheKey, entry] of probeBackoff.entries()) {
+      const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+      if (entryNodeName && normalizedNames.has(entryNodeName)) probeBackoff.delete(cacheKey);
     }
   }
 }
@@ -6690,12 +6741,36 @@ function sanitizeRuntimeConfig(input = {}) {
   return sanitized;
 }
 
-const CONFIG_SECRET_FIELDS = ["cfApiToken", "tgBotToken", "mediaAggregationEmbyPassword"];
+const CONFIG_SECRET_FIELDS = [
+  "cfApiToken",
+  "tgBotToken",
+  "mediaAggregationEmbyUsername",
+  "mediaAggregationEmbyPassword"
+];
+const FULL_BACKUP_REDACTED_SECRET_FIELDS = ["cfApiToken", "tgBotToken"];
 
 function redactRuntimeConfigSecrets(input = {}) {
   const config = sanitizeRuntimeConfig(input);
   for (const field of CONFIG_SECRET_FIELDS) delete config[field];
   return config;
+}
+
+function redactFullBackupServiceSecrets(input = {}) {
+  const config = sanitizeRuntimeConfig(input);
+  for (const field of FULL_BACKUP_REDACTED_SECRET_FIELDS) delete config[field];
+  return config;
+}
+
+function redactNodeEmbyCredentials(node = {}) {
+  if (!isPlainObject(node)) return node;
+  const redacted = { ...node };
+  delete redacted.mediaAggregationEmbyUsername;
+  delete redacted.mediaAggregationEmbyPassword;
+  delete redacted.mediaAggregationEmbyCredentialsConfigured;
+  delete redacted.serverRecordEmbyUsername;
+  delete redacted.serverRecordEmbyPassword;
+  delete redacted.serverRecordEmbyCredentialsConfigured;
+  return redacted;
 }
 
 function preserveRuntimeConfigSecrets(input = {}, currentConfig = {}) {
@@ -9539,6 +9614,8 @@ const CacheManager = {
     } else if (state.phase === 5) {
       cleanMap(GLOBALS.PlaybackInfoResponseCache, v => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
       cleanMap(GLOBALS.MediaAggregationAuthCache, v => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationAuth");
+      cleanMap(GLOBALS.ServerRecordAuthCache, v => !v || (Number(v.expiresAt) || 0) <= now, "serverRecordAuth");
+      cleanMap(GLOBALS.ServerRecordProbeBackoff, v => !v || (Number(v.retryAt) || 0) <= now, "serverRecordProbeBackoff");
       state.phase = 6;
     } else if (state.phase === 6) {
       cleanMap(GLOBALS.ProxyFailoverStateCache, v => {
@@ -9658,8 +9735,8 @@ const D1TidyPlanner = {
     const hasExpiredLogs = facts.deletedExpiredLogCount > 0;
     const fullMaintenance = isFullTidyMaintenanceMode(context.maintenanceMode, context.mode);
     const shouldRebuildLogsFts = fullMaintenance
-      ? true
-      : (hasExpiredLogs && (!facts.ftsReady || database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp })));
+      || !facts.ftsReady
+      || (hasExpiredLogs && database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp }));
     const shouldOptimizeDb = fullMaintenance
       ? true
       : (hasExpiredLogs && database.shouldRunLogsOptimize(context.lastOptimizeAt, { nowMs: context.nowTimestamp }));
@@ -10260,6 +10337,220 @@ const Database = {
   },
   getKV(env) { return Auth.getKV(env); },
   getDB(env) { return env.DB || env.D1 || env.PROXY_LOGS; },
+  getD1RuntimeIndexContract() {
+    return {
+      idx_sys_locks_expires_at: {
+        table: this.SCHEDULED_LOCKS_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_sys_locks_expires_at ON ${this.SCHEDULED_LOCKS_TABLE} (expires_at DESC)`
+      },
+      idx_auth_failures_expires_at: {
+        table: this.AUTH_FAILURES_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_auth_failures_expires_at ON ${this.AUTH_FAILURES_TABLE} (expires_at)`
+      },
+      idx_cf_dashboard_cache_expires_at: {
+        table: this.CF_DASH_CACHE_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_cf_dashboard_cache_expires_at ON ${this.CF_DASH_CACHE_TABLE} (expires_at)`
+      },
+      idx_cf_runtime_cache_expires_at: {
+        table: this.CF_RUNTIME_CACHE_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_cf_runtime_cache_expires_at ON ${this.CF_RUNTIME_CACHE_TABLE} (expires_at)`
+      },
+      idx_dns_ip_pool_items_updated_ip: {
+        table: this.DNS_IP_POOL_ITEMS_TABLE,
+        columns: ["updated_at", "ip"],
+        createSql: `CREATE INDEX idx_dns_ip_pool_items_updated_ip ON ${this.DNS_IP_POOL_ITEMS_TABLE} (updated_at DESC, ip ASC)`
+      },
+      idx_dns_ip_pool_sources_sort: {
+        table: this.DNS_IP_POOL_SOURCES_TABLE,
+        columns: ["sort_order", "updated_at"],
+        createSql: `CREATE INDEX idx_dns_ip_pool_sources_sort ON ${this.DNS_IP_POOL_SOURCES_TABLE} (sort_order ASC, updated_at ASC)`
+      },
+      idx_dns_ip_pool_fetch_cache_expires: {
+        table: this.DNS_IP_POOL_FETCH_CACHE_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_dns_ip_pool_fetch_cache_expires ON ${this.DNS_IP_POOL_FETCH_CACHE_TABLE} (expires_at)`
+      },
+      idx_dns_ip_probe_cache_expire: {
+        table: this.DNS_IP_PROBE_CACHE_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_dns_ip_probe_cache_expire ON ${this.DNS_IP_PROBE_CACHE_TABLE} (expires_at)`
+      },
+      idx_dns_ip_probe_cache_colo_ip_expires: {
+        table: this.DNS_IP_PROBE_CACHE_TABLE,
+        columns: ["entry_colo", "ip", "expires_at"],
+        createSql: `CREATE INDEX idx_dns_ip_probe_cache_colo_ip_expires ON ${this.DNS_IP_PROBE_CACHE_TABLE} (entry_colo, ip, expires_at)`
+      },
+      idx_proxy_logs_timestamp: {
+        table: this.LOGS_TABLE,
+        columns: ["timestamp"],
+        createSql: `CREATE INDEX idx_proxy_logs_timestamp ON ${this.LOGS_TABLE} (timestamp)`
+      },
+      idx_proxy_logs_client_time: {
+        table: this.LOGS_TABLE,
+        columns: ["client_ip", "timestamp"],
+        createSql: `CREATE INDEX idx_proxy_logs_client_time ON ${this.LOGS_TABLE} (client_ip, timestamp DESC)`
+      },
+      idx_proxy_logs_status_time: {
+        table: this.LOGS_TABLE,
+        columns: ["status_code", "timestamp"],
+        createSql: `CREATE INDEX idx_proxy_logs_status_time ON ${this.LOGS_TABLE} (status_code, timestamp)`
+      },
+      idx_proxy_logs_category_time: {
+        table: this.LOGS_TABLE,
+        columns: ["category", "timestamp"],
+        createSql: `CREATE INDEX idx_proxy_logs_category_time ON ${this.LOGS_TABLE} (category, timestamp)`
+      }
+    };
+  },
+  getD1RuntimeColumnAdditions() {
+    return {
+      [this.SYS_STATUS_TABLE]: {
+        payload: "TEXT NOT NULL DEFAULT '{}'",
+        updated_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.SCHEDULED_LOCKS_TABLE]: {
+        token: "TEXT NOT NULL DEFAULT ''",
+        owner: "TEXT NOT NULL DEFAULT ''",
+        acquired_at: "INTEGER NOT NULL DEFAULT 0",
+        renewed_at: "INTEGER",
+        expires_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.AUTH_FAILURES_TABLE]: {
+        fail_count: "INTEGER NOT NULL DEFAULT 0",
+        expires_at: "INTEGER NOT NULL DEFAULT 0",
+        updated_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.CF_DASH_CACHE_TABLE]: {
+        zone_id: "TEXT NOT NULL DEFAULT ''",
+        bucket_date: "TEXT NOT NULL DEFAULT ''",
+        payload: "TEXT NOT NULL DEFAULT '{}'",
+        version: "INTEGER NOT NULL DEFAULT 0",
+        cached_at: "INTEGER NOT NULL DEFAULT 0",
+        expires_at: "INTEGER NOT NULL DEFAULT 0",
+        updated_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.CF_RUNTIME_CACHE_TABLE]: {
+        cache_group: "TEXT NOT NULL DEFAULT ''",
+        resource_id: "TEXT NOT NULL DEFAULT ''",
+        payload: "TEXT NOT NULL DEFAULT '{}'",
+        cached_at: "INTEGER NOT NULL DEFAULT 0",
+        expires_at: "INTEGER NOT NULL DEFAULT 0",
+        updated_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.DNS_IP_POOL_ITEMS_TABLE]: {
+        ip_type: "TEXT NOT NULL DEFAULT ''",
+        source_kind: "TEXT NOT NULL DEFAULT ''",
+        source_label: "TEXT",
+        line_label: "TEXT NOT NULL DEFAULT ''",
+        remark: "TEXT",
+        created_at: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.DNS_IP_POOL_SOURCES_TABLE]: {
+        name: "TEXT NOT NULL DEFAULT ''",
+        url: "TEXT NOT NULL DEFAULT ''",
+        source_type: "TEXT NOT NULL DEFAULT 'url'",
+        domain: "TEXT",
+        source_kind: "TEXT NOT NULL DEFAULT 'custom'",
+        preset_id: "TEXT NOT NULL DEFAULT ''",
+        builtin_id: "TEXT NOT NULL DEFAULT ''",
+        enabled: "INTEGER NOT NULL DEFAULT 1",
+        sort_order: "INTEGER NOT NULL DEFAULT 0",
+        ip_limit: "INTEGER NOT NULL DEFAULT 5",
+        last_fetch_at: "TEXT",
+        last_fetch_status: "TEXT",
+        last_fetch_count: "INTEGER NOT NULL DEFAULT 0",
+        created_at: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: {
+        items_json: "TEXT NOT NULL DEFAULT '[]'",
+        source_results_json: "TEXT NOT NULL DEFAULT '[]'",
+        imported_count: "INTEGER NOT NULL DEFAULT 0",
+        enabled_source_count: "INTEGER NOT NULL DEFAULT 0",
+        cached_at: "INTEGER NOT NULL DEFAULT 0",
+        expires_at: "INTEGER NOT NULL DEFAULT 0",
+        created_at: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.DNS_IP_PROBE_CACHE_TABLE]: {
+        probe_status: "TEXT NOT NULL DEFAULT ''",
+        latency_ms: "INTEGER",
+        cf_ray: "TEXT",
+        colo_code: "TEXT",
+        city_name: "TEXT",
+        country_code: "TEXT",
+        country_name: "TEXT",
+        probed_at: "TEXT NOT NULL DEFAULT ''",
+        expires_at: "INTEGER NOT NULL DEFAULT 0"
+      },
+      [this.LOGS_TABLE]: {
+        timestamp: "INTEGER NOT NULL DEFAULT 0",
+        node_name: "TEXT NOT NULL DEFAULT ''",
+        request_path: "TEXT NOT NULL DEFAULT ''",
+        request_method: "TEXT NOT NULL DEFAULT ''",
+        status_code: "INTEGER NOT NULL DEFAULT 0",
+        response_time: "INTEGER NOT NULL DEFAULT 0",
+        client_ip: "TEXT NOT NULL DEFAULT ''",
+        inbound_colo: "TEXT",
+        outbound_colo: "TEXT",
+        user_agent: "TEXT",
+        referer: "TEXT",
+        category: "TEXT DEFAULT 'api'",
+        error_detail: "TEXT",
+        detail_json: "TEXT",
+        created_at: "TEXT NOT NULL DEFAULT ''",
+        inbound_ip: "TEXT",
+        outbound_ip: "TEXT"
+      },
+      [this.STATS_HOURLY_TABLE]: {
+        request_count: "INTEGER NOT NULL DEFAULT 0",
+        play_count: "INTEGER NOT NULL DEFAULT 0",
+        playback_info_count: "INTEGER NOT NULL DEFAULT 0",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.SERVER_LAST_WATCH_TABLE]: {
+        last_watched_at: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      }
+    };
+  },
+  getD1RequiredPrimaryKeyContract() {
+    return {
+      [this.SYS_STATUS_TABLE]: ["scope"],
+      [this.SCHEDULED_LOCKS_TABLE]: ["scope"],
+      [this.AUTH_FAILURES_TABLE]: ["ip"],
+      [this.CF_DASH_CACHE_TABLE]: ["cache_key"],
+      [this.CF_RUNTIME_CACHE_TABLE]: ["cache_key"],
+      [this.DNS_IP_POOL_ITEMS_TABLE]: ["id"],
+      [this.DNS_IP_POOL_SOURCES_TABLE]: ["id"],
+      [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature"],
+      [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
+      [this.LOGS_TABLE]: ["id"],
+      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
+      [this.SERVER_LAST_WATCH_TABLE]: ["node_name"]
+    };
+  },
+  getD1RetiredIndexNames() {
+    return [
+      "idx_proxy_logs_client_ip",
+      "idx_proxy_logs_inbound_colo",
+      "idx_proxy_logs_outbound_colo",
+      "idx_proxy_logs_timestamp_id",
+      "idx_proxy_logs_node_time",
+      "idx_proxy_logs_category",
+      "idx_proxy_stats_hourly_date",
+      "idx_dns_ip_pool_items_updated_at",
+      "idx_dns_ip_pool_items_ip_type",
+      "idx_sys_status_updated_at",
+      "idx_cf_dashboard_cache_zone_bucket",
+      "idx_cf_runtime_cache_group_resource"
+    ];
+  },
   getD1SchemaReadyState(db) {
     if (!db || typeof db.prepare !== "function") return null;
     let state = GLOBALS.D1SchemaReadyState.get(db);
@@ -10559,11 +10850,27 @@ const Database = {
     const columnsReady = requiredColumns.every(name => columns.has(name));
     const [table, trigger] = await Promise.all([
       db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1").bind(this.LOGS_FTS_TABLE).first(),
-      db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'trigger' AND name = ? LIMIT 1").bind(this.LOGS_FTS_INSERT_TRIGGER).first()
+      db.prepare("SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'trigger' AND name = ? LIMIT 1").bind(this.LOGS_FTS_INSERT_TRIGGER).first()
     ]);
-    const virtualTableReady = /^CREATE\s+VIRTUAL\s+TABLE\b/i.test(String(table?.sql || "").trim());
+    const tableSql = normalizeSqlIdentifierSearchText(table?.sql || "").replace(/'/g, "");
+    const virtualTableReady = /^create\s+virtual\s+table\b/.test(tableSql)
+      && /\busing\s+fts5\s*\(/.test(tableSql)
+      && new RegExp(`\\bcontent\\s*=\\s*${this.LOGS_TABLE}\\b`).test(tableSql)
+      && /\bcontent_rowid\s*=\s*id\b/.test(tableSql);
+    const triggerSql = normalizeSqlIdentifierSearchText(trigger?.sql || "");
+    const compactTriggerSql = triggerSql.replace(/\s+/g, "");
+    const expectedTriggerInsert = `insert into ${this.LOGS_FTS_TABLE} (
+      rowid, node_name, request_path, user_agent, error_detail, detail_json
+    ) values (
+      new.id, new.node_name, new.request_path,
+      coalesce(new.user_agent, ''), coalesce(new.error_detail, ''), coalesce(new.detail_json, '')
+    )`.replace(/\s+/g, "");
+    const triggerWritesExpectedColumns = compactTriggerSql.includes(expectedTriggerInsert);
     const triggerReady = String(trigger?.name || "") === this.LOGS_FTS_INSERT_TRIGGER
-      && String(trigger?.tbl_name || "") === this.LOGS_TABLE;
+      && String(trigger?.tbl_name || "") === this.LOGS_TABLE
+      && new RegExp(`\\bafter\\s+insert\\s+on\\s+${this.LOGS_TABLE}\\b`).test(triggerSql)
+      && new RegExp(`\\binsert\\s+into\\s+${this.LOGS_FTS_TABLE}\\s*\\(`).test(triggerSql)
+      && triggerWritesExpectedColumns;
     return { tableReady: true, virtualTableReady, columnsReady, triggerReady, ready: virtualTableReady && columnsReady && triggerReady };
   },
   async isLogsFtsReady(db) {
@@ -10715,21 +11022,7 @@ const Database = {
       this.STATS_HOURLY_TABLE,
       this.SERVER_LAST_WATCH_TABLE
     ];
-    const requiredIndexes = {
-      idx_sys_locks_expires_at: { table: this.SCHEDULED_LOCKS_TABLE, columns: ["expires_at"] },
-      idx_auth_failures_expires_at: { table: this.AUTH_FAILURES_TABLE, columns: ["expires_at"] },
-      idx_cf_dashboard_cache_expires_at: { table: this.CF_DASH_CACHE_TABLE, columns: ["expires_at"] },
-      idx_cf_runtime_cache_expires_at: { table: this.CF_RUNTIME_CACHE_TABLE, columns: ["expires_at"] },
-      idx_dns_ip_pool_items_updated_ip: { table: this.DNS_IP_POOL_ITEMS_TABLE, columns: ["updated_at", "ip"] },
-      idx_dns_ip_pool_sources_sort: { table: this.DNS_IP_POOL_SOURCES_TABLE, columns: ["sort_order", "updated_at"] },
-      idx_dns_ip_pool_fetch_cache_expires: { table: this.DNS_IP_POOL_FETCH_CACHE_TABLE, columns: ["expires_at"] },
-      idx_dns_ip_probe_cache_expire: { table: this.DNS_IP_PROBE_CACHE_TABLE, columns: ["expires_at"] },
-      idx_dns_ip_probe_cache_colo_ip_expires: { table: this.DNS_IP_PROBE_CACHE_TABLE, columns: ["entry_colo", "ip", "expires_at"] },
-      idx_proxy_logs_timestamp: { table: this.LOGS_TABLE, columns: ["timestamp"] },
-      idx_proxy_logs_client_time: { table: this.LOGS_TABLE, columns: ["client_ip", "timestamp"] },
-      idx_proxy_logs_status_time: { table: this.LOGS_TABLE, columns: ["status_code", "timestamp"] },
-      idx_proxy_logs_category_time: { table: this.LOGS_TABLE, columns: ["category", "timestamp"] }
-    };
+    const requiredIndexes = this.getD1RuntimeIndexContract();
     const requiredColumns = {
       [this.SYS_STATUS_TABLE]: ["scope", "payload", "updated_at"],
       [this.SCHEDULED_LOCKS_TABLE]: ["scope", "token", "owner", "acquired_at", "renewed_at", "expires_at"],
@@ -10744,20 +11037,7 @@ const Database = {
       [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"],
       [this.SERVER_LAST_WATCH_TABLE]: ["node_name", "last_watched_at", "updated_at"]
     };
-    const requiredPrimaryKeys = {
-      [this.SYS_STATUS_TABLE]: ["scope"],
-      [this.SCHEDULED_LOCKS_TABLE]: ["scope"],
-      [this.AUTH_FAILURES_TABLE]: ["ip"],
-      [this.CF_DASH_CACHE_TABLE]: ["cache_key"],
-      [this.CF_RUNTIME_CACHE_TABLE]: ["cache_key"],
-      [this.DNS_IP_POOL_ITEMS_TABLE]: ["id"],
-      [this.DNS_IP_POOL_SOURCES_TABLE]: ["id"],
-      [this.DNS_IP_POOL_FETCH_CACHE_TABLE]: ["signature"],
-      [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
-      [this.LOGS_TABLE]: ["id"],
-      [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
-      [this.SERVER_LAST_WATCH_TABLE]: ["node_name"]
-    };
+    const requiredPrimaryKeys = this.getD1RequiredPrimaryKeyContract();
     const issues = [];
     const tableStatus = Object.fromEntries(requiredTables.map(name => [name, tableNames.has(name)]));
     for (const [name, ready] of Object.entries(tableStatus)) if (!ready) issues.push(`missing_table:${name}`);
@@ -10857,8 +11137,229 @@ const Database = {
       constraints: constraintStatus,
       ftsReady: fts.ready,
       fts,
+      autoRepairPolicy: {
+        createMissingTables: true,
+        addKnownColumns: true,
+        repairNamedIndexes: true,
+        rebuildDerivedFts: true,
+        rebuildPrimaryOrUniqueConstraints: false,
+        deleteUnknownObjects: false
+      },
       issues
     };
+  },
+  async getD1TableNameSet(db) {
+    if (!db) return new Set();
+    const rows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
+    return new Set((rows?.results || []).map(row => String(row?.name || "")).filter(Boolean));
+  },
+  async assertD1RepairableTableShapes(db, tableNames = null) {
+    const knownTables = tableNames instanceof Set ? tableNames : await this.getD1TableNameSet(db);
+    const issues = [];
+    for (const [tableName, expectedPrimaryKey] of Object.entries(this.getD1RequiredPrimaryKeyContract())) {
+      if (!knownTables.has(tableName)) continue;
+      const definitions = await this.getTableColumnDefinitions(db, tableName);
+      const actualPrimaryKey = definitions
+        .filter(column => column.primaryKeyOrder > 0)
+        .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+        .map(column => column.name);
+      const idColumn = tableName === this.LOGS_TABLE
+        ? definitions.find(column => column.name === "id")
+        : null;
+      if (serializeConfigValue(actualPrimaryKey) !== serializeConfigValue(expectedPrimaryKey)
+        || (idColumn && idColumn.type !== "INTEGER")) {
+        issues.push(`invalid_primary_key:${tableName}`);
+      }
+    }
+    if (knownTables.has(this.DNS_IP_POOL_ITEMS_TABLE)) {
+      let uniqueIpReady = false;
+      const tableIndexes = await this.getTableIndexDefinitions(db, this.DNS_IP_POOL_ITEMS_TABLE);
+      for (const index of tableIndexes.filter(item => item.unique && !item.partial)) {
+        const columns = await this.getIndexKeyColumns(db, index.name);
+        if (serializeConfigValue(columns) === serializeConfigValue(["ip"])) {
+          uniqueIpReady = true;
+          break;
+        }
+      }
+      if (!uniqueIpReady) issues.push(`missing_unique_key:${this.DNS_IP_POOL_ITEMS_TABLE}.ip`);
+    }
+    if (issues.length) {
+      const error = new Error("D1 schema contains key constraints that cannot be repaired automatically");
+      error.code = "D1_SCHEMA_INCOMPATIBLE";
+      error.status = 409;
+      error.details = { issues, phase: "preflight" };
+      throw error;
+    }
+    return true;
+  },
+  async ensureD1KnownColumns(db) {
+    const tableNames = await this.getD1TableNameSet(db);
+    const adjustedColumns = [];
+    for (const [tableName, additions] of Object.entries(this.getD1RuntimeColumnAdditions())) {
+      if (!tableNames.has(tableName)) continue;
+      const columns = await this.getTableColumns(db, tableName);
+      for (const [columnName, definition] of Object.entries(additions)) {
+        if (columns.has(columnName)) continue;
+        await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
+        columns.add(columnName);
+        adjustedColumns.push(`${tableName}.${columnName}`);
+      }
+    }
+    return adjustedColumns;
+  },
+  async repairD1RuntimeIndexes(db) {
+    const tableNames = await this.getD1TableNameSet(db);
+    const indexRows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all();
+    const existingIndexNames = new Set((indexRows?.results || []).map(row => String(row?.name || "")).filter(Boolean));
+    const droppedRetiredIndexes = [];
+    const createdIndexes = [];
+    const repairedIndexes = [];
+
+    for (const indexName of this.getD1RetiredIndexNames()) {
+      if (!existingIndexNames.has(indexName)) continue;
+      await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
+      existingIndexNames.delete(indexName);
+      droppedRetiredIndexes.push(indexName);
+    }
+
+    for (const [indexName, definition] of Object.entries(this.getD1RuntimeIndexContract())) {
+      if (!tableNames.has(definition.table)) continue;
+      const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")
+        .bind(indexName)
+        .first();
+      let valid = false;
+      if (owner) {
+        const listedIndex = (await this.getTableIndexDefinitions(db, definition.table))
+          .find(index => index.name === indexName);
+        const actualColumns = await this.getIndexKeyColumns(db, indexName);
+        valid = String(owner?.tbl_name || "") === definition.table
+          && listedIndex?.unique === false
+          && listedIndex?.partial === false
+          && serializeConfigValue(actualColumns) === serializeConfigValue(definition.columns);
+      }
+      if (valid) continue;
+      if (owner) {
+        await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
+        repairedIndexes.push(indexName);
+      } else {
+        createdIndexes.push(indexName);
+      }
+      await db.prepare(definition.createSql).run();
+    }
+    return { droppedRetiredIndexes, createdIndexes, repairedIndexes };
+  },
+  async initializeD1Database(db, options = {}) {
+    if (!db) {
+      const error = new Error("D1 not configured");
+      error.code = "D1_NOT_CONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const profile = options.includeFts === true ? "logs-fts" : "logs-core";
+    let state = GLOBALS.D1DatabaseInitReady.get(db);
+    if (!state || !(state.inFlight instanceof Map)) {
+      state = { tail: Promise.resolve(), inFlight: new Map() };
+      GLOBALS.D1DatabaseInitReady.set(db, state);
+    }
+    let initTask = state.inFlight.get(profile);
+    if (!initTask) {
+      const previousTask = Promise.resolve(state.tail).catch(() => {});
+      initTask = previousTask.then(() => this.runD1DatabaseInitialization(db, {
+        ...options,
+        profile,
+        failOnIncompatible: false
+      }));
+      state.tail = initTask.catch(() => {});
+      state.inFlight.set(profile, initTask);
+    }
+    try {
+      const result = await initTask;
+      if (options.failOnIncompatible === true && result?.runtimeCompatibilityReady !== true) {
+        const error = new Error("D1 schema remains incompatible after automatic repair");
+        error.code = "D1_SCHEMA_INCOMPATIBLE";
+        error.status = 409;
+        error.details = {
+          phase: String(result?.blockedPhase || "final_status"),
+          issues: result?.status?.issues,
+          autoRepairPolicy: result?.status?.autoRepairPolicy,
+          result
+        };
+        throw error;
+      }
+      return result;
+    } finally {
+      if (state.inFlight.get(profile) === initTask) state.inFlight.delete(profile);
+    }
+  },
+  async runD1DatabaseInitialization(db, options = {}) {
+    const profile = options.includeFts === true ? "logs-fts" : "logs-core";
+    this.invalidateD1SchemaReadiness(db, "all");
+    const tablesBefore = await this.getD1TableNameSet(db);
+    try {
+      await this.assertD1RepairableTableShapes(db, tablesBefore);
+    } catch (error) {
+      if (String(error?.code || "") !== "D1_SCHEMA_INCOMPATIBLE") throw error;
+      const status = await this.getD1SchemaStatus(db);
+      const result = {
+        profile,
+        runtimeCompatibilityReady: false,
+        migrationReady: status.migrationReady === true,
+        schemaVersion: status.schemaVersion,
+        createdTables: [],
+        adjustedColumns: [],
+        droppedRetiredIndexes: [],
+        createdIndexes: [],
+        repairedIndexes: [],
+        ftsRebuilt: false,
+        ftsRecreated: false,
+        blockedPhase: "preflight",
+        steps: [],
+        status
+      };
+      if (options.failOnIncompatible === true) {
+        error.details = {
+          ...(isPlainObject(error?.details) ? error.details : {}),
+          issues: status.issues,
+          autoRepairPolicy: status.autoRepairPolicy,
+          result
+        };
+        throw error;
+      }
+      return result;
+    }
+    const adjustedColumns = await this.ensureD1KnownColumns(db);
+    const bootstrap = await this.bootstrapD1Schema(db, profile);
+    const adjustedAfterCreate = await this.ensureD1KnownColumns(db);
+    const indexChanges = await this.repairD1RuntimeIndexes(db);
+    const tablesAfter = await this.getD1TableNameSet(db);
+    const createdTables = [...tablesAfter].filter(name => !tablesBefore.has(name));
+    GLOBALS.LogsReadinessProbeCache.delete(db);
+    const status = await this.getD1SchemaStatus(db);
+    const result = {
+      profile,
+      runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
+      migrationReady: status.migrationReady === true,
+      schemaVersion: status.schemaVersion,
+      createdTables,
+      adjustedColumns: [...new Set([...adjustedColumns, ...adjustedAfterCreate])],
+      ...indexChanges,
+      ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
+      ftsRecreated: bootstrap.ftsResult?.recreated === true,
+      steps: bootstrap.steps,
+      status
+    };
+    if (options.failOnIncompatible === true && result.runtimeCompatibilityReady !== true) {
+      const error = new Error("D1 schema remains incompatible after automatic repair");
+      error.code = "D1_SCHEMA_INCOMPATIBLE";
+      error.status = 409;
+      error.details = {
+        issues: status.issues,
+        autoRepairPolicy: status.autoRepairPolicy,
+        result
+      };
+      throw error;
+    }
+    return result;
   },
   async probeLogsReadiness(db, options = {}) {
     if (!db) {
@@ -11475,6 +11976,16 @@ const Database = {
     } catch {
       return [];
     }
+  },
+  async getDnsIpPoolSourcesFromDbStrict(db) {
+    if (!db) throw new Error("D1 not configured");
+    await this.ensureDnsIpWorkspaceSchema(db);
+    const result = await db.prepare(`SELECT id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
+      FROM ${this.DNS_IP_POOL_SOURCES_TABLE}
+      ORDER BY sort_order ASC, updated_at ASC`).all();
+    return (Array.isArray(result?.results) ? result.results : [])
+      .map((row, index) => normalizeDnsIpPoolSourceRecord(row, index))
+      .filter(source => hasDnsIpPoolSourceTarget(source));
   },
   async getDnsIpPoolSources(envOrStore) {
     const stores = this.resolveOpsStatusStores(envOrStore);
@@ -12646,20 +13157,23 @@ const Database = {
         0
       );
     };
-    let totalBytes;
-    try {
-      totalBytes = await readWindowBytes(monthWindow.startTs, monthWindow.endTs);
-    } catch (error) {
-      const message = String(error?.message || error || "").toLowerCase();
-      const rangeLimited = message.includes("cannot request a time range wider than 1d")
-        || (message.includes("time range") && message.includes("1d"));
-      if (!rangeLimited) throw error;
-      totalBytes = 0;
-      const dayMs = 24 * 60 * 60 * 1000;
-      for (let cursor = monthWindow.startTs; cursor <= monthWindow.endTs; cursor += dayMs) {
-        const dayEnd = Math.min(monthWindow.endTs, cursor + dayMs - 1);
-        totalBytes += await readWindowBytes(cursor, dayEnd);
-      }
+    // httpRequestsAdaptiveGroups accepts at most one day per request. Keep the
+    // edgeResponseBytes metric consistent with the daily dashboard card.
+    const dayMs = 24 * 60 * 60 * 1000;
+    const dayWindows = [];
+    for (let startTs = monthWindow.startTs; startTs <= monthWindow.endTs; startTs += dayMs) {
+      dayWindows.push({
+        startTs,
+        endTs: Math.min(monthWindow.endTs, startTs + dayMs - 1)
+      });
+    }
+    let totalBytes = 0;
+    const maxConcurrentQueries = 4;
+    for (let index = 0; index < dayWindows.length; index += maxConcurrentQueries) {
+      const bytes = await Promise.all(dayWindows
+        .slice(index, index + maxConcurrentQueries)
+        .map(({ startTs, endTs }) => readWindowBytes(startTs, endTs)));
+      totalBytes += bytes.reduce((sum, value) => sum + value, 0);
     }
     return normalizeDashboardMonthlyTrafficPayload({
       ...basePayload,
@@ -13385,6 +13899,19 @@ const Database = {
       return null;
     }
   },
+  async getOpsStatusPayloadFromDbStrict(db, scope) {
+    if (!db || !scope) throw new Error("D1 status scope is not configured");
+    const ready = await this.ensureSysStatusTable(db);
+    if (!ready) {
+      const error = new Error("D1 sys_status table is unavailable");
+      error.code = "D1_COMPATIBILITY_REQUIRED";
+      error.status = 409;
+      throw error;
+    }
+    const row = await db.prepare(`SELECT payload FROM ${this.SYS_STATUS_TABLE} WHERE scope = ? LIMIT 1`).bind(scope).first();
+    if (!row?.payload) return null;
+    return typeof row.payload === "string" ? JSON.parse(row.payload) : row.payload;
+  },
   async putOpsStatusPayloadToDb(db, scope, payload, updatedAtMs) {
     if (!db || !scope || !payload || typeof payload !== "object") return false;
     const ready = await this.ensureSysStatusTable(db);
@@ -13652,6 +14179,10 @@ const Database = {
     if (!normalizedLines.length) return null;
     const activeLineId = this.resolveActiveLineId(rawNode.activeLineId, normalizedLines, Array.isArray(rawNode.lines) ? rawNode.lines : [], rawNode.port);
     const entryMode = normalizeNodeEntryMode(rawNode.entryMode);
+    const resolvedServerRecordCredentials = resolveServerRecordCredentials(rawNode);
+    const explicitServerRecordCredentialSource = ["record", "node"].includes(String(rawNode.serverRecordEmbyCredentialSource || "").trim().toLowerCase())
+      ? String(rawNode.serverRecordEmbyCredentialSource).trim().toLowerCase()
+      : "";
     return {
       name,
       cacheRevision: buildNodeDerivedCacheRevision(name, rawNode),
@@ -13666,6 +14197,9 @@ const Database = {
       tagColor: String(rawNode.tagColor ?? ""),
       remark: String(rawNode.remark ?? ""),
       serverRecord: normalizeServerRecordSettings(rawNode.serverRecord),
+      serverRecordEmbyUsername: resolvedServerRecordCredentials.username,
+      serverRecordEmbyCredentialsConfigured: hasConfiguredServerRecordCredentials(rawNode),
+      serverRecordEmbyCredentialSource: explicitServerRecordCredentialSource || resolvedServerRecordCredentials.source,
       lines: normalizedLines.map((line) => ({
         id: String(line.id || "").trim(),
         name: String(line.name || "").trim(),
@@ -14586,9 +15120,11 @@ const Database = {
         : 0
     };
   },
-  async classifyKvTidyKeys(kv, allKeys = []) {
+  async classifyKvTidyKeys(kv, allKeys = [], options = {}) {
     const nodeNames = [];
     const removableKeys = new Set();
+    const preservedD1LegacyKeys = [];
+    const canDeleteD1OwnedLegacyKeys = options.canDeleteD1OwnedLegacyKeys === true;
     const knownSectionKeys = new Set(Object.values(this.LEGACY_OPS_STATUS_SECTION_KEYS));
     let untouchedOtherKeyCount = 0;
     let opsStatusKeyCount = 0;
@@ -14638,18 +15174,30 @@ const Database = {
         continue;
       }
       if (keyName === this.LEGACY_DNS_IP_POOL_SOURCES_KEY) {
-        removableKeys.add(keyName);
-        dnsIpPoolSourceKeyCount += 1;
+        if (canDeleteD1OwnedLegacyKeys) {
+          removableKeys.add(keyName);
+          dnsIpPoolSourceKeyCount += 1;
+        } else {
+          preservedD1LegacyKeys.push(keyName);
+        }
         continue;
       }
       if (keyName === this.LEGACY_TELEGRAM_ALERT_STATE_KEY) {
-        removableKeys.add(keyName);
-        telegramAlertStateKeyCount += 1;
+        if (canDeleteD1OwnedLegacyKeys) {
+          removableKeys.add(keyName);
+          telegramAlertStateKeyCount += 1;
+        } else {
+          preservedD1LegacyKeys.push(keyName);
+        }
         continue;
       }
       if (knownSectionKeys.has(keyName) || keyName === this.LEGACY_OPS_STATUS_KEY) {
-        removableKeys.add(keyName);
-        opsStatusKeyCount += 1;
+        if (canDeleteD1OwnedLegacyKeys) {
+          removableKeys.add(keyName);
+          opsStatusKeyCount += 1;
+        } else {
+          preservedD1LegacyKeys.push(keyName);
+        }
         continue;
       }
       if (keyName.startsWith(this.DNS_RECORD_HISTORY_PREFIX)) {
@@ -14672,6 +15220,7 @@ const Database = {
     return {
       nodeNames,
       removableKeys,
+      preservedD1LegacyKeys,
       untouchedOtherKeyCount,
       opsStatusKeyCount,
       dnsRecordHistoryKeyCount,
@@ -14683,6 +15232,135 @@ const Database = {
       loginFailureKeyCount,
       dnsFetchLockKeyCount
     };
+  },
+  async buildKvD1LegacyMigrationPlan(kv, removableKeys = []) {
+    const migrations = [];
+    const sectionByKey = new Map(Object.entries(this.LEGACY_OPS_STATUS_SECTION_KEYS)
+      .map(([sectionName, key]) => [key, sectionName]));
+    for (const key of Array.isArray(removableKeys) ? removableKeys : [...removableKeys]) {
+      let kind = "";
+      let sectionName = "";
+      if (key === this.LEGACY_DNS_IP_POOL_SOURCES_KEY) kind = "dns_ip_pool_sources";
+      else if (key === this.LEGACY_OPS_STATUS_KEY) kind = "ops_status_root";
+      else if (sectionByKey.has(key)) {
+        kind = "ops_status_section";
+        sectionName = String(sectionByKey.get(key) || "");
+      } else if (key === this.LEGACY_TELEGRAM_ALERT_STATE_KEY) kind = "telegram_alert_state";
+      if (!kind) continue;
+      const payload = await kvGetStrict(kv, key, { type: "json" });
+      migrations.push({
+        key,
+        kind,
+        sectionName,
+        payload: this.normalizeKvD1LegacyMigrationPayload(kind, payload, key)
+      });
+    }
+    return migrations;
+  },
+  normalizeKvD1LegacyMigrationPayload(kind = "", payload = null, key = "") {
+    const normalizedKind = String(kind || "").trim();
+    const fail = (reason) => {
+      const error = new Error(`Legacy KV payload cannot be migrated safely: ${String(key || normalizedKind || "unknown")}`);
+      error.code = "D1_LEGACY_PAYLOAD_INVALID";
+      error.status = 409;
+      error.details = { key: String(key || ""), kind: normalizedKind, reason };
+      throw error;
+    };
+    if (["ops_status_root", "ops_status_section", "telegram_alert_state"].includes(normalizedKind)) {
+      if (!isPlainObject(payload)) fail("expected_object");
+      return payload;
+    }
+    if (normalizedKind === "dns_ip_pool_sources") {
+      const rawSources = Array.isArray(payload)
+        ? payload
+        : (isPlainObject(payload) && Array.isArray(payload.sources) ? payload.sources : null);
+      if (!rawSources) fail("expected_source_array");
+      const normalizedSources = rawSources.map((source, index) => {
+        if (!isPlainObject(source)) fail(`invalid_source:${index}`);
+        const sourceId = String(source?.id || "").trim();
+        if (!sourceId) fail(`missing_source_id:${index}`);
+        const normalized = normalizeDnsIpPoolSourceRecord(source, index);
+        if (!hasDnsIpPoolSourceTarget(normalized)) fail(`missing_source_target:${index}`);
+        return { ...normalized, id: sourceId };
+      });
+      const sourceIds = normalizedSources.map(source => String(source?.id || "").trim());
+      if (sourceIds.some(id => !id) || new Set(sourceIds).size !== sourceIds.length) fail("duplicate_or_missing_source_id");
+      return normalizedSources;
+    }
+    fail("unsupported_kind");
+  },
+  async applyKvD1LegacyMigrations(db, migrations = []) {
+    const actions = (Array.isArray(migrations) ? migrations : []).map(action => ({
+      ...action,
+      payload: this.normalizeKvD1LegacyMigrationPayload(action?.kind, action?.payload, action?.key)
+    }));
+    if (!actions.length) return { migratedKeyCount: 0, migratedDnsIpPoolSourceCount: 0 };
+    if (!db) {
+      const error = new Error("D1 is required before deleting D1-owned legacy KV keys");
+      error.code = "D1_COMPATIBILITY_REQUIRED";
+      error.status = 409;
+      throw error;
+    }
+    let migratedKeyCount = 0;
+    let migratedDnsIpPoolSourceCount = 0;
+    const rootActions = actions.filter(action => action?.kind === "ops_status_root");
+    const sectionActions = actions.filter(action => action?.kind === "ops_status_section");
+    const telegramActions = actions.filter(action => action?.kind === "telegram_alert_state");
+    const dnsSourceActions = actions.filter(action => action?.kind === "dns_ip_pool_sources");
+    const updatedAtMs = nowMs();
+    const putStatusStrict = async (scope, payload) => {
+      const written = await this.putOpsStatusPayloadToDb(db, scope, payload, updatedAtMs);
+      if (written === true) return;
+      const error = new Error(`D1 legacy state migration failed for ${scope}`);
+      error.code = "D1_LEGACY_MIGRATION_FAILED";
+      error.status = 503;
+      throw error;
+    };
+
+    if (rootActions.length) {
+      const legacyRoot = rootActions.reduce((current, action) => mergeStatusPatch(current, isPlainObject(action?.payload) ? action.payload : {}), {});
+      const currentRoot = await this.getOpsStatusPayloadFromDbStrict(db, this.getOpsStatusDbScope());
+      await putStatusStrict(
+        this.getOpsStatusDbScope(),
+        mergeStatusPatch(legacyRoot, isPlainObject(currentRoot) ? currentRoot : {})
+      );
+      migratedKeyCount += rootActions.length;
+    }
+    for (const action of sectionActions) {
+      const sectionName = String(action?.sectionName || "").trim();
+      if (!sectionName) continue;
+      const scope = this.getOpsStatusDbScope(sectionName);
+      const currentSection = await this.getOpsStatusPayloadFromDbStrict(db, scope);
+      await putStatusStrict(
+        scope,
+        mergeStatusPatch(isPlainObject(action?.payload) ? action.payload : {}, isPlainObject(currentSection) ? currentSection : {})
+      );
+      migratedKeyCount += 1;
+    }
+    if (telegramActions.length) {
+      const legacyState = telegramActions.reduce((current, action) => mergeStatusPatch(current, isPlainObject(action?.payload) ? action.payload : {}), {});
+      const currentState = await this.getOpsStatusPayloadFromDbStrict(db, this.TELEGRAM_ALERT_STATE_DB_SCOPE);
+      await putStatusStrict(
+        this.TELEGRAM_ALERT_STATE_DB_SCOPE,
+        mergeStatusPatch(legacyState, isPlainObject(currentState) ? currentState : {})
+      );
+      migratedKeyCount += telegramActions.length;
+    }
+    for (const action of dnsSourceActions) {
+      const legacySources = action.payload;
+      const currentSources = await this.getDnsIpPoolSourcesFromDbStrict(db);
+      const mergedSources = new Map();
+      for (const source of [...legacySources, ...currentSources]) {
+        const key = String(source?.id || "").trim();
+        if (key) mergedSources.set(key, source);
+      }
+      if (legacySources.length || currentSources.length) {
+        await this.persistDnsIpPoolSources({ db }, [...mergedSources.values()]);
+      }
+      migratedDnsIpPoolSourceCount += legacySources.length;
+      migratedKeyCount += 1;
+    }
+    return { migratedKeyCount, migratedDnsIpPoolSourceCount };
   },
   async collectKvTidyNodeMutations(kv, nodeNames = [], nextTidyConfig = {}, rollbackKvEntries = []) {
     const rewrittenNodes = [];
@@ -14830,6 +15508,7 @@ const Database = {
       scannedKeys: [...new Set(Array.isArray(plan?.scannedKeys) ? plan.scannedKeys : [])].sort(),
       revisions: isPlainObject(plan?.revisions) ? plan.revisions : {},
       mutationPlan,
+      d1LegacyMigrations: Array.isArray(plan?.d1LegacyMigrations) ? plan.d1LegacyMigrations : [],
       rebuiltNodeSummaries: Array.isArray(plan?.rebuiltNodeSummaries) ? plan.rebuiltNodeSummaries : []
     }));
   },
@@ -14898,6 +15577,114 @@ const Database = {
     }
     return payload;
   },
+  buildD1TidyPlanHash(plan = {}) {
+    const schemaStatus = isPlainObject(plan?.schemaStatus) ? plan.schemaStatus : {};
+    return hashStableText(serializeConfigValue({
+      scope: "d1",
+      mode: String(plan?.mode || "manual"),
+      maintenanceMode: String(plan?.maintenanceMode || "smart"),
+      nowMs: Number(plan?.nowMs) || 0,
+      retentionDays: Number(plan?.retentionDays) || 0,
+      retentionCutoffMs: Number(plan?.retentionCutoffMs) || 0,
+      utcOffsetMinutes: Number(plan?.utcOffsetMinutes) || 0,
+      scheduledNowMs: Number(plan?.scheduledNowMs) || 0,
+      dayWindow: isPlainObject(plan?.dayWindow) ? plan.dayWindow : {},
+      statsBucketDate: String(plan?.statsBucketDate || ""),
+      statsStartTs: Number(plan?.statsStartTs) || 0,
+      statsEndTs: Number(plan?.statsEndTs) || 0,
+      statsUtcOffsetMinutes: Number(plan?.statsUtcOffsetMinutes) || 0,
+      schemaStatus: {
+        runtimeCompatibilityReady: schemaStatus.runtimeCompatibilityReady === true,
+        migrationReady: schemaStatus.migrationReady === true,
+        tables: isPlainObject(schemaStatus.tables) ? schemaStatus.tables : {},
+        columns: isPlainObject(schemaStatus.columns) ? schemaStatus.columns : {},
+        indexes: isPlainObject(schemaStatus.indexes) ? schemaStatus.indexes : {},
+        constraints: isPlainObject(schemaStatus.constraints) ? schemaStatus.constraints : {},
+        ftsReady: schemaStatus.ftsReady === true,
+        issues: Array.isArray(schemaStatus.issues) ? schemaStatus.issues : []
+      },
+      flags: isPlainObject(plan?.flags) ? plan.flags : {},
+      summary: isPlainObject(plan?.summary) ? plan.summary : {},
+      preview: isPlainObject(plan?.preview) ? plan.preview : {},
+      d1DnsIpPoolSources: Array.isArray(plan?.d1DnsIpPoolSources) ? plan.d1DnsIpPoolSources : []
+    }));
+  },
+  async createD1TidyPlanToken(env, plan = {}, options = {}) {
+    const secret = String(env?.JWT_SECRET || "").trim();
+    if (!secret) {
+      const error = new Error("JWT_SECRET is required to sign the D1 tidy plan");
+      error.code = "SERVER_MISCONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const issuedAt = Math.max(0, Math.floor(Number(options.issuedAtMs ?? nowMs()) / 1000));
+    const expiresAt = issuedAt + Math.max(60, Math.floor(Number(options.ttlMs) || D1_TIDY_PLAN_TOKEN_TTL_MS) / 1000);
+    const payloadPart = encodeBase64UrlUtf8(JSON.stringify({
+      version: 1,
+      scope: "d1",
+      planHash: String(plan?.planHash || this.buildD1TidyPlanHash(plan)).trim(),
+      planNowMs: Number(plan?.nowMs) || 0,
+      scheduledNowMs: Number(plan?.scheduledNowMs) || Number(plan?.nowMs) || 0,
+      maintenanceMode: String(plan?.maintenanceMode || "smart"),
+      statsBucketDate: String(plan?.statsBucketDate || ""),
+      statsStartTs: Number(plan?.statsStartTs) || 0,
+      statsEndTs: Number(plan?.statsEndTs) || 0,
+      statsUtcOffsetMinutes: Number(plan?.statsUtcOffsetMinutes) || 0,
+      issuedAt,
+      expiresAt
+    }));
+    return `${payloadPart}.${await Auth.sign(secret, payloadPart)}`;
+  },
+  async verifyD1TidyPlanToken(env, token = "", options = {}) {
+    const secret = String(env?.JWT_SECRET || "").trim();
+    const rawToken = String(token || "").trim();
+    if (!secret) {
+      const error = new Error("JWT_SECRET is required to verify the D1 tidy plan");
+      error.code = "SERVER_MISCONFIGURED";
+      error.status = 503;
+      throw error;
+    }
+    const dotIndex = rawToken.indexOf(".");
+    if (dotIndex <= 0 || dotIndex === rawToken.length - 1) {
+      const error = new Error("D1 tidy plan token is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    const payloadPart = rawToken.slice(0, dotIndex);
+    const signature = rawToken.slice(dotIndex + 1);
+    if (signature !== await Auth.sign(secret, payloadPart)) {
+      const error = new Error("D1 tidy plan token signature is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    let payload = null;
+    try {
+      payload = JSON.parse(decodeBase64UrlUtf8(payloadPart));
+    } catch {
+      payload = null;
+    }
+    const nowSeconds = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1000));
+    if (!isPlainObject(payload)
+      || payload.version !== 1
+      || payload.scope !== "d1"
+      || !String(payload.planHash || "").trim()
+      || !(Number(payload.planNowMs) > 0)) {
+      const error = new Error("D1 tidy plan token payload is invalid");
+      error.code = "TIDY_PLAN_INVALID";
+      error.status = 409;
+      throw error;
+    }
+    if (Number(payload.expiresAt) <= nowSeconds) {
+      const error = new Error("D1 tidy plan has expired");
+      error.code = "TIDY_PLAN_STALE";
+      error.status = 409;
+      error.details = { reason: "expired", expiresAt: Number(payload.expiresAt) || 0 };
+      throw error;
+    }
+    return payload;
+  },
   async resolveKvTidyQuotaBudget(env, mutationPlan = [], options = {}) {
     const kv = options.kv || this.getKV(env);
     const runtimeConfig = sanitizeRuntimeConfig(options.config || {});
@@ -14941,6 +15728,31 @@ const Database = {
   async buildKvTidyPlan(env, options = {}) {
     const kv = options.kv || this.getKV(env);
     if (!kv) throw new Error("KV not configured");
+    const db = options.db || this.getDB(env) || null;
+    let d1Compatibility = {
+      configured: !!db,
+      runtimeCompatibilityReady: false,
+      migrationReady: false,
+      issues: db ? ["d1_status_unavailable"] : ["db_not_configured"]
+    };
+    if (db) {
+      try {
+        const status = await this.getD1SchemaStatus(db);
+        d1Compatibility = {
+          configured: true,
+          runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
+          migrationReady: status.migrationReady === true,
+          issues: Array.isArray(status.issues) ? status.issues : []
+        };
+      } catch (error) {
+        d1Compatibility = {
+          configured: true,
+          runtimeCompatibilityReady: false,
+          migrationReady: false,
+          issues: [String(error?.code || "d1_status_failed")]
+        };
+      }
+    }
 
     const allKeys = (await this.listKvKeysStrict(kv)).sort();
     const adminIndexUploadKeys = allKeys.filter(key => key.startsWith(this.ADMIN_INDEX_UPLOAD_PREFIX));
@@ -14952,6 +15764,7 @@ const Database = {
     const {
       nodeNames,
       removableKeys,
+      preservedD1LegacyKeys,
       untouchedOtherKeyCount,
       opsStatusKeyCount,
       dnsRecordHistoryKeyCount,
@@ -14962,7 +15775,10 @@ const Database = {
       telegramAlertStateKeyCount,
       loginFailureKeyCount,
       dnsFetchLockKeyCount
-    } = await this.classifyKvTidyKeys(kv, allKeys);
+    } = await this.classifyKvTidyKeys(kv, allKeys, {
+      canDeleteD1OwnedLegacyKeys: d1Compatibility.runtimeCompatibilityReady === true
+    });
+    const d1LegacyMigrations = await this.buildKvD1LegacyMigrationPlan(kv, removableKeys);
 
     const repairedConfig = await this.readRepairableRuntimeConfig(kv);
     const currentStoredConfig = isPlainObject(repairedConfig.rawConfig) ? repairedConfig.rawConfig : {};
@@ -15167,8 +15983,10 @@ const Database = {
       deletedDnsIpPoolSourceKeyCount: dnsIpPoolSourceKeyCount,
       deletedOpsStatusKeyCount: opsStatusKeyCount,
       deletedTelegramAlertStateKeyCount: telegramAlertStateKeyCount,
+      migratedD1LegacyKeyCount: d1LegacyMigrations.length,
       deletedDnsFetchLockKeyCount: dnsFetchLockKeyCount,
       deletedAdminIndexUploadCount: unreferencedAdminIndexUploadKeys.length,
+      preservedD1LegacyKeyCount: preservedD1LegacyKeys.length,
       untouchedOtherKeyCount,
       rawSnapshotCount: rawSnapshots.length,
       previousFullIndexBytes,
@@ -15206,6 +16024,17 @@ const Database = {
     pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只删除当前配置和保留快照都不再引用的内容寻址 index.html。");
 
     const rewriteGroups = [];
+    if (d1LegacyMigrations.length > 0) {
+      pushTidyPreviewGroup(
+        rewriteGroups,
+        true,
+        "d1_legacy_migrations",
+        "遗留 KV 数据迁入 D1",
+        d1LegacyMigrations.map(item => item.key),
+        d1LegacyMigrations.length,
+        "会先把仍有内容的旧运维状态、Telegram 状态和 DNS IP 池源合并到 D1；全部写入成功后才删除原 KV 键。"
+      );
+    }
     if (configRewriteNeeded) {
       pushTidyPreviewGroup(rewriteGroups, true, "runtime_config", "全局设置 sys:theme", [
         ...configMigration.legacyKeysPresent,
@@ -15252,6 +16081,17 @@ const Database = {
         this.NODES_INDEX_META_KEY
       ], preservedMetaCount, "不会删除这些 revision / meta 键。");
     }
+    if (preservedD1LegacyKeys.length > 0) {
+      pushTidyPreviewGroup(
+        preserveGroups,
+        true,
+        "d1_legacy_keys_pending",
+        "等待 D1 兼容确认的遗留 KV 键",
+        preservedD1LegacyKeys,
+        preservedD1LegacyKeys.length,
+        "D1 未通过运行时兼容检查，本次保留这些旧位置的数据；初始化 DB 成功后再次整理即可删除。"
+      );
+    }
 
     const warnings = [];
     if (repairedConfig.hadMalformedValue) {
@@ -15272,6 +16112,9 @@ const Database = {
     if (untouchedOtherKeyCount > 0) {
       warnings.push(`发现 ${untouchedOtherKeyCount} 个未列入整理白名单的 KV 键，本次不会自动删除。`);
     }
+    if (preservedD1LegacyKeys.length > 0) {
+      warnings.push(`D1 兼容门禁未通过，已保留 ${preservedD1LegacyKeys.length} 个由 D1 接管的遗留 KV 键。`);
+    }
     if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenSnapshotCount === 0 && rewrittenNodeCount === 0) {
       warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
     }
@@ -15287,6 +16130,8 @@ const Database = {
       nodesIndex: rebuiltNodeIndex,
       rebuiltNodeSummaries,
       revisions,
+      d1Compatibility,
+      d1LegacyMigrations,
       summary,
       quotaBudget,
       mutationPlan,
@@ -15307,8 +16152,14 @@ const Database = {
     const kv = options.kv || this.getKV(options.env);
     if (!kv) throw new Error("KV not configured");
     const mutationPlan = Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : [];
+    const d1LegacyMigrations = Array.isArray(plan?.d1LegacyMigrations) ? plan.d1LegacyMigrations : [];
+    let d1MigrationResult = { migratedKeyCount: 0, migratedDnsIpPoolSourceCount: 0 };
 
     try {
+      d1MigrationResult = await this.applyKvD1LegacyMigrations(
+        options.db || this.getDB(options.env) || null,
+        d1LegacyMigrations
+      );
       await this.applyKvMutationsWithRollback(kv, mutationPlan);
     } catch (error) {
       invalidateRuntimeConfigCache();
@@ -15335,7 +16186,11 @@ const Database = {
       exp: nowMs() + 60000
     };
 
-    return this.buildTidyResult(plan, plan?.summary || {}, "kv", {
+    return this.buildTidyResult(plan, {
+      ...(plan?.summary || {}),
+      migratedD1LegacyKeyCount: d1MigrationResult.migratedKeyCount,
+      migratedDnsIpPoolSourceCount: d1MigrationResult.migratedDnsIpPoolSourceCount
+    }, "kv", {
       config: plan?.config || {},
       nodesIndex: Array.isArray(plan?.nodesIndex) ? plan.nodesIndex : []
     });
@@ -15462,14 +16317,22 @@ const Database = {
     const db = options.db || this.getDB(env);
     const kv = options.kv || this.getKV(env) || null;
     if (!db) throw new Error("D1 not configured");
+    const schemaStatus = await this.getD1SchemaStatus(db);
     const runtimeConfig = sanitizeRuntimeConfig(options.config || (env ? await getRuntimeConfig(env) : {}));
     const baseContext = D1TidyPlanner.buildContext(runtimeConfig, options);
     const context = D1TidyPlanner.attachPreviousState(this, baseContext, options.previousCleanupStatus);
     const facts = await D1TidyPlanner.readFacts(this, db, kv, context);
     const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
     const flags = D1TidyPlanner.buildFlags(this, context, facts, sourcePolicy);
+    const summary = D1TidyPlanner.buildSummary(context, facts, sourcePolicy, flags);
+    summary.runtimeCompatibilityReady = schemaStatus.runtimeCompatibilityReady === true;
+    summary.requiresSchemaInitialization = schemaStatus.runtimeCompatibilityReady !== true;
+    const preview = D1TidyPlanner.buildPreview(context, facts, sourcePolicy, flags);
+    if (schemaStatus.runtimeCompatibilityReady !== true) {
+      preview.warnings.unshift("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
+    }
 
-    return {
+    const plan = {
       scope: "d1",
       mode: context.mode,
       maintenanceMode: context.maintenanceMode,
@@ -15489,16 +16352,30 @@ const Database = {
       dnsIpPoolSourceAction: sourcePolicy.dnsIpPoolSourceAction,
       skipDnsIpPoolSourceCleanup: sourcePolicy.skipDnsIpPoolSourceCleanup,
       previousD1State: context.previousD1State,
+      schemaStatus,
       flags,
-      summary: D1TidyPlanner.buildSummary(context, facts, sourcePolicy, flags),
-      preview: D1TidyPlanner.buildPreview(context, facts, sourcePolicy, flags)
+      summary,
+      preview
     };
+    plan.planHash = this.buildD1TidyPlanHash(plan);
+    return plan;
   },
   async applyD1TidyPlan(plan, options = {}) {
     const env = options.env;
     const db = options.db || this.getDB(env);
     const kv = options.kv || this.getKV(env) || null;
     if (!db) throw new Error("D1 not configured");
+    const compatibilityStatus = await this.getD1SchemaStatus(db);
+    if (compatibilityStatus.runtimeCompatibilityReady !== true) {
+      const error = new Error("D1 schema must pass runtime compatibility checks before tidy execution");
+      error.code = "D1_SCHEMA_INCOMPATIBLE";
+      error.status = 409;
+      error.details = {
+        issues: compatibilityStatus.issues,
+        autoRepairPolicy: compatibilityStatus.autoRepairPolicy
+      };
+      throw error;
+    }
 
     const executionPlan = plan || await this.buildD1TidyPlan(env, { ...options, db, kv });
     const mode = String(executionPlan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
@@ -15649,8 +16526,71 @@ const Database = {
   async tidyD1Data(env, options = {}) {
     const mode = String(options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
     const maintenanceMode = normalizeTidyMaintenanceMode(options.maintenanceMode, mode);
-    const plan = options.plan || await this.buildD1TidyPlan(env, { ...options, mode, maintenanceMode });
-    return await this.applyD1TidyPlan(plan, { ...options, env });
+    const db = options.db || this.getDB(env);
+    if (!db) throw new Error("D1 not configured");
+    if (mode === "manual") {
+      const tokenPayload = await this.verifyD1TidyPlanToken(env, options.planToken);
+      const statusBefore = await this.getD1SchemaStatus(db);
+      if (statusBefore.runtimeCompatibilityReady !== true) {
+        const error = new Error("D1 schema changed after preview; initialize and preview again");
+        error.code = "TIDY_PLAN_STALE";
+        error.status = 409;
+        error.details = { reason: "schema_changed", issues: statusBefore.issues };
+        throw error;
+      }
+      const plan = await this.buildD1TidyPlan(env, {
+        ...options,
+        db,
+        mode,
+        maintenanceMode: normalizeTidyMaintenanceMode(tokenPayload.maintenanceMode, mode),
+        nowMs: Number(tokenPayload.planNowMs),
+        scheduledNow: new Date(Number(tokenPayload.scheduledNowMs) || Number(tokenPayload.planNowMs)),
+        statsBucketDate: String(tokenPayload.statsBucketDate || ""),
+        statsStartTs: Number(tokenPayload.statsStartTs) || 0,
+        statsEndTs: Number(tokenPayload.statsEndTs) || 0,
+        statsUtcOffsetMinutes: Number(tokenPayload.statsUtcOffsetMinutes) || 0
+      });
+      if (String(plan.planHash || "") !== String(tokenPayload.planHash || "")) {
+        const error = new Error("D1 tidy data changed after preview");
+        error.code = "TIDY_PLAN_STALE";
+        error.status = 409;
+        error.details = {
+          reason: "plan_changed",
+          previewPlanHash: String(tokenPayload.planHash || ""),
+          currentPlanHash: String(plan.planHash || "")
+        };
+        throw error;
+      }
+      const result = await this.applyD1TidyPlan(plan, { ...options, db, env, mode, maintenanceMode: plan.maintenanceMode });
+      return {
+        ...result,
+        compatibility: {
+          runtimeCompatibilityReady: true,
+          migrationReady: statusBefore.migrationReady === true,
+          schemaVersion: statusBefore.schemaVersion,
+          status: statusBefore
+        }
+      };
+    }
+    const statusBefore = await this.getD1SchemaStatus(db);
+    const compatibility = statusBefore.runtimeCompatibilityReady !== true
+      ? await this.initializeD1Database(db, { includeFts: false, failOnIncompatible: true })
+      : {
+          runtimeCompatibilityReady: true,
+          migrationReady: statusBefore.migrationReady === true,
+          schemaVersion: statusBefore.schemaVersion,
+          createdTables: [],
+          adjustedColumns: [],
+          droppedRetiredIndexes: [],
+          createdIndexes: [],
+          repairedIndexes: [],
+          ftsRebuilt: false,
+          ftsRecreated: false,
+          status: statusBefore
+        };
+    const plan = options.plan || await this.buildD1TidyPlan(env, { ...options, db, mode, maintenanceMode });
+    const result = await this.applyD1TidyPlan(plan, { ...options, db, env });
+    return { ...result, compatibility };
   },
   shouldRunLogsOptimize(lastOptimizeAt, options = {}) {
     const now = Number(options.nowMs) || nowMs();
@@ -16841,8 +17781,9 @@ const Database = {
         for (const [name, value] of Object.entries(options.query)) url.searchParams.set(name, String(value));
       }
       const response = await fetch(url.toString(), {
-        method: "GET",
+        method: String(options.method || "GET").toUpperCase(),
         headers: new Headers(headers),
+        body: options.body,
         cache: "no-store",
         signal: controller.signal
       });
@@ -16877,6 +17818,59 @@ const Database = {
     if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
     if (status === 401 || status === 403) return "unauthorized";
     return "offline";
+  },
+  async authenticateServerRecord(nodeName = "", node = {}, targetRecord = null, requestHeaders = new Headers()) {
+    const credentials = resolveServerRecordCredentials(node);
+    if (!credentials.configured || !isTargetRecord(targetRecord)) return null;
+    const nodeRevision = String(node?.cacheRevision || buildNodeDerivedCacheRevision(nodeName, node)).trim();
+    const cacheKey = `server-record-auth:${hashStableText(serializeConfigValue({
+      nodeName: String(nodeName || "").trim().toLowerCase(),
+      nodeRevision,
+      target: hashStableText(serializeConfigValue(targetRecord)),
+      username: hashStableText(credentials.username),
+      password: hashStableText(credentials.password)
+    }))}`;
+    const authCache = GLOBALS.ServerRecordAuthCache;
+    const cached = authCache.get(cacheKey);
+    const now = nowMs();
+    if (cached && Number(cached.expiresAt) > now && cached.token) {
+      touchMapEntry(authCache, cacheKey);
+      return cached;
+    }
+    return await runSingleFlight(buildSingleFlightKey(["server-record-auth", cacheKey]), async () => {
+      const current = authCache.get(cacheKey);
+      if (current && Number(current.expiresAt) > nowMs() && current.token) {
+        touchMapEntry(authCache, cacheKey);
+        return current;
+      }
+      const headers = new Headers(requestHeaders);
+      stripSensitiveProxyAuthHeaders(headers);
+      headers.delete("Cookie");
+      headers.set("Accept", "application/json");
+      headers.set("Content-Type", "application/json");
+      headers.set("X-Emby-Authorization", 'MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy-server-records", Version="1"');
+      try {
+        const result = await this.fetchServerRecordEndpoint(targetRecord, "/Users/AuthenticateByName", headers, {
+          method: "POST",
+          body: JSON.stringify({ Username: credentials.username, Pw: credentials.password }),
+          expectJson: true
+        });
+        const token = String(result?.json?.AccessToken || result?.json?.accessToken || result?.json?.SessionInfo?.AccessToken || "").trim();
+        if (!result.ok || result.parseError || !token) {
+          return { token: "", userId: "", error: `http_${result.status || 0}` };
+        }
+        const entry = {
+          nodeName: String(nodeName || "").trim().toLowerCase(),
+          token,
+          userId: String(result?.json?.User?.Id || result?.json?.user?.Id || "").trim(),
+          expiresAt: nowMs() + MEDIA_AGGREGATION_AUTH_TTL_MS
+        };
+        setBoundedMapEntry(authCache, cacheKey, entry, SERVER_RECORD_AUTH_CACHE_MAX);
+        return entry;
+      } catch (error) {
+        return { token: "", userId: "", error: String(error?.code || "authentication_failed").toLowerCase() };
+      }
+    });
   },
   async probeServerRecord(nodeName = "", node = {}) {
     const checkedAt = new Date().toISOString();
@@ -16966,9 +17960,21 @@ const Database = {
       };
     }
 
+    const detailHeaders = new Headers(headers);
+    let credentialError = "";
+    const serverRecordCredentials = resolveServerRecordCredentials(node);
+    if (serverRecordCredentials.configured) {
+      // Dedicated server-record credentials must not fall back to a node's proxy token.
+      stripSensitiveProxyAuthHeaders(detailHeaders);
+      detailHeaders.delete("Cookie");
+      const auth = await this.authenticateServerRecord(nodeName, node, selectedTarget, headers);
+      if (auth?.token) detailHeaders.set("X-Emby-Token", auth.token);
+      else credentialError = String(auth?.error || "authentication_failed");
+    }
+
     const countTypes = [["movies", "Movie"], ["series", "Series"], ["episodes", "Episode"]];
     const [infoResult, countResults] = await Promise.all([
-      this.fetchServerRecordEndpoint(selectedTarget, "/System/Info", headers, { expectJson: true })
+      this.fetchServerRecordEndpoint(selectedTarget, "/System/Info", detailHeaders, { expectJson: true })
         .catch(error => ({
           ok: false,
           status: 0,
@@ -16977,8 +17983,9 @@ const Database = {
           errorCode: String(error?.code || "upstream_unavailable").toLowerCase()
         })),
       Promise.all(countTypes.map(async ([key, itemType]) => {
+        if (credentialError) return { key, value: null, error: credentialError };
         try {
-          const result = await this.fetchServerRecordEndpoint(selectedTarget, "/Items", headers, {
+          const result = await this.fetchServerRecordEndpoint(selectedTarget, "/Items", detailHeaders, {
             expectJson: true,
             query: { IncludeItemTypes: itemType, Recursive: "true", Limit: "1" }
           });
@@ -17024,18 +18031,63 @@ const Database = {
   async getServerRecordProbe(nodeName = "", node = {}, options = {}) {
     const name = String(nodeName || "").trim().toLowerCase();
     const revision = String(node?.cacheRevision || buildNodeDerivedCacheRevision(name, node)).trim();
+    const forceRefresh = options.forceRefresh === true;
+    const now = nowMs();
     const cached = GLOBALS.ServerRecordsSnapshotCache.get(name);
-    if (options.forceRefresh !== true && cached && cached.revision === revision && Number(cached.expiresAt) > nowMs()) {
+    const hasCurrentCachedValue = cached && cached.revision === revision && Number(cached.expiresAt) > now;
+    if (!forceRefresh && hasCurrentCachedValue) {
       touchMapEntry(GLOBALS.ServerRecordsSnapshotCache, name);
-      return cached.value;
+      return { ...cached.value, probe: { source: "cache", retryAt: "" } };
     }
-    const value = await this.probeServerRecord(name, node);
-    setBoundedMapEntry(GLOBALS.ServerRecordsSnapshotCache, name, {
-      revision,
-      expiresAt: nowMs() + DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
-      value
-    }, Config.Defaults.ServerRecordsSnapshotMax);
-    return value;
+    const backoffKey = `${name}:${revision}`;
+    const backoff = GLOBALS.ServerRecordProbeBackoff.get(backoffKey);
+    if (forceRefresh && hasCurrentCachedValue && backoff && Number(backoff.retryAt) > now) {
+      touchMapEntry(GLOBALS.ServerRecordsSnapshotCache, name);
+      touchMapEntry(GLOBALS.ServerRecordProbeBackoff, backoffKey);
+      return {
+        ...cached.value,
+        probe: {
+          source: "backoff",
+          retryAt: new Date(Number(backoff.retryAt)).toISOString()
+        }
+      };
+    }
+    const value = await runSingleFlight(buildSingleFlightKey(["server-record-probe", name, revision]), async () => {
+      const probeValue = await this.probeServerRecord(name, node);
+      const errorCode = String(probeValue?.runtime?.errorCode || "").trim().toLowerCase();
+      const retryableFailure = String(probeValue?.runtime?.state || "") === "offline"
+        && ["timeout", "upstream_unavailable"].includes(errorCode);
+      if (retryableFailure) {
+        const previous = GLOBALS.ServerRecordProbeBackoff.get(backoffKey);
+        const failures = previous?.revision === revision ? Math.max(0, Number(previous.failures) || 0) + 1 : 1;
+        const delayMs = Math.min(
+          SERVER_RECORD_PROBE_BACKOFF_MAX_MS,
+          SERVER_RECORD_PROBE_BACKOFF_BASE_MS * (2 ** Math.min(failures - 1, 16))
+        );
+        setBoundedMapEntry(GLOBALS.ServerRecordProbeBackoff, backoffKey, {
+          nodeName: name,
+          revision,
+          failures,
+          retryAt: nowMs() + delayMs
+        }, SERVER_RECORD_PROBE_BACKOFF_MAX);
+      } else {
+        GLOBALS.ServerRecordProbeBackoff.delete(backoffKey);
+      }
+      setBoundedMapEntry(GLOBALS.ServerRecordsSnapshotCache, name, {
+        revision,
+        expiresAt: nowMs() + DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
+        value: probeValue
+      }, Config.Defaults.ServerRecordsSnapshotMax);
+      return probeValue;
+    });
+    const completedBackoff = GLOBALS.ServerRecordProbeBackoff.get(backoffKey);
+    return {
+      ...value,
+      probe: {
+        source: "live",
+        retryAt: completedBackoff?.retryAt ? new Date(Number(completedBackoff.retryAt)).toISOString() : ""
+      }
+    };
   },
   async getServerRecordsSnapshotPayload(env, options = {}) {
     const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
@@ -17053,7 +18105,10 @@ const Database = {
         expiryEnabled: settings.expiryEnabled,
         expiryMode: settings.expiryMode,
         expiresAt: settings.expiresAt,
-        expiryDays: settings.expiryDays
+        expiryDays: settings.expiryDays,
+        serverRecordEmbyUsername: String(node?.serverRecordEmbyUsername || "").trim(),
+        serverRecordEmbyCredentialsConfigured: hasConfiguredServerRecordCredentials(node),
+        serverRecordEmbyCredentialSource: String(node?.serverRecordEmbyCredentialSource || "none")
       };
     }).filter(node => node.nodeName);
     const enabledNodes = availableNodes.filter(node => node.enabled);
@@ -17103,6 +18158,7 @@ const Database = {
             errorCode: probeRequested ? "node_not_found" : "manual_refresh_required"
           },
           counts: probe.counts || { movies: null, series: null, episodes: null, state: "unavailable", errors: {} },
+          probe: probe.probe || { source: probeRequested ? "live" : "not_checked", retryAt: "" },
           watch: {
             lastWatchedAt: String(watch.lastWatchedAt || ""),
             state: watchState
@@ -17164,6 +18220,20 @@ const Database = {
     const normalizedServerRecord = normalizeServerRecordSettings(n.serverRecord);
     if (JSON.stringify(normalizedServerRecord) !== JSON.stringify(isPlainObject(n.serverRecord) ? n.serverRecord : {})) changed = true;
     n.serverRecord = normalizedServerRecord;
+    const inheritedServerRecordCredentialFlag = n.serverRecordEmbyCredentialsConfigured === true
+      && !Object.prototype.hasOwnProperty.call(n, "serverRecordEmbyPassword");
+    const normalizedServerRecordEmbyUsername = String(n.serverRecordEmbyUsername ?? "").trim();
+    const normalizedServerRecordEmbyPassword = String(n.serverRecordEmbyPassword ?? "");
+    const normalizedServerRecordCredentialsConfigured = Boolean(
+      normalizedServerRecordEmbyUsername
+      || inheritedServerRecordCredentialFlag
+    );
+    if (String(n.serverRecordEmbyUsername ?? "") !== normalizedServerRecordEmbyUsername) changed = true;
+    if (String(n.serverRecordEmbyPassword ?? "") !== normalizedServerRecordEmbyPassword) changed = true;
+    if (n.serverRecordEmbyCredentialsConfigured !== normalizedServerRecordCredentialsConfigured) changed = true;
+    n.serverRecordEmbyUsername = normalizedServerRecordEmbyUsername;
+    n.serverRecordEmbyPassword = normalizedServerRecordEmbyPassword;
+    n.serverRecordEmbyCredentialsConfigured = normalizedServerRecordCredentialsConfigured;
     if (n.remark === undefined) { n.remark = ""; changed = true; }
     if (n.tagColor === undefined) { n.tagColor = ""; changed = true; }
     if (n.remarkColor === undefined) { n.remarkColor = ""; changed = true; }
@@ -17192,7 +18262,7 @@ const Database = {
     const normalizedMediaAggregationEmbyUsername = String(n.mediaAggregationEmbyUsername ?? "").trim();
     const normalizedMediaAggregationEmbyPassword = String(n.mediaAggregationEmbyPassword ?? "");
     const normalizedMediaAggregationCredentialsConfigured = Boolean(
-      (normalizedMediaAggregationEmbyUsername && normalizedMediaAggregationEmbyPassword.length > 0)
+      normalizedMediaAggregationEmbyUsername
       || inheritedMediaAggregationCredentialFlag
     );
     if (String(n.mediaAggregationEmbyUsername ?? "") !== normalizedMediaAggregationEmbyUsername) changed = true;
@@ -17319,6 +18389,12 @@ const Database = {
             : existingNode.tags),
       remark: rawNode?.remark !== undefined ? rawNode.remark : (existingNode.remark || ""),
       serverRecord: rawNode?.serverRecord !== undefined ? rawNode.serverRecord : existingNode.serverRecord,
+      serverRecordEmbyUsername: rawNode?.serverRecordEmbyUsername !== undefined
+        ? String(rawNode.serverRecordEmbyUsername || "").trim()
+        : String(existingNode.serverRecordEmbyUsername || "").trim(),
+      serverRecordEmbyPassword: rawNode?.serverRecordEmbyPassword !== undefined
+        ? String(rawNode.serverRecordEmbyPassword || "")
+        : String(existingNode.serverRecordEmbyPassword || ""),
       tagColor: rawNode?.tagColor !== undefined ? String(rawNode.tagColor || "").trim() : (existingNode.tagColor || ""),
       remarkColor: rawNode?.remarkColor !== undefined ? String(rawNode.remarkColor || "").trim() : (existingNode.remarkColor || ""),
       displayName: rawNode?.displayName !== undefined ? String(rawNode.displayName || "").trim() : (existingNode.displayName || ""),
@@ -17833,15 +18909,23 @@ const Database = {
             kv,
             maintenanceMode: normalizeTidyMaintenanceMode(data?.maintenanceMode, "manual")
           });
+          const requiresSchemaInitialization = plan.schemaStatus?.runtimeCompatibilityReady !== true;
+          const planToken = requiresSchemaInitialization
+            ? ""
+            : await Database.createD1TidyPlanToken(env, plan);
           return jsonResponse({
             success: true,
             scope: "d1",
+            planHash: requiresSchemaInitialization ? "" : plan.planHash,
+            planToken,
+            planExpiresAt: planToken ? new Date(nowMs() + D1_TIDY_PLAN_TOKEN_TTL_MS).toISOString() : "",
+            requiresSchemaInitialization,
             summary: plan.summary,
             ...plan.preview
           });
         }
         if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace");
-        const plan = await Database.buildKvTidyPlan(env, { kv });
+        const plan = await Database.buildKvTidyPlan(env, { kv, db });
         const planToken = await Database.createKvTidyPlanToken(env, plan);
         return jsonResponse({
           success: true,
@@ -18347,8 +19431,9 @@ const Database = {
     async exportConfig(data, { env, ctx, request }) {
       const kv = Database.getKV(env);
       const includeSecrets = data?.includeSecrets === true;
-      if (includeSecrets && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportConfig") {
-        return jsonError("CONFIRMATION_REQUIRED", "导出完整密钥需要显式确认", 428);
+      const includeEmbyCredentials = includeSecrets || data?.includeEmbyCredentials === true;
+      if (includeEmbyCredentials && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportConfig") {
+        return jsonError("CONFIRMATION_REQUIRED", "导出 Emby 凭据需要显式确认", 428);
       }
       const config = await getRuntimeConfigStrict(env);
       const indexState = buildResolvedAdminIndexState(env, config);
@@ -18359,8 +19444,10 @@ const Database = {
       const backupPayload = {
         version: Config.Defaults.Version, 
         exportTime: new Date().toISOString(), 
-        nodes: includeSecrets ? storedNodes : storedNodes.map(redactMediaAggregationNodeCredentials),
-        config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
+        nodes: includeEmbyCredentials ? storedNodes : storedNodes.map(redactNodeEmbyCredentials),
+        config: includeSecrets
+          ? config
+          : (includeEmbyCredentials ? redactFullBackupServiceSecrets(config) : redactRuntimeConfigSecrets(config)),
         adminIndexUpload: adminIndexUpload
           ? {
               version: adminIndexUpload.version,
@@ -18371,8 +19458,8 @@ const Database = {
               html: adminIndexUpload.html
             }
           : null,
-        secretsRedacted: includeSecrets !== true,
-        containsSecrets: includeSecrets === true
+        secretsRedacted: includeEmbyCredentials !== true,
+        containsSecrets: includeEmbyCredentials === true
       };
       const importRequestBytes = new TextEncoder().encode(JSON.stringify({
         action: "importFull",
@@ -18559,6 +19646,46 @@ const Database = {
         throw remapAdminReadKvError(error, "SERVER_RECORDS_READ_FAILED", "服务器记录读取失败：节点数据不可用", "admin.read.server_records");
       }
     },
+    async getServerRecordCredential(data, { env, ctx, request }) {
+      const nodeName = String(data?.nodeName || "").trim().toLowerCase();
+      const recordRevealEvent = (statusCode, outcome) => {
+        Logger.record(env, ctx, {
+          nodeName: nodeName || "unknown",
+          requestPath: `${getAdminPath(env)}/server-records/credential`,
+          requestMethod: "POST",
+          statusCode,
+          category: "auth",
+          clientIp: request?.headers?.get?.("cf-connecting-ip") || "unknown",
+          userAgent: request?.headers?.get?.("user-agent") || "",
+          errorDetail: `server_record_credential_reveal_${outcome}`,
+          detailJson: { event: "server_record_credential_reveal", outcome }
+        });
+      };
+      if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请选择服务器节点", 400);
+      if (!env?.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
+      const adminPassword = typeof data?.adminPassword === "string" ? data.adminPassword : "";
+      if (!adminPassword) {
+        recordRevealEvent(428, "recent_auth_required");
+        return jsonError("RECENT_AUTH_REQUIRED", "显示服务器记录密码前需要重新验证管理密码", 428);
+      }
+      if (adminPassword !== env.ADMIN_PASS) {
+        recordRevealEvent(401, "recent_auth_failed");
+        return jsonError("RECENT_AUTH_FAILED", "管理密码验证失败", 401);
+      }
+      const node = await Database.getNodeForRead(nodeName, env);
+      if (!node) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
+      const credentials = resolveServerRecordCredentials(node);
+      recordRevealEvent(200, "success");
+      return jsonResponse({
+        success: true,
+        credential: {
+          username: credentials.username,
+          password: credentials.password,
+          configured: credentials.configured,
+          source: credentials.source
+        }
+      });
+    },
     async getDashboardD1WriteHotspot(data, { env, ctx }) {
       const config = await getRuntimeConfigStrict(env);
       return jsonResponse(await Database.buildDashboardD1WriteHotspotPayload(env, { config, nowMs: nowMs() }));
@@ -18606,11 +19733,29 @@ const Database = {
       return await runKvDataMutation(async () => {
         const existingNode = await kv.get(`${Database.PREFIX}${nodeName}`, { type: "json" });
         if (!existingNode) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
+        const hasUsername = Object.prototype.hasOwnProperty.call(data || {}, "serverRecordEmbyUsername");
+        const hasPassword = Object.prototype.hasOwnProperty.call(data || {}, "serverRecordEmbyPassword");
+        const serverRecordEmbyUsername = hasUsername
+          ? String(data?.serverRecordEmbyUsername || "").trim()
+          : String(existingNode.serverRecordEmbyUsername || "").trim();
+        let serverRecordEmbyPassword = hasPassword
+          ? String(data?.serverRecordEmbyPassword || "")
+          : String(existingNode.serverRecordEmbyPassword || "");
+        if (hasUsername && !serverRecordEmbyUsername) serverRecordEmbyPassword = "";
+        const credentialValidationError = getServerRecordCredentialValidationError({
+          serverRecordEmbyUsername,
+          serverRecordEmbyPassword
+        });
+        if (credentialValidationError) {
+          return jsonError(credentialValidationError.code, credentialValidationError.message, 400);
+        }
         const mutation = Database.buildPreparedNodeMutation({
           name: nodeName,
           originalName: nodeName,
           tags,
           tag: tags[0] || "",
+          serverRecordEmbyUsername,
+          serverRecordEmbyPassword,
           serverRecord: {
             enabled: data?.enabled === true,
             expiryEnabled,
@@ -18662,6 +19807,8 @@ const Database = {
       const adminNode = { name: nodeName.toLowerCase(), ...node };
       delete adminNode.mediaAggregationEmbyPassword;
       adminNode.mediaAggregationEmbyCredentialsConfigured = nodeCredentialsConfigured;
+      delete adminNode.serverRecordEmbyPassword;
+      adminNode.serverRecordEmbyCredentialsConfigured = hasConfiguredServerRecordCredentials(node);
       return jsonResponse({
         success: true,
         node: adminNode,
@@ -18714,6 +19861,15 @@ const Database = {
           return jsonError(
             credentialValidationError.code,
             credentialValidationError.message,
+            400,
+            { name }
+          );
+        }
+        const serverRecordCredentialValidationError = getServerRecordCredentialValidationError(mutation.nextNode);
+        if (serverRecordCredentialValidationError) {
+          return jsonError(
+            serverRecordCredentialValidationError.code,
+            serverRecordCredentialValidationError.message,
             400,
             { name }
           );
@@ -18992,7 +20148,7 @@ const Database = {
         if (missingCredentialNames.length > 0) {
           return jsonError(
             "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED",
-            "已勾选节点没有可用的完整 Emby 账号和密码，请填写节点账号密码或全局账号密码",
+            "已勾选节点没有可用的 Emby 账号，请填写节点账号或全局账号；密码可以留空",
             400,
             { nodeNames: missingCredentialNames }
           );
@@ -19165,6 +20321,15 @@ const Database = {
               return jsonError(
                 credentialValidationError.code,
                 credentialValidationError.message,
+                400,
+                { name }
+              );
+            }
+            const serverRecordCredentialValidationError = getServerRecordCredentialValidationError(mutation.nextNode);
+            if (serverRecordCredentialValidationError) {
+              return jsonError(
+                serverRecordCredentialValidationError.code,
+                serverRecordCredentialValidationError.message,
                 400,
                 { name }
               );
@@ -19382,11 +20547,12 @@ const Database = {
         } catch(e) { return jsonError("PURGE_ERROR", e.message); }
     },
 
-    async tidyKvData(data, { env, ctx, kv }) {
+    async tidyKvData(data, { env, ctx, kv, db }) {
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace");
       try {
         const result = await Database.tidyKvData(env, {
           kv,
+          db,
           ctx,
           planToken: String(data?.planToken || "").trim()
         });
@@ -19427,7 +20593,13 @@ const Database = {
       if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库");
       try {
         const maintenanceMode = normalizeTidyMaintenanceMode(data?.maintenanceMode, "manual");
-        const result = await Database.tidyD1Data(env, { db, kv, ctx, maintenanceMode });
+        const result = await Database.tidyD1Data(env, {
+          db,
+          kv,
+          ctx,
+          maintenanceMode,
+          planToken: String(data?.planToken || "").trim()
+        });
         const nowIso = new Date().toISOString();
         const scheduledStatus = Database.buildD1TidyStatusPayload(result.summary, {
           mode: "manual",
@@ -20313,29 +21485,27 @@ const Database = {
 
     async initD1Schema(data, { db }) {
       if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-      Database.invalidateD1SchemaReadiness(db, "all");
-      const bootstrap = await Database.bootstrapD1Schema(db, "logs-core");
-      const status = await Database.getD1SchemaStatus(db);
+      const initialization = await Database.initializeD1Database(db, { includeFts: true });
+      const status = initialization.status;
       return jsonResponse({
         success: status.runtimeCompatibilityReady === true,
         runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
         migrationReady: status.migrationReady === true,
         schemaVersion: status.schemaVersion,
-        steps: bootstrap.steps,
+        initialization,
+        steps: initialization.steps,
         status
       });
     },
 
     async initLogsDb(data, { db }) {
       if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-      Database.invalidateD1SchemaReadiness(db, "logs");
-      await Database.ensureLogsBaseSchema(db);
-      await Database.ensureStatsHourlySchema(db);
-      const schemaStatus = await Database.getD1SchemaStatus(db);
+      const initialization = await Database.initializeD1Database(db, { includeFts: true });
+      const schemaStatus = initialization.status;
       const ftsReady = schemaStatus.ftsReady === true;
       const statsReady = schemaStatus.tables?.[Database.STATS_HOURLY_TABLE] === true;
       const logStatus = await Database.bumpLogsRevision(db, {
-        schemaReady: true,
+        schemaReady: schemaStatus.tables?.[Database.LOGS_TABLE] === true,
         ftsReady,
         statsReady,
         schemaVersion: schemaStatus.schemaVersion,
@@ -20344,7 +21514,7 @@ const Database = {
         categoryEnabled: true
       });
       return jsonResponse({
-        success: true,
+        success: schemaStatus.runtimeCompatibilityReady === true,
         schemaVersion: schemaStatus.schemaVersion,
         runtimeCompatibilityVersion: Database.D1_SCHEMA_VERSION,
         runtimeCompatibilityReady: schemaStatus.runtimeCompatibilityReady === true,
@@ -20352,6 +21522,8 @@ const Database = {
         categoryEnabled: true,
         ftsReady,
         statsReady,
+        initialization,
+        steps: initialization.steps,
         status: schemaStatus,
         revisions: {
           logsRevision: Database.getLogsRevisionFromStatus(logStatus?.log || logStatus)
@@ -22234,45 +23406,52 @@ const Proxy = {
       touchMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey);
       return cached;
     }
-    const { targetRecords } = this.parseTargetRecords(node, "*");
-    const targetRecord = targetRecords[0];
-    if (!targetRecord) return null;
-    const loginUrl = buildUpstreamProxyUrl(targetRecord, `${String(apiPrefix || "")}/Users/AuthenticateByName`);
-    const headers = this.buildMediaAggregationRequestHeaders(execution, node, loginUrl, null);
-    stripSensitiveProxyAuthHeaders(headers);
-    headers.delete("Cookie");
-    headers.set("Content-Type", "application/json");
-    headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
-    let upstream;
-    try {
-      upstream = await this.performFetchWithTimeout(loginUrl, async () => ({
-        method: "POST",
-        headers,
-        body: JSON.stringify({ Username: username, Pw: password }),
-        redirect: "manual"
-      }), {
-        timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
-        requestLifecycle: null
-      });
-      const bodyResult = await readResponseTextWithLimit(upstream.response, 64 * 1024);
-      if (!upstream.response.ok || bodyResult.exceeded) return null;
-      const payload = JSON.parse(bodyResult.text || "{}");
-      const token = String(payload?.AccessToken || payload?.accessToken || payload?.SessionInfo?.AccessToken || "").trim();
-      if (!token) return null;
-      const entry = {
-        nodeName,
-        nodeRevision,
-        token,
-        userId: String(payload?.User?.Id || payload?.user?.Id || "").trim(),
-        expiresAt: now + MEDIA_AGGREGATION_AUTH_TTL_MS
-      };
-      setBoundedMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey, entry, MEDIA_AGGREGATION_AUTH_CACHE_MAX);
-      return entry;
-    } catch {
-      return null;
-    } finally {
-      try { upstream?.releaseFetchController?.(); } catch {}
-    }
+    return await runSingleFlight(buildSingleFlightKey(["media-aggregation-auth", cacheKey]), async () => {
+      const current = GLOBALS.MediaAggregationAuthCache.get(cacheKey);
+      if (current && Number(current.expiresAt) > nowMs() && current.token) {
+        touchMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey);
+        return current;
+      }
+      const { targetRecords } = this.parseTargetRecords(node, "*");
+      const targetRecord = targetRecords[0];
+      if (!targetRecord) return null;
+      const loginUrl = buildUpstreamProxyUrl(targetRecord, `${String(apiPrefix || "")}/Users/AuthenticateByName`);
+      const headers = this.buildMediaAggregationRequestHeaders(execution, node, loginUrl, null);
+      stripSensitiveProxyAuthHeaders(headers);
+      headers.delete("Cookie");
+      headers.set("Content-Type", "application/json");
+      headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
+      let upstream;
+      try {
+        upstream = await this.performFetchWithTimeout(loginUrl, async () => ({
+          method: "POST",
+          headers,
+          body: JSON.stringify({ Username: username, Pw: password }),
+          redirect: "manual"
+        }), {
+          timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+          requestLifecycle: null
+        });
+        const bodyResult = await readResponseTextWithLimit(upstream.response, 64 * 1024);
+        if (!upstream.response.ok || bodyResult.exceeded) return null;
+        const payload = JSON.parse(bodyResult.text || "{}");
+        const token = String(payload?.AccessToken || payload?.accessToken || payload?.SessionInfo?.AccessToken || "").trim();
+        if (!token) return null;
+        const entry = {
+          nodeName,
+          nodeRevision,
+          token,
+          userId: String(payload?.User?.Id || payload?.user?.Id || "").trim(),
+          expiresAt: nowMs() + MEDIA_AGGREGATION_AUTH_TTL_MS
+        };
+        setBoundedMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey, entry, MEDIA_AGGREGATION_AUTH_CACHE_MAX);
+        return entry;
+      } catch {
+        return null;
+      } finally {
+        try { upstream?.releaseFetchController?.(); } catch {}
+      }
+    });
   },
   async resolveMediaAggregationPrimaryProviderIds(execution, payload, upstreamState) {
     const directProviderIds = normalizeMediaAggregationProviderIds(payload?.ProviderIds || payload?.providerIds);
@@ -29448,9 +30627,10 @@ export default {
             const statsEndTs = dayWindow.endTs;
             const statsUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config.scheduleUtcOffsetMinutes);
             const previousCleanupStatus = Database.getPreviousD1TidyState(previousScheduledStatus);
-            const d1Plan = await Database.buildD1TidyPlan(env, {
+            const d1Result = await Database.tidyD1Data(env, {
               db,
               kv,
+              ctx,
               config,
               mode: "scheduled",
               maintenanceMode: "smart",
@@ -29461,15 +30641,7 @@ export default {
               statsBucketDate,
               statsStartTs,
               statsEndTs,
-              statsUtcOffsetMinutes
-            });
-            const d1Result = await Database.applyD1TidyPlan(d1Plan, {
-              env,
-              db,
-              kv,
-              ctx,
-              mode: "scheduled",
-              maintenanceMode: "smart",
+              statsUtcOffsetMinutes,
               beforeEachStep: ensureLeaseActive
             });
             const d1FinishedAt = nowIso();

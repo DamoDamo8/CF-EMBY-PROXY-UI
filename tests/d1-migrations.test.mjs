@@ -100,6 +100,14 @@ function createD1Adapter(database) {
   };
 }
 
+function createDeferred() {
+  let resolve;
+  const promise = new Promise(resolvePromise => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 test("D1 migrations build the fresh v6 baseline in order", async () => {
   const migrations = await loadMigrations();
   assert.deepEqual(migrations.map(migration => migration.filename), [
@@ -216,6 +224,45 @@ test("D1 schema status rejects a malformed FTS table and runtime initialization 
     assert.equal(readyStatus.ftsReady, true);
     assert.equal(readyStatus.fts.virtualTableReady, true);
     assert.equal(readyStatus.fts.triggerReady, true);
+
+    database.exec(`
+      DROP TRIGGER proxy_logs_fts_ai;
+      CREATE TRIGGER proxy_logs_fts_ai AFTER INSERT ON proxy_logs BEGIN SELECT 1; END;
+    `);
+    const malformedTriggerStatus = await Database.getD1SchemaStatus(d1);
+    assert.equal(malformedTriggerStatus.ftsReady, false);
+    assert.equal(malformedTriggerStatus.fts.triggerReady, false);
+    assert.ok(malformedTriggerStatus.issues.includes("missing_trigger:proxy_logs_fts_ai"));
+
+    const repaired = await Database.initializeD1Database(d1, { includeFts: true });
+    assert.equal(repaired.status.ftsReady, true);
+    assert.equal(repaired.ftsRebuilt, true);
+
+    database.exec(`
+      DROP TRIGGER proxy_logs_fts_ai;
+      CREATE TRIGGER proxy_logs_fts_ai AFTER INSERT ON proxy_logs BEGIN
+        INSERT INTO proxy_logs_fts(rowid, node_name, request_path, user_agent, error_detail, detail_json)
+        VALUES (new.id, new.request_path, new.node_name, new.user_agent, new.error_detail, new.detail_json);
+      END;
+    `);
+    const wrongTriggerMappingStatus = await Database.getD1SchemaStatus(d1);
+    assert.equal(wrongTriggerMappingStatus.ftsReady, false);
+    assert.equal(wrongTriggerMappingStatus.fts.triggerReady, false);
+    const triggerMappingRepair = await Database.initializeD1Database(d1, { includeFts: true });
+    assert.equal(triggerMappingRepair.status.ftsReady, true);
+    assert.equal(triggerMappingRepair.ftsRebuilt, true);
+
+    database.exec(`
+      DROP TRIGGER proxy_logs_fts_ai;
+      DROP TABLE proxy_logs_fts;
+      CREATE VIRTUAL TABLE proxy_logs_fts USING fts5(node_name, request_path, user_agent, error_detail, detail_json);
+    `);
+    const wrongContentBindingStatus = await Database.getD1SchemaStatus(d1);
+    assert.equal(wrongContentBindingStatus.ftsReady, false);
+    assert.equal(wrongContentBindingStatus.fts.virtualTableReady, false);
+    const contentBindingRepair = await Database.initializeD1Database(d1, { includeFts: true });
+    assert.equal(contentBindingRepair.ftsRecreated, true);
+    assert.equal(contentBindingRepair.status.ftsReady, true);
   } finally {
     database.close();
   }
@@ -245,6 +292,90 @@ test("D1 schema status rejects missing runtime columns and same-name indexes on 
     assert.equal(status.runtimeCompatibilityReady, false);
     assert.equal(status.migrationReady, false);
     assert.equal(status.schemaVersion, null);
+  } finally {
+    database.close();
+  }
+});
+
+test("initialize DB repairs known columns and named indexes without losing legacy rows", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    database.exec(`
+      DROP INDEX idx_auth_failures_expires_at;
+      DROP TABLE auth_failures;
+      CREATE TABLE auth_failures (ip TEXT PRIMARY KEY);
+      INSERT INTO auth_failures (ip) VALUES ('203.0.113.40');
+      CREATE INDEX idx_auth_failures_expires_at ON auth_failures (ip);
+      DROP INDEX idx_proxy_logs_client_time;
+      CREATE INDEX idx_proxy_logs_client_time ON proxy_logs (node_name);
+      CREATE INDEX idx_proxy_logs_client_ip ON proxy_logs (client_ip);
+      CREATE TABLE proxy_logs_fts (node_name TEXT, request_path TEXT);
+    `);
+
+    const d1 = createD1Adapter(database);
+    const result = await Database.initializeD1Database(d1, { includeFts: true });
+    assert.equal(result.runtimeCompatibilityReady, true);
+    assert.equal(result.migrationReady, true);
+    assert.ok(result.adjustedColumns.includes("auth_failures.fail_count"));
+    assert.ok(result.repairedIndexes.includes("idx_auth_failures_expires_at"));
+    assert.ok(result.repairedIndexes.includes("idx_proxy_logs_client_time"));
+    assert.ok(result.droppedRetiredIndexes.includes("idx_proxy_logs_client_ip"));
+    assert.equal(result.ftsRecreated, true);
+    assert.equal(database.prepare("SELECT ip FROM auth_failures").get().ip, "203.0.113.40");
+    assert.equal(database.prepare("SELECT fail_count FROM auth_failures").get().fail_count, 0);
+    assert.deepEqual(
+      database.prepare("PRAGMA index_info(idx_auth_failures_expires_at)").all().map(row => row.name),
+      ["expires_at"]
+    );
+    assert.equal(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_ip"), false);
+  } finally {
+    database.close();
+  }
+});
+
+test("KV legacy state is merged into D1 before its old keys can be removed", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    await Database.putOpsStatusPayloadToDb(d1, Database.getOpsStatusDbScope(), {
+      scheduled: { status: "current", currentOnly: true }
+    }, Date.now());
+    await Database.persistDnsIpPoolSources({ db: d1 }, [{
+      id: "current-source",
+      name: "Current source",
+      url: "https://current.example/ips.txt",
+      sourceType: "url",
+      sourceKind: "custom"
+    }]);
+
+    const result = await Database.applyKvD1LegacyMigrations(d1, [{
+      key: Database.LEGACY_OPS_STATUS_KEY,
+      kind: "ops_status_root",
+      payload: { scheduled: { status: "legacy", legacyOnly: true } }
+    }, {
+      key: Database.LEGACY_DNS_IP_POOL_SOURCES_KEY,
+      kind: "dns_ip_pool_sources",
+      payload: [{
+        id: "legacy-source",
+        name: "Legacy source",
+        url: "https://legacy.example/ips.txt",
+        sourceType: "url",
+        sourceKind: "custom"
+      }]
+    }]);
+
+    assert.equal(result.migratedKeyCount, 2);
+    assert.equal(result.migratedDnsIpPoolSourceCount, 1);
+    const root = await Database.getOpsStatusPayloadFromDb(d1, Database.getOpsStatusDbScope());
+    assert.equal(root.scheduled.status, "current");
+    assert.equal(root.scheduled.currentOnly, true);
+    assert.equal(root.scheduled.legacyOnly, true);
+    assert.deepEqual(
+      new Set((await Database.getDnsIpPoolSourcesFromDb(d1)).map(source => source.id)),
+      new Set(["legacy-source", "current-source"])
+    );
   } finally {
     database.close();
   }
@@ -317,6 +448,12 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
     assert.ok(partialStatus.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
     assert.equal(partialStatus.migrationReady, false);
 
+    const initialized = await Database.initializeD1Database(d1, { includeFts: false });
+    assert.equal(initialized.runtimeCompatibilityReady, false);
+    assert.ok(initialized.status.issues.includes("invalid_primary_key:auth_failures"));
+    assert.ok(initialized.status.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM auth_failures").get().total, 0);
+
     database.exec(`
       DROP INDEX idx_dns_ip_pool_items_ip_partial;
       CREATE UNIQUE INDEX idx_dns_ip_pool_items_ip_expression
@@ -326,6 +463,192 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
     assert.equal(expressionStatus.constraints.uniqueKeys["dns_ip_pool_items.ip"], false);
     assert.ok(expressionStatus.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
     assert.equal(expressionStatus.migrationReady, false);
+  } finally {
+    database.close();
+  }
+});
+
+test("initialize DB leaves unknown same-name tables untouched when key contracts are invalid", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec("CREATE TABLE auth_failures (foreign_column TEXT)");
+    const d1 = createD1Adapter(database);
+    const initialized = await Database.initializeD1Database(d1, { includeFts: false });
+
+    assert.equal(initialized.runtimeCompatibilityReady, false);
+    assert.ok(initialized.status.issues.includes("invalid_primary_key:auth_failures"));
+    assert.deepEqual(
+      database.prepare("PRAGMA table_info(auth_failures)").all().map(row => row.name),
+      ["foreign_column"]
+    );
+    await assert.rejects(
+      Database.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true }),
+      error => error?.code === "D1_SCHEMA_INCOMPATIBLE"
+        && error?.details?.phase === "preflight"
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("D1 initialization serializes core and FTS profiles on one binding", async () => {
+  const database = Object.create(Database);
+  const binding = {};
+  const coreStarted = createDeferred();
+  const releaseCore = createDeferred();
+  const events = [];
+  let active = 0;
+  let maxActive = 0;
+  database.runD1DatabaseInitialization = async (db, options = {}) => {
+    const profile = options.includeFts === true ? "logs-fts" : "logs-core";
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    events.push(`${profile}:start`);
+    if (profile === "logs-core") {
+      coreStarted.resolve();
+      await releaseCore.promise;
+    }
+    events.push(`${profile}:end`);
+    active -= 1;
+    return { profile };
+  };
+
+  const coreTask = database.initializeD1Database(binding, { includeFts: false });
+  await coreStarted.promise;
+  const ftsTask = database.initializeD1Database(binding, { includeFts: true });
+  await Promise.resolve();
+  assert.equal(maxActive, 1);
+  assert.deepEqual(events, ["logs-core:start"]);
+  releaseCore.resolve();
+  await Promise.all([coreTask, ftsTask]);
+
+  assert.equal(maxActive, 1);
+  assert.deepEqual(events, ["logs-core:start", "logs-core:end", "logs-fts:start", "logs-fts:end"]);
+});
+
+test("D1 tidy requires a new signed preview when rows change", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const now = Date.parse("2026-07-25T00:00:00.000Z");
+    const env = { DB: d1, JWT_SECRET: "d1-tidy-test-secret" };
+    const config = { logRetentionDays: 7 };
+    const previewPlan = await Database.buildD1TidyPlan(env, {
+      db: d1,
+      config,
+      mode: "manual",
+      maintenanceMode: "smart",
+      nowMs: now
+    });
+    const planToken = await Database.createD1TidyPlanToken(env, previewPlan);
+    database.exec(`INSERT INTO proxy_logs (
+      timestamp, node_name, request_path, request_method, status_code,
+      response_time, client_ip, category, created_at
+    ) VALUES (1, 'late-expired', '/expired', 'GET', 200, 1, '198.51.100.20', 'api', '1970-01-01T00:00:00.001Z')`);
+
+    await assert.rejects(
+      Database.tidyD1Data(env, {
+        db: d1,
+        config,
+        mode: "manual",
+        maintenanceMode: "smart",
+        planToken
+      }),
+      error => error?.code === "TIDY_PLAN_STALE"
+        && error?.details?.reason === "plan_changed"
+    );
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM proxy_logs WHERE node_name = 'late-expired'").get().total, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("D1 tidy executes an unchanged signed preview", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const now = Date.parse("2026-07-25T00:00:00.000Z");
+    const env = { DB: d1, JWT_SECRET: "d1-tidy-success-secret" };
+    const config = { logRetentionDays: 7 };
+    const plan = await Database.buildD1TidyPlan(env, {
+      db: d1,
+      config,
+      mode: "manual",
+      maintenanceMode: "smart",
+      nowMs: now
+    });
+    const planToken = await Database.createD1TidyPlanToken(env, plan);
+    const result = await Database.tidyD1Data(env, {
+      db: d1,
+      config,
+      mode: "manual",
+      maintenanceMode: "smart",
+      planToken
+    });
+
+    assert.equal(result.summary.status, "success");
+    assert.equal(result.compatibility.runtimeCompatibilityReady, true);
+  } finally {
+    database.close();
+  }
+});
+
+test("D1 tidy preview cannot authorize deletes until initialization is followed by a new preview", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(`
+      CREATE TABLE proxy_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, legacy_payload TEXT);
+      INSERT INTO proxy_logs (legacy_payload) VALUES ('keep-until-repreview');
+    `);
+    const d1 = createD1Adapter(database);
+    const env = { DB: d1, JWT_SECRET: "d1-tidy-preview-secret" };
+    const firstResponse = await Database.ApiHandlers.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
+    const firstPreview = await firstResponse.json();
+    assert.equal(firstPreview.requiresSchemaInitialization, true);
+    assert.equal(firstPreview.planToken, "");
+    assert.equal(firstPreview.summary.deletedExpiredLogCount, 0);
+
+    const initialized = await Database.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true });
+    assert.equal(initialized.runtimeCompatibilityReady, true);
+    const secondResponse = await Database.ApiHandlers.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
+    const secondPreview = await secondResponse.json();
+    assert.equal(secondPreview.requiresSchemaInitialization, false);
+    assert.ok(secondPreview.planToken);
+    assert.equal(secondPreview.summary.deletedExpiredLogCount, 1);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM proxy_logs").get().total, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("scheduled D1 tidy fails before deletion when key contracts drift", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    database.exec(`
+      INSERT INTO proxy_logs (
+        timestamp, node_name, request_path, request_method, status_code,
+        response_time, client_ip, category, created_at
+      ) VALUES (1, 'scheduled-expired', '/expired', 'GET', 200, 1, '198.51.100.30', 'api', '1970-01-01T00:00:00.001Z');
+      DROP INDEX idx_auth_failures_expires_at;
+      DROP TABLE auth_failures;
+      CREATE TABLE auth_failures (ip TEXT, fail_count INTEGER, expires_at INTEGER, updated_at INTEGER);
+      CREATE INDEX idx_auth_failures_expires_at ON auth_failures (expires_at);
+    `);
+    const d1 = createD1Adapter(database);
+    await assert.rejects(
+      Database.tidyD1Data({ DB: d1 }, {
+        db: d1,
+        config: { logRetentionDays: 7 },
+        mode: "scheduled",
+        maintenanceMode: "smart",
+        scheduledNow: new Date("2026-07-25T00:00:00.000Z")
+      }),
+      error => error?.code === "D1_SCHEMA_INCOMPATIBLE"
+    );
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM proxy_logs WHERE node_name = 'scheduled-expired'").get().total, 1);
   } finally {
     database.close();
   }

@@ -203,10 +203,14 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-summary{margin-top:.35rem;font-size:.8125rem;line-height:1.25rem;color:var(--record-muted)}
 #view-server-records .server-record-add,#view-server-records .server-record-primary{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;min-height:2.5rem;border:1px solid transparent;border-radius:var(--ui-control-radius-px);background:#2563eb;padding:.625rem .875rem;color:#fff;font-size:.8125rem;font-weight:600;transition:background-color .18s ease,transform .18s ease,box-shadow .18s ease}
 #view-server-records .server-record-add:hover,#view-server-records .server-record-primary:hover{background:#1d4ed8;transform:translateY(-1px);box-shadow:0 10px 22px rgba(37,99,235,.16)}
-#view-server-records .server-record-search{position:relative;margin-bottom:1.25rem;max-width:28rem}
+#view-server-records .server-record-filter-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(10rem,12rem);gap:.75rem;margin-bottom:1.5rem}
+#view-server-records .server-record-search,#view-server-records .server-record-expiry-filter{position:relative;display:block;min-width:0;width:100%}
 #view-server-records .server-record-search>svg,#view-server-records .server-record-search>i{position:absolute;left:.8rem;top:50%;width:1rem;height:1rem;transform:translateY(-50%);color:#94a3b8;pointer-events:none}
 #view-server-records .server-record-search input{width:100%;height:2.5rem;border:1px solid var(--record-border);background:var(--record-surface);padding:.5rem .8rem .5rem 2.4rem;color:var(--record-text);font-size:.8125rem;outline:none}
 #view-server-records .server-record-search input:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(59,130,246,.12)}
+#view-server-records .server-record-expiry-filter>svg,#view-server-records .server-record-expiry-filter>i{position:absolute;left:.8rem;top:50%;z-index:1;width:1rem;height:1rem;transform:translateY(-50%);color:#94a3b8;pointer-events:none}
+#view-server-records .server-record-expiry-filter select{width:100%;height:2.5rem;border:1px solid var(--record-border);background:var(--record-surface);padding:.5rem 2rem .5rem 2.4rem;color:var(--record-text);font-size:.8125rem;outline:none}
+#view-server-records .server-record-expiry-filter select:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(59,130,246,.12)}
 #view-server-records .server-record-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,20rem),1fr));gap:1rem}
 #view-server-records .server-record-card{position:relative;display:flex;min-height:20rem;flex-direction:column;overflow:hidden;border:1px solid var(--record-border);border-radius:var(--ui-radius-px);background:var(--record-surface);padding:1.25rem;box-shadow:0 8px 24px rgba(15,23,42,.04);transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease}
 #view-server-records .server-record-card:hover{transform:translateY(-2px);border-color:#cbd5e1;box-shadow:0 16px 32px rgba(15,23,42,.07)}
@@ -245,11 +249,16 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-expiry-mode{font-size:.6875rem;font-weight:650;color:var(--record-muted)}
 #view-server-records .server-record-expiry-date{min-width:0;color:var(--record-text);font-size:.9375rem;line-height:1.25rem;overflow-wrap:anywhere}
 #view-server-records .server-record-expiry-remaining{flex:0 0 auto;color:var(--record-text);font-size:.8125rem;font-weight:650}.server-record-expiry.is-warning .server-record-expiry-remaining{color:#e11d48}
-#view-server-records .server-record-card-actions{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,2.5rem);gap:.5rem;margin-top:auto;padding-top:1.25rem}
+#view-server-records .server-record-card-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr) 2.5rem;align-items:center;gap:.75rem;margin-top:auto;padding-top:1.25rem}
 #view-server-records .server-record-card-actions.single{grid-template-columns:minmax(0,1fr)}
 #view-server-records .server-record-icon-button{display:inline-flex;width:2.5rem;height:2.5rem;align-items:center;justify-content:center;border:1px solid var(--record-border);border-radius:var(--ui-control-radius-px);background:var(--record-surface);color:var(--record-muted)}
 #view-server-records .server-record-icon-button:hover{border-color:#94a3b8;color:var(--record-text)}#view-server-records .server-record-icon-button.danger:hover{border-color:#fecaca;color:#dc2626;background:#fef2f2}
 .dark #view-server-records .server-record-icon-button.danger:hover{border-color:rgba(239,68,68,.45);background:rgba(127,29,29,.18);color:#fca5a5}
+#view-server-records .server-record-card-refresh{flex:0 0 2.5rem}
+#view-server-records .server-record-runtime-status{display:inline-flex;min-width:0;min-height:2.5rem;align-items:center;justify-content:center;gap:.45rem;justify-self:stretch;border:1px solid var(--record-border);border-radius:var(--ui-control-radius-px);background:var(--record-soft);padding:.5rem .75rem;color:var(--record-muted);font-size:.75rem;line-height:1rem;font-weight:650;text-align:center}
+#view-server-records .server-record-runtime-status.online{border-color:#a7f3d0;background:#ecfdf5;color:#047857}.dark #view-server-records .server-record-runtime-status.online{border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.12);color:#6ee7b7}
+#view-server-records .server-record-runtime-status.maintenance{border-color:#fde68a;background:#fffbeb;color:#b45309}.dark #view-server-records .server-record-runtime-status.maintenance{border-color:rgba(245,158,11,.3);background:rgba(245,158,11,.12);color:#fcd34d}
+#view-server-records .server-record-runtime-status.offline{border-color:#fecaca;background:#fef2f2;color:#b91c1c}.dark #view-server-records .server-record-runtime-status.offline{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.12);color:#fca5a5}
 #view-server-records button:disabled{cursor:not-allowed;opacity:.55;transform:none;box-shadow:none}
 #view-server-records .server-record-empty{grid-column:1/-1;border:1px dashed var(--record-border);border-radius:var(--ui-radius-px);padding:3.5rem 1.5rem;text-align:center;color:var(--record-muted)}
 #view-server-records .server-record-empty-icon{display:flex;width:3rem;height:3rem;margin:0 auto 1rem;align-items:center;justify-content:center;border-radius:9999px;background:var(--record-soft);color:#94a3b8}
@@ -263,6 +272,9 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #server-record-dialog .server-record-dialog-close:hover{background:#f1f5f9;color:#0f172a}.dark #server-record-dialog .server-record-dialog-close:hover,#server-record-dialog.dark .server-record-dialog-close:hover{background:#1e293b;color:#fff}
 #server-record-dialog .server-record-form-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
 #server-record-dialog .server-record-form-field{min-width:0}#server-record-dialog .server-record-form-field.span-2{grid-column:1/-1}
+#server-record-dialog .server-record-resource-section{grid-column:1/-1;padding-top:.1rem}
+#server-record-dialog .server-record-resource-section h3{margin:0 0 .65rem;font-size:.8125rem;font-weight:700;color:#334155}.dark #server-record-dialog .server-record-resource-section h3,#server-record-dialog.dark .server-record-resource-section h3{color:#e2e8f0}
+#server-record-dialog .server-record-resource-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
 #server-record-dialog .server-record-expiry-toggle{display:flex;min-height:2.5rem;align-items:center;gap:.65rem;margin:0;padding:.65rem .75rem;border:1px solid #cbd5e1;border-radius:var(--ui-control-radius-px,10px);background:#f8fafc}.dark #server-record-dialog .server-record-expiry-toggle,#server-record-dialog.dark .server-record-expiry-toggle{border-color:#475569;background:#020617}
 #server-record-dialog .server-record-expiry-toggle input{width:1rem;min-height:1rem;height:1rem;margin:0;accent-color:#2563eb}#server-record-dialog .server-record-expiry-toggle span{font-size:.8125rem;font-weight:650;color:#334155}.dark #server-record-dialog .server-record-expiry-toggle span,#server-record-dialog.dark .server-record-expiry-toggle span{color:#e2e8f0}
 #server-record-dialog .server-record-expiry-settings{display:grid;gap:1rem;margin-top:.75rem}#server-record-dialog .server-record-expiry-settings[hidden]{display:none}
@@ -275,6 +287,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #server-record-dialog input,#server-record-dialog select{width:100%;min-height:2.5rem;border:1px solid #cbd5e1;border-radius:var(--ui-control-radius-px,10px);background:#fff;padding:.55rem .7rem;color:#0f172a;font-size:.8125rem;outline:none}.dark #server-record-dialog input,.dark #server-record-dialog select,#server-record-dialog.dark input,#server-record-dialog.dark select{border-color:#475569;background:#020617;color:#f8fafc}
 #server-record-dialog select:disabled{cursor:not-allowed;opacity:.7}
 #server-record-dialog input:focus,#server-record-dialog select:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(59,130,246,.12)}
+#server-record-dialog [data-sensitive-input-toggle="1"]{position:relative;display:block;min-width:0}#server-record-dialog [data-sensitive-input-toggle="1"]>input{padding-right:2.75rem!important}#server-record-dialog [data-sensitive-input-toggle="1"]>button{position:absolute;right:.35rem;top:50%;display:inline-flex;width:2rem;height:2rem;align-items:center;justify-content:center;transform:translateY(-50%);border:0;background:transparent;padding:0;color:#64748b}#server-record-dialog [data-sensitive-input-toggle="1"]>button:hover{color:#0284c7}.dark #server-record-dialog [data-sensitive-input-toggle="1"]>button,#server-record-dialog.dark [data-sensitive-input-toggle="1"]>button{color:#94a3b8}.dark #server-record-dialog [data-sensitive-input-toggle="1"]>button:hover,#server-record-dialog.dark [data-sensitive-input-toggle="1"]>button:hover{color:#7dd3fc}#server-record-dialog [data-sensitive-input-toggle="1"]>button:focus-visible{outline:2px solid rgba(59,130,246,.5);outline-offset:1px}#server-record-dialog [data-sensitive-input-toggle="1"]>button:disabled{cursor:not-allowed;opacity:.5}
 #server-record-dialog .server-record-tag-picker{border:1px solid #cbd5e1;border-radius:var(--ui-control-radius-px,10px);background:#fff;padding:.55rem}.dark #server-record-dialog .server-record-tag-picker,#server-record-dialog.dark .server-record-tag-picker{border-color:#475569;background:#020617}
 #server-record-dialog .server-record-tag-values{display:flex;min-height:1.75rem;flex-wrap:wrap;align-items:center;gap:.4rem;margin-bottom:.45rem}
 #server-record-dialog .server-record-tag-placeholder{font-size:.75rem;color:#94a3b8}
@@ -289,7 +302,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #server-record-dialog .server-record-dialog-secondary,#server-record-dialog .server-record-dialog-submit{min-height:2.5rem;border-radius:var(--ui-control-radius-px,10px);padding:.6rem 1rem;font-size:.8125rem;font-weight:600}
 #server-record-dialog .server-record-dialog-secondary{border:1px solid #cbd5e1;color:#475569}.dark #server-record-dialog .server-record-dialog-secondary,#server-record-dialog.dark .server-record-dialog-secondary{border-color:#475569;color:#cbd5e1}
 #server-record-dialog .server-record-dialog-submit{background:#2563eb;color:#fff}#server-record-dialog .server-record-dialog-submit:hover{background:#1d4ed8}
-@media(max-width:639px){#view-server-records .server-record-toolbar{align-items:stretch;flex-direction:column}#view-server-records .server-record-toolbar-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr)}#view-server-records .server-record-add{width:100%}#view-server-records .server-record-expiry-body{align-items:flex-start;flex-direction:column;gap:.35rem}#server-record-dialog .server-record-form-grid{grid-template-columns:minmax(0,1fr)}#server-record-dialog .server-record-form-field.span-2{grid-column:auto}}
+@media(max-width:639px){#view-server-records .server-record-toolbar{align-items:stretch;flex-direction:column}#view-server-records .server-record-toolbar-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr)}#view-server-records .server-record-add{width:100%}#view-server-records .server-record-filter-row{grid-template-columns:minmax(0,1fr)}#view-server-records .server-record-expiry-body{align-items:flex-start;flex-direction:column;gap:.35rem}#server-record-dialog .server-record-form-grid,#server-record-dialog .server-record-resource-grid{grid-template-columns:minmax(0,1fr)}#server-record-dialog .server-record-form-field.span-2{grid-column:auto}}
 </style>`;
 const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancements="1">
 (() => {
@@ -314,8 +327,12 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     period: 'day',
     daily: null,
     monthly: null,
+    monthlyPeriodKey: '',
+    monthlyExpiresAt: 0,
+    monthlyAvailable: false,
     pending: false
   };
+  const DASHBOARD_MONTHLY_TRAFFIC_CLIENT_TTL_MS = 30 * 60 * 1000;
   const dashboardLayerState = {
     loadSeq: 0,
     statsLoaded: false,
@@ -325,6 +342,17 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     runtimeLoading: false,
     hotspotLoading: false
   };
+
+  function shouldRetainDashboardD1WriteHotspot(hotspot) {
+    if (!hotspot || typeof hotspot !== 'object') return false;
+    return String(hotspot.status || '').trim().toLowerCase() !== 'idle';
+  }
+
+  function retainDashboardD1WriteHotspotInStats(stats, hotspot) {
+    const payload = stats && typeof stats === 'object' ? stats : {};
+    if (!shouldRetainDashboardD1WriteHotspot(hotspot)) return payload;
+    return { ...payload, d1WriteHotspot: hotspot };
+  }
   const workerHtmlUpdateState = {
     root: null,
     workerFile: null,
@@ -337,12 +365,16 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     root: null,
     selected: new Set(),
     username: '',
+    savedUsername: '',
     password: '',
     hasPassword: false,
     bidirectionalProgressEnabled: false,
     search: '',
     hydrated: false,
     loading: false,
+    savePending: false,
+    hydrationSeq: 0,
+    draftRevision: 0,
     dirty: false,
     renderSignature: ''
   };
@@ -351,6 +383,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     availableNodes: [],
     legacyRecords: null,
     query: '',
+    expiryModeFilter: '',
     editingNodeName: '',
     legacyEditingId: '',
     draftTags: [],
@@ -360,6 +393,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     loading: false,
     refreshingAll: false,
     refreshingNodes: [],
+    deletingNodes: [],
+    loadSeq: 0,
+    dialogTrigger: null,
     saving: false,
     error: ''
   };
@@ -391,6 +427,61 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     });
   }
 
+  const SENSITIVE_VALUE_PLACEHOLDER = '********';
+  const SERVER_RECORD_CREDENTIAL_REVEAL_TTL_MS = 30 * 1000;
+
+  function setSensitiveInputVisibility(input, button, revealed) {
+    if (!input || !button) return;
+    input.type = revealed ? 'text' : 'password';
+    button.setAttribute('aria-pressed', revealed ? 'true' : 'false');
+    button.setAttribute('aria-label', revealed ? '隐藏敏感信息' : '显示敏感信息');
+    button.setAttribute('title', revealed ? '隐藏敏感信息' : '显示敏感信息');
+    button.innerHTML = '<i data-lucide="' + (revealed ? 'eye-off' : 'eye') + '" class="h-4 w-4" aria-hidden="true"></i>';
+    scheduleIconRefresh(button);
+  }
+
+  function syncSensitiveInputPresentation(input, hint = '') {
+    if (!input) return;
+    const normalizedHint = String(hint || '').trim();
+    input.placeholder = SENSITIVE_VALUE_PLACEHOLDER;
+    input.dataset.sensitiveHint = normalizedHint;
+    if (normalizedHint) input.setAttribute('title', normalizedHint);
+    else input.removeAttribute('title');
+    input.closest?.('[data-sensitive-input-toggle]')?.querySelector?.('button')?.toggleAttribute('disabled', input.disabled === true);
+  }
+
+  function mountSensitiveInputToggle(input) {
+    if (!input || input.readOnly || input.dataset.sensitiveToggleBound === 'true') return;
+    const basePlaceholder = input.getAttribute('placeholder') || '';
+    input.dataset.sensitiveToggleBound = 'true';
+    syncSensitiveInputPresentation(input, basePlaceholder);
+    input.setAttribute('aria-label', input.getAttribute('aria-label') || '敏感信息');
+
+    const parent = input.parentElement;
+    if (!parent) return;
+    const wrapper = document.createElement('span');
+    wrapper.setAttribute('data-sensitive-input-toggle', '1');
+    wrapper.style.cssText = 'position:relative;display:block;min-width:0;';
+    parent.insertBefore(wrapper, input);
+    wrapper.appendChild(input);
+    input.style.paddingRight = '2.75rem';
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'absolute right-2 top-1/2 -translate-y-1/2 inline-flex h-8 w-8 items-center justify-center text-slate-400 transition hover:text-sky-600 focus:outline-none focus:ring-2 focus:ring-sky-500/30 disabled:cursor-not-allowed disabled:opacity-50 dark:text-slate-500 dark:hover:text-sky-300';
+    button.disabled = input.disabled;
+    button.addEventListener('click', () => {
+      setSensitiveInputVisibility(input, button, input.type === 'password');
+    });
+    wrapper.appendChild(button);
+    setSensitiveInputVisibility(input, button, false);
+    syncSensitiveInputPresentation(input, basePlaceholder);
+  }
+
+  function mountSensitiveInputToggles(root = document) {
+    root?.querySelectorAll?.('input[type="password"]:not([readonly])').forEach((input) => mountSensitiveInputToggle(input));
+  }
+
   function scheduleShellRefresh() {
     if (shellFrameId) return;
     shellFrameId = enqueue(() => {
@@ -399,6 +490,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       applyToolbarEnhancements();
       applyLayoutEnhancements();
       applySafetyContractEnhancements();
+      mountSensitiveInputToggles(document);
       syncServerRecordsShell(window.App);
       syncDashboardTrafficToggle(window.App);
     });
@@ -826,6 +918,26 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     return lines.join('\\n');
   }
 
+  function formatD1InitializationResult(result = {}) {
+    const initialization = result?.initialization && typeof result.initialization === 'object'
+      ? result.initialization
+      : {};
+    const groups = [
+      ['新建表', initialization.createdTables],
+      ['补齐列', initialization.adjustedColumns],
+      ['新建索引', initialization.createdIndexes],
+      ['修复索引', initialization.repairedIndexes],
+      ['移除旧索引', initialization.droppedRetiredIndexes]
+    ];
+    const actionLines = groups
+      .filter(([, items]) => Array.isArray(items) && items.length > 0)
+      .map(([label, items]) => '• ' + label + '：' + items.join('、'));
+    if (initialization.ftsRecreated === true) actionLines.push('• 重建异常 FTS 派生表');
+    else if (initialization.ftsRebuilt === true) actionLines.push('• 重建 FTS 全文索引');
+    if (!actionLines.length) actionLines.push('• 当前结构无需调整');
+    return formatD1SchemaStatus(result?.status || {}) + '\\n\\n本次自动调整：\\n' + actionLines.join('\\n');
+  }
+
   function getDashboardTrafficNodes() {
     const count = document.querySelector('#dash-traffic-count');
     const card = count?.closest?.('.glass-card') || null;
@@ -922,6 +1034,21 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     if (icon) icon.classList.toggle('animate-spin', dashboardTrafficState.pending);
   }
 
+  function getDashboardMonthPeriodKey(app = window.App, timestamp = Date.now()) {
+    const configuredOffset = Number(app?.runtimeConfig?.scheduleUtcOffsetMinutes ?? 480);
+    const utcOffsetMinutes = Number.isFinite(configuredOffset) ? Math.trunc(configuredOffset) : 480;
+    const shifted = new Date(Math.max(0, Number(timestamp) || Date.now()) + utcOffsetMinutes * 60 * 1000);
+    return shifted.getUTCFullYear() + '-' + String(shifted.getUTCMonth() + 1).padStart(2, '0');
+  }
+
+  function isDashboardMonthlyTrafficCacheFresh(app = window.App, timestamp = Date.now()) {
+    const now = Math.max(0, Number(timestamp) || Date.now());
+    return dashboardTrafficState.monthlyAvailable === true
+      && !!dashboardTrafficState.monthly
+      && dashboardTrafficState.monthlyPeriodKey === getDashboardMonthPeriodKey(app, now)
+      && Number(dashboardTrafficState.monthlyExpiresAt) > now;
+  }
+
   async function toggleDashboardTrafficPeriod(app = window.App) {
     if (!app || dashboardTrafficState.pending) return;
     if (dashboardTrafficState.period === 'month') {
@@ -933,37 +1060,67 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
     dashboardTrafficState.daily = snapshotDashboardTrafficCard() || dashboardTrafficState.daily;
     dashboardTrafficState.period = 'month';
-    if (dashboardTrafficState.monthly) {
+    const expectedPeriodKey = getDashboardMonthPeriodKey(app);
+    if (isDashboardMonthlyTrafficCacheFresh(app)) {
       renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
       updateDashboardTrafficToggleButton();
       return;
     }
 
+    const retainedMonthly = dashboardTrafficState.monthlyAvailable === true
+      && dashboardTrafficState.monthlyPeriodKey === expectedPeriodKey
+      ? dashboardTrafficState.monthly
+      : null;
     dashboardTrafficState.pending = true;
-    renderDashboardTrafficCard({
-      count: '加载中...',
-      hint: '正在汇总本月 CF Zone 流量',
-      title: '本月流量按需加载',
-      detail: ' ',
-      badges: [{ label: '月统计: 加载中', tone: 'slate' }]
-    }, 'month', app);
+    renderDashboardTrafficCard(retainedMonthly || {
+        count: '加载中...',
+        hint: '正在汇总本月 CF Zone 流量',
+        title: '本月流量按需加载',
+        detail: ' ',
+        badges: [{ label: '月统计: 加载中', tone: 'slate' }]
+      }, 'month', app);
     updateDashboardTrafficToggleButton();
     try {
       const payload = await app.apiCall('getMonthlyTrafficStats');
-      dashboardTrafficState.monthly = buildMonthlyTrafficCardView(payload, app);
+      const monthlyView = buildMonthlyTrafficCardView(payload, app);
+      const payloadPeriodKey = String(payload?.periodKey || expectedPeriodKey).trim() || expectedPeriodKey;
+      const currentPeriodKey = getDashboardMonthPeriodKey(app);
+      const querySucceeded = payload?.cfAnalyticsLoaded === true
+        && String(payload?.cacheStatus || 'live').trim().toLowerCase() !== 'stale'
+        && payloadPeriodKey === currentPeriodKey;
+      if (querySucceeded) {
+        dashboardTrafficState.monthly = monthlyView;
+        dashboardTrafficState.monthlyPeriodKey = payloadPeriodKey;
+        dashboardTrafficState.monthlyExpiresAt = Date.now() + DASHBOARD_MONTHLY_TRAFFIC_CLIENT_TTL_MS;
+        dashboardTrafficState.monthlyAvailable = true;
+      } else if (!retainedMonthly) {
+        dashboardTrafficState.monthly = monthlyView;
+        dashboardTrafficState.monthlyPeriodKey = payloadPeriodKey;
+        dashboardTrafficState.monthlyExpiresAt = 0;
+        dashboardTrafficState.monthlyAvailable = false;
+      }
       if (dashboardTrafficState.period === 'month') {
-        renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+        renderDashboardTrafficCard(querySucceeded ? monthlyView : (retainedMonthly || monthlyView), 'month', app);
+      }
+      if (payload?.cfAnalyticsLoaded !== true) {
+        app.showMessage?.('本月流量查询失败: ' + (payload?.cfAnalyticsError || payload?.cfAnalyticsStatus || '未知错误'), { tone: 'error' });
       }
     } catch (error) {
-      dashboardTrafficState.monthly = {
+      const failureView = {
         count: '加载失败',
         hint: '本月流量查询失败',
         title: String(error?.message || '未知错误'),
         detail: String(error?.message || '未知错误'),
         badges: [{ label: '月统计: 查询失败', tone: 'red' }]
       };
+      if (!retainedMonthly) {
+        dashboardTrafficState.monthly = failureView;
+        dashboardTrafficState.monthlyPeriodKey = expectedPeriodKey;
+        dashboardTrafficState.monthlyExpiresAt = 0;
+        dashboardTrafficState.monthlyAvailable = false;
+      }
       if (dashboardTrafficState.period === 'month') {
-        renderDashboardTrafficCard(dashboardTrafficState.monthly, 'month', app);
+        renderDashboardTrafficCard(retainedMonthly || failureView, 'month', app);
       }
       app.showMessage?.('本月流量查询失败: ' + (error?.message || '未知错误'), { tone: 'error' });
     } finally {
@@ -1038,6 +1195,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       displayName: String(source.displayName || source.name || source.nodeName || '').trim().slice(0, 80),
       accessUrl: String(source.accessUrl || source.url || '').trim().slice(0, 2048),
       tags: normalizeServerRecordTags(source.tags || source.tag),
+      serverRecordEmbyUsername: String(source.serverRecordEmbyUsername || '').trim(),
+      serverRecordEmbyCredentialsConfigured: source.serverRecordEmbyCredentialsConfigured === true,
+      serverRecordEmbyCredentialSource: ['record', 'node'].includes(String(source.serverRecordEmbyCredentialSource || '').trim().toLowerCase()) ? String(source.serverRecordEmbyCredentialSource).trim().toLowerCase() : 'none',
       expiryEnabled,
       expiryMode: String(source.expiryMode || source.expiry?.mode || (source.expiresAt ? 'fixed' : 'rolling')).trim().toLowerCase() === 'fixed' ? 'fixed' : 'rolling',
       expiresAt: String(source.expiresAt || '').trim().slice(0, 10),
@@ -1104,6 +1264,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     if (source) {
       return {
         tags: normalizeServerRecordTags(source.tags),
+        serverRecordEmbyUsername: String(source.serverRecordEmbyUsername || '').trim(),
+        serverRecordEmbyCredentialsConfigured: source.serverRecordEmbyCredentialsConfigured === true,
+        serverRecordEmbyCredentialSource: ['record', 'node'].includes(String(source.serverRecordEmbyCredentialSource || '').trim().toLowerCase()) ? String(source.serverRecordEmbyCredentialSource).trim().toLowerCase() : 'none',
         expiryEnabled: source.expiryEnabled === true,
         expiryMode: source.expiryMode === 'fixed' ? 'fixed' : 'rolling',
         expiresAt: String(source.expiresAt || '').trim(),
@@ -1115,6 +1278,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       .find((node) => node.nodeName === normalizedNodeName) || null;
     return {
       tags: normalizeServerRecordTags([...(selectedNode?.tags || []), ...(legacyRecord?.tags || [])]),
+      serverRecordEmbyUsername: String(selectedNode?.serverRecordEmbyUsername || '').trim(),
+      serverRecordEmbyCredentialsConfigured: selectedNode?.serverRecordEmbyCredentialsConfigured === true,
+      serverRecordEmbyCredentialSource: ['record', 'node'].includes(String(selectedNode?.serverRecordEmbyCredentialSource || '').trim().toLowerCase()) ? String(selectedNode.serverRecordEmbyCredentialSource).trim().toLowerCase() : 'none',
       expiryEnabled: selectedNode?.expiryEnabled === true || Boolean(legacyRecord?.expiresAt),
       expiryMode: String(selectedNode?.expiryMode || (selectedNode?.expiresAt || legacyRecord?.expiresAt ? 'fixed' : 'rolling')) === 'fixed' ? 'fixed' : 'rolling',
       expiresAt: String(selectedNode?.expiresAt || legacyRecord?.expiresAt || '').trim(),
@@ -1204,6 +1370,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       displayName: String(node?.displayName || node?.nodeName || '').trim(),
       accessUrl: String(node?.accessUrl || '').trim(),
       tags: normalizeServerRecordTags(node?.tags),
+      serverRecordEmbyUsername: String(node?.serverRecordEmbyUsername || '').trim(),
+      serverRecordEmbyCredentialsConfigured: node?.serverRecordEmbyCredentialsConfigured === true,
+      serverRecordEmbyCredentialSource: ['record', 'node'].includes(String(node?.serverRecordEmbyCredentialSource || '').trim().toLowerCase()) ? String(node.serverRecordEmbyCredentialSource).trim().toLowerCase() : 'none',
       enabled: node?.enabled === true,
       expiryEnabled: node?.expiryEnabled === true,
       expiryMode: String(node?.expiryMode || (node?.expiresAt ? 'fixed' : 'rolling')).trim().toLowerCase() === 'fixed' ? 'fixed' : 'rolling',
@@ -1213,18 +1382,24 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   async function loadServerRecords(app, options = {}) {
-    if (!app || serverRecordsUiState.loading) return;
     const forceRefresh = options.forceRefresh === true;
+    if (!app || (serverRecordsUiState.loading && (!forceRefresh || serverRecordsUiState.refreshingAll))) return;
+    const loadSeq = (Number(serverRecordsUiState.loadSeq) || 0) + 1;
+    serverRecordsUiState.loadSeq = loadSeq;
+    const isCurrentLoad = () => loadSeq === serverRecordsUiState.loadSeq;
     serverRecordsUiState.attempted = true;
     serverRecordsUiState.loading = true;
     serverRecordsUiState.refreshingAll = forceRefresh;
     serverRecordsUiState.error = '';
     renderServerRecordsView(app);
     const refreshButton = document.querySelector('[data-server-record-refresh]');
-    refreshButton?.setAttribute('aria-busy', 'true');
-    if (refreshButton) refreshButton.disabled = true;
+    if (forceRefresh) {
+      refreshButton?.setAttribute('aria-busy', 'true');
+      if (refreshButton) refreshButton.disabled = true;
+    }
     try {
       const result = await app.apiCall('getServerRecordsSnapshot', { forceRefresh });
+      if (!isCurrentLoad()) return;
       const previousRecords = new Map(serverRecordsUiState.records.map((record) => [record.nodeName, record]));
       serverRecordsUiState.records = (Array.isArray(result?.records) ? result.records : []).map(normalizeServerRecord).filter((record) => record.nodeName).map((record) => {
         const previous = previousRecords.get(record.nodeName);
@@ -1234,24 +1409,29 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       serverRecordsUiState.availableNodes = (Array.isArray(result?.availableNodes) ? result.availableNodes : []).map(normalizeAvailableServerRecordNode).filter((node) => node.nodeName);
       serverRecordsUiState.loaded = true;
       if (options.skipMigration !== true && await migrateLegacyServerRecords(app)) {
+        if (!isCurrentLoad()) return;
         serverRecordsUiState.loading = false;
         return await loadServerRecords(app, { skipMigration: true });
       }
     } catch (error) {
+      if (!isCurrentLoad()) return;
       console.error('load server records failed', error);
       serverRecordsUiState.error = error?.message || '服务器记录加载失败';
     } finally {
+      if (!isCurrentLoad()) return;
       serverRecordsUiState.loading = false;
       serverRecordsUiState.refreshingAll = false;
-      refreshButton?.removeAttribute('aria-busy');
-      if (refreshButton) refreshButton.disabled = false;
+      if (forceRefresh) {
+        refreshButton?.removeAttribute('aria-busy');
+        if (refreshButton) refreshButton.disabled = false;
+      }
       renderServerRecordsView(app);
     }
   }
 
   async function refreshSingleServerRecord(app, nodeName = '') {
     const normalizedNodeName = String(nodeName || '').trim().toLowerCase();
-    if (!app || !normalizedNodeName || serverRecordsUiState.loading || serverRecordsUiState.refreshingAll || serverRecordsUiState.refreshingNodes.includes(normalizedNodeName)) return;
+    if (!app || !normalizedNodeName || serverRecordsUiState.loading || serverRecordsUiState.refreshingAll || serverRecordsUiState.refreshingNodes.includes(normalizedNodeName) || serverRecordsUiState.deletingNodes.includes(normalizedNodeName)) return;
     serverRecordsUiState.refreshingNodes = [...serverRecordsUiState.refreshingNodes, normalizedNodeName];
     renderServerRecordsView(app);
     try {
@@ -1304,13 +1484,13 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
   function getServerRecordRuntimeStatus(record = {}) {
     const states = {
-      online: ['online', '在线'],
+      online: ['online', '服务器在线'],
       maintenance: ['maintenance', '维护中'],
       shutting_down: ['maintenance', '正在关机'],
       unauthorized: ['offline', '认证失败'],
       timeout: ['offline', '连接超时'],
       not_checked: ['not_checked', '未检测'],
-      offline: ['offline', '离线']
+      offline: ['offline', '服务器掉线']
     };
     const state = states[String(record?.runtime?.state || '').trim()] || states.offline;
     return { key: state[0], label: state[1] };
@@ -1341,21 +1521,13 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       : '滚动 ' + (Number(status.expiryDays) || 30) + ' 天';
   }
 
-  function isSafeServerRecordUrl(value = '') {
-    try {
-      const url = new URL(String(value || '').trim());
-      return url.protocol === 'http:' || url.protocol === 'https:';
-    } catch {
-      return false;
-    }
-  }
-
   function buildServerRecordCard(record) {
     const expiry = getServerRecordExpiryStatus(record);
     const runtime = getServerRecordRuntimeStatus(record);
     const expiryEnabled = record.expiryEnabled === true && expiry.key !== 'disabled';
     const refreshing = serverRecordsUiState.refreshingAll || serverRecordsUiState.refreshingNodes.includes(record.nodeName);
-    const canOpen = isSafeServerRecordUrl(record.accessUrl);
+    const deleting = serverRecordsUiState.deletingNodes.includes(record.nodeName);
+    const actionLocked = refreshing || deleting;
     const tags = record.tags.map((tag) => '<span class="server-record-badge tag">' + escapeServerRecordHtml(tag) + '</span>').join('');
     const expiryBadge = expiryEnabled ? '<span class="server-record-badge ' + escapeServerRecordHtml(expiry.key) + '">' + escapeServerRecordHtml(expiry.label) + '</span>' : '';
     const warningClass = expiryEnabled && (expiry.key === 'expired' || expiry.key === 'expiring') ? ' is-warning' : '';
@@ -1364,14 +1536,26 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const expiryDateText = expiry.expiresAt || '等待播放记录';
     const expirySection = expiryEnabled ? '<div class="server-record-expiry' + warningClass + '"><div class="server-record-expiry-head"><span class="server-record-expiry-label">预计过期</span><span class="server-record-expiry-mode">' + escapeServerRecordHtml(formatServerRecordExpiryMode(expiry)) + '</span></div><div class="server-record-expiry-body"><strong class="server-record-expiry-date">' + escapeServerRecordHtml(expiryDateText) + '</strong><span class="server-record-expiry-remaining">' + escapeServerRecordHtml(formatServerRecordExpiry(record, expiry)) + '</span></div></div>' : '';
     return '<article class="server-record-card' + (expiryEnabled ? ' is-' + expiry.key : '') + '" data-server-record-card="' + escapeServerRecordHtml(record.nodeName) + '">'
-      + '<div class="server-record-card-head"><div><h3 class="server-record-title">' + escapeServerRecordHtml(record.displayName) + '</h3><div class="server-record-badges">' + tags + '<span class="server-record-badge ' + runtime.key + '"><span class="server-record-dot" aria-hidden="true"></span>' + escapeServerRecordHtml(runtime.label) + '</span>' + expiryBadge + '</div></div><span class="server-record-icon ' + runtime.key + '" title="服务器状态：' + escapeServerRecordHtml(runtime.label) + '" aria-label="服务器状态：' + escapeServerRecordHtml(runtime.label) + '"><i data-lucide="server-cog" aria-hidden="true"></i></span></div>'
+      + '<div class="server-record-card-head"><div><h3 class="server-record-title">' + escapeServerRecordHtml(record.displayName) + '</h3><div class="server-record-badges">' + tags + expiryBadge + '</div></div><button type="button" class="server-record-icon-button server-record-card-refresh" data-server-record-refresh-one="' + escapeServerRecordHtml(record.nodeName) + '" title="刷新此服务器的状态、资源统计和预计过期" aria-label="刷新 ' + escapeServerRecordHtml(record.displayName) + ' 的服务器状态、资源统计和预计过期"' + (actionLocked ? ' disabled' : '') + (refreshing ? ' aria-busy="true"' : '') + '><i data-lucide="' + (refreshing ? 'loader-circle' : 'refresh-cw') + '" class="w-4 h-4' + (refreshing ? ' animate-spin' : '') + '" aria-hidden="true"></i></button></div>'
       + '<div class="server-record-metrics" aria-label="媒体库统计" title="' + escapeServerRecordHtml(countTitle) + '"><div class="server-record-metric"><span class="server-record-metric-label">电影</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.movies) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">剧集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.series) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">单集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.episodes) + '</span></div></div>'
       + '<div class="server-record-details"><div class="server-record-detail"><span class="server-record-detail-label">上次观看</span><span class="server-record-detail-value">' + escapeServerRecordHtml(lastWatchedText) + '</span></div>' + expirySection + '</div>'
-      + '<div class="server-record-card-actions"><button type="button" class="server-record-primary" data-server-record-open="' + escapeServerRecordHtml(record.nodeName) + '"' + (canOpen ? '' : ' disabled') + '><i data-lucide="play" class="w-4 h-4" aria-hidden="true"></i>打开服务器</button><button type="button" class="server-record-icon-button" data-server-record-refresh-one="' + escapeServerRecordHtml(record.nodeName) + '" title="刷新此服务器的资源统计和预计过期" aria-label="刷新 ' + escapeServerRecordHtml(record.displayName) + ' 的资源统计和预计过期"' + (refreshing ? ' disabled aria-busy="true"' : '') + '><i data-lucide="' + (refreshing ? 'loader-circle' : 'refresh-cw') + '" class="w-4 h-4' + (refreshing ? ' animate-spin' : '') + '" aria-hidden="true"></i></button><button type="button" class="server-record-icon-button" data-server-record-edit="' + escapeServerRecordHtml(record.nodeName) + '" title="编辑记录" aria-label="编辑 ' + escapeServerRecordHtml(record.displayName) + '"><i data-lucide="pencil" class="w-4 h-4" aria-hidden="true"></i></button><button type="button" class="server-record-icon-button danger" data-server-record-delete="' + escapeServerRecordHtml(record.nodeName) + '" title="移除记录" aria-label="移除 ' + escapeServerRecordHtml(record.displayName) + '"><i data-lucide="trash-2" class="w-4 h-4" aria-hidden="true"></i></button></div></article>';
+      + '<div class="server-record-card-actions"><button type="button" class="server-record-icon-button" data-server-record-edit="' + escapeServerRecordHtml(record.nodeName) + '" title="编辑记录" aria-label="编辑 ' + escapeServerRecordHtml(record.displayName) + '"' + (deleting ? ' disabled' : '') + '><i data-lucide="pencil" class="w-4 h-4" aria-hidden="true"></i></button><div class="server-record-runtime-status ' + runtime.key + '" role="status" aria-label="服务器状态：' + escapeServerRecordHtml(runtime.label) + '"><span class="server-record-dot" aria-hidden="true"></span><span>' + escapeServerRecordHtml(runtime.label) + '</span></div><button type="button" class="server-record-icon-button danger" data-server-record-delete="' + escapeServerRecordHtml(record.nodeName) + '" title="移除记录" aria-label="移除 ' + escapeServerRecordHtml(record.displayName) + '"' + (deleting ? ' disabled aria-busy="true"' : '') + '><i data-lucide="' + (deleting ? 'loader-circle' : 'trash-2') + '" class="w-4 h-4' + (deleting ? ' animate-spin' : '') + '" aria-hidden="true"></i></button></div></article>';
   }
 
   function buildLegacyServerRecordCard(record) {
     return '<article class="server-record-card is-legacy" data-server-record-legacy-card="' + escapeServerRecordHtml(record.id) + '"><div class="server-record-card-head"><div><h3 class="server-record-title">' + escapeServerRecordHtml(record.name) + '</h3><div class="server-record-badges"><span class="server-record-badge maintenance">待关联</span>' + record.tags.map((tag) => '<span class="server-record-badge tag">' + escapeServerRecordHtml(tag) + '</span>').join('') + '</div></div><span class="server-record-icon"><i data-lucide="unplug" aria-hidden="true"></i></span></div><div class="server-record-details"><div class="server-record-detail"><span class="server-record-detail-label">旧访问地址</span><span class="server-record-detail-value">' + escapeServerRecordHtml(record.url || '未设置') + '</span></div><div class="server-record-detail"><span class="server-record-detail-label">预计过期</span><span class="server-record-detail-value">' + escapeServerRecordHtml(record.expiresAt || '未设置') + '</span></div></div><div class="server-record-card-actions single"><button type="button" class="server-record-primary" data-server-record-legacy="' + escapeServerRecordHtml(record.id) + '"><i data-lucide="link" class="w-4 h-4" aria-hidden="true"></i>关联节点</button></div></article>';
+  }
+
+  function matchesServerRecordFilters(record, query = '', expiryModeFilter = '') {
+    const normalizedQuery = String(query || '').trim().toLowerCase();
+    const normalizedExpiryMode = ['rolling', 'fixed'].includes(String(expiryModeFilter || '').trim().toLowerCase())
+      ? String(expiryModeFilter).trim().toLowerCase()
+      : '';
+    const matchesQuery = !normalizedQuery
+      || (record.displayName + ' ' + record.nodeName + ' ' + record.tags.join(' ')).toLowerCase().includes(normalizedQuery);
+    const matchesExpiryMode = !normalizedExpiryMode
+      || (record.expiryEnabled === true && getServerRecordExpiryStatus(record).mode === normalizedExpiryMode);
+    return matchesQuery && matchesExpiryMode;
   }
 
   function ensureServerRecordsView(app) {
@@ -1382,7 +1566,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     view = document.createElement('section');
     view.id = 'view-server-records';
     view.className = 'view-section w-full mx-auto';
-    view.innerHTML = '<div class="server-record-toolbar"><div class="server-record-toolbar-copy"><p class="server-record-kicker">SERVER OVERVIEW</p><h2 class="server-record-heading">服务器概览</h2><p class="server-record-summary" data-server-record-summary></p></div><div class="server-record-toolbar-actions"><button type="button" class="server-record-icon-button" data-server-record-refresh title="刷新全部资源统计和预计过期" aria-label="刷新全部资源统计和预计过期"><i data-lucide="refresh-cw" class="w-4 h-4" aria-hidden="true"></i></button><button type="button" class="server-record-add" data-server-record-add><i data-lucide="plus" class="w-4 h-4" aria-hidden="true"></i>新增记录</button></div></div><label class="server-record-search"><i data-lucide="search" aria-hidden="true"></i><span class="sr-only">搜索服务器记录</span><input type="search" data-server-record-search placeholder="搜索服务器名称或标签" autocomplete="off"></label><div class="server-record-grid" data-server-record-grid></div>';
+    view.innerHTML = '<div class="server-record-toolbar"><div class="server-record-toolbar-copy"><p class="server-record-kicker">SERVER OVERVIEW</p><h2 class="server-record-heading">服务器概览</h2><p class="server-record-summary" data-server-record-summary role="status" aria-live="polite" aria-atomic="true"></p></div><div class="server-record-toolbar-actions"><button type="button" class="server-record-icon-button" data-server-record-refresh title="刷新全部资源统计和预计过期" aria-label="刷新全部资源统计和预计过期"><i data-lucide="refresh-cw" class="w-4 h-4" aria-hidden="true"></i></button><button type="button" class="server-record-add" data-server-record-add><i data-lucide="plus" class="w-4 h-4" aria-hidden="true"></i>新增记录</button></div></div><div class="server-record-filter-row"><label class="server-record-search"><i data-lucide="search" aria-hidden="true"></i><span class="sr-only">搜索服务器记录</span><input type="search" data-server-record-search placeholder="搜索服务器名称或标签" autocomplete="off"></label><label class="server-record-expiry-filter"><i data-lucide="list-filter" aria-hidden="true"></i><span class="sr-only">按预计过期方式筛选</span><select data-server-record-expiry-mode-filter><option value="">全部到期方式</option><option value="rolling">滚动天数</option><option value="fixed">固定日期</option></select></label></div><div class="server-record-grid" data-server-record-grid aria-busy="false"></div>';
     contentArea.insertBefore(view, document.getElementById('view-logs') || null);
     view.querySelector('[data-server-record-add]')?.addEventListener('click', () => openServerRecordDialog(app));
     view.querySelector('[data-server-record-refresh]')?.addEventListener('click', () => loadServerRecords(app, { forceRefresh: true }));
@@ -1390,6 +1574,12 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     if (searchInput) searchInput.value = serverRecordsUiState.query;
     searchInput?.addEventListener('input', (event) => {
       serverRecordsUiState.query = String(event.target?.value || '').trim().toLowerCase();
+      renderServerRecordsView(app);
+    });
+    const expiryModeSelect = view.querySelector('[data-server-record-expiry-mode-filter]');
+    if (expiryModeSelect) expiryModeSelect.value = serverRecordsUiState.expiryModeFilter;
+    expiryModeSelect?.addEventListener('change', (event) => {
+      serverRecordsUiState.expiryModeFilter = ['rolling', 'fixed'].includes(String(event.target?.value || '')) ? String(event.target.value) : '';
       renderServerRecordsView(app);
     });
     view.addEventListener('click', (event) => handleServerRecordViewClick(event, app));
@@ -1402,16 +1592,18 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const records = serverRecordsUiState.records;
     const legacyRecords = readLegacyServerRecords();
     const query = serverRecordsUiState.query;
-    const renderSignature = JSON.stringify([query, records, legacyRecords, serverRecordsUiState.loading, serverRecordsUiState.refreshingAll, serverRecordsUiState.refreshingNodes, serverRecordsUiState.error]);
+    const expiryModeFilter = serverRecordsUiState.expiryModeFilter;
+    const renderSignature = JSON.stringify([query, expiryModeFilter, records, legacyRecords, serverRecordsUiState.loading, serverRecordsUiState.refreshingAll, serverRecordsUiState.refreshingNodes, serverRecordsUiState.deletingNodes, serverRecordsUiState.error]);
     if (view.dataset.serverRecordRenderSignature === renderSignature) return;
     view.dataset.serverRecordRenderSignature = renderSignature;
-    const visible = query ? records.filter((record) => (record.displayName + ' ' + record.nodeName + ' ' + record.tags.join(' ')).toLowerCase().includes(query)) : records;
-    const visibleLegacy = query ? legacyRecords.filter((record) => (record.name + ' ' + record.tags.join(' ')).toLowerCase().includes(query)) : legacyRecords;
+    const visible = records.filter((record) => matchesServerRecordFilters(record, query, expiryModeFilter));
+    const visibleLegacy = expiryModeFilter ? [] : (query ? legacyRecords.filter((record) => (record.name + ' ' + record.tags.join(' ')).toLowerCase().includes(query)) : legacyRecords);
     const expiringCount = records.filter((record) => ['expiring', 'expired'].includes(getServerRecordExpiryStatus(record).key)).length;
     const summary = view.querySelector('[data-server-record-summary]');
     if (summary) summary.textContent = serverRecordsUiState.refreshingAll ? '正在手动刷新全部资源统计…' : (serverRecordsUiState.loading ? '正在读取服务器记录…' : '共 ' + records.length + ' 条记录' + (expiringCount ? '，' + expiringCount + ' 条即将或已经到期' : '') + (legacyRecords.length ? '，' + legacyRecords.length + ' 条待关联' : ''));
     const grid = view.querySelector('[data-server-record-grid]');
     if (!grid) return;
+    grid.setAttribute('aria-busy', serverRecordsUiState.loading || serverRecordsUiState.refreshingAll ? 'true' : 'false');
     const cards = [...visible.map((record) => buildServerRecordCard(record)), ...visibleLegacy.map((record) => buildLegacyServerRecordCard(record))];
     const emptyText = serverRecordsUiState.error ? escapeServerRecordHtml(serverRecordsUiState.error) : (serverRecordsUiState.loading ? '正在加载服务器记录' : (records.length || legacyRecords.length ? '没有匹配的服务器记录' : '暂无服务器记录'));
     grid.innerHTML = cards.length ? cards.join('') : '<div class="server-record-empty"><span class="server-record-empty-icon"><i data-lucide="server" class="w-5 h-5" aria-hidden="true"></i></span><p class="font-medium text-slate-700 dark:text-slate-200">' + emptyText + '</p></div>';
@@ -1443,6 +1635,175 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     return mode;
   }
 
+  function invalidateServerRecordCredentialRequest(form) {
+    if (!form) return 0;
+    if (form.__serverRecordCredentialRevealTimer) {
+      const clearTimer = typeof window.clearTimeout === 'function' ? window.clearTimeout.bind(window) : clearTimeout;
+      clearTimer(form.__serverRecordCredentialRevealTimer);
+      form.__serverRecordCredentialRevealTimer = 0;
+    }
+    const requestId = (Number(form.__serverRecordCredentialRequestId) || 0) + 1;
+    form.__serverRecordCredentialRequestId = requestId;
+    return requestId;
+  }
+
+  function concealServerRecordCredential(form, passwordInput = null, button = null) {
+    if (!form) return;
+    if (form.__serverRecordCredentialRevealTimer) {
+      const clearTimer = typeof window.clearTimeout === 'function' ? window.clearTimeout.bind(window) : clearTimeout;
+      clearTimer(form.__serverRecordCredentialRevealTimer);
+      form.__serverRecordCredentialRevealTimer = 0;
+    }
+    const input = passwordInput || form.elements?.serverRecordEmbyPassword || null;
+    const visibilityButton = button || input?.closest?.('[data-sensitive-input-toggle]')?.querySelector?.('button') || null;
+    if (input) input.value = '';
+    form.dataset.serverRecordCredentialPasswordLoaded = 'false';
+    form.dataset.serverRecordCredentialPasswordOriginal = '';
+    form.dataset.serverRecordCredentialPasswordEdited = 'false';
+    if (input && visibilityButton) setSensitiveInputVisibility(input, visibilityButton, false);
+  }
+
+  function restoreServerRecordDialogFocus() {
+    const trigger = serverRecordsUiState.dialogTrigger;
+    serverRecordsUiState.dialogTrigger = null;
+    enqueue(() => {
+      const fallback = document.querySelector?.('[data-server-record-add]');
+      const target = trigger?.isConnected ? trigger : fallback;
+      if (!target?.focus) return;
+      try {
+        target.focus({ preventScroll: true });
+      } catch {
+        target.focus();
+      }
+    });
+  }
+
+  function scheduleServerRecordCredentialConceal(form, passwordInput, button) {
+    if (!form || !passwordInput || !button) return;
+    if (form.__serverRecordCredentialRevealTimer) {
+      const clearTimer = typeof window.clearTimeout === 'function' ? window.clearTimeout.bind(window) : clearTimeout;
+      clearTimer(form.__serverRecordCredentialRevealTimer);
+    }
+    const scheduleTimer = typeof window.setTimeout === 'function' ? window.setTimeout.bind(window) : setTimeout;
+    form.__serverRecordCredentialRevealTimer = scheduleTimer(() => {
+      form.__serverRecordCredentialRevealTimer = 0;
+      if (form.dataset.serverRecordCredentialPasswordLoaded !== 'true') return;
+      concealServerRecordCredential(form, passwordInput, button);
+    }, SERVER_RECORD_CREDENTIAL_REVEAL_TTL_MS);
+  }
+
+  function getServerRecordCredentialNodeName(form) {
+    return serverRecordsUiState.editingNodeName || String(form?.elements?.nodeName?.value || '').trim();
+  }
+
+  function isServerRecordCredentialRevealCurrent(form, requestId, nodeName) {
+    if (!form || Number(form.__serverRecordCredentialRequestId) !== Number(requestId)) return false;
+    const dialog = form.closest?.('dialog');
+    if (dialog && dialog.open !== true) return false;
+    return getServerRecordCredentialNodeName(form) === String(nodeName || '').trim();
+  }
+
+  function handleServerRecordCredentialUsernameInput(form, app = null) {
+    if (!form) return;
+    if (app) form.__serverRecordCredentialApp = app;
+    invalidateServerRecordCredentialRequest(form);
+    const usernameInput = form.elements.serverRecordEmbyUsername;
+    const passwordInput = form.elements.serverRecordEmbyPassword;
+    if (!usernameInput || !passwordInput) return;
+    const usernameMatchesSaved = String(usernameInput.value || '').trim() === String(form.dataset.serverRecordCredentialUsername || '');
+    const originallyConfigured = form.dataset.serverRecordCredentialOriginallyConfigured === 'true';
+    form.dataset.serverRecordCredentialConfigured = usernameMatchesSaved && originallyConfigured ? 'true' : 'false';
+    if (!usernameMatchesSaved) {
+      passwordInput.value = '';
+      form.dataset.serverRecordCredentialPasswordLoaded = 'false';
+      form.dataset.serverRecordCredentialPasswordOriginal = '';
+      form.dataset.serverRecordCredentialPasswordEdited = 'false';
+      const button = passwordInput.closest?.('[data-sensitive-input-toggle]')?.querySelector?.('button');
+      if (button) setSensitiveInputVisibility(passwordInput, button, false);
+    }
+    const configured = form.dataset.serverRecordCredentialConfigured === 'true';
+    syncSensitiveInputPresentation(passwordInput, usernameMatchesSaved && form.dataset.serverRecordCredentialSource === 'node'
+      ? '可选，留空继续使用节点密码'
+      : (configured ? '可选，留空保持不变' : '可选，可留空'));
+  }
+
+  function bindServerRecordPasswordReveal(form, passwordInput) {
+    if (!form || !passwordInput || form.dataset.serverRecordCredentialRevealBound === 'true') return;
+    const button = passwordInput.closest?.('[data-sensitive-input-toggle]')?.querySelector?.('button');
+    if (!button) return;
+    form.dataset.serverRecordCredentialRevealBound = 'true';
+    passwordInput.addEventListener('input', () => {
+      invalidateServerRecordCredentialRequest(form);
+      form.dataset.serverRecordCredentialPasswordEdited = 'true';
+      button.disabled = passwordInput.disabled === true;
+    });
+    button.addEventListener('click', async (event) => {
+      const app = form.__serverRecordCredentialApp;
+      const configured = form.dataset.serverRecordCredentialConfigured === 'true';
+      if (!app || !configured || passwordInput.type === 'text' || passwordInput.value) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const nodeName = getServerRecordCredentialNodeName(form);
+      if (!nodeName) return;
+      const promptForPassword = typeof window.prompt === 'function' ? window.prompt.bind(window) : null;
+      const adminPassword = promptForPassword ? String(promptForPassword('请输入管理密码以显示 EMBY 密码') || '') : '';
+      if (!adminPassword) return;
+      const requestId = invalidateServerRecordCredentialRequest(form);
+      button.disabled = true;
+      try {
+        const result = await app.apiCall('getServerRecordCredential', { nodeName, adminPassword });
+        if (!isServerRecordCredentialRevealCurrent(form, requestId, nodeName)) return;
+        const credential = result?.credential && typeof result.credential === 'object' ? result.credential : {};
+        const password = String(credential.password || '');
+        passwordInput.value = password;
+        form.dataset.serverRecordCredentialPasswordLoaded = 'true';
+        form.dataset.serverRecordCredentialPasswordOriginal = password;
+        form.dataset.serverRecordCredentialPasswordEdited = 'false';
+        setSensitiveInputVisibility(passwordInput, button, true);
+        scheduleServerRecordCredentialConceal(form, passwordInput, button);
+      } catch (error) {
+        if (isServerRecordCredentialRevealCurrent(form, requestId, nodeName)) {
+          app.showMessage?.('读取 EMBY 密码失败：' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+        }
+      } finally {
+        if (Number(form.__serverRecordCredentialRequestId) === requestId) {
+          button.disabled = passwordInput.disabled === true;
+        }
+      }
+    }, true);
+  }
+
+  function syncServerRecordCredentialFields(form, draft = null, app = null) {
+    if (!form) return;
+    const usernameInput = form.elements.serverRecordEmbyUsername;
+    const passwordInput = form.elements.serverRecordEmbyPassword;
+    if (!usernameInput || !passwordInput) return;
+    if (app) form.__serverRecordCredentialApp = app;
+    mountSensitiveInputToggle(passwordInput);
+    bindServerRecordPasswordReveal(form, passwordInput);
+    if (draft) {
+      invalidateServerRecordCredentialRequest(form);
+      const username = String(draft.serverRecordEmbyUsername || '').trim();
+      const configured = draft.serverRecordEmbyCredentialsConfigured === true;
+      usernameInput.value = username;
+      passwordInput.value = '';
+      form.dataset.serverRecordCredentialUsername = username;
+      form.dataset.serverRecordCredentialConfigured = configured ? 'true' : 'false';
+      form.dataset.serverRecordCredentialOriginallyConfigured = configured ? 'true' : 'false';
+      form.dataset.serverRecordCredentialSource = String(draft.serverRecordEmbyCredentialSource || 'none');
+      form.dataset.serverRecordCredentialPasswordLoaded = 'false';
+      form.dataset.serverRecordCredentialPasswordOriginal = '';
+      form.dataset.serverRecordCredentialPasswordEdited = 'false';
+      const button = passwordInput.closest?.('[data-sensitive-input-toggle]')?.querySelector?.('button');
+      if (button) setSensitiveInputVisibility(passwordInput, button, false);
+    }
+    const configured = form.dataset.serverRecordCredentialConfigured === 'true';
+    passwordInput.required = false;
+    syncSensitiveInputPresentation(passwordInput, form.dataset.serverRecordCredentialSource === 'node'
+      ? '可选，留空继续使用节点密码'
+      : (configured ? '可选，留空保持不变' : '可选，可留空'));
+  }
+
   function ensureServerRecordDialog(app) {
     let dialog = document.getElementById('server-record-dialog');
     if (dialog) {
@@ -1451,7 +1812,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     }
     dialog = document.createElement('dialog');
     dialog.id = 'server-record-dialog';
-    dialog.innerHTML = '<form class="server-record-dialog-body" data-server-record-form><div class="server-record-dialog-head"><h2 class="server-record-dialog-title" data-server-record-dialog-title>新增服务器记录</h2><button type="button" class="server-record-dialog-close" data-server-record-close title="关闭" aria-label="关闭"><i data-lucide="x" class="w-5 h-5" aria-hidden="true"></i></button></div><div class="server-record-form-grid"><div class="server-record-form-field span-2"><label for="server-record-node">服务器节点</label><select id="server-record-node" name="nodeName" required></select></div><div class="server-record-form-field span-2"><label for="server-record-tag-input">标签</label><div class="server-record-tag-picker" data-server-record-tag-picker><div class="server-record-tag-values" data-server-record-tag-values></div><input id="server-record-tag-input" data-server-record-tag-input maxlength="24" placeholder="搜索或输入标签，按 Enter 添加" autocomplete="off"><div class="server-record-tag-options" data-server-record-tag-options></div></div></div><div class="server-record-form-field span-2"><label class="server-record-expiry-toggle"><input name="expiryEnabled" type="checkbox"><span>启用预计过期</span></label><div class="server-record-expiry-settings" data-server-record-expiry-settings hidden><div class="server-record-expiry-modes" role="group" aria-label="预计过期模式"><button type="button" class="server-record-expiry-mode" data-server-record-expiry-mode="fixed" aria-pressed="true">固定日期</button><button type="button" class="server-record-expiry-mode" data-server-record-expiry-mode="rolling" aria-pressed="false">滚动天数</button></div><input name="expiryMode" type="hidden" value="fixed"><div class="server-record-expiry-pane" data-server-record-expiry-pane="fixed"><label for="server-record-expires">固定到期日期</label><input id="server-record-expires" name="expiresAt" type="date"></div><div class="server-record-expiry-pane" data-server-record-expiry-pane="rolling" hidden><label for="server-record-expiry-days">过期天数</label><div class="server-record-days-input"><input id="server-record-expiry-days" name="expiryDays" type="number" min="1" max="3650" step="1" value="30"><span class="server-record-days-unit">天</span></div></div></div></div></div><div class="server-record-dialog-actions"><button type="button" class="server-record-dialog-secondary" data-server-record-close>取消</button><button type="submit" class="server-record-dialog-submit" data-server-record-submit>保存记录</button></div></form>';
+    dialog.innerHTML = '<form class="server-record-dialog-body" data-server-record-form><div class="server-record-dialog-head"><h2 class="server-record-dialog-title" data-server-record-dialog-title>新增服务器记录</h2><button type="button" class="server-record-dialog-close" data-server-record-close title="关闭" aria-label="关闭"><i data-lucide="x" class="w-5 h-5" aria-hidden="true"></i></button></div><div class="server-record-form-grid"><div class="server-record-form-field span-2"><label for="server-record-node">服务器节点</label><select id="server-record-node" name="nodeName" required></select></div><div class="server-record-form-field span-2"><label for="server-record-tag-input">标签</label><div class="server-record-tag-picker" data-server-record-tag-picker><div class="server-record-tag-values" data-server-record-tag-values></div><input id="server-record-tag-input" data-server-record-tag-input maxlength="24" placeholder="搜索或输入标签，按 Enter 添加" autocomplete="off"><div class="server-record-tag-options" data-server-record-tag-options></div></div></div><section class="server-record-resource-section span-2" aria-labelledby="server-record-resource-title"><h3 id="server-record-resource-title">资源统计</h3><div class="server-record-resource-grid"><div class="server-record-form-field"><label for="server-record-emby-username">EMBY账号</label><input id="server-record-emby-username" name="serverRecordEmbyUsername" type="text" autocomplete="username"></div><div class="server-record-form-field"><label for="server-record-emby-password">EMBY密码</label><input id="server-record-emby-password" name="serverRecordEmbyPassword" type="password" autocomplete="new-password"></div></div></section><div class="server-record-form-field span-2"><label class="server-record-expiry-toggle"><input name="expiryEnabled" type="checkbox"><span>启用预计过期</span></label><div class="server-record-expiry-settings" data-server-record-expiry-settings hidden><div class="server-record-expiry-modes" role="group" aria-label="预计过期模式"><button type="button" class="server-record-expiry-mode" data-server-record-expiry-mode="fixed" aria-pressed="true">固定日期</button><button type="button" class="server-record-expiry-mode" data-server-record-expiry-mode="rolling" aria-pressed="false">滚动天数</button></div><input name="expiryMode" type="hidden" value="fixed"><div class="server-record-expiry-pane" data-server-record-expiry-pane="fixed"><label for="server-record-expires">固定到期日期</label><input id="server-record-expires" name="expiresAt" type="date"></div><div class="server-record-expiry-pane" data-server-record-expiry-pane="rolling" hidden><label for="server-record-expiry-days">过期天数</label><div class="server-record-days-input"><input id="server-record-expiry-days" name="expiryDays" type="number" min="1" max="3650" step="1" value="30"><span class="server-record-days-unit">天</span></div></div></div></div></div><div class="server-record-dialog-actions"><button type="button" class="server-record-dialog-secondary" data-server-record-close>取消</button><button type="submit" class="server-record-dialog-submit" data-server-record-submit>保存记录</button></div></form>';
     document.body.appendChild(dialog);
     dialog.classList.toggle('dark', app?.isDarkTheme === true);
     dialog.querySelectorAll('[data-server-record-close]').forEach((button) => button.addEventListener('click', () => dialog.close()));
@@ -1460,6 +1821,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     }));
     dialog.querySelector('[name="expiryEnabled"]')?.addEventListener('change', () => {
       syncServerRecordExpiryMode(dialog, dialog.querySelector('[name="expiryMode"]')?.value || 'rolling');
+    });
+    dialog.querySelector('[name="serverRecordEmbyUsername"]')?.addEventListener('input', (event) => {
+      handleServerRecordCredentialUsernameInput(event.currentTarget?.form, app);
     });
     dialog.querySelector('[data-server-record-form]')?.addEventListener('submit', (event) => saveServerRecordFromDialog(event, app));
     dialog.querySelector('[name="nodeName"]')?.addEventListener('change', (event) => {
@@ -1475,6 +1839,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       if (form?.elements?.expiryEnabled) form.elements.expiryEnabled.checked = draft.expiryEnabled === true;
       if (form?.elements?.expiresAt) form.elements.expiresAt.value = draft.expiresAt;
       if (form?.elements?.expiryDays) form.elements.expiryDays.value = String(draft.expiryDays);
+      syncServerRecordCredentialFields(form, draft, app);
       syncServerRecordExpiryMode(dialog, draft.expiryMode);
       renderServerRecordTagPicker(dialog);
     });
@@ -1496,10 +1861,15 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       if (remove) toggleServerRecordDraftTag(remove.getAttribute('data-server-record-tag-remove'), dialog);
     });
     dialog.addEventListener('close', () => {
+      const form = dialog.querySelector('[data-server-record-form]');
+      invalidateServerRecordCredentialRequest(form);
+      concealServerRecordCredential(form);
+      if (form) form.__serverRecordCredentialApp = null;
       serverRecordsUiState.editingNodeName = '';
       serverRecordsUiState.legacyEditingId = '';
       serverRecordsUiState.draftTags = [];
       serverRecordsUiState.tagQuery = '';
+      restoreServerRecordDialogFocus();
     });
     scheduleIconRefresh(dialog);
     return dialog;
@@ -1566,8 +1936,11 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     form.elements.expiryEnabled.checked = initialDraft.expiryEnabled === true;
     form.elements.expiresAt.value = initialDraft.expiresAt;
     form.elements.expiryDays.value = String(initialDraft.expiryDays);
+    syncServerRecordCredentialFields(form, initialDraft, app);
     syncServerRecordExpiryMode(dialog, initialDraft.expiryMode);
     renderServerRecordTagPicker(dialog);
+    const activeElement = document.activeElement;
+    serverRecordsUiState.dialogTrigger = activeElement && typeof activeElement.focus === 'function' ? activeElement : null;
     dialog.showModal();
     enqueue(() => {
       if (!source) return form.elements.nodeName?.focus();
@@ -1580,6 +1953,19 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const form = event.currentTarget;
     const nodeName = serverRecordsUiState.editingNodeName || String(form.elements.nodeName?.value || '').trim();
     if (!nodeName || serverRecordsUiState.saving) return;
+    const serverRecordEmbyUsername = String(form.elements.serverRecordEmbyUsername?.value || '').trim();
+    const passwordInput = form.elements.serverRecordEmbyPassword;
+    const serverRecordEmbyPassword = String(passwordInput?.value || '');
+    const savedUsername = String(form.dataset.serverRecordCredentialUsername || '');
+    const credentialSource = String(form.dataset.serverRecordCredentialSource || 'none');
+    const passwordChanged = form.dataset.serverRecordCredentialPasswordLoaded === 'true'
+      ? serverRecordEmbyPassword !== String(form.dataset.serverRecordCredentialPasswordOriginal || '')
+      : form.dataset.serverRecordCredentialPasswordEdited === 'true';
+    if (!serverRecordEmbyUsername && passwordChanged && serverRecordEmbyPassword) {
+      app?.showMessage?.('填写 EMBY 密码时必须同时填写账号', { tone: 'warning', modal: true });
+      form.elements.serverRecordEmbyUsername?.focus();
+      return;
+    }
     const wasEditing = !!serverRecordsUiState.editingNodeName;
     serverRecordsUiState.saving = true;
     const submit = form.querySelector('[data-server-record-submit]');
@@ -1589,6 +1975,12 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         nodeName,
         enabled: true,
         tags: serverRecordsUiState.draftTags,
+        ...(credentialSource === 'node' && serverRecordEmbyUsername === savedUsername && !passwordChanged
+          ? {}
+          : {
+              serverRecordEmbyUsername,
+              ...(passwordChanged || serverRecordEmbyUsername !== savedUsername ? { serverRecordEmbyPassword } : {})
+            }),
         expiryEnabled: form.elements.expiryEnabled?.checked === true,
         expiryMode: String(form.elements.expiryMode?.value || 'fixed'),
         expiresAt: String(form.elements.expiresAt?.value || ''),
@@ -1615,11 +2007,15 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   async function deleteServerRecord(app, record) {
+    const nodeName = String(record?.nodeName || '').trim().toLowerCase();
+    if (!app || !nodeName || serverRecordsUiState.deletingNodes.includes(nodeName)) return;
+    serverRecordsUiState.deletingNodes = [...serverRecordsUiState.deletingNodes, nodeName];
+    renderServerRecordsView(app);
+    try {
     const accepted = typeof app?.askConfirm === 'function' ? await app.askConfirm('确定从服务器记录中移除“' + record.displayName + '”？节点本身和已有上次观看时间不会删除。', { title: '移除服务器记录', tone: 'danger', confirmText: '移除' }) : window.confirm('确定移除“' + record.displayName + '”的服务器记录？');
     if (!accepted) return;
-    try {
       const result = await app.apiCall('saveServerRecordSettings', {
-        nodeName: record.nodeName,
+        nodeName,
         enabled: false,
         tags: record.tags,
         expiryEnabled: record.expiryEnabled === true,
@@ -1632,11 +2028,14 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       app?.showMessage?.('服务器记录已移除', { tone: 'success' });
     } catch (error) {
       app?.showMessage?.('移除服务器记录失败：' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+    } finally {
+      serverRecordsUiState.deletingNodes = serverRecordsUiState.deletingNodes.filter((name) => name !== nodeName);
+      renderServerRecordsView(app);
     }
   }
 
   function handleServerRecordViewClick(event, app) {
-    const target = event.target?.closest?.('[data-server-record-open],[data-server-record-refresh-one],[data-server-record-edit],[data-server-record-delete],[data-server-record-legacy]');
+    const target = event.target?.closest?.('[data-server-record-refresh-one],[data-server-record-edit],[data-server-record-delete],[data-server-record-legacy]');
     if (!target) return;
     const legacyId = target.getAttribute('data-server-record-legacy');
     if (legacyId) {
@@ -1644,13 +2043,12 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       if (legacyRecord) openServerRecordDialog(app, null, legacyRecord);
       return;
     }
-    const id = target.getAttribute('data-server-record-open') || target.getAttribute('data-server-record-refresh-one') || target.getAttribute('data-server-record-edit') || target.getAttribute('data-server-record-delete');
+    const id = target.getAttribute('data-server-record-refresh-one') || target.getAttribute('data-server-record-edit') || target.getAttribute('data-server-record-delete');
     const record = serverRecordsUiState.records.find((item) => item.nodeName === id);
     if (!record) return;
     if (target.hasAttribute('data-server-record-refresh-one')) return void refreshSingleServerRecord(app, record.nodeName);
     if (target.hasAttribute('data-server-record-edit')) return openServerRecordDialog(app, record);
     if (target.hasAttribute('data-server-record-delete')) return void deleteServerRecord(app, record);
-    if (isSafeServerRecordUrl(record.accessUrl)) window.open(record.accessUrl, '_blank', 'noopener,noreferrer');
   }
 
   function syncServerRecordsNavigation(app) {
@@ -1823,7 +2221,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     if (typeof app.applyDashboardStatsState === 'function') {
       const applyDashboardStatsState = app.applyDashboardStatsState.bind(app);
       app.applyDashboardStatsState = function applyDashboardStatsStateWithTrafficPeriod(...args) {
-        const result = applyDashboardStatsState(...args);
+        const retainedHotspot = this.dashboardD1WriteHotspot;
+        const stats = retainDashboardD1WriteHotspotInStats(args[0], retainedHotspot);
+        const result = applyDashboardStatsState(stats, ...args.slice(1));
         enqueue(() => {
           const nodes = getDashboardTrafficNodes();
           if (dashboardTrafficState.period === 'day') {
@@ -1862,7 +2262,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
             const cacheMeta = snapshot.cacheMeta && typeof snapshot.cacheMeta === 'object' ? snapshot.cacheMeta : {};
             if (!liveStatsApplied && snapshot.stats && typeof snapshot.stats === 'object') {
               this.applyDashboardStatsState({ ...snapshot.stats, cacheStatus: cacheMeta.cacheStatus || 'cache' });
-              if (previousHotspot && typeof previousHotspot === 'object') this.dashboardD1WriteHotspot = previousHotspot;
               dashboardLayerState.statsLoaded = true;
             }
             if (!liveRuntimeApplied && snapshot.runtimeStatus && typeof snapshot.runtimeStatus === 'object') {
@@ -1879,7 +2278,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
           if (!routeIsCurrent()) return stats;
           liveStatsApplied = true;
           this.applyDashboardStatsState(stats && typeof stats === 'object' ? stats : {});
-          if (previousHotspot && typeof previousHotspot === 'object') this.dashboardD1WriteHotspot = previousHotspot;
           dashboardLayerState.statsLoaded = true;
           return stats;
         }).catch((error) => {
@@ -1952,7 +2350,34 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       const action = scope === 'd1' ? 'tidyD1Data' : 'tidyKvData';
       const confirmText = scope === 'd1' ? '开始整理 D1' : '开始整理 KV';
       try {
-        const preview = await this.apiCall('previewTidyData', { scope });
+        let preview = await this.apiCall('previewTidyData', { scope });
+        if (scope === 'd1' && preview?.requiresSchemaInitialization === true) {
+          const initializeAccepted = await this.askConfirm(
+            'D1 结构尚未通过兼容检查。当前预览不会授权删除；请先运行统一“初始化 DB”，完成后系统会重新生成实际整理预览。',
+            {
+              title: '整理 D1 前置检查',
+              tone: 'warning',
+              confirmText: '初始化 DB'
+            }
+          );
+          if (!initializeAccepted) return;
+          const initializationResult = await this.apiCall('initLogsDb');
+          if (initializationResult?.revisions) this.applyAdminRevisions(initializationResult.revisions);
+          await this.showMessage(formatD1InitializationResult(initializationResult), {
+            title: '初始化 DB 结果',
+            tone: initializationResult?.runtimeCompatibilityReady === true
+              ? (initializationResult?.migrationReady === true ? 'success' : 'warning')
+              : 'error',
+            modal: true
+          });
+          if (initializationResult?.runtimeCompatibilityReady !== true) return;
+          preview = await this.apiCall('previewTidyData', { scope });
+          if (preview?.requiresSchemaInitialization === true) {
+            const error = new Error('D1 初始化后仍未通过兼容检查，请检查 Schema 状态');
+            error.code = 'D1_SCHEMA_INCOMPATIBLE';
+            throw error;
+          }
+        }
         const dialog = this.buildTidyPreviewConfirmDialog(preview, scope);
         const message = this.buildTidyPreviewConfirmText(preview, scope);
         const quotaBlocked = preview?.quotaBudget?.blocked === true;
@@ -1966,7 +2391,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         });
         if (!accepted || quotaBlocked) return;
         const planToken = String(preview?.planToken || '');
-        const executionPayload = scope === 'kv' ? { planToken } : {};
+        const executionPayload = { planToken };
         const result = await this.apiCall(action, executionPayload);
         const refreshTasks = [this.loadSettings()];
         if (scope === 'kv') {
@@ -1988,10 +2413,11 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       } catch (error) {
         console.error('runPreviewedTidy failed', error);
         const errorCode = String(error?.code || '');
-        const planRecoveryMessage = scope === 'kv' && errorCode === 'TIDY_PLAN_STALE'
-          ? 'KV 整理计划已过期或数据已变化，请重新预览并确认后再执行。'
-          : scope === 'kv' && errorCode === 'TIDY_PLAN_INVALID'
-            ? 'KV 整理计划凭证无效，请重新预览并确认后再执行。'
+        const scopeLabel = scope === 'd1' ? 'D1' : 'KV';
+        const planRecoveryMessage = errorCode === 'TIDY_PLAN_STALE'
+          ? scopeLabel + ' 整理计划已过期或数据已变化，请重新预览并确认后再执行。'
+          : errorCode === 'TIDY_PLAN_INVALID'
+            ? scopeLabel + ' 整理计划凭证无效，请重新预览并确认后再执行。'
             : '';
         this.showMessage(planRecoveryMessage || title + '失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
       }
@@ -2012,38 +2438,54 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       }
     };
 
-    app.getD1SchemaStatusFromUi = async function getD1SchemaStatusFromUi() {
+    app.exportNodes = async function exportNodesWithOptionalEmbyCredentials(options = {}) {
+      const includeEmbyCredentials = options?.includeEmbyCredentials === true;
+      if (includeEmbyCredentials) {
+        const accepted = await this.askConfirm(
+          '节点备份将包含节点聚合和服务器记录的 Emby 账号密码。请仅保存到可信位置，使用后及时删除。',
+          { title: '导出含 Emby 凭据节点', tone: 'danger', confirmText: '确认导出' }
+        );
+        if (!accepted) return;
+      }
       try {
-        const result = await this.apiCall('getD1SchemaStatus');
-        const status = result?.status && typeof result.status === 'object' ? result.status : result;
-        await this.showMessage(formatD1SchemaStatus(status), { title: 'D1 Schema 状态', tone: status?.migrationReady === true ? 'success' : 'warning', modal: true });
-        return status;
+        const result = includeEmbyCredentials
+          ? await callConfirmedAdminAction(this, 'exportConfig', { includeEmbyCredentials: true }, 'exportConfig')
+          : await this.apiCall('exportConfig');
+        const suffix = includeEmbyCredentials ? '_with_emby_credentials' : '';
+        this.downloadJson(Array.isArray(result?.nodes) ? result.nodes : [], 'emby_nodes' + suffix + '_' + Date.now() + '.json');
       } catch (error) {
-        console.error('getD1SchemaStatusFromUi failed', error);
-        this.showMessage('读取 D1 Schema 状态失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
-        return null;
+        console.error('exportNodes failed', error);
+        this.showMessage('节点导出失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
       }
     };
 
-    app.initD1SchemaFromUi = async function initD1SchemaFromUi() {
+    app.exportFull = async function exportFullWithEmbyCredentials() {
       const accepted = await this.askConfirm(
-        '该操作会检查 D1 当前结构并补齐运行时兼容列。正式版本仍以 Wrangler migrations 记录为准。',
-        { title: '初始化 D1 Schema', tone: 'warning', confirmText: '开始检查并补齐' }
+        '完整备份将包含所有 Emby 聚合和服务器记录凭据。请仅保存到可信位置，使用后及时删除。',
+        { title: '导出完整备份', tone: 'danger', confirmText: '确认导出' }
       );
       if (!accepted) return;
       try {
-        const result = await this.apiCall('initD1Schema');
+        const result = await callConfirmedAdminAction(this, 'exportConfig', { includeEmbyCredentials: true }, 'exportConfig');
+        if (result) this.downloadJson(result, 'emby_proxy_full_backup_' + Date.now() + '.json');
+      } catch (error) {
+        console.error('exportFull failed', error);
+        this.showMessage('完整备份导出失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+      }
+    };
+
+    app.initLogsDbFromUi = async function initializeDatabaseFromUi() {
+      try {
+        const result = await this.apiCall('initLogsDb');
         if (result?.revisions) this.applyAdminRevisions(result.revisions);
-        const statusResult = await this.apiCall('getD1SchemaStatus');
-        const status = statusResult?.status && typeof statusResult.status === 'object' ? statusResult.status : statusResult;
-        await this.showMessage(formatD1SchemaStatus(status), {
-          title: 'D1 Schema 初始化结果',
-          tone: status?.runtimeCompatibilityReady === true ? 'success' : 'warning',
+        await this.showMessage(formatD1InitializationResult(result), {
+          title: '初始化 DB 结果',
+          tone: result?.runtimeCompatibilityReady === true ? (result?.migrationReady === true ? 'success' : 'warning') : 'error',
           modal: true
         });
       } catch (error) {
-        console.error('initD1SchemaFromUi failed', error);
-        this.showMessage('D1 Schema 初始化失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+        console.error('initLogsDbFromUi failed', error);
+        this.showMessage('初始化 DB 失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
       }
     };
   }
@@ -2065,19 +2507,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       : null;
     const actionGroup = initLogsButton?.parentElement;
     const existingButtons = actionGroup ? [...actionGroup.querySelectorAll('[data-admin-runtime-action^="d1-schema-"]')] : [];
-    if (!actionGroup || app?.isSettingsExpertMode?.() !== true) {
-      for (const button of existingButtons) button.remove();
-      return;
-    }
-    let statusButton = actionGroup.querySelector('[data-admin-runtime-action="d1-schema-status"]');
-    if (!statusButton) {
-      statusButton = createRuntimeActionButton(initLogsButton, 'd1-schema-status', 'Schema 状态', 'list-checks', () => app.getD1SchemaStatusFromUi());
-      initLogsButton.insertAdjacentElement('afterend', statusButton);
-    }
-    if (!actionGroup.querySelector('[data-admin-runtime-action="d1-schema-init"]')) {
-      const initSchemaButton = createRuntimeActionButton(initLogsButton, 'd1-schema-init', '初始化 Schema', 'database-zap', () => app.initD1SchemaFromUi());
-      statusButton.insertAdjacentElement('afterend', initSchemaButton);
-    }
+    for (const button of existingButtons) button.remove();
+    initLogsButton?.setAttribute('title', '检查并补齐 D1 运行时结构、索引与 FTS，然后返回最终 Schema 状态');
   }
 
   function syncSecretExportButton(app) {
@@ -2104,6 +2535,27 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     defaultExportButton.insertAdjacentElement('afterend', button);
   }
 
+  function syncNodeCredentialExportButton(app) {
+    const nodesView = document.getElementById('view-nodes');
+    const defaultExportButton = nodesView?.querySelector('[data-ui-icon="nodes-toolbar-export"]')?.closest?.('button');
+    const actionGroup = defaultExportButton?.parentElement;
+    const existingButton = actionGroup?.querySelector('[data-admin-runtime-action="export-nodes-emby-credentials"]') || null;
+    if (!actionGroup || !defaultExportButton) {
+      existingButton?.remove();
+      return;
+    }
+    if (existingButton) return;
+    const button = createRuntimeActionButton(
+      defaultExportButton,
+      'export-nodes-emby-credentials',
+      '导出含 Emby 凭据',
+      'key-round',
+      () => app.exportNodes({ includeEmbyCredentials: true })
+    );
+    button.className = 'flex-1 sm:flex-none px-4 py-2 border border-amber-300 text-amber-700 rounded-xl text-sm font-medium transition hover:bg-amber-100 dark:border-amber-900/40 dark:text-amber-300 dark:hover:bg-amber-900/20 flex items-center justify-center';
+    defaultExportButton.insertAdjacentElement('afterend', button);
+  }
+
   function syncPlaybackInfoModeCopy() {
     const select = document.querySelector('#form-playback-info-mode');
     if (!select) return;
@@ -2121,7 +2573,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     return {
       username,
       passwordConfigured,
-      configured: Boolean(username && passwordConfigured)
+      configured: Boolean(username)
     };
   }
 
@@ -2178,13 +2630,14 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       usernameInput.value = String(form.mediaAggregationEmbyUsername || '');
     }
     if (passwordInput) {
+      mountSensitiveInputToggle(passwordInput);
       passwordInput.disabled = !useNodeCredentials;
-      passwordInput.placeholder = credentialState.passwordConfigured ? '已配置，留空保持不变' : '输入节点固定 Emby 密码';
+      syncSensitiveInputPresentation(passwordInput, credentialState.passwordConfigured ? '可选，留空保持不变' : '可选，可留空');
     }
     if (usernameInput) usernameInput.disabled = !useNodeCredentials;
     if (status) {
       status.textContent = useNodeCredentials
-        ? (credentialState.passwordConfigured ? '已配置节点账号密码；留空密码将保持原密码。' : '请同时填写节点账号和密码。')
+        ? (credentialState.passwordConfigured ? '节点密码可选；留空将保持原密码。' : '节点密码可选，可只填写账号。')
         : '当前使用全局聚合账号。';
     }
   }
@@ -2200,6 +2653,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         const credentialState = normalizeMediaAggregationNodeCredentialState(rawNode);
         if (result?.form && typeof result.form === 'object') {
           result.form.mediaAggregationEmbyUsername = credentialState.username;
+          result.form.mediaAggregationEmbyOriginalUsername = credentialState.username;
           result.form.mediaAggregationEmbyPassword = '';
           result.form.mediaAggregationEmbyPasswordConfigured = credentialState.passwordConfigured;
           result.form.mediaAggregationEmbyUseNodeCredentials = rawNode.mediaAggregationEmbyCredentialsConfigured === true
@@ -2226,15 +2680,15 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         const useNodeCredentials = form.mediaAggregationEmbyUseNodeCredentials === true;
         const username = String(form.mediaAggregationEmbyUsername || '').trim();
         const password = String(form.mediaAggregationEmbyPassword || '');
-        const passwordConfigured = form.mediaAggregationEmbyPasswordConfigured === true;
-        if (useNodeCredentials && (!username || (!password && !passwordConfigured))) {
-          this.setNodeModalFeedback?.('节点固定 Emby 账号和密码必须同时填写。', 'warning');
-          this.setNodeModalFieldError?.('mediaAggregationCredentials', '请同时填写节点账号和密码');
+        const originalUsername = String(form.mediaAggregationEmbyOriginalUsername || '').trim();
+        if (useNodeCredentials && !username) {
+          this.setNodeModalFeedback?.('请填写节点固定 Emby 账号；密码可以留空。', 'warning');
+          this.setNodeModalFieldError?.('mediaAggregationCredentials', '请填写节点 Emby 账号');
           return null;
         }
         this.__mediaAggregationNodeCredentialPayload = {
           mediaAggregationEmbyUsername: useNodeCredentials ? username : '',
-          ...(useNodeCredentials && password ? { mediaAggregationEmbyPassword: password } : {}),
+          ...(useNodeCredentials && (password || username !== originalUsername) ? { mediaAggregationEmbyPassword: password } : {}),
           ...(!useNodeCredentials ? { mediaAggregationEmbyPassword: '' } : {})
         };
         try {
@@ -2262,10 +2716,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   function hasMediaAggregationGlobalCredentials() {
-    return Boolean(
-      String(mediaAggregationState.username || '').trim()
-      && (String(mediaAggregationState.password || '').length > 0 || mediaAggregationState.hasPassword)
-    );
+    return Boolean(String(mediaAggregationState.username || '').trim());
   }
 
   function hasMediaAggregationNodeCredentials(node) {
@@ -2274,6 +2725,29 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
   function canSelectMediaAggregationNode(node) {
     return hasMediaAggregationNodeCredentials(node) || hasMediaAggregationGlobalCredentials();
+  }
+
+  function markMediaAggregationDraftDirty() {
+    mediaAggregationState.dirty = true;
+    mediaAggregationState.draftRevision = (Number(mediaAggregationState.draftRevision) || 0) + 1;
+    mediaAggregationState.renderSignature = '';
+  }
+
+  function syncMediaAggregationBusy() {
+    const root = mediaAggregationState.root;
+    if (!root) return;
+    const busy = mediaAggregationState.savePending === true;
+    root.setAttribute('aria-busy', busy ? 'true' : 'false');
+    root.toggleAttribute?.('data-media-aggregation-save-pending', busy);
+    root.querySelectorAll?.('[data-media-aggregation-username="1"],[data-media-aggregation-password="1"],[data-media-aggregation-progress="1"],[data-media-aggregation-search="1"]').forEach((input) => {
+      input.disabled = busy;
+    });
+    root.querySelectorAll?.('[data-media-aggregation-list="1"] input[type="checkbox"]').forEach((input) => {
+      const available = input.closest?.('[data-media-aggregation-item="1"]')?.getAttribute?.('data-media-aggregation-available') === '1';
+      input.disabled = busy || !available;
+    });
+    const button = root.querySelector?.('[data-media-aggregation-save="1"]');
+    if (button) button.disabled = busy;
   }
 
   function updateMediaAggregationSummary() {
@@ -2317,7 +2791,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       const key = String(node.name || '').trim().toLowerCase();
       if (mediaAggregationState.selected.has(key) && !canSelectMediaAggregationNode(node)) {
         mediaAggregationState.selected.delete(key);
-        mediaAggregationState.dirty = true;
+        markMediaAggregationDraftDirty();
       }
     }
     if (!nodes.length) {
@@ -2335,16 +2809,15 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       label.setAttribute('data-media-aggregation-available', available ? '1' : '0');
       label.title = available
         ? '可使用节点固定账号或全局聚合账号'
-        : '请先为节点配置完整账号密码，或填写全局聚合账号密码';
+        : '请先为节点配置账号，或填写全局聚合账号；密码可以留空';
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
-      checkbox.disabled = !available;
+      checkbox.disabled = !available || mediaAggregationState.savePending === true;
       checkbox.checked = mediaAggregationState.selected.has(key);
       checkbox.addEventListener('change', () => {
         if (checkbox.checked) mediaAggregationState.selected.add(key);
         else mediaAggregationState.selected.delete(key);
-        mediaAggregationState.dirty = true;
-        mediaAggregationState.renderSignature = '';
+        markMediaAggregationDraftDirty();
         updateMediaAggregationSummary();
       });
       const content = document.createElement('div');
@@ -2356,7 +2829,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       meta.className = 'mt-1 break-all text-xs text-slate-500';
       const credentialText = hasMediaAggregationNodeCredentials(node)
         ? '节点账号已配置'
-        : (globalCredentialsAvailable ? '使用全局账号' : '缺少账号密码');
+        : (globalCredentialsAvailable ? '使用全局账号' : '缺少账号');
       if (!available) meta.setAttribute('data-media-aggregation-credential-state', 'missing');
       meta.textContent = [name, credentialText, node.tag ? '标签: ' + node.tag : '', node.remark ? '备注: ' + node.remark : ''].filter(Boolean).join(' · ');
       content.append(title, meta);
@@ -2366,15 +2839,20 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     updateMediaAggregationSummary();
   }
 
-  async function hydrateMediaAggregationState(app, force = false) {
-    if (!app || mediaAggregationState.loading || (mediaAggregationState.hydrated && !force)) return;
+  async function hydrateMediaAggregationState(app, force = false, options = {}) {
+    if (!app || (mediaAggregationState.loading && options.allowWhileLoading !== true) || (mediaAggregationState.hydrated && !force)) return;
+    const hydrationSeq = (Number(mediaAggregationState.hydrationSeq) || 0) + 1;
+    mediaAggregationState.hydrationSeq = hydrationSeq;
+    const draftRevision = Number(mediaAggregationState.draftRevision) || 0;
     mediaAggregationState.loading = true;
     try {
       const payload = await app.apiCall('getSettingsBootstrap');
+      if (hydrationSeq !== mediaAggregationState.hydrationSeq || (mediaAggregationState.dirty && (options.replaceDraft !== true || draftRevision !== mediaAggregationState.draftRevision))) return;
       const config = payload?.config && typeof payload.config === 'object' ? payload.config : {};
       mediaAggregationState.selected = new Set((Array.isArray(config.mediaAggregationNodes) ? config.mediaAggregationNodes : [])
         .map((name) => String(name || '').trim().toLowerCase()).filter(Boolean));
       mediaAggregationState.username = String(config.mediaAggregationEmbyUsername || '').trim();
+      mediaAggregationState.savedUsername = mediaAggregationState.username;
       mediaAggregationState.password = '';
       mediaAggregationState.hasPassword = String(config.mediaAggregationEmbyPassword || '').length > 0;
       mediaAggregationState.bidirectionalProgressEnabled = config.mediaAggregationBidirectionalProgressEnabled === true;
@@ -2386,20 +2864,21 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       if (usernameInput) usernameInput.value = mediaAggregationState.username;
       if (passwordInput) {
         passwordInput.value = '';
-        passwordInput.placeholder = mediaAggregationState.hasPassword ? '已配置，留空保持不变' : '输入全局默认 Emby 密码';
+        mountSensitiveInputToggle(passwordInput);
+        syncSensitiveInputPresentation(passwordInput, mediaAggregationState.hasPassword ? '可选，留空保持不变' : '可选，可留空');
       }
       const progressInput = mediaAggregationState.root?.querySelector('[data-media-aggregation-progress="1"]');
       if (progressInput) progressInput.checked = mediaAggregationState.bidirectionalProgressEnabled;
       renderMediaAggregationNodeList(app);
     } catch (error) {
-      console.error('hydrateMediaAggregationState failed', error);
+      if (hydrationSeq === mediaAggregationState.hydrationSeq) console.error('hydrateMediaAggregationState failed', error);
     } finally {
-      mediaAggregationState.loading = false;
+      if (hydrationSeq === mediaAggregationState.hydrationSeq) mediaAggregationState.loading = false;
     }
   }
 
   async function saveMediaAggregationState(app) {
-    if (!app || mediaAggregationState.loading) return;
+    if (!app || mediaAggregationState.loading || mediaAggregationState.savePending) return;
     const selectedNodeNames = [...mediaAggregationState.selected];
     const username = String(mediaAggregationState.username || '').trim();
     const password = String(mediaAggregationState.password || '');
@@ -2414,40 +2893,43 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       return !node || !canSelectMediaAggregationNode(node);
     });
     if (invalidCredentialNames.length > 0) {
-      app.showMessage?.('以下节点缺少可用账号密码，无法勾选: ' + invalidCredentialNames.join(', '), { tone: 'warning', modal: true });
+      app.showMessage?.('以下节点缺少可用账号，无法勾选: ' + invalidCredentialNames.join(', '), { tone: 'warning', modal: true });
       return;
     }
-    const accepted = await app.askConfirm?.(
-      selectedNodeNames.length
-        ? '将保存聚合池，并把已勾选节点的 PlaybackInfo 模式自动设为“改写模式”。'
-        : '将关闭影视资源版本聚合，并把此前由快捷勾选设为改写的节点恢复为继承全局。',
-      { title: '保存影视资源版本聚合', tone: 'warning', confirmText: '保存' }
-    );
-    if (accepted === false) return;
-    mediaAggregationState.loading = true;
-    const button = mediaAggregationState.root?.querySelector('[data-media-aggregation-save="1"]');
-    if (button) button.disabled = true;
+    mediaAggregationState.savePending = true;
+    syncMediaAggregationBusy();
     try {
+      const accepted = await app.askConfirm?.(
+        selectedNodeNames.length
+          ? '将保存聚合池，并把已勾选节点的 PlaybackInfo 模式自动设为“改写模式”。'
+          : '将关闭影视资源版本聚合，并把此前由快捷勾选设为改写的节点恢复为继承全局。',
+        { title: '保存影视资源版本聚合', tone: 'warning', confirmText: '保存' }
+      );
+      if (accepted === false) return;
+      mediaAggregationState.loading = true;
       const requestPayload = {
         selectedNodeNames,
         username,
         bidirectionalProgressEnabled: mediaAggregationState.bidirectionalProgressEnabled
       };
-      if (password) requestPayload.password = password;
+      if (password || username !== mediaAggregationState.savedUsername) requestPayload.password = password;
       const result = await app.apiCall('saveMediaAggregationPolicyShortcuts', requestPayload);
       if (result?.revisions) app.applyAdminRevisions?.(result.revisions);
-      mediaAggregationState.hasPassword = Boolean(password || mediaAggregationState.hasPassword);
+      mediaAggregationState.hasPassword = password ? true : (username !== mediaAggregationState.savedUsername ? false : mediaAggregationState.hasPassword);
       mediaAggregationState.password = '';
       mediaAggregationState.dirty = false;
+      mediaAggregationState.draftRevision = (Number(mediaAggregationState.draftRevision) || 0) + 1;
       await Promise.allSettled([app.loadNodes?.(), app.loadSettings?.()]);
-      await hydrateMediaAggregationState(app, true);
+      await hydrateMediaAggregationState(app, true, { allowWhileLoading: true, replaceDraft: true });
       app.showMessage?.('影视资源版本聚合设置已保存。', { tone: 'success' });
     } catch (error) {
       console.error('saveMediaAggregationState failed', error);
       app.showMessage?.('影视资源版本聚合保存失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
     } finally {
       mediaAggregationState.loading = false;
-      if (button) button.disabled = false;
+      mediaAggregationState.savePending = false;
+      syncMediaAggregationBusy();
+      renderMediaAggregationNodeList(app);
     }
   }
 
@@ -2466,19 +2948,17 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       sourceList.insertAdjacentElement('afterend', root);
       root.querySelector('[data-media-aggregation-username="1"]')?.addEventListener('input', (event) => {
         mediaAggregationState.username = String(event.target?.value || '');
-        mediaAggregationState.dirty = true;
-        mediaAggregationState.renderSignature = '';
+        markMediaAggregationDraftDirty();
         renderMediaAggregationNodeList(app);
       });
       root.querySelector('[data-media-aggregation-password="1"]')?.addEventListener('input', (event) => {
         mediaAggregationState.password = String(event.target?.value || '');
-        mediaAggregationState.dirty = true;
-        mediaAggregationState.renderSignature = '';
+        markMediaAggregationDraftDirty();
         renderMediaAggregationNodeList(app);
       });
       root.querySelector('[data-media-aggregation-progress="1"]')?.addEventListener('change', (event) => {
         mediaAggregationState.bidirectionalProgressEnabled = event.target?.checked === true;
-        mediaAggregationState.dirty = true;
+        markMediaAggregationDraftDirty();
       });
       root.querySelector('[data-media-aggregation-search="1"]')?.addEventListener('input', (event) => {
         mediaAggregationState.search = String(event.target?.value || '');
@@ -2489,6 +2969,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       scheduleIconRefresh(root);
     }
     mediaAggregationState.root = root;
+    syncMediaAggregationBusy();
+    mountSensitiveInputToggle(root.querySelector('[data-media-aggregation-password="1"]'));
     if (!mediaAggregationState.hydrated) hydrateMediaAggregationState(app);
     else renderMediaAggregationNodeList(app);
   }
@@ -2502,6 +2984,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     ensureServerExpirySettings(app);
     syncD1SchemaActionButtons(app);
     syncSecretExportButton(app);
+    syncNodeCredentialExportButton(app);
     syncPlaybackInfoModeCopy();
     syncMediaAggregationPanel(app);
   }

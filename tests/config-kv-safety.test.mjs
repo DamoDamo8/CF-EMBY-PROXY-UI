@@ -300,7 +300,9 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
   const currentConfig = {
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret"
+    tgBotToken: "current-tg-secret",
+    mediaAggregationEmbyUsername: "current-emby-user",
+    mediaAggregationEmbyPassword: "current-emby-password"
   };
   const { kv } = createKv({ [Database.CONFIG_KEY]: currentConfig });
   const env = {
@@ -317,17 +319,21 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     assert.equal(backup.secretsRedacted, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.config.mediaAggregationEmbyUsername, undefined);
+    assert.equal(backup.config.mediaAggregationEmbyPassword, undefined);
 
     await Database.ApiHandlers.importSettings(backup, { env, ctx: null, kv, meta: {} });
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    assert.equal(restored.mediaAggregationEmbyUsername, "current-emby-user");
+    assert.equal(restored.mediaAggregationEmbyPassword, "current-emby-password");
   } finally {
     invalidateRuntimeConfigCache();
   }
 });
 
-test("redacted full backup roundtrip preserves current secrets", async () => {
+test("full backup requires confirmation before retaining Emby credentials", async () => {
   const adminIndexRecord = await buildAdminLocalIndexUploadRecord(
     '<!doctype html><html><body><div id="app"></div></body></html>',
     "index.html"
@@ -336,6 +342,8 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     rateLimitRpm: 30,
     cfApiToken: "current-cf-secret",
     tgBotToken: "current-tg-secret",
+    mediaAggregationEmbyUsername: "global-user",
+    mediaAggregationEmbyPassword: "global-password",
     indexUrl: adminIndexRecord.sourceUrl
   };
   const currentNode = {
@@ -344,7 +352,9 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
     activeLineId: "main",
     mediaAggregationEmbyUsername: "node-user",
-    mediaAggregationEmbyPassword: "node-password"
+    mediaAggregationEmbyPassword: "node-password",
+    serverRecordEmbyUsername: "record-user",
+    serverRecordEmbyPassword: "record-password"
   };
   const uploadKey = Database.buildAdminIndexUploadKey(adminIndexRecord.revision);
   const { kv } = createKv({
@@ -359,18 +369,48 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
   };
   invalidateRuntimeConfigCache();
   try {
-    const exportedResponse = await Database.ApiHandlers.exportConfig({}, {
+    const rejectedResponse = await Database.ApiHandlers.exportConfig({ includeEmbyCredentials: true }, {
       env,
       ctx: null,
       request: new Request("https://worker.test/admin")
     });
+    assert.equal(rejectedResponse.status, 428);
+    assert.equal((await rejectedResponse.json()).error.code, "CONFIRMATION_REQUIRED");
+
+    const redactedResponse = await Database.ApiHandlers.exportConfig({}, {
+      env,
+      ctx: null,
+      request: new Request("https://worker.test/admin")
+    });
+    const redactedBackup = await redactedResponse.json();
+    assert.equal(redactedBackup.secretsRedacted, true);
+    assert.equal(redactedBackup.containsSecrets, false);
+    assert.equal(redactedBackup.config.mediaAggregationEmbyUsername, undefined);
+    assert.equal(redactedBackup.config.mediaAggregationEmbyPassword, undefined);
+    assert.equal(redactedBackup.nodes[0].mediaAggregationEmbyUsername, undefined);
+    assert.equal(redactedBackup.nodes[0].mediaAggregationEmbyPassword, undefined);
+    assert.equal(redactedBackup.nodes[0].serverRecordEmbyUsername, undefined);
+    assert.equal(redactedBackup.nodes[0].serverRecordEmbyPassword, undefined);
+
+    const exportedResponse = await Database.ApiHandlers.exportConfig({ includeEmbyCredentials: true }, {
+      env,
+      ctx: null,
+      request: new Request("https://worker.test/admin", {
+        headers: { "X-Admin-Confirm": "exportConfig" }
+      })
+    });
     const backup = await exportedResponse.json();
-    assert.equal(backup.secretsRedacted, true);
+    assert.equal(backup.secretsRedacted, false);
+    assert.equal(backup.containsSecrets, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.config.mediaAggregationEmbyUsername, "global-user");
+    assert.equal(backup.config.mediaAggregationEmbyPassword, "global-password");
     assert.equal(backup.nodes.length, 1);
-    assert.equal(backup.nodes[0].mediaAggregationEmbyUsername, undefined);
-    assert.equal(backup.nodes[0].mediaAggregationEmbyPassword, undefined);
+    assert.equal(backup.nodes[0].mediaAggregationEmbyUsername, "node-user");
+    assert.equal(backup.nodes[0].mediaAggregationEmbyPassword, "node-password");
+    assert.equal(backup.nodes[0].serverRecordEmbyUsername, "record-user");
+    assert.equal(backup.nodes[0].serverRecordEmbyPassword, "record-password");
     assert.equal(backup.adminIndexUpload.revision, adminIndexRecord.revision);
     assert.equal(backup.adminIndexUpload.html, adminIndexRecord.html);
 
@@ -379,16 +419,46 @@ test("redacted full backup roundtrip preserves current secrets", async () => {
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    assert.equal(restored.mediaAggregationEmbyUsername, "global-user");
+    assert.equal(restored.mediaAggregationEmbyPassword, "global-password");
     const restoredNode = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
     assert.equal(restoredNode.mediaAggregationEmbyUsername, "node-user");
     assert.equal(restoredNode.mediaAggregationEmbyPassword, "node-password");
+    assert.equal(restoredNode.serverRecordEmbyUsername, "record-user");
+    assert.equal(restoredNode.serverRecordEmbyPassword, "record-password");
     assert.equal((await Database.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
   } finally {
     invalidateRuntimeConfigCache();
   }
 });
 
-test("media aggregation shortcut rejects selected nodes without effective credentials", async () => {
+test("full import rejects a server record password without a username before writing", async () => {
+  const { kv, operations } = createKv({ [Database.CONFIG_KEY]: {} });
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-server-record-credentials"
+  };
+  invalidateRuntimeConfigCache();
+  try {
+    const response = await Database.ApiHandlers.importFull({
+      nodes: [{
+        name: "orphan-password",
+        target: "https://origin.example",
+        serverRecordEmbyPassword: "secret-without-user"
+      }]
+    }, { env, ctx: null, kv });
+    const payload = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "SERVER_RECORD_CREDENTIALS_INCOMPLETE");
+    assert.equal(await kv.get(`${Database.PREFIX}orphan-password`, { type: "json" }), null);
+    assert.deepEqual(operations, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("media aggregation shortcut requires usernames and accepts an empty global password", async () => {
   const primaryNode = {
     name: "primary",
     target: "https://primary.test",
@@ -424,6 +494,18 @@ test("media aggregation shortcut rejects selected nodes without effective creden
     assert.equal(response.status, 400);
     assert.equal(payload.error.code, "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED");
     assert.deepEqual(payload.error.details.nodeNames, ["backup"]);
+
+    const successResponse = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+      selectedNodeNames: ["primary", "backup"],
+      username: "global-user",
+      password: ""
+    }, { env, ctx: null, kv });
+    const successPayload = await successResponse.json();
+    assert.equal(successResponse.status, 200);
+    assert.equal(successPayload.success, true);
+    const savedConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    assert.equal(savedConfig.mediaAggregationEmbyUsername, "global-user");
+    assert.equal(savedConfig.mediaAggregationEmbyPassword, "");
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -569,6 +651,113 @@ test("KV tidy removes orphaned local HTML records and preserves referenced versi
   } finally {
     invalidateRuntimeConfigCache();
   }
+});
+
+test("KV tidy preserves D1-owned legacy keys until D1 compatibility is ready", async () => {
+  const legacyKeys = [
+    Database.LEGACY_DNS_IP_POOL_SOURCES_KEY,
+    Database.LEGACY_OPS_STATUS_KEY,
+    Database.LEGACY_TELEGRAM_ALERT_STATE_KEY
+  ];
+  const { kv } = createKv({
+    [Database.CONFIG_KEY]: {},
+    [Database.LEGACY_DNS_IP_POOL_SOURCES_KEY]: [{ id: "legacy-source" }],
+    [Database.LEGACY_OPS_STATUS_KEY]: { scheduled: { status: "legacy" } },
+    [Database.LEGACY_TELEGRAM_ALERT_STATE_KEY]: { lastAlertAt: "2026-07-25T00:00:00.000Z" }
+  });
+
+  const plan = await Database.buildKvTidyPlan({ ENI_KV: kv }, { kv });
+  const deletedKeys = plan.mutationPlan
+    .filter(mutation => mutation.type === "delete")
+    .map(mutation => mutation.key);
+  const preserveGroup = plan.preview.preserveGroups.find(group => group.key === "d1_legacy_keys_pending");
+
+  assert.deepEqual(legacyKeys.filter(key => deletedKeys.includes(key)), []);
+  assert.equal(plan.summary.preservedD1LegacyKeyCount, 3);
+  assert.equal(preserveGroup?.count, 3);
+  assert.deepEqual(new Set(preserveGroup?.samples || []), new Set(legacyKeys));
+  assert.equal(plan.d1Compatibility.runtimeCompatibilityReady, false);
+});
+
+test("KV tidy performs no KV deletes when the D1 compatibility copy fails", async () => {
+  const { kv, operations, values } = createKv({ legacy: { status: "old" } });
+  const originalApplyKvD1LegacyMigrations = Database.applyKvD1LegacyMigrations;
+  Database.applyKvD1LegacyMigrations = async () => {
+    throw new Error("d1 copy failed");
+  };
+  try {
+    await assert.rejects(
+      Database.applyKvTidyPlan({
+        mutationPlan: [{ type: "delete", key: "legacy" }],
+        d1LegacyMigrations: [{ key: "legacy", kind: "ops_status_root", payload: { status: "old" } }],
+        summary: {},
+        preview: { scope: "kv" }
+      }, { kv, db: {} }),
+      /d1 copy failed/
+    );
+    assert.equal(values.has("legacy"), true);
+    assert.deepEqual(operations, []);
+  } finally {
+    Database.applyKvD1LegacyMigrations = originalApplyKvD1LegacyMigrations;
+  }
+});
+
+test("KV tidy rejects malformed D1-owned legacy payloads before any KV delete", async () => {
+  const legacyKey = Database.LEGACY_OPS_STATUS_KEY;
+  const { kv, operations, values } = createKv({
+    [legacyKey]: ["unexpected-array-state"]
+  });
+
+  await assert.rejects(
+    Database.applyKvTidyPlan({
+      mutationPlan: [{ type: "delete", key: legacyKey }],
+      d1LegacyMigrations: [{
+        key: legacyKey,
+        kind: "ops_status_root",
+        payload: ["unexpected-array-state"]
+      }],
+      summary: {},
+      preview: { scope: "kv" }
+    }, { kv, db: {} }),
+    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
+      && error?.details?.reason === "expected_object"
+  );
+
+  assert.equal(values.has(legacyKey), true);
+  assert.deepEqual(operations, []);
+});
+
+test("KV legacy DNS migration rejects lossy source normalization", async () => {
+  assert.throws(
+    () => Database.normalizeKvD1LegacyMigrationPayload(
+      "dns_ip_pool_sources",
+      [{ url: "https://missing-id.example/ips.txt" }],
+      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+    ),
+    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
+      && error?.details?.reason === "missing_source_id:0"
+  );
+  assert.throws(
+    () => Database.normalizeKvD1LegacyMigrationPayload(
+      "dns_ip_pool_sources",
+      [{ id: "missing-target", name: "Broken source" }],
+      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+    ),
+    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
+      && error?.details?.reason === "missing_source_target:0"
+  );
+  assert.throws(
+    () => Database.normalizeKvD1LegacyMigrationPayload(
+      "dns_ip_pool_sources",
+      [
+        { id: "duplicate", url: "https://one.example/ips.txt" },
+        { id: "duplicate", url: "https://two.example/ips.txt" }
+      ],
+      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+    ),
+    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
+      && error?.details?.reason === "duplicate_or_missing_source_id"
+  );
 });
 
 test("full import keeps a competing config save queued until rollback completes", async () => {
