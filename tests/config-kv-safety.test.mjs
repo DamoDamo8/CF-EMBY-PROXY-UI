@@ -333,6 +333,113 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
   }
 });
 
+test("TMDB poster key is stored in KV but redacted from management reads, snapshots, and default exports", async () => {
+  const tmdbApiKey = "abcdefghijklmnopqrstuvwxyz123456";
+  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 20 } });
+  const env = {
+    ENI_KV: kv,
+    TMDB_API_KEY: "environment-fallback-secret",
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-tmdb-poster-key"
+  };
+  invalidateRuntimeConfigCache();
+  try {
+    const saveResponse = await Database.ApiHandlers.saveConfig({
+      config: { rateLimitRpm: 20, tmdbApiKey }
+    }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
+    assert.equal(saveResponse.status, 200);
+    const savedPayload = await saveResponse.json();
+    assert.equal(savedPayload.posterMetadata.tmdb.configured, true);
+    assert.equal(savedPayload.posterMetadata.tmdb.storage, "kv_config");
+    assert.equal(savedPayload.config.tmdbApiKey, undefined);
+    assert.equal(savedPayload.config.tmdbApiKeyConfigured, true);
+    assert.doesNotMatch(JSON.stringify(savedPayload), new RegExp(tmdbApiKey));
+
+    const storedConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    assert.equal(storedConfig.tmdbApiKey, tmdbApiKey);
+    const snapshots = await kv.get(Database.CONFIG_SNAPSHOTS_KEY, { type: "json" });
+    assert.ok(snapshots.every(snapshot => snapshot?.config?.tmdbApiKey === undefined));
+
+    const readResponse = await Database.ApiHandlers.loadConfig({}, { env, kv, db: null, ctx: null });
+    const readPayload = await readResponse.json();
+    assert.equal(readPayload.config.tmdbApiKey, undefined);
+    assert.equal(readPayload.config.tmdbApiKeyConfigured, true);
+
+    const settingsBootstrapResponse = await Database.ApiHandlers.getSettingsBootstrap({}, { env, kv, db: null, ctx: null });
+    const settingsBootstrapPayload = await settingsBootstrapResponse.json();
+    assert.equal(settingsBootstrapPayload.posterMetadata.tmdb.storage, "kv_config");
+    assert.equal(settingsBootstrapPayload.config.tmdbApiKey, undefined);
+    assert.doesNotMatch(JSON.stringify(settingsBootstrapPayload), /environment-fallback-secret/);
+
+    const adminBootstrapResponse = await Database.ApiHandlers.getAdminBootstrap({}, { env, kv, db: null, ctx: null });
+    const adminBootstrapPayload = await adminBootstrapResponse.json();
+    assert.equal(adminBootstrapPayload.posterMetadata.tmdb.storage, "kv_config");
+    assert.equal(adminBootstrapPayload.config.tmdbApiKey, undefined);
+    assert.doesNotMatch(JSON.stringify(adminBootstrapPayload), new RegExp(`${tmdbApiKey}|environment-fallback-secret`));
+
+    const previewResponse = await Database.ApiHandlers.previewConfig({ config: { rateLimitRpm: 25 } }, { env, kv, ctx: null });
+    const previewPayload = await previewResponse.json();
+    assert.equal(previewPayload.config.tmdbApiKey, undefined);
+    assert.equal(previewPayload.config.tmdbApiKeyConfigured, true);
+
+    const defaultExport = await Database.ApiHandlers.exportSettings({}, {
+      env,
+      request: new Request("https://worker.test/admin")
+    });
+    assert.equal((await defaultExport.json()).config.tmdbApiKey, undefined);
+    const confirmedExport = await Database.ApiHandlers.exportSettings({ includeSecrets: true }, {
+      env,
+      request: new Request("https://worker.test/admin", {
+        headers: { "X-Admin-Confirm": "exportSettings" }
+      })
+    });
+    assert.equal((await confirmedExport.json()).config.tmdbApiKey, tmdbApiKey);
+
+    const defaultFullExport = await Database.ApiHandlers.exportConfig({}, {
+      env,
+      ctx: null,
+      request: new Request("https://worker.test/admin")
+    });
+    assert.equal((await defaultFullExport.json()).config.tmdbApiKey, undefined);
+    const confirmedFullExport = await Database.ApiHandlers.exportConfig({ includeSecrets: true }, {
+      env,
+      ctx: null,
+      request: new Request("https://worker.test/admin", {
+        headers: { "X-Admin-Confirm": "exportConfig" }
+      })
+    });
+    assert.equal((await confirmedFullExport.json()).config.tmdbApiKey, tmdbApiKey);
+
+    const ordinarySave = await Database.ApiHandlers.saveConfig({ config: { rateLimitRpm: 30 } }, { env, ctx: null, kv, meta: { section: "account" } });
+    const ordinarySavePayload = await ordinarySave.json();
+    assert.equal(ordinarySavePayload.config.tmdbApiKey, undefined);
+    assert.equal(ordinarySavePayload.posterMetadata.tmdb.storage, "kv_config");
+    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, tmdbApiKey);
+
+    const ordinaryImport = await Database.ApiHandlers.importSettings({ config: { rateLimitRpm: 40 } }, { env, ctx: null, kv, meta: {} });
+    assert.equal((await ordinaryImport.json()).config.tmdbApiKey, undefined);
+    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, tmdbApiKey);
+
+    const removeResponse = await Database.ApiHandlers.saveConfig({
+      config: { rateLimitRpm: 30, tmdbApiKey: "" }
+    }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
+    assert.equal(removeResponse.status, 200);
+    const removePayload = await removeResponse.json();
+    assert.equal(removePayload.posterMetadata.tmdb.configured, true);
+    assert.equal(removePayload.posterMetadata.tmdb.storage, "worker_secret");
+    assert.doesNotMatch(JSON.stringify(removePayload), /environment-fallback-secret/);
+    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
+
+    const legacyCompatibilityResponse = await Database.ApiHandlers.savePosterMetadataSettings({
+      operation: "set",
+      tmdbApiKey
+    }, { env, ctx: null, kv });
+    assert.equal(legacyCompatibilityResponse.status, 200);
+    assert.equal((await legacyCompatibilityResponse.json()).posterMetadata.tmdb.storage, "kv_config");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("full backup requires confirmation before retaining Emby credentials", async () => {
   const adminIndexRecord = await buildAdminLocalIndexUploadRecord(
     '<!doctype html><html><body><div id="app"></div></body></html>',
@@ -498,7 +605,10 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
     const successResponse = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
       selectedNodeNames: ["primary", "backup"],
       username: "global-user",
-      password: ""
+      password: "",
+      matchMode: "strict",
+      firstResultTimeoutMs: 2200,
+      gracePeriodMs: 600
     }, { env, ctx: null, kv });
     const successPayload = await successResponse.json();
     assert.equal(successResponse.status, 200);
@@ -506,6 +616,35 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
     const savedConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(savedConfig.mediaAggregationEmbyUsername, "global-user");
     assert.equal(savedConfig.mediaAggregationEmbyPassword, "");
+    assert.equal(savedConfig.mediaAggregationMatchMode, "strict");
+    assert.equal(savedConfig.mediaAggregationFirstResultTimeoutMs, 2200);
+    assert.equal(savedConfig.mediaAggregationGracePeriodMs, 600);
+    const managedPrimary = await kv.get(`${Database.PREFIX}primary`, { type: "json" });
+    const managedBackup = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    assert.equal(managedPrimary.playbackInfoMode, "rewrite");
+    assert.equal(managedPrimary.mediaAggregationManagedRewrite, true);
+    assert.equal(managedBackup.mediaAggregationManagedRewrite, true);
+
+    await kv.put(`${Database.PREFIX}backup`, JSON.stringify({
+      ...managedBackup,
+      playbackInfoMode: "rewrite",
+      mediaAggregationManagedRewrite: false
+    }));
+    const disabledResponse = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+      selectedNodeNames: [],
+      username: "global-user"
+    }, { env, ctx: null, kv });
+    assert.equal(disabledResponse.status, 200);
+    const disabledConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    assert.equal(disabledConfig.mediaAggregationMatchMode, "strict");
+    assert.equal(disabledConfig.mediaAggregationFirstResultTimeoutMs, 2200);
+    assert.equal(disabledConfig.mediaAggregationGracePeriodMs, 600);
+    const restoredPrimary = await kv.get(`${Database.PREFIX}primary`, { type: "json" });
+    const preservedBackup = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    assert.equal(restoredPrimary.playbackInfoMode, "inherit");
+    assert.equal(restoredPrimary.mediaAggregationManagedRewrite, false);
+    assert.equal(preservedBackup.playbackInfoMode, "rewrite");
+    assert.equal(preservedBackup.mediaAggregationManagedRewrite, false);
   } finally {
     invalidateRuntimeConfigCache();
   }

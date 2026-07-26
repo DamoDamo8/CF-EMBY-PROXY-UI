@@ -178,6 +178,10 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #node-modal [data-admin-node-media-credentials-grid="1"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}
 @media (max-width:767px){#node-modal [data-admin-node-media-credentials-grid="1"]{grid-template-columns:minmax(0,1fr)}}
 #view-settings [data-media-aggregation-actions="1"]{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.75rem}
+#view-settings [data-poster-metadata-grid="1"]{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.75rem}
+#view-settings [data-poster-metadata-status="1"]{display:inline-flex;align-items:center;min-height:2.5rem;padding:.5rem .75rem;border:1px solid var(--settings-border);border-radius:max(12px,var(--ui-control-radius-px));background:var(--settings-soft);font-size:.8125rem;line-height:1.25rem;color:#475569}
+.dark #view-settings [data-poster-metadata-status="1"]{color:#cbd5e1}
+#view-settings [data-poster-metadata-actions="1"]{display:flex;align-items:center;justify-content:space-between;gap:.75rem;margin-top:.75rem}
 #view-settings .ui-block-head,
 #view-settings .settings-nav-shell .border-b,
 #view-settings #settings-forms>div>.ui-settings-panel+.ui-settings-panel{border-color:var(--settings-border) !important}
@@ -214,7 +218,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-settings button:disabled,
 #view-settings .settings-secondary-btn:disabled,
 #view-settings .set-tab:disabled{opacity:.65 !important;pointer-events:none}
-@media (max-width:767px){#view-nodes [data-admin-node-toolbar-row="1"],#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:minmax(0,1fr)}#view-nodes [data-admin-node-toolbar-row="1"]>*{width:100%}#view-settings .settings-view-layout{display:flex;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-grid="1"],#view-settings [data-media-aggregation-credentials="1"]{grid-template-columns:minmax(0,1fr)}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"],#view-settings [data-media-aggregation-actions="1"]{align-items:stretch;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"] button,#view-settings [data-media-aggregation-actions="1"] button{width:100%}}
+@media (max-width:767px){#view-nodes [data-admin-node-toolbar-row="1"],#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:minmax(0,1fr)}#view-nodes [data-admin-node-toolbar-row="1"]>*{width:100%}#view-settings .settings-view-layout{display:flex;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-grid="1"],#view-settings [data-media-aggregation-credentials="1"],#view-settings [data-poster-metadata-grid="1"]{grid-template-columns:minmax(0,1fr)}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"],#view-settings [data-media-aggregation-actions="1"],#view-settings [data-poster-metadata-actions="1"]{align-items:stretch;flex-direction:column}#view-settings .settings-worker-html-update-card [data-admin-worker-html-actions="1"] button,#view-settings [data-media-aggregation-actions="1"] button,#view-settings [data-poster-metadata-actions="1"] button{width:100%}}
 @media (min-width:768px) and (max-width:1535px){#view-nodes [data-admin-node-toolbar-actions="1"]{grid-template-columns:repeat(3,minmax(0,1fr));width:100%}#view-nodes [data-admin-node-toolbar-actions="1"]>*{width:100%}}
 @media (min-width:1536px){#view-nodes [data-admin-node-toolbar="1"]{grid-template-columns:minmax(0,1fr) max-content}#view-nodes [data-admin-node-toolbar-actions="1"]{justify-content:end}}
 @media (min-width:768px){#app-shell.settings-split-layout #content-area{overflow:hidden}#app-shell.settings-split-layout #view-settings{height:100%;min-height:0;overflow:hidden}#app-shell.settings-split-layout #view-settings .settings-view-layout{height:100%;min-height:0}#app-shell.settings-split-layout #view-settings .settings-nav-shell{position:sticky;top:0;max-height:100%;overflow-y:auto;flex:0 0 auto}#app-shell.settings-split-layout #view-settings #settings-forms{height:100%;min-height:0;overflow-y:auto;padding-right:.25rem;scrollbar-gutter:stable}}
@@ -236,8 +240,8 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-dashboard [data-dashboard-traffic-toggle="1"] i,#view-dashboard [data-dashboard-traffic-toggle="1"] svg{width:1rem;height:1rem}
 .dark #view-dashboard [data-dashboard-traffic-toggle="1"]{border-color:#334155;background:rgba(15,23,42,.92);color:#cbd5e1}
 .dark #view-dashboard [data-dashboard-traffic-toggle="1"]:hover{border-color:#64748b;background:#111827;color:#34d399}
-#view-server-records{--record-border:#e2e8f0;--record-soft:#f8fafc;--record-surface:#fff;--record-text:#0f172a;--record-muted:#64748b}
-.dark #view-server-records{--record-border:#1e293b;--record-soft:#0f172a;--record-surface:#020617;--record-text:#f8fafc;--record-muted:#94a3b8}
+#view-server-records{--record-border:#e2e8f0;--record-soft:#f8fafc;--record-surface:#fff;--record-transition:#eef2f7;--record-text:#0f172a;--record-muted:#64748b}
+.dark #view-server-records{--record-border:#1e293b;--record-soft:#0f172a;--record-surface:#020617;--record-transition:#08111f;--record-text:#f8fafc;--record-muted:#94a3b8}
 #view-server-records .server-record-toolbar{display:flex;align-items:center;justify-content:space-between;gap:1rem;margin-bottom:1.5rem}
 #view-server-records .server-record-toolbar-copy{min-width:0}
 #view-server-records .server-record-toolbar-actions{display:flex;align-items:center;gap:.5rem}
@@ -254,17 +258,18 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-expiry-filter>svg,#view-server-records .server-record-expiry-filter>i{position:absolute;left:.8rem;top:50%;z-index:1;width:1rem;height:1rem;transform:translateY(-50%);color:#94a3b8;pointer-events:none}
 #view-server-records .server-record-expiry-filter select{width:100%;height:2.5rem;border:1px solid var(--record-border);background:var(--record-surface);padding:.5rem 2rem .5rem 2.4rem;color:var(--record-text);font-size:.8125rem;outline:none}
 #view-server-records .server-record-expiry-filter select:focus{border-color:#60a5fa;box-shadow:0 0 0 3px rgba(59,130,246,.12)}
-#view-server-records .server-record-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,20rem),1fr));gap:1rem}
-#view-server-records .server-record-card{position:relative;display:flex;min-height:20rem;flex-direction:column;overflow:hidden;border:1px solid var(--record-border);border-radius:var(--ui-radius-px);background:var(--record-surface);padding:1.25rem;box-shadow:0 8px 24px rgba(15,23,42,.04);transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease}
+#view-server-records .server-record-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,30rem),1fr));gap:1rem}
+#view-server-records .server-record-card{position:relative;display:flex;min-width:0;min-height:22rem;flex-direction:column;gap:1rem;overflow:hidden;border:1px solid var(--record-border);border-radius:var(--ui-radius-px);background:var(--record-surface);padding:1rem;box-shadow:0 8px 24px rgba(15,23,42,.04);transition:border-color .2s ease,box-shadow .2s ease,transform .2s ease}
 #view-server-records .server-record-card:hover{transform:translateY(-2px);border-color:#cbd5e1;box-shadow:0 16px 32px rgba(15,23,42,.07)}
 .dark #view-server-records .server-record-card:hover{border-color:#475569;box-shadow:0 16px 32px rgba(2,6,23,.32)}
 #view-server-records .server-record-card.is-expiring,#view-server-records .server-record-card.is-expired{border-color:#fecdd3}
 .dark #view-server-records .server-record-card.is-expiring,.dark #view-server-records .server-record-card.is-expired{border-color:rgba(244,63,94,.42)}
 #view-server-records .server-record-card.is-expiring:before,#view-server-records .server-record-card.is-expired:before{position:absolute;inset:0 0 auto;height:3px;background:#f43f5e;content:""}
-#view-server-records .server-record-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem}
-#view-server-records .server-record-title{margin:0;font-size:1.125rem;line-height:1.5rem;font-weight:700;color:var(--record-text);overflow-wrap:anywhere}
-#view-server-records .server-record-badges{display:flex;flex-wrap:wrap;gap:.4rem;margin-top:.65rem}
-#view-server-records .server-record-badge{display:inline-flex;align-items:center;gap:.35rem;border-radius:9999px;padding:.25rem .55rem;font-size:.6875rem;line-height:1rem;font-weight:600}
+#view-server-records .server-record-card-head{display:flex;min-width:0;align-items:center;justify-content:space-between;gap:.75rem;border-bottom:1px solid var(--record-border);padding-bottom:.75rem}
+#view-server-records .server-record-card-identity{display:flex;min-width:0;flex:1;align-items:center;flex-wrap:wrap;gap:.4rem}
+#view-server-records .server-record-title{min-width:0;margin:0 .15rem 0 0;color:var(--record-text);font-size:1.125rem;line-height:1.5rem;font-weight:700;overflow-wrap:anywhere}
+#view-server-records .server-record-badges{display:flex;min-width:0;align-items:center;flex-wrap:wrap;gap:.3rem}
+#view-server-records .server-record-badge{display:inline-flex;max-width:100%;align-items:center;gap:.3rem;border-radius:9999px;padding:.2rem .45rem;font-size:.625rem;line-height:.9rem;font-weight:600;overflow-wrap:anywhere}
 #view-server-records .server-record-badge.tag{background:#f1f5f9;color:#475569}.dark #view-server-records .server-record-badge.tag{background:#1e293b;color:#cbd5e1}
 #view-server-records .server-record-badge.online{background:#ecfdf5;color:#047857}.dark #view-server-records .server-record-badge.online{background:rgba(16,185,129,.12);color:#6ee7b7}
 #view-server-records .server-record-badge.expiring,#view-server-records .server-record-badge.expired{background:#fff1f2;color:#e11d48}.dark #view-server-records .server-record-badge.expiring,.dark #view-server-records .server-record-badge.expired{background:rgba(244,63,94,.12);color:#fda4af}
@@ -272,27 +277,34 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-badge.maintenance{background:#fffbeb;color:#b45309}.dark #view-server-records .server-record-badge.maintenance{background:rgba(245,158,11,.12);color:#fcd34d}
 #view-server-records .server-record-badge.offline{background:#f1f5f9;color:#64748b}.dark #view-server-records .server-record-badge.offline{background:#1e293b;color:#94a3b8}
 #view-server-records .server-record-dot{width:.4rem;height:.4rem;border-radius:9999px;background:currentColor}
-#view-server-records .server-record-icon{display:flex;width:2.5rem;height:2.5rem;flex:0 0 2.5rem;align-items:center;justify-content:center;border-radius:9999px;background:var(--record-soft);color:#94a3b8}
-#view-server-records .server-record-icon svg{width:1.125rem;height:1.125rem}
-#view-server-records .server-record-icon.online{background:#ecfdf5;color:#059669}.dark #view-server-records .server-record-icon.online{background:rgba(16,185,129,.12);color:#6ee7b7}
-#view-server-records .server-record-icon.offline{background:#fef2f2;color:#dc2626}.dark #view-server-records .server-record-icon.offline{background:rgba(239,68,68,.12);color:#fca5a5}
-#view-server-records .server-record-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));margin-top:1.25rem;border-top:1px solid var(--record-border);border-bottom:1px solid var(--record-border);padding:1rem 0}
-#view-server-records .server-record-metric{min-width:0;padding:0 .75rem;border-right:1px solid var(--record-border)}
-#view-server-records .server-record-metric:first-child{padding-left:0}#view-server-records .server-record-metric:last-child{padding-right:0;border-right:0}
-#view-server-records .server-record-metric-label{display:block;font-size:.6875rem;color:var(--record-muted)}
-#view-server-records .server-record-metric-value{display:block;margin-top:.2rem;font-size:1rem;font-weight:650;color:var(--record-text);overflow:hidden;text-overflow:ellipsis}
+#view-server-records .server-record-split{display:grid;min-width:0;flex:1;grid-template-columns:minmax(7.5rem,4fr) minmax(0,8fr);gap:1rem;align-items:center}
+#view-server-records .server-record-info{display:flex;min-width:0;height:100%;flex-direction:column;justify-content:center;gap:.75rem}
+#view-server-records .server-record-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.4rem}
+#view-server-records .server-record-metric{display:grid;min-width:0;gap:.1rem;border:1px solid var(--record-border);border-radius:max(6px,calc(var(--ui-control-radius-px) - 2px));background:var(--record-soft);padding:.5rem .35rem;text-align:center}
+#view-server-records .server-record-metric-label{display:block;font-size:.625rem;line-height:.9rem;color:var(--record-muted)}
+#view-server-records .server-record-metric-value{display:block;min-width:0;color:var(--record-text);font-size:.8125rem;line-height:1rem;font-weight:700;overflow:hidden;text-overflow:ellipsis}
 #view-server-records .server-record-details{display:grid;gap:.75rem;margin-top:1rem}
 #view-server-records .server-record-detail{display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;font-size:.8125rem}
 #view-server-records .server-record-detail-label{color:var(--record-muted)}#view-server-records .server-record-detail-value{max-width:65%;color:var(--record-text);font-weight:550;text-align:right;overflow-wrap:anywhere}
 #view-server-records .server-record-detail-value.is-warning{color:#e11d48}
-#view-server-records .server-record-expiry{display:grid;gap:.6rem;border:1px solid var(--record-border);border-radius:var(--ui-control-radius-px);background:var(--record-soft);padding:.8rem .9rem}
-#view-server-records .server-record-expiry.is-warning{border-color:#fecdd3;background:#fff1f2}.dark #view-server-records .server-record-expiry.is-warning{border-color:rgba(244,63,94,.35);background:rgba(244,63,94,.08)}
-#view-server-records .server-record-expiry-head,#view-server-records .server-record-expiry-body{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
-#view-server-records .server-record-expiry-label{font-size:.75rem;color:var(--record-muted)}
-#view-server-records .server-record-expiry-mode{font-size:.6875rem;font-weight:650;color:var(--record-muted)}
-#view-server-records .server-record-expiry-date{min-width:0;color:var(--record-text);font-size:.9375rem;line-height:1.25rem;overflow-wrap:anywhere}
-#view-server-records .server-record-expiry-remaining{flex:0 0 auto;color:var(--record-text);font-size:.8125rem;font-weight:650}.server-record-expiry.is-warning .server-record-expiry-remaining{color:#e11d48}
-#view-server-records .server-record-card-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr) 2.5rem;align-items:center;gap:.75rem;margin-top:auto;padding-top:1.25rem}
+#view-server-records .server-record-watch{display:grid;min-width:0;gap:.2rem;border:1px solid var(--record-border);border-radius:max(6px,calc(var(--ui-control-radius-px) - 1px));background:var(--record-soft);padding:.75rem}
+#view-server-records .server-record-watch-poster{position:relative;width:100%;aspect-ratio:2/3;overflow:hidden;border:1px solid var(--record-border);border-radius:max(6px,calc(var(--ui-control-radius-px) + 2px));background:var(--record-soft);color:#94a3b8}
+#view-server-records .server-record-watch-poster img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#view-server-records .server-record-watch-poster img[hidden]{display:none}
+#view-server-records .server-record-watch-placeholder{display:flex;width:100%;height:100%;flex-direction:column;align-items:center;justify-content:center;gap:.35rem;color:var(--record-muted);font-size:.625rem;font-weight:600;text-align:center}
+#view-server-records .server-record-watch-placeholder svg{width:2rem;height:2rem;stroke-width:1.5}
+#view-server-records .server-record-watch-label{font-size:.625rem;line-height:.9rem;font-weight:700;color:#4f46e5;text-transform:uppercase}.dark #view-server-records .server-record-watch-label{color:#818cf8}
+#view-server-records .server-record-watch-title{display:-webkit-box;overflow:hidden;color:var(--record-text);font-size:.8125rem;line-height:1.15rem;font-weight:700;overflow-wrap:anywhere;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+#view-server-records .server-record-watch-time{overflow:hidden;color:var(--record-muted);font-size:.6875rem;line-height:1rem;text-overflow:ellipsis;white-space:nowrap}
+#view-server-records .server-record-expiry{display:flex;min-width:0;align-items:flex-start;justify-content:space-between;gap:.75rem;padding-top:.15rem;color:var(--record-muted)}
+#view-server-records .server-record-expiry.is-warning{color:#e11d48}
+#view-server-records .server-record-expiry-head,#view-server-records .server-record-expiry-body{display:grid;min-width:0;gap:.1rem}
+#view-server-records .server-record-expiry-body{text-align:right}
+#view-server-records .server-record-expiry-label{font-size:.6875rem;line-height:1rem;color:currentColor}
+#view-server-records .server-record-expiry-mode{font-size:.625rem;line-height:.9rem;font-weight:650;color:currentColor}
+#view-server-records .server-record-expiry-date{min-width:0;color:var(--record-text);font-size:.6875rem;line-height:1rem;overflow-wrap:anywhere}
+#view-server-records .server-record-expiry-remaining{color:var(--record-text);font-size:.6875rem;line-height:1rem;font-weight:650}.server-record-expiry.is-warning .server-record-expiry-remaining{color:#e11d48}
+#view-server-records .server-record-card-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr) 2.5rem;align-items:center;gap:.75rem;border-top:1px solid var(--record-border);background:transparent;padding-top:.75rem}
 #view-server-records .server-record-card-actions.single{grid-template-columns:minmax(0,1fr)}
 #view-server-records .server-record-icon-button{display:inline-flex;width:2.5rem;height:2.5rem;align-items:center;justify-content:center;border:1px solid var(--record-border);border-radius:var(--ui-control-radius-px);background:var(--record-surface);color:var(--record-muted)}
 #view-server-records .server-record-icon-button:hover{border-color:#94a3b8;color:var(--record-text)}#view-server-records .server-record-icon-button.danger:hover{border-color:#fecaca;color:#dc2626;background:#fef2f2}
@@ -302,6 +314,8 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-runtime-status.online{border-color:#a7f3d0;background:#ecfdf5;color:#047857}.dark #view-server-records .server-record-runtime-status.online{border-color:rgba(16,185,129,.3);background:rgba(16,185,129,.12);color:#6ee7b7}
 #view-server-records .server-record-runtime-status.maintenance{border-color:#fde68a;background:#fffbeb;color:#b45309}.dark #view-server-records .server-record-runtime-status.maintenance{border-color:rgba(245,158,11,.3);background:rgba(245,158,11,.12);color:#fcd34d}
 #view-server-records .server-record-runtime-status.offline{border-color:#fecaca;background:#fef2f2;color:#b91c1c}.dark #view-server-records .server-record-runtime-status.offline{border-color:rgba(239,68,68,.3);background:rgba(239,68,68,.12);color:#fca5a5}
+#view-server-records .server-record-card.is-legacy{min-height:20rem;padding:1.25rem}
+#view-server-records .server-record-card.is-legacy .server-record-card-actions{margin-top:auto;border-top:0;padding:1.25rem 0 0}
 #view-server-records button:disabled{cursor:not-allowed;opacity:.55;transform:none;box-shadow:none}
 #view-server-records .server-record-empty{grid-column:1/-1;border:1px dashed var(--record-border);border-radius:var(--ui-radius-px);padding:3.5rem 1.5rem;text-align:center;color:var(--record-muted)}
 #view-server-records .server-record-empty-icon{display:flex;width:3rem;height:3rem;margin:0 auto 1rem;align-items:center;justify-content:center;border-radius:9999px;background:var(--record-soft);color:#94a3b8}
@@ -345,7 +359,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #server-record-dialog .server-record-dialog-secondary,#server-record-dialog .server-record-dialog-submit{min-height:2.5rem;border-radius:var(--ui-control-radius-px,10px);padding:.6rem 1rem;font-size:.8125rem;font-weight:600}
 #server-record-dialog .server-record-dialog-secondary{border:1px solid #cbd5e1;color:#475569}.dark #server-record-dialog .server-record-dialog-secondary,#server-record-dialog.dark .server-record-dialog-secondary{border-color:#475569;color:#cbd5e1}
 #server-record-dialog .server-record-dialog-submit{background:#2563eb;color:#fff}#server-record-dialog .server-record-dialog-submit:hover{background:#1d4ed8}
-@media(max-width:639px){#view-server-records .server-record-toolbar{align-items:stretch;flex-direction:column}#view-server-records .server-record-toolbar-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr)}#view-server-records .server-record-add{width:100%}#view-server-records .server-record-filter-row{grid-template-columns:minmax(0,1fr)}#view-server-records .server-record-expiry-body{align-items:flex-start;flex-direction:column;gap:.35rem}#server-record-dialog .server-record-form-grid,#server-record-dialog .server-record-resource-grid{grid-template-columns:minmax(0,1fr)}#server-record-dialog .server-record-form-field.span-2{grid-column:auto}}
+@media(max-width:639px){#view-server-records .server-record-toolbar{align-items:stretch;flex-direction:column}#view-server-records .server-record-toolbar-actions{display:grid;grid-template-columns:2.5rem minmax(0,1fr)}#view-server-records .server-record-add{width:100%}#view-server-records .server-record-filter-row{grid-template-columns:minmax(0,1fr)}#view-server-records .server-record-card{padding:.875rem}#view-server-records .server-record-card-head{align-items:flex-start}#view-server-records .server-record-split{grid-template-columns:minmax(6.75rem,4fr) minmax(0,8fr);gap:.75rem}#view-server-records .server-record-expiry{align-items:flex-start;flex-direction:column;gap:.25rem}#view-server-records .server-record-expiry-body{text-align:left}#server-record-dialog .server-record-form-grid,#server-record-dialog .server-record-resource-grid{grid-template-columns:minmax(0,1fr)}#server-record-dialog .server-record-form-field.span-2{grid-column:auto}}
 </style><script data-admin-runtime-enhancements="1">
 (() => {
   if (window.__ADMIN_RUNTIME_ENHANCEMENTS_READY__) return;
@@ -363,6 +377,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
   let shellFrameId = 0;
   let nodeModalWasOpen = false;
   let patchedSafetyContractApp = null;
+  let patchedPosterMetadataAccountApp = null;
   let patchedMediaAggregationNodeApp = null;
   let patchedServerRecordsApp = null;
   const dashboardTrafficState = {
@@ -411,6 +426,9 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     password: '',
     hasPassword: false,
     bidirectionalProgressEnabled: false,
+    matchMode: 'title_year',
+    firstResultTimeoutMs: 1500,
+    gracePeriodMs: 800,
     search: '',
     hydrated: false,
     loading: false,
@@ -419,6 +437,18 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     draftRevision: 0,
     dirty: false,
     renderSignature: ''
+  };
+  const posterMetadataState = {
+    root: null,
+    tmdbConfigured: false,
+    tmdbStorage: 'none',
+    draftKey: '',
+    removeRequested: false,
+    hydrated: false,
+    loading: false,
+    loadAttempted: false,
+    pending: false,
+    hydrationSeq: 0
   };
   const serverRecordsUiState = {
     records: [],
@@ -437,6 +467,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     refreshingNodes: [],
     deletingNodes: [],
     loadSeq: 0,
+    nodeRefreshSeq: new Map(),
     dialogTrigger: null,
     saving: false,
     error: ''
@@ -969,15 +1000,21 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       ['补齐列', initialization.adjustedColumns],
       ['新建索引', initialization.createdIndexes],
       ['修复索引', initialization.repairedIndexes],
-      ['移除旧索引', initialization.droppedRetiredIndexes]
+      ['移除旧索引', initialization.droppedRetiredIndexes],
+      ['采纳迁移基线', initialization.adoptedMigrations || result?.adoptedMigrations]
     ];
     const actionLines = groups
       .filter(([, items]) => Array.isArray(items) && items.length > 0)
       .map(([label, items]) => '• ' + label + '：' + items.join('、'));
     if (initialization.ftsRecreated === true) actionLines.push('• 重建异常 FTS 派生表');
     else if (initialization.ftsRebuilt === true) actionLines.push('• 重建 FTS 全文索引');
+    if (initialization.migrationTableCreated === true) actionLines.push('• 新建并校验 d1_migrations');
     if (!actionLines.length) actionLines.push('• 当前结构无需调整');
-    return formatD1SchemaStatus(result?.status || {}) + '\n\n本次自动调整：\n' + actionLines.join('\n');
+    const recoveryBookmark = String(result?.recoveryBookmark || initialization.recoveryBookmark || '').trim();
+    const bookmarkSection = recoveryBookmark
+      ? '\n\n初始化前 Time Travel Bookmark：\n' + recoveryBookmark
+      : '';
+    return formatD1SchemaStatus(result?.status || {}) + '\n\n本次自动调整：\n' + actionLines.join('\n') + bookmarkSection;
   }
 
   function getDashboardTrafficNodes() {
@@ -1258,11 +1295,20 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
         series: Number.isFinite(Number(counts.series ?? source.series)) ? Math.max(0, Math.round(Number(counts.series ?? source.series))) : null,
         episodes: Number.isFinite(Number(counts.episodes ?? source.episodes)) ? Math.max(0, Math.round(Number(counts.episodes ?? source.episodes))) : null,
         state: String(counts.state || 'unavailable').trim(),
-        errors: counts.errors && typeof counts.errors === 'object' ? counts.errors : {}
+        errors: counts.errors && typeof counts.errors === 'object' ? counts.errors : {},
+        checkedAt: String(counts.checkedAt || '').trim(),
+        source: ['live', 'persisted'].includes(String(counts.source || '').trim()) ? String(counts.source).trim() : 'unavailable',
+        persisted: counts.persisted === true
       },
       watch: {
         lastWatchedAt: String(watch.lastWatchedAt || source.lastWatched || '').trim(),
-        state: String(watch.state || 'unavailable').trim()
+        state: String(watch.state || 'unavailable').trim(),
+        itemId: String(watch.itemId || '').trim(),
+        itemName: String(watch.itemName || '').trim().slice(0, 256),
+        itemType: String(watch.itemType || '').trim().slice(0, 64),
+        seriesName: String(watch.seriesName || '').trim().slice(0, 256),
+        imageTag: String(watch.imageTag || '').trim().slice(0, 256),
+        posterUrl: String(watch.posterUrl || '').trim().startsWith('/') ? String(watch.posterUrl).trim() : ''
       },
       expiry: {
         enabled: expiryEnabled,
@@ -1474,6 +1520,12 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
   async function refreshSingleServerRecord(app, nodeName = '') {
     const normalizedNodeName = String(nodeName || '').trim().toLowerCase();
     if (!app || !normalizedNodeName || serverRecordsUiState.loading || serverRecordsUiState.refreshingAll || serverRecordsUiState.refreshingNodes.includes(normalizedNodeName) || serverRecordsUiState.deletingNodes.includes(normalizedNodeName)) return;
+    const refreshSeq = (Number(serverRecordsUiState.nodeRefreshSeq.get(normalizedNodeName)) || 0) + 1;
+    const loadSeq = serverRecordsUiState.loadSeq;
+    serverRecordsUiState.nodeRefreshSeq.set(normalizedNodeName, refreshSeq);
+    const isCurrentRefresh = () => serverRecordsUiState.nodeRefreshSeq.get(normalizedNodeName) === refreshSeq
+      && serverRecordsUiState.loadSeq === loadSeq
+      && !serverRecordsUiState.deletingNodes.includes(normalizedNodeName);
     serverRecordsUiState.refreshingNodes = [...serverRecordsUiState.refreshingNodes, normalizedNodeName];
     renderServerRecordsView(app);
     try {
@@ -1481,11 +1533,8 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       const refreshed = (Array.isArray(result?.records) ? result.records : [])
         .map(normalizeServerRecord)
         .find((record) => record.nodeName === normalizedNodeName);
-      if (refreshed) {
+      if (refreshed && isCurrentRefresh()) {
         serverRecordsUiState.records = serverRecordsUiState.records.map((record) => record.nodeName === normalizedNodeName ? refreshed : record);
-      }
-      if (Array.isArray(result?.availableNodes)) {
-        serverRecordsUiState.availableNodes = result.availableNodes.map(normalizeAvailableServerRecordNode).filter((node) => node.nodeName);
       }
     } catch (error) {
       console.error('refresh server record failed', error);
@@ -1510,18 +1559,14 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
         expiryDays: Number.isInteger(record.expiry.expiryDays) ? record.expiry.expiryDays : record.expiryDays
       };
     }
-    if (record.expiresAt) {
-      const expiry = new Date(record.expiresAt + 'T00:00:00');
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      if (!Number.isNaN(expiry.getTime())) {
-        const days = Math.ceil((expiry.getTime() - today.getTime()) / 86400000);
-        if (days < 0) return { key: 'expired', label: '已到期', days, expiresAt: record.expiresAt, mode: 'fixed', expiryDays: null };
-        if (days <= 7) return { key: 'expiring', label: '即将到期', days, expiresAt: record.expiresAt, mode: 'fixed', expiryDays: null };
-        return { key: 'valid', label: '有效', days, expiresAt: record.expiresAt, mode: 'fixed', expiryDays: null };
-      }
-    }
-    return { key: 'unset', label: '未设置到期', days: null, expiresAt: '', mode: record.expiryMode || 'rolling', expiryDays: record.expiryDays || 30 };
+    return {
+      key: 'unset',
+      label: '未设置到期',
+      days: null,
+      expiresAt: String(record.expiresAt || '').trim(),
+      mode: record.expiryMode || 'rolling',
+      expiryDays: record.expiryDays || 30
+    };
   }
 
   function getServerRecordRuntimeStatus(record = {}) {
@@ -1573,14 +1618,30 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     const tags = record.tags.map((tag) => '<span class="server-record-badge tag">' + escapeServerRecordHtml(tag) + '</span>').join('');
     const expiryBadge = expiryEnabled ? '<span class="server-record-badge ' + escapeServerRecordHtml(expiry.key) + '">' + escapeServerRecordHtml(expiry.label) + '</span>' : '';
     const warningClass = expiryEnabled && (expiry.key === 'expired' || expiry.key === 'expiring') ? ' is-warning' : '';
-    const countTitle = record.counts.state === 'partial' ? '部分媒体统计读取失败' : record.counts.state === 'unavailable' ? '尚未手动刷新或媒体统计不可用' : '';
+    const countTitle = record.counts.source === 'persisted'
+      ? (record.counts.state === 'partial'
+          ? '已保存的部分媒体统计，更新时间 ' + formatServerRecordDateTime(record.counts.checkedAt) + '；未取得的项目显示为 --'
+          : '已保存的媒体统计，更新时间 ' + formatServerRecordDateTime(record.counts.checkedAt))
+      : record.counts.persisted
+        ? (record.counts.state === 'partial'
+            ? '实时部分媒体统计已保存，更新时间 ' + formatServerRecordDateTime(record.counts.checkedAt) + '；未取得的项目显示为 --'
+            : '实时媒体统计已保存，更新时间 ' + formatServerRecordDateTime(record.counts.checkedAt))
+        : record.counts.state === 'partial'
+          ? '部分媒体统计读取失败'
+          : record.counts.state === 'unavailable' ? '尚未手动刷新或媒体统计不可用' : '';
     const lastWatchedText = record.watch.state === 'ok' ? formatServerRecordDateTime(record.watch.lastWatchedAt) : '数据不可用';
+    const watchTitle = record.watch.itemName
+      ? (record.watch.seriesName && record.watch.seriesName !== record.watch.itemName ? record.watch.seriesName + ' · ' + record.watch.itemName : record.watch.itemName)
+      : (record.watch.itemId ? '最近观看媒体' : '尚未记录媒体');
+    const watchPoster = '<div class="server-record-watch-poster"><span class="server-record-watch-placeholder" aria-hidden="true"><i data-lucide="image"></i><span>2:3 海报框</span></span>'
+      + (record.watch.posterUrl ? '<img data-server-record-poster src="' + escapeServerRecordHtml(record.watch.posterUrl) + '" alt="' + escapeServerRecordHtml(watchTitle + ' 海报') + '" loading="lazy" decoding="async" referrerpolicy="no-referrer">' : '') + '</div>';
+    const watchSection = '<div class="server-record-watch"><span class="server-record-watch-label">上次观看</span><strong class="server-record-watch-title" title="' + escapeServerRecordHtml(watchTitle) + '">' + escapeServerRecordHtml(watchTitle) + '</strong><span class="server-record-watch-time">' + escapeServerRecordHtml(lastWatchedText) + '</span></div>';
     const expiryDateText = expiry.expiresAt || '等待播放记录';
     const expirySection = expiryEnabled ? '<div class="server-record-expiry' + warningClass + '"><div class="server-record-expiry-head"><span class="server-record-expiry-label">预计过期</span><span class="server-record-expiry-mode">' + escapeServerRecordHtml(formatServerRecordExpiryMode(expiry)) + '</span></div><div class="server-record-expiry-body"><strong class="server-record-expiry-date">' + escapeServerRecordHtml(expiryDateText) + '</strong><span class="server-record-expiry-remaining">' + escapeServerRecordHtml(formatServerRecordExpiry(record, expiry)) + '</span></div></div>' : '';
     return '<article class="server-record-card' + (expiryEnabled ? ' is-' + expiry.key : '') + '" data-server-record-card="' + escapeServerRecordHtml(record.nodeName) + '">'
-      + '<div class="server-record-card-head"><div><h3 class="server-record-title">' + escapeServerRecordHtml(record.displayName) + '</h3><div class="server-record-badges">' + tags + expiryBadge + '</div></div><button type="button" class="server-record-icon-button server-record-card-refresh" data-server-record-refresh-one="' + escapeServerRecordHtml(record.nodeName) + '" title="刷新此服务器的状态、资源统计和预计过期" aria-label="刷新 ' + escapeServerRecordHtml(record.displayName) + ' 的服务器状态、资源统计和预计过期"' + (actionLocked ? ' disabled' : '') + (refreshing ? ' aria-busy="true"' : '') + '><i data-lucide="' + (refreshing ? 'loader-circle' : 'refresh-cw') + '" class="w-4 h-4' + (refreshing ? ' animate-spin' : '') + '" aria-hidden="true"></i></button></div>'
-      + '<div class="server-record-metrics" aria-label="媒体库统计" title="' + escapeServerRecordHtml(countTitle) + '"><div class="server-record-metric"><span class="server-record-metric-label">电影</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.movies) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">剧集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.series) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">单集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.episodes) + '</span></div></div>'
-      + '<div class="server-record-details"><div class="server-record-detail"><span class="server-record-detail-label">上次观看</span><span class="server-record-detail-value">' + escapeServerRecordHtml(lastWatchedText) + '</span></div>' + expirySection + '</div>'
+      + '<div class="server-record-card-head"><div class="server-record-card-identity"><h3 class="server-record-title">' + escapeServerRecordHtml(record.displayName) + '</h3><div class="server-record-badges">' + tags + expiryBadge + '</div></div><button type="button" class="server-record-icon-button server-record-card-refresh" data-server-record-refresh-one="' + escapeServerRecordHtml(record.nodeName) + '" title="刷新服务器状态并保存此节点的资源统计" aria-label="刷新 ' + escapeServerRecordHtml(record.displayName) + ' 的服务器状态并保存资源统计"' + (actionLocked ? ' disabled' : '') + (refreshing ? ' aria-busy="true"' : '') + '><i data-lucide="' + (refreshing ? 'loader-circle' : 'refresh-cw') + '" class="w-4 h-4' + (refreshing ? ' animate-spin' : '') + '" aria-hidden="true"></i></button></div>'
+      + '<div class="server-record-split">' + watchPoster + '<div class="server-record-info">' + watchSection
+      + '<div class="server-record-metrics" aria-label="媒体库统计" title="' + escapeServerRecordHtml(countTitle) + '"><div class="server-record-metric"><span class="server-record-metric-label">电影</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.movies) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">剧集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.series) + '</span></div><div class="server-record-metric"><span class="server-record-metric-label">单集</span><span class="server-record-metric-value">' + formatServerRecordNumber(record.counts.episodes) + '</span></div></div>' + expirySection + '</div></div>'
       + '<div class="server-record-card-actions"><button type="button" class="server-record-icon-button" data-server-record-edit="' + escapeServerRecordHtml(record.nodeName) + '" title="编辑记录" aria-label="编辑 ' + escapeServerRecordHtml(record.displayName) + '"' + (deleting ? ' disabled' : '') + '><i data-lucide="pencil" class="w-4 h-4" aria-hidden="true"></i></button><div class="server-record-runtime-status ' + runtime.key + '" role="status" aria-label="服务器状态：' + escapeServerRecordHtml(runtime.label) + '"><span class="server-record-dot" aria-hidden="true"></span><span>' + escapeServerRecordHtml(runtime.label) + '</span></div><button type="button" class="server-record-icon-button danger" data-server-record-delete="' + escapeServerRecordHtml(record.nodeName) + '" title="移除记录" aria-label="移除 ' + escapeServerRecordHtml(record.displayName) + '"' + (deleting ? ' disabled aria-busy="true"' : '') + '><i data-lucide="' + (deleting ? 'loader-circle' : 'trash-2') + '" class="w-4 h-4' + (deleting ? ' animate-spin' : '') + '" aria-hidden="true"></i></button></div></article>';
   }
 
@@ -1608,7 +1669,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     view = document.createElement('section');
     view.id = 'view-server-records';
     view.className = 'view-section w-full mx-auto';
-    view.innerHTML = '<div class="server-record-toolbar"><div class="server-record-toolbar-copy"><p class="server-record-kicker">SERVER OVERVIEW</p><h2 class="server-record-heading">服务器概览</h2><p class="server-record-summary" data-server-record-summary role="status" aria-live="polite" aria-atomic="true"></p></div><div class="server-record-toolbar-actions"><button type="button" class="server-record-icon-button" data-server-record-refresh title="刷新全部资源统计和预计过期" aria-label="刷新全部资源统计和预计过期"><i data-lucide="refresh-cw" class="w-4 h-4" aria-hidden="true"></i></button><button type="button" class="server-record-add" data-server-record-add><i data-lucide="plus" class="w-4 h-4" aria-hidden="true"></i>新增记录</button></div></div><div class="server-record-filter-row"><label class="server-record-search"><i data-lucide="search" aria-hidden="true"></i><span class="sr-only">搜索服务器记录</span><input type="search" data-server-record-search placeholder="搜索服务器名称或标签" autocomplete="off"></label><label class="server-record-expiry-filter"><i data-lucide="list-filter" aria-hidden="true"></i><span class="sr-only">按预计过期方式筛选</span><select data-server-record-expiry-mode-filter><option value="">全部到期方式</option><option value="rolling">滚动天数</option><option value="fixed">固定日期</option></select></label></div><div class="server-record-grid" data-server-record-grid aria-busy="false"></div>';
+    view.innerHTML = '<div class="server-record-toolbar"><div class="server-record-toolbar-copy"><p class="server-record-kicker">SERVER OVERVIEW</p><h2 class="server-record-heading">服务器概览</h2><p class="server-record-summary" data-server-record-summary role="status" aria-live="polite" aria-atomic="true"></p></div><div class="server-record-toolbar-actions"><button type="button" class="server-record-icon-button" data-server-record-refresh title="刷新服务器状态并保存全部资源统计" aria-label="刷新服务器状态并保存全部资源统计"><i data-lucide="refresh-cw" class="w-4 h-4" aria-hidden="true"></i></button><button type="button" class="server-record-add" data-server-record-add><i data-lucide="plus" class="w-4 h-4" aria-hidden="true"></i>新增记录</button></div></div><div class="server-record-filter-row"><label class="server-record-search"><i data-lucide="search" aria-hidden="true"></i><span class="sr-only">搜索服务器记录</span><input type="search" data-server-record-search placeholder="搜索服务器名称或标签" autocomplete="off"></label><label class="server-record-expiry-filter"><i data-lucide="list-filter" aria-hidden="true"></i><span class="sr-only">按预计过期方式筛选</span><select data-server-record-expiry-mode-filter><option value="">全部到期方式</option><option value="rolling">滚动天数</option><option value="fixed">固定日期</option></select></label></div><div class="server-record-grid" data-server-record-grid aria-busy="false"></div>';
     contentArea.insertBefore(view, document.getElementById('view-logs') || null);
     view.querySelector('[data-server-record-add]')?.addEventListener('click', () => openServerRecordDialog(app));
     view.querySelector('[data-server-record-refresh]')?.addEventListener('click', () => loadServerRecords(app, { forceRefresh: true }));
@@ -1642,13 +1703,16 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     const visibleLegacy = expiryModeFilter ? [] : (query ? legacyRecords.filter((record) => (record.name + ' ' + record.tags.join(' ')).toLowerCase().includes(query)) : legacyRecords);
     const expiringCount = records.filter((record) => ['expiring', 'expired'].includes(getServerRecordExpiryStatus(record).key)).length;
     const summary = view.querySelector('[data-server-record-summary]');
-    if (summary) summary.textContent = serverRecordsUiState.refreshingAll ? '正在手动刷新全部资源统计…' : (serverRecordsUiState.loading ? '正在读取服务器记录…' : '共 ' + records.length + ' 条记录' + (expiringCount ? '，' + expiringCount + ' 条即将或已经到期' : '') + (legacyRecords.length ? '，' + legacyRecords.length + ' 条待关联' : ''));
+    if (summary) summary.textContent = serverRecordsUiState.refreshingAll ? '正在刷新服务器状态并保存全部资源统计…' : (serverRecordsUiState.loading ? '正在读取服务器记录…' : '共 ' + records.length + ' 条记录' + (expiringCount ? '，' + expiringCount + ' 条即将或已经到期' : '') + (legacyRecords.length ? '，' + legacyRecords.length + ' 条待关联' : ''));
     const grid = view.querySelector('[data-server-record-grid]');
     if (!grid) return;
     grid.setAttribute('aria-busy', serverRecordsUiState.loading || serverRecordsUiState.refreshingAll ? 'true' : 'false');
     const cards = [...visible.map((record) => buildServerRecordCard(record)), ...visibleLegacy.map((record) => buildLegacyServerRecordCard(record))];
     const emptyText = serverRecordsUiState.error ? escapeServerRecordHtml(serverRecordsUiState.error) : (serverRecordsUiState.loading ? '正在加载服务器记录' : (records.length || legacyRecords.length ? '没有匹配的服务器记录' : '暂无服务器记录'));
     grid.innerHTML = cards.length ? cards.join('') : '<div class="server-record-empty"><span class="server-record-empty-icon"><i data-lucide="server" class="w-5 h-5" aria-hidden="true"></i></span><p class="font-medium text-slate-700 dark:text-slate-200">' + emptyText + '</p></div>';
+    grid.querySelectorAll('[data-server-record-poster]').forEach((image) => {
+      image.addEventListener('error', () => { image.hidden = true; }, { once: true });
+    });
     scheduleIconRefresh(view);
   }
 
@@ -2132,6 +2196,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     app.currentHash = serverRecordsHash;
     app.pageTitle = '服务器记录';
     app.sidebarOpen = false;
+    app.syncViewportState?.(serverRecordsHash);
     if (syncHash && window.location?.hash !== serverRecordsHash) window.history?.pushState?.(null, '', serverRecordsHash);
     enqueue(() => {
       const view = ensureServerRecordsView(app);
@@ -2234,6 +2299,293 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       app.syncSettingsFormFromRuntimeConfig(app.runtimeConfig || {});
     }
     syncServerExpirySettingsControls(app);
+  }
+
+  function readPosterMetadataState(payload = {}) {
+    const metadata = payload?.posterMetadata && typeof payload.posterMetadata === 'object'
+      ? payload.posterMetadata
+      : {};
+    const tmdbStorage = ['kv_config', 'worker_secret'].includes(metadata?.tmdb?.storage)
+      ? metadata.tmdb.storage
+      : 'none';
+    return {
+      tmdbConfigured: metadata?.tmdb?.configured === true,
+      tmdbStorage
+    };
+  }
+
+  const TMDB_API_KEY_INPUT_REGEX = /^[A-Za-z0-9_-]{16,256}$/;
+
+  function getPosterMetadataKeyInput() {
+    return posterMetadataState.root?.querySelector?.('[data-poster-metadata-tmdb-key="1"]') || null;
+  }
+
+  function syncPosterMetadataDraftFromInput() {
+    const input = getPosterMetadataKeyInput();
+    if (input) posterMetadataState.draftKey = String(input.value || '').trim();
+    if (posterMetadataState.draftKey) posterMetadataState.removeRequested = false;
+    return posterMetadataState.draftKey;
+  }
+
+  function getPosterMetadataAccountMutation() {
+    const tmdbApiKey = syncPosterMetadataDraftFromInput();
+    if (posterMetadataState.removeRequested) return { type: 'remove', tmdbApiKey: '' };
+    if (tmdbApiKey) return { type: posterMetadataState.tmdbStorage === 'kv_config' ? 'replace' : 'add', tmdbApiKey };
+    return null;
+  }
+
+  function applyPosterMetadataStatePayload(payload = {}) {
+    const nextState = readPosterMetadataState(payload);
+    posterMetadataState.tmdbConfigured = nextState.tmdbConfigured;
+    posterMetadataState.tmdbStorage = nextState.tmdbStorage;
+    posterMetadataState.hydrated = true;
+    return nextState;
+  }
+
+  function togglePosterMetadataRemoval(app) {
+    if (posterMetadataState.pending) return;
+    if (!posterMetadataState.removeRequested && posterMetadataState.tmdbStorage !== 'kv_config') return;
+    posterMetadataState.removeRequested = !posterMetadataState.removeRequested;
+    posterMetadataState.draftKey = '';
+    const input = getPosterMetadataKeyInput();
+    if (input) input.value = '';
+    syncPosterMetadataPanel(app);
+  }
+
+  function hideOriginalAccountSaveButton(settingsRoot, panel) {
+    settingsRoot.querySelectorAll?.('button').forEach((button) => {
+      if (panel.contains?.(button)
+        || button.getAttribute('data-account-settings-save') === '1'
+        || String(button.textContent || '').trim() !== '保存账号设置') return;
+      button.hidden = true;
+      button.tabIndex = -1;
+      button.setAttribute('aria-hidden', 'true');
+      button.setAttribute('data-account-save-replaced', '1');
+    });
+  }
+
+  function syncAccountSettingsSaveActions(settingsRoot, panel, app) {
+    let actions = document.getElementById('account-settings-save-actions');
+    if (!actions) {
+      actions = document.createElement('div');
+      actions.id = 'account-settings-save-actions';
+      actions.setAttribute('data-account-settings-save-actions', '1');
+      actions.className = 'flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 pt-4 dark:border-slate-800';
+      actions.innerHTML = '<button data-account-settings-save="1" type="button" class="inline-flex min-h-10 items-center justify-center rounded-control bg-brand-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-700"><i data-lucide="save" class="mr-2 h-4 w-4" aria-hidden="true"></i>保存账号设置</button>';
+      actions.querySelector('[data-account-settings-save="1"]')?.addEventListener('click', () => {
+        void app.saveSettings?.('account');
+      });
+      scheduleIconRefresh(actions);
+    }
+    if (panel.nextElementSibling !== actions) panel.insertAdjacentElement('afterend', actions);
+    const saveButton = actions.querySelector('[data-account-settings-save="1"]');
+    if (saveButton) {
+      saveButton.disabled = posterMetadataState.pending === true;
+      saveButton.setAttribute('aria-busy', posterMetadataState.pending === true ? 'true' : 'false');
+    }
+    return actions;
+  }
+
+  function syncPosterMetadataPanel(app) {
+    const settingsRoot = document.getElementById('set-account');
+    if (!settingsRoot || !app) return;
+    let panel = document.getElementById('poster-metadata-settings-panel');
+    if (!panel) {
+      panel = document.createElement('section');
+      panel.id = 'poster-metadata-settings-panel';
+      panel.setAttribute('data-poster-metadata-panel', '1');
+      panel.className = 'ui-settings-panel settings-block h-full';
+      panel.innerHTML = '<div class="ui-block-head"><div><div class="ui-section-kicker">POSTER METADATA</div><div class="ui-section-title">影视海报来源</div></div><i data-lucide="image" class="h-4 w-4 text-sky-600" aria-hidden="true"></i></div>'
+        + '<div data-poster-metadata-grid="1"><label class="block text-xs text-slate-500">TMDB v3 API Key<input data-poster-metadata-tmdb-key="1" type="password" autocomplete="new-password" spellcheck="false" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><div><span class="block text-xs text-slate-500">IMDb 识别</span><span data-poster-metadata-imdb="1" data-poster-metadata-status="1" class="mt-1">经 TMDB Find 解析</span></div></div>'
+        + '<div class="mt-3"><span data-poster-metadata-tmdb-status="1" data-poster-metadata-status="1">TMDB 密钥未配置</span><p class="mt-2 text-xs leading-5 text-slate-500">TMDB 直接 ID → IMDb ID 经 TMDB Find → Emby → 占位海报</p></div>'
+        + '<div data-poster-metadata-actions="1"><p class="text-xs leading-5 text-slate-500">管理台密钥保存至 KV 并优先生效；Worker Secret 仅作兼容兜底。快照与默认导出会自动脱敏。</p><div class="flex flex-wrap gap-2"><button data-poster-metadata-remove="1" type="button" class="settings-secondary-btn min-h-10 px-4 py-2 text-sm font-medium">移除 KV 密钥</button></div></div>';
+      panel.querySelector('[data-poster-metadata-tmdb-key="1"]')?.addEventListener('input', (event) => {
+        posterMetadataState.draftKey = String(event.currentTarget?.value || '').trim();
+        if (posterMetadataState.draftKey) posterMetadataState.removeRequested = false;
+        syncPosterMetadataPanel(app);
+      });
+      panel.querySelector('[data-poster-metadata-remove="1"]')?.addEventListener('click', () => {
+        togglePosterMetadataRemoval(app);
+      });
+      mountSensitiveInputToggle(panel.querySelector('[data-poster-metadata-tmdb-key="1"]'));
+      scheduleIconRefresh(panel);
+    }
+    if (panel.parentElement !== settingsRoot) settingsRoot.appendChild(panel);
+    const accountSaveActions = syncAccountSettingsSaveActions(settingsRoot, panel, app);
+    if (settingsRoot.lastElementChild !== accountSaveActions || accountSaveActions.previousElementSibling !== panel) {
+      settingsRoot.appendChild(panel);
+      settingsRoot.appendChild(accountSaveActions);
+    }
+    hideOriginalAccountSaveButton(settingsRoot, panel);
+    posterMetadataState.root = panel;
+    const input = panel.querySelector('[data-poster-metadata-tmdb-key="1"]');
+    if (input) {
+      mountSensitiveInputToggle(input);
+      if (posterMetadataState.removeRequested) input.value = '';
+      else if (!input.value && posterMetadataState.draftKey) input.value = posterMetadataState.draftKey;
+      const placeholder = posterMetadataState.tmdbStorage === 'kv_config'
+        ? '留空不会修改当前 KV 密钥'
+        : (posterMetadataState.tmdbStorage === 'worker_secret'
+            ? '输入 KV 密钥可覆盖 Worker Secret'
+            : '请输入 TMDB v3 API Key');
+      syncSensitiveInputPresentation(input, placeholder);
+      input.disabled = posterMetadataState.pending === true;
+    }
+    const tmdbStatus = panel.querySelector('[data-poster-metadata-tmdb-status="1"]');
+    if (tmdbStatus) {
+      tmdbStatus.textContent = posterMetadataState.removeRequested
+        ? 'TMDB KV 密钥将在保存账号设置后移除'
+        : (posterMetadataState.draftKey
+            ? (posterMetadataState.tmdbStorage === 'kv_config' ? 'TMDB KV 密钥待替换' : 'TMDB KV 密钥待新增')
+            : (posterMetadataState.tmdbStorage === 'kv_config'
+                ? 'TMDB 密钥已配置（KV，优先）'
+                : (posterMetadataState.tmdbStorage === 'worker_secret'
+                    ? 'TMDB 已通过 Worker Secret 配置（兼容兜底）'
+                    : 'TMDB 密钥未配置')));
+    }
+    const removeButton = panel.querySelector('[data-poster-metadata-remove="1"]');
+    if (removeButton) {
+      removeButton.disabled = posterMetadataState.pending === true
+        || (!posterMetadataState.removeRequested && posterMetadataState.tmdbStorage !== 'kv_config');
+      removeButton.setAttribute('aria-busy', posterMetadataState.pending === true ? 'true' : 'false');
+      removeButton.textContent = posterMetadataState.removeRequested ? '撤销移除' : '移除 KV 密钥';
+    }
+    if (!posterMetadataState.hydrated && !posterMetadataState.loading && !posterMetadataState.loadAttempted) {
+      void hydratePosterMetadataState(app);
+    }
+  }
+
+  async function hydratePosterMetadataState(app, force = false) {
+    if (!app || posterMetadataState.loading || (posterMetadataState.hydrated && !force)) return;
+    const hydrationSeq = (Number(posterMetadataState.hydrationSeq) || 0) + 1;
+    posterMetadataState.hydrationSeq = hydrationSeq;
+    posterMetadataState.loading = true;
+    posterMetadataState.loadAttempted = true;
+    try {
+      const payload = await app.apiCall('getSettingsBootstrap');
+      if (hydrationSeq !== posterMetadataState.hydrationSeq) return;
+      applyPosterMetadataStatePayload(payload);
+    } catch (error) {
+      if (hydrationSeq === posterMetadataState.hydrationSeq) console.error('hydratePosterMetadataState failed', error);
+    } finally {
+      if (hydrationSeq === posterMetadataState.hydrationSeq) {
+        posterMetadataState.loading = false;
+        syncPosterMetadataPanel(app);
+      }
+    }
+  }
+
+  function patchPosterMetadataAccountSaveChain(app) {
+    if (!app || patchedPosterMetadataAccountApp === app) return;
+    if (typeof app.getConfigPanelFieldKeys !== 'function'
+      || typeof app.collectConfigSectionFromForm !== 'function'
+      || typeof app.prepareConfigChangePreview !== 'function'
+      || typeof app.apiCall !== 'function'
+      || typeof app.saveSettings !== 'function') return;
+    patchedPosterMetadataAccountApp = app;
+
+    const getConfigPanelFieldKeys = app.getConfigPanelFieldKeys.bind(app);
+    app.getConfigPanelFieldKeys = function getConfigPanelFieldKeysWithPosterMetadata(section, panel = '') {
+      const fields = getConfigPanelFieldKeys(section, panel);
+      const normalizedFields = Array.isArray(fields) ? fields.slice() : [];
+      if (section === 'account' || panel === 'account') {
+        if (!normalizedFields.includes('tmdbApiKey')) normalizedFields.push('tmdbApiKey');
+      }
+      return normalizedFields;
+    };
+
+    const collectConfigSectionFromForm = app.collectConfigSectionFromForm.bind(app);
+    app.collectConfigSectionFromForm = function collectConfigSectionFromFormWithPosterMetadata(section, options = {}) {
+      const sectionConfig = collectConfigSectionFromForm(section, options);
+      if (section !== 'account') return sectionConfig;
+      const mutation = getPosterMetadataAccountMutation();
+      if (mutation) sectionConfig.tmdbApiKey = mutation.tmdbApiKey;
+      else delete sectionConfig.tmdbApiKey;
+      return sectionConfig;
+    };
+
+    if (typeof app.formatConfigPreviewValue === 'function') {
+      const formatConfigPreviewValue = app.formatConfigPreviewValue.bind(app);
+      app.formatConfigPreviewValue = function formatConfigPreviewValueWithRedactedPosterKey(field, value) {
+        if (field === 'tmdbApiKey') return value ? '已填写' : '未配置';
+        return formatConfigPreviewValue(field, value);
+      };
+    }
+
+    const prepareConfigChangePreview = app.prepareConfigChangePreview.bind(app);
+    app.prepareConfigChangePreview = async function prepareConfigChangePreviewWithPosterMetadata(section, currentConfig, nextConfig, panel = section) {
+      const result = await prepareConfigChangePreview(section, currentConfig, nextConfig, panel);
+      if (section !== 'account' && panel !== 'account') return result;
+      const mutation = getPosterMetadataAccountMutation();
+      if (!mutation) return result;
+      const sanitizedConfig = {
+        ...(result?.sanitizedConfig && typeof result.sanitizedConfig === 'object' ? result.sanitizedConfig : {}),
+        tmdbApiKey: mutation.tmdbApiKey
+      };
+      const actionLabel = mutation.type === 'remove' ? '移除' : (mutation.type === 'replace' ? '替换' : '新增');
+      const preview = result?.preview && typeof result.preview === 'object' ? result.preview : {};
+      const rawExistingMessage = String(preview.message || '');
+      const safeExistingMessage = mutation.tmdbApiKey
+        ? rawExistingMessage.split(mutation.tmdbApiKey).join('********')
+        : rawExistingMessage;
+      const messagePrefix = preview.hasChanges === true
+        ? safeExistingMessage
+        : '即将保存「账号设置」以下变更：';
+      return {
+        ...result,
+        sanitizedConfig,
+        preview: {
+          ...preview,
+          hasChanges: true,
+          message: messagePrefix + '\n• TMDB KV 密钥：' + actionLabel
+        }
+      };
+    };
+
+    let activeAccountSave = null;
+    const apiCall = app.apiCall.bind(app);
+    app.apiCall = async function apiCallWithPosterMetadataAccountSave(action, payload, ...args) {
+      const result = await apiCall(action, payload, ...args);
+      if (activeAccountSave
+        && action === 'saveConfig'
+        && payload?.meta?.section === 'account') {
+        activeAccountSave.saved = true;
+        activeAccountSave.result = result;
+      }
+      return result;
+    };
+
+    const saveSettings = app.saveSettings.bind(app);
+    app.saveSettings = async function saveSettingsWithPosterMetadata(section, panel = section, ...args) {
+      if (section !== 'account' && panel !== 'account') return saveSettings(section, panel, ...args);
+      if (posterMetadataState.pending) return null;
+      const tmdbApiKey = syncPosterMetadataDraftFromInput();
+      if (tmdbApiKey && !TMDB_API_KEY_INPUT_REGEX.test(tmdbApiKey)) {
+        this.showMessage?.('请输入有效的 TMDB v3 API Key。', { tone: 'warning', modal: true });
+        getPosterMetadataKeyInput()?.focus?.();
+        return null;
+      }
+      const transaction = { saved: false, result: null };
+      activeAccountSave = transaction;
+      posterMetadataState.pending = true;
+      syncPosterMetadataPanel(this);
+      try {
+        const result = await saveSettings(section, panel, ...args);
+        if (transaction.saved) {
+          posterMetadataState.draftKey = '';
+          posterMetadataState.removeRequested = false;
+          const input = getPosterMetadataKeyInput();
+          if (input) input.value = '';
+          if (transaction.result?.posterMetadata) applyPosterMetadataStatePayload(transaction.result);
+          else await hydratePosterMetadataState(this, true);
+        }
+        return result;
+      } finally {
+        if (activeAccountSave === transaction) activeAccountSave = null;
+        posterMetadataState.pending = false;
+        syncPosterMetadataPanel(this);
+      }
+    };
   }
 
   function patchSafetyContractMethods(app) {
@@ -2530,6 +2882,28 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
         this.showMessage('初始化 DB 失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
       }
     };
+
+    app.getD1TimeTravelBookmarkFromUi = async function getD1TimeTravelBookmarkFromUi() {
+      try {
+        const result = await this.apiCall('getD1TimeTravelBookmark');
+        const bookmark = String(result?.bookmark || '').trim();
+        if (!bookmark) throw new Error('后端未返回 Bookmark');
+        let copied = false;
+        if (typeof window?.navigator?.clipboard?.writeText === 'function') {
+          try {
+            await window.navigator.clipboard.writeText(bookmark);
+            copied = true;
+          } catch {}
+        }
+        await this.showMessage(
+          '当前 Time Travel Bookmark：\n' + bookmark + '\n\n' + (copied ? 'Bookmark 已复制到剪贴板。' : '浏览器未允许自动复制，请从上方结果中复制。'),
+          { title: 'D1 Time Travel Bookmark', tone: copied ? 'success' : 'warning', modal: true }
+        );
+      } catch (error) {
+        console.error('getD1TimeTravelBookmarkFromUi failed', error);
+        this.showMessage('获取 Time Travel Bookmark 失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+      }
+    };
   }
 
   function createRuntimeActionButton(referenceButton, actionName, label, iconName, onClick) {
@@ -2549,8 +2923,21 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       : null;
     const actionGroup = initLogsButton?.parentElement;
     const existingButtons = actionGroup ? [...actionGroup.querySelectorAll('[data-admin-runtime-action^="d1-schema-"]')] : [];
-    for (const button of existingButtons) button.remove();
-    initLogsButton?.setAttribute('title', '检查并补齐 D1 运行时结构、索引与 FTS，然后返回最终 Schema 状态');
+    for (const button of existingButtons) {
+      if (button.getAttribute('data-admin-runtime-action') !== 'd1-schema-bookmark') button.remove();
+    }
+    initLogsButton?.setAttribute('title', '先获取 Time Travel Bookmark，再补齐 D1 结构并采纳已验证的迁移基线');
+    if (!actionGroup || !initLogsButton || actionGroup.querySelector('[data-admin-runtime-action="d1-schema-bookmark"]')) return;
+    const bookmarkButton = createRuntimeActionButton(
+      initLogsButton,
+      'd1-schema-bookmark',
+      '获取 Bookmark',
+      'history',
+      () => app.getD1TimeTravelBookmarkFromUi()
+    );
+    bookmarkButton.setAttribute('title', '只读获取并复制当前 D1 Time Travel Bookmark');
+    initLogsButton.insertAdjacentElement('afterend', bookmarkButton);
+    scheduleIconRefresh(bookmarkButton);
   }
 
   function syncSecretExportButton(app) {
@@ -2781,7 +3168,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     const busy = mediaAggregationState.savePending === true;
     root.setAttribute('aria-busy', busy ? 'true' : 'false');
     root.toggleAttribute?.('data-media-aggregation-save-pending', busy);
-    root.querySelectorAll?.('[data-media-aggregation-username="1"],[data-media-aggregation-password="1"],[data-media-aggregation-progress="1"],[data-media-aggregation-search="1"]').forEach((input) => {
+    root.querySelectorAll?.('[data-media-aggregation-username="1"],[data-media-aggregation-password="1"],[data-media-aggregation-progress="1"],[data-media-aggregation-search="1"],[data-media-aggregation-match-mode="1"],[data-media-aggregation-first-timeout="1"],[data-media-aggregation-grace-period="1"]').forEach((input) => {
       input.disabled = busy;
     });
     root.querySelectorAll?.('[data-media-aggregation-list="1"] input[type="checkbox"]').forEach((input) => {
@@ -2898,6 +3285,9 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       mediaAggregationState.password = '';
       mediaAggregationState.hasPassword = String(config.mediaAggregationEmbyPassword || '').length > 0;
       mediaAggregationState.bidirectionalProgressEnabled = config.mediaAggregationBidirectionalProgressEnabled === true;
+      mediaAggregationState.matchMode = String(config.mediaAggregationMatchMode || '').trim().toLowerCase() === 'strict' ? 'strict' : 'title_year';
+      mediaAggregationState.firstResultTimeoutMs = Math.min(10000, Math.max(100, Math.trunc(Number(config.mediaAggregationFirstResultTimeoutMs) || 1500)));
+      mediaAggregationState.gracePeriodMs = Math.min(5000, Math.max(0, Math.trunc(Number(config.mediaAggregationGracePeriodMs) || 800)));
       mediaAggregationState.hydrated = true;
       mediaAggregationState.dirty = false;
       mediaAggregationState.renderSignature = '';
@@ -2911,6 +3301,12 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       }
       const progressInput = mediaAggregationState.root?.querySelector('[data-media-aggregation-progress="1"]');
       if (progressInput) progressInput.checked = mediaAggregationState.bidirectionalProgressEnabled;
+      const matchModeInput = mediaAggregationState.root?.querySelector('[data-media-aggregation-match-mode="1"]');
+      const firstTimeoutInput = mediaAggregationState.root?.querySelector('[data-media-aggregation-first-timeout="1"]');
+      const gracePeriodInput = mediaAggregationState.root?.querySelector('[data-media-aggregation-grace-period="1"]');
+      if (matchModeInput) matchModeInput.value = mediaAggregationState.matchMode;
+      if (firstTimeoutInput) firstTimeoutInput.value = String(mediaAggregationState.firstResultTimeoutMs);
+      if (gracePeriodInput) gracePeriodInput.value = String(mediaAggregationState.gracePeriodMs);
       renderMediaAggregationNodeList(app);
     } catch (error) {
       if (hydrationSeq === mediaAggregationState.hydrationSeq) console.error('hydrateMediaAggregationState failed', error);
@@ -2952,7 +3348,10 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       const requestPayload = {
         selectedNodeNames,
         username,
-        bidirectionalProgressEnabled: mediaAggregationState.bidirectionalProgressEnabled
+        bidirectionalProgressEnabled: mediaAggregationState.bidirectionalProgressEnabled,
+        matchMode: mediaAggregationState.matchMode,
+        firstResultTimeoutMs: mediaAggregationState.firstResultTimeoutMs,
+        gracePeriodMs: mediaAggregationState.gracePeriodMs
       };
       if (password || username !== mediaAggregationState.savedUsername) requestPayload.password = password;
       const result = await app.apiCall('saveMediaAggregationPolicyShortcuts', requestPayload);
@@ -2982,7 +3381,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
     if (!root) {
       root = document.createElement('section');
       root.setAttribute('data-media-aggregation-panel', '1');
-      root.innerHTML = '<div class="flex items-start justify-between gap-3"><div><div class="text-sm font-semibold text-slate-900 dark:text-white">影视资源版本聚合</div><p class="mt-1 text-xs leading-5 text-slate-500">按 TMDB / IMDB 匹配池内同一影视；节点固定账号优先，全局账号作为默认兜底。</p></div><i data-lucide="layers-3" class="mt-0.5 h-4 w-4 text-sky-600" aria-hidden="true"></i></div><div class="mt-3" data-media-aggregation-credentials="1"><label class="block text-xs text-slate-500">全局默认 Emby 账号<input data-media-aggregation-username="1" type="text" autocomplete="username" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><label class="block text-xs text-slate-500">全局默认 Emby 密码<input data-media-aggregation-password="1" type="password" autocomplete="new-password" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label></div><input data-media-aggregation-search="1" type="search" class="mt-3 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" placeholder="搜索聚合节点..." /><div class="mt-2 text-xs text-slate-500" data-media-aggregation-summary="1"></div><div class="mt-2" data-media-aggregation-list="1"></div><div data-media-aggregation-actions="1"><p class="text-xs leading-5 text-slate-500">只有具备节点账号或全局账号的节点可以勾选；勾选后会同步把 PlaybackInfo 模式设为改写模式。</p><button data-media-aggregation-save="1" type="button" class="inline-flex min-h-10 items-center justify-center border border-sky-300 px-4 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950/40"><i data-lucide="save" class="mr-2 h-4 w-4" aria-hidden="true"></i>保存聚合设置</button></div>';
+      root.innerHTML = '<div class="flex items-start justify-between gap-3"><div><div class="text-sm font-semibold text-slate-900 dark:text-white">影视资源版本聚合</div><p class="mt-1 text-xs leading-5 text-slate-500">按 TMDB → IMDb → 严格标题年份匹配；节点固定账号优先，全局账号作为默认兜底。</p></div><i data-lucide="layers-3" class="mt-0.5 h-4 w-4 text-sky-600" aria-hidden="true"></i></div><div class="mt-3" data-media-aggregation-credentials="1"><label class="block text-xs text-slate-500">全局默认 Emby 账号<input data-media-aggregation-username="1" type="text" autocomplete="username" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><label class="block text-xs text-slate-500">全局默认 Emby 密码<input data-media-aggregation-password="1" type="password" autocomplete="new-password" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label></div><div data-media-aggregation-policy="1" class="mt-3 grid gap-3 sm:grid-cols-3"><label class="block text-xs text-slate-500">匹配策略<select data-media-aggregation-match-mode="1" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white"><option value="title_year">强 ID + 标题年份</option><option value="strict">仅强 ID</option></select></label><label class="block text-xs text-slate-500">首结果等待（毫秒）<input data-media-aggregation-first-timeout="1" type="number" min="100" max="10000" step="100" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><label class="block text-xs text-slate-500">宽恕期（毫秒）<input data-media-aggregation-grace-period="1" type="number" min="0" max="5000" step="100" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label></div><input data-media-aggregation-search="1" type="search" class="mt-3 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" placeholder="搜索聚合节点..." /><div class="mt-2 text-xs text-slate-500" data-media-aggregation-summary="1"></div><div class="mt-2" data-media-aggregation-list="1"></div><div data-media-aggregation-actions="1"><p class="text-xs leading-5 text-slate-500">只有具备节点账号或全局账号的节点可以勾选；勾选后会同步把 PlaybackInfo 模式设为改写模式。</p><button data-media-aggregation-save="1" type="button" class="inline-flex min-h-10 items-center justify-center border border-sky-300 px-4 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950/40"><i data-lucide="save" class="mr-2 h-4 w-4" aria-hidden="true"></i>保存聚合设置</button></div>';
       const progressLabel = document.createElement('label');
       progressLabel.className = 'mt-3 flex items-start gap-2 text-sm text-slate-700 dark:text-slate-300';
       progressLabel.innerHTML = '<input data-media-aggregation-progress="1" type="checkbox" class="mt-0.5 h-4 w-4 rounded" /><span><strong class="font-medium">双向同步播放进度</strong><span class="mt-0.5 block text-xs text-slate-500">默认关闭时仅由主服记录；开启后携带聚合 MediaSourceId 的播放事件会静默并发上报备服。</span></span>';
@@ -3000,6 +3399,18 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
       });
       root.querySelector('[data-media-aggregation-progress="1"]')?.addEventListener('change', (event) => {
         mediaAggregationState.bidirectionalProgressEnabled = event.target?.checked === true;
+        markMediaAggregationDraftDirty();
+      });
+      root.querySelector('[data-media-aggregation-match-mode="1"]')?.addEventListener('change', (event) => {
+        mediaAggregationState.matchMode = String(event.target?.value || '').trim().toLowerCase() === 'strict' ? 'strict' : 'title_year';
+        markMediaAggregationDraftDirty();
+      });
+      root.querySelector('[data-media-aggregation-first-timeout="1"]')?.addEventListener('input', (event) => {
+        mediaAggregationState.firstResultTimeoutMs = Math.min(10000, Math.max(100, Math.trunc(Number(event.target?.value) || 1500)));
+        markMediaAggregationDraftDirty();
+      });
+      root.querySelector('[data-media-aggregation-grace-period="1"]')?.addEventListener('input', (event) => {
+        mediaAggregationState.gracePeriodMs = Math.min(5000, Math.max(0, Math.trunc(Number(event.target?.value) || 0)));
         markMediaAggregationDraftDirty();
       });
       root.querySelector('[data-media-aggregation-search="1"]')?.addEventListener('input', (event) => {
@@ -3020,10 +3431,12 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
   function applySafetyContractEnhancements() {
     const app = window.App;
     if (!app) return;
+    patchPosterMetadataAccountSaveChain(app);
     patchSafetyContractMethods(app);
     patchMediaAggregationNodeCredentials(app);
     syncNodeMediaAggregationCredentialFields(app);
     ensureServerExpirySettings(app);
+    syncPosterMetadataPanel(app);
     syncD1SchemaActionButtons(app);
     syncSecretExportButton(app);
     syncNodeCredentialExportButton(app);
@@ -3065,7 +3478,10 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
         }
         for (const node of record.removedNodes) {
           if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
-          if (node.matches?.('[data-admin-node-media-credentials="1"]') || node.querySelector?.('[data-admin-node-media-credentials="1"]')) {
+          if (
+            node.matches?.('[data-admin-node-media-credentials="1"],[data-poster-metadata-panel="1"]')
+            || node.querySelector?.('[data-admin-node-media-credentials="1"],[data-poster-metadata-panel="1"]')
+          ) {
             shouldRefreshShell = true;
           }
         }

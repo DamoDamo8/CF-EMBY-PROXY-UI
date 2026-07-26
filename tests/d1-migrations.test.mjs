@@ -63,17 +63,32 @@ function getIndexes(database, tableName) {
   return new Set(database.prepare(`PRAGMA index_list(${tableName})`).all().map(index => index.name));
 }
 
-function createD1Adapter(database) {
-  return {
+function createD1Adapter(database, options = {}) {
+  let batchChain = Promise.resolve();
+  const executeBatch = async statements => {
+    database.exec("BEGIN");
+    try {
+      const results = [];
+      for (const statement of statements) results.push(await statement.run());
+      database.exec("COMMIT");
+      return results;
+    } catch (error) {
+      database.exec("ROLLBACK");
+      throw error;
+    }
+  };
+  const adapter = {
     prepare(sql) {
-      const statement = database.prepare(String(sql));
+      const sqlText = String(sql);
+      const statement = database.prepare(sqlText);
       let bindings = [];
-      const adapter = {
+      const prepared = {
         bind(...values) {
           bindings = values;
-          return adapter;
+          return prepared;
         },
         async run() {
+          options.events?.push({ type: "run", sql: sqlText });
           return statement.run(...bindings);
         },
         async all() {
@@ -83,21 +98,30 @@ function createD1Adapter(database) {
           return statement.get(...bindings) || null;
         }
       };
-      return adapter;
+      return prepared;
     },
-    async batch(statements) {
-      database.exec("BEGIN");
-      try {
-        const results = [];
-        for (const statement of statements) results.push(await statement.run());
-        database.exec("COMMIT");
-        return results;
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
-      }
+    batch(statements) {
+      const task = batchChain.then(() => executeBatch(statements));
+      batchChain = task.catch(() => {});
+      return task;
     }
   };
+  if (options.withSession !== false) {
+    adapter.withSession = consistency => {
+      options.events?.push({ type: "session", consistency: String(consistency || "") });
+      if (options.sessionError) throw options.sessionError;
+      return {
+        prepare(sql) {
+          return adapter.prepare(sql);
+        },
+        getBookmark() {
+          if (options.bookmarkError) throw options.bookmarkError;
+          return options.bookmark || "test-time-travel-bookmark";
+        }
+      };
+    };
+  }
+  return adapter;
 }
 
 function createDeferred() {
@@ -108,13 +132,15 @@ function createDeferred() {
   return { promise, resolve };
 }
 
-test("D1 migrations build the fresh v6 baseline in order", async () => {
+test("D1 migrations build the fresh v8 baseline in order", async () => {
   const migrations = await loadMigrations();
   assert.deepEqual(migrations.map(migration => migration.filename), [
     "0001_d1_fresh_baseline.sql",
     "0002_d1_historical_compatibility.sql",
     "0003_d1_schema_v5_indexes.sql",
-    "0004_server_watch_stats.sql"
+    "0004_server_watch_stats.sql",
+    "0005_server_record_snapshots.sql",
+    "0006_server_record_poster_cache.sql"
   ]);
   assert.ok(migrations.every(migration => !/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i.test(executableSql(migration.sql))));
 
@@ -135,7 +161,9 @@ test("D1 migrations build the fresh v6 baseline in order", async () => {
       "dns_ip_probe_cache",
       "proxy_logs",
       "proxy_stats_hourly",
-      "server_last_watch"
+      "server_last_watch",
+      "server_record_snapshots",
+      "server_record_poster_cache"
     ]) {
       assert.ok(tables.has(tableName), `missing table ${tableName}`);
     }
@@ -144,15 +172,46 @@ test("D1 migrations build the fresh v6 baseline in order", async () => {
       assert.ok(getColumns(database, "proxy_logs").has(columnName), `missing fresh column ${columnName}`);
     }
     assert.deepEqual([...getColumns(database, "server_last_watch")].sort(), ["last_watched_at", "node_name", "updated_at"]);
+    assert.deepEqual([...getColumns(database, "server_record_snapshots")].sort(), [
+      "counts_errors_json",
+      "counts_state",
+      "episode_count",
+      "last_item_id",
+      "last_item_image_tag",
+      "last_item_name",
+      "last_item_series_name",
+      "last_item_type",
+      "last_item_watched_at",
+      "movie_count",
+      "node_name",
+      "series_count",
+      "stats_checked_at",
+      "updated_at"
+    ]);
+    assert.deepEqual([...getColumns(database, "server_record_poster_cache")].sort(), [
+      "expires_at",
+      "failure_code",
+      "image_path",
+      "imdb_id",
+      "item_id",
+      "node_name",
+      "provider",
+      "resolved_at",
+      "retry_after",
+      "tmdb_id",
+      "updated_at",
+      "watched_at"
+    ]);
     assert.ok(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_time"));
     assert.ok(getIndexes(database, "dns_ip_probe_cache").has("idx_dns_ip_probe_cache_colo_ip_expires"));
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 4);
+    assert.ok(getIndexes(database, "server_record_poster_cache").has("idx_server_record_poster_cache_expires_at"));
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 6);
 
     const d1 = createD1Adapter(database);
     const status = await Database.getD1SchemaStatus(d1);
     assert.equal(status.runtimeCompatibilityReady, true);
     assert.equal(status.migrationReady, true);
-    assert.equal(status.schemaVersion, 6);
+    assert.equal(status.schemaVersion, 8);
   } finally {
     database.close();
   }
@@ -329,6 +388,151 @@ test("initialize DB repairs known columns and named indexes without losing legac
       ["expires_at"]
     );
     assert.equal(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_ip"), false);
+  } finally {
+    database.close();
+  }
+});
+
+test("managed initialization captures a bookmark before writes, adopts v8 migrations, and preserves 0005 rows", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(await readFile(new URL("0005_server_record_snapshots.sql", MIGRATIONS_URL), "utf8"));
+    database.exec(`INSERT INTO server_record_snapshots (
+      node_name, movie_count, series_count, episode_count, counts_state,
+      counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+      last_item_type, last_item_series_name, last_item_image_tag,
+      last_item_watched_at, updated_at
+    ) VALUES (
+      'persisted-node', 12, 4, 88, 'ok', '{}', '2026-07-25T01:00:00.000Z',
+      'item-5', 'Persisted Movie', 'Movie', '', 'tag-5',
+      '2026-07-25T00:30:00.000Z', '2026-07-25T01:00:00.000Z'
+    )`);
+    const events = [];
+    const d1 = createD1Adapter(database, { events, bookmark: "bookmark-before-managed-init" });
+
+    const initialized = await Database.initializeD1Database(d1, {
+      includeFts: true,
+      adoptMigrations: true,
+      requireBookmark: true,
+      failOnIncompatible: true
+    });
+
+    const bookmarkProbeIndex = events.findIndex(event => event.type === "run" && /^SELECT 1 AS bookmark_probe/i.test(event.sql));
+    const firstMutationIndex = events.findIndex(event => event.type === "run" && /^(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(event.sql.trim()));
+    assert.ok(bookmarkProbeIndex >= 0);
+    assert.ok(firstMutationIndex > bookmarkProbeIndex);
+    assert.equal(initialized.recoveryBookmark, "bookmark-before-managed-init");
+    assert.equal(initialized.migrationTableCreated, true);
+    assert.deepEqual(initialized.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
+    assert.equal(initialized.runtimeCompatibilityReady, true);
+    assert.equal(initialized.migrationReady, true);
+    assert.equal(initialized.schemaVersion, 8);
+    assert.equal(initialized.status.missingMigrations.length, 0);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
+    const preservedSnapshot = database.prepare("SELECT node_name, movie_count, last_item_id FROM server_record_snapshots").get();
+    assert.equal(preservedSnapshot.node_name, "persisted-node");
+    assert.equal(preservedSnapshot.movie_count, 12);
+    assert.equal(preservedSnapshot.last_item_id, "item-5");
+
+    events.length = 0;
+    const repeated = await Database.initializeD1Database(d1, {
+      includeFts: true,
+      adoptMigrations: true,
+      requireBookmark: true,
+      failOnIncompatible: true
+    });
+    assert.deepEqual(repeated.adoptedMigrations, []);
+    assert.equal(repeated.migrationTableCreated, false);
+    assert.equal(repeated.migrationReady, true);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM server_record_snapshots").get().total, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("managed initialization fails closed with zero mutations when bookmark capture fails", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const events = [];
+    const d1 = createD1Adapter(database, {
+      events,
+      bookmarkError: new Error("bookmark service unavailable")
+    });
+    await assert.rejects(
+      Database.initializeD1Database(d1, {
+        includeFts: true,
+        adoptMigrations: true,
+        requireBookmark: true,
+        failOnIncompatible: true
+      }),
+      error => error?.code === "D1_TIME_TRAVEL_BOOKMARK_FAILED"
+    );
+    assert.equal(events.some(event => event.type === "run" && /^(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(event.sql.trim())), false);
+    assert.deepEqual(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("managed initialization rejects a malformed migration table before bookmark capture or writes", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec("CREATE TABLE d1_migrations (name TEXT)");
+    const events = [];
+    const d1 = createD1Adapter(database, { events });
+    await assert.rejects(
+      Database.initializeD1Database(d1, {
+        includeFts: true,
+        adoptMigrations: true,
+        requireBookmark: true,
+        failOnIncompatible: true
+      }),
+      error => error?.code === "D1_MIGRATION_TABLE_INVALID"
+        && error?.details?.phase === "preflight"
+    );
+    assert.equal(events.some(event => event.type === "session"), false);
+    assert.equal(events.some(event => event.type === "run" && /^(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(event.sql.trim())), false);
+    assert.deepEqual(database.prepare("PRAGMA table_info(d1_migrations)").all().map(column => column.name), ["name"]);
+  } finally {
+    database.close();
+  }
+});
+
+test("Time Travel bookmark admin action is read-only", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const events = [];
+    const d1 = createD1Adapter(database, { events, bookmark: "bookmark-from-admin" });
+    const response = await Database.ApiHandlers.getD1TimeTravelBookmark({}, { db: d1 });
+    const payload = await response.json();
+
+    assert.equal(payload.success, true);
+    assert.equal(payload.bookmark, "bookmark-from-admin");
+    assert.equal(payload.consistency, "first-primary");
+    assert.equal(events.some(event => event.type === "run" && /^(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(event.sql.trim())), false);
+    assert.deepEqual(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("initLogsDb admin action returns a managed v8 baseline and recovery bookmark", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const d1 = createD1Adapter(database, { bookmark: "bookmark-from-init-api" });
+    const response = await Database.ApiHandlers.initLogsDb({}, { db: d1 });
+    const payload = await response.json();
+
+    assert.equal(payload.success, true);
+    assert.equal(payload.runtimeCompatibilityReady, true);
+    assert.equal(payload.migrationReady, true);
+    assert.equal(payload.schemaVersion, 8);
+    assert.equal(payload.recoveryBookmark, "bookmark-from-init-api");
+    assert.deepEqual(payload.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
+    assert.equal(payload.initialization.migrationTableCreated, true);
+    assert.equal(payload.status.missingMigrations.length, 0);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
   } finally {
     database.close();
   }
@@ -654,7 +858,7 @@ test("scheduled D1 tidy fails before deletion when key contracts drift", async (
   }
 });
 
-test("runtime D1 SQL executes against the fresh v6 schema", async () => {
+test("runtime D1 SQL executes against the fresh v8 schema", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     applyMigrations(database, await loadMigrations());
@@ -666,11 +870,64 @@ test("runtime D1 SQL executes against the fresh v6 schema", async () => {
     await Database.upsertServerLastWatch(d1, "server-a", new Date(now + 1000).toISOString());
     await Promise.all([
       Database.upsertServerLastWatch(d1, "server-a", nowIso),
-      Database.upsertServerLastWatch(d1, "server-a", new Date(now + 3000).toISOString())
+      Database.upsertServerLastWatch(d1, "server-a", new Date(now + 3000).toISOString(), {
+        itemId: "movie-3000",
+        itemName: "Latest movie",
+        itemType: "Movie",
+        imageTag: "poster-3000"
+      })
     ]);
     const lastWatch = await Database.getServerLastWatch(d1, ["server-a", "server-b"]);
     assert.equal(lastWatch.get("server-a")?.lastWatchedAt, new Date(now + 3000).toISOString());
     assert.equal(lastWatch.has("server-b"), false);
+
+    await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "server-a",
+      counts: { movies: 4, series: 5, episodes: 6, errors: {} },
+      checkedAt: new Date(now + 5000).toISOString()
+    }]);
+    await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "server-a",
+      counts: { movies: 1, series: 2, episodes: 3, errors: {} },
+      checkedAt: new Date(now + 4000).toISOString()
+    }]);
+    const snapshots = await Database.getServerRecordSnapshots(d1, ["server-a"]);
+    assert.deepEqual(snapshots.get("server-a")?.counts, {
+      movies: 4,
+      series: 5,
+      episodes: 6,
+      state: "ok",
+      errors: {},
+      checkedAt: new Date(now + 5000).toISOString(),
+      source: "persisted"
+    });
+    assert.deepEqual(snapshots.get("server-a")?.lastItem, {
+      itemId: "movie-3000",
+      itemName: "Latest movie",
+      itemType: "Movie",
+      seriesName: "",
+      imageTag: "poster-3000",
+      watchedAt: new Date(now + 3000).toISOString()
+    });
+    await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "server-a",
+      counts: { movies: null, series: 7, episodes: 8, errors: { movies: "http_503" } },
+      checkedAt: new Date(now + 6000).toISOString()
+    }]);
+    assert.deepEqual((await Database.getServerRecordSnapshots(d1, ["server-a"])).get("server-a")?.counts, {
+      movies: null,
+      series: 7,
+      episodes: 8,
+      state: "partial",
+      errors: { movies: "http_503" },
+      checkedAt: new Date(now + 6000).toISOString(),
+      source: "persisted"
+    });
+    assert.equal(await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "server-a",
+      counts: { movies: null, series: null, episodes: null, errors: { movies: "offline" } },
+      checkedAt: new Date(now + 6000).toISOString()
+    }]), 0);
 
     const bootstrap = await Database.bootstrapD1Schema(d1, "logs-core");
     assert.equal(bootstrap.runtimeTablesReady, true);
@@ -855,6 +1112,9 @@ test("runtime D1 SQL executes against the fresh v6 schema", async () => {
       INSERT INTO cf_runtime_cache (
         cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
       ) VALUES ('expired-smoke', 'test', 'test', '{}', 1, 1, 1);
+      INSERT INTO server_record_poster_cache (
+        node_name, watched_at, item_id, expires_at, updated_at
+      ) VALUES ('expired-smoke', '1970-01-01T00:00:00.001Z', 'item-smoke', '1970-01-01T00:00:00.001Z', '1970-01-01T00:00:00.001Z');
     `);
     const tidyPlan = await Database.buildD1TidyPlan({ DB: d1 }, {
       db: d1,
@@ -876,7 +1136,8 @@ test("runtime D1 SQL executes against the fresh v6 schema", async () => {
       ["dns_ip_probe_cache", "ip", "198.51.100.2"],
       ["auth_failures", "ip", "198.51.100.10"],
       ["cf_dashboard_cache", "cache_key", "expired-smoke"],
-      ["cf_runtime_cache", "cache_key", "expired-smoke"]
+      ["cf_runtime_cache", "cache_key", "expired-smoke"],
+      ["server_record_poster_cache", "node_name", "expired-smoke"]
     ]) {
       const expiredCount = database.prepare(`SELECT COUNT(*) AS total FROM ${tableName} WHERE ${columnName} = ?`)
         .get(value)
@@ -885,6 +1146,119 @@ test("runtime D1 SQL executes against the fresh v6 schema", async () => {
     }
 
     assert.equal(await Database.deleteDnsIpPoolItems(d1, ["1.1.1.1"]), 1);
+  } finally {
+    database.close();
+  }
+});
+
+test("server-record D1 rows move with node renames, merge by freshness, and are removed on delete", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const nodeValues = new Map();
+    const kv = {
+      async put(key, value) { nodeValues.set(key, String(value)); },
+      async delete(key) { nodeValues.delete(key); }
+    };
+    await Database.upsertServerLastWatch(d1, "alpha", "2026-07-25T01:00:00.000Z", {
+      itemId: "alpha-item",
+      itemName: "Alpha item",
+      itemType: "Movie"
+    });
+    await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "alpha",
+      counts: { movies: 1, series: 2, episodes: 3, errors: {} },
+      checkedAt: "2026-07-25T01:30:00.000Z"
+    }]);
+    await Database.upsertServerLastWatch(d1, "beta", "2026-07-25T02:00:00.000Z", {
+      itemId: "beta-item",
+      itemName: "Beta item",
+      itemType: "Episode",
+      seriesName: "Beta series"
+    });
+    await Database.persistServerRecordProbeSnapshots(d1, [{
+      nodeName: "beta",
+      counts: { movies: 4, series: 5, episodes: 6, errors: {} },
+      checkedAt: "2026-07-25T02:30:00.000Z"
+    }]);
+    await Database.setServerRecordPosterCache(d1, {
+      nodeName: "alpha",
+      watchedAt: "2026-07-25T01:00:00.000Z",
+      itemId: "alpha-item",
+      tmdbId: "100",
+      provider: "tmdb_direct",
+      imagePath: "/alpha-poster.jpg",
+      expiresAt: "2026-08-01T01:00:00.000Z"
+    });
+    await Database.setServerRecordPosterCache(d1, {
+      nodeName: "beta",
+      watchedAt: "2026-07-25T02:00:00.000Z",
+      itemId: "beta-item",
+      tmdbId: "200",
+      provider: "tmdb_direct",
+      imagePath: "/beta-poster.jpg",
+      expiresAt: "2026-08-01T02:00:00.000Z"
+    });
+    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:01.000Z", "alpha-item"), null);
+
+    const rename = {
+      previousName: "alpha",
+      previousNode: { target: "https://alpha.example" },
+      nextName: "beta",
+      nextNode: { target: "https://beta.example" },
+      nodeChanged: true
+    };
+    await Database.applyPreparedNodeMutation(rename, { kv, db: d1 });
+    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), false);
+    assert.equal(nodeValues.has(`${Database.PREFIX}beta`), true);
+    const renamedWatch = await Database.getServerLastWatch(d1, ["alpha", "beta"]);
+    const renamedSnapshots = await Database.getServerRecordSnapshots(d1, ["alpha", "beta"]);
+    assert.equal(renamedWatch.has("alpha"), false);
+    assert.equal(renamedWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
+    assert.equal(renamedSnapshots.has("alpha"), false);
+    assert.deepEqual(renamedSnapshots.get("beta")?.counts, {
+      movies: 4,
+      series: 5,
+      episodes: 6,
+      state: "ok",
+      errors: {},
+      checkedAt: "2026-07-25T02:30:00.000Z",
+      source: "persisted"
+    });
+    assert.deepEqual(renamedSnapshots.get("beta")?.lastItem, {
+      itemId: "beta-item",
+      itemName: "Beta item",
+      itemType: "Episode",
+      seriesName: "Beta series",
+      imageTag: "",
+      watchedAt: "2026-07-25T02:00:00.000Z"
+    });
+    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"), null);
+    assert.equal(await Database.getServerRecordPosterCache(d1, "beta", "2026-07-25T02:00:00.000Z", "beta-item"), null);
+
+    await Database.rollbackPreparedNodeMutation(rename, { kv, db: d1 });
+    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), true);
+    assert.equal(nodeValues.has(`${Database.PREFIX}beta`), false);
+    const restoredWatch = await Database.getServerLastWatch(d1, ["alpha", "beta"]);
+    assert.equal(restoredWatch.get("alpha")?.lastWatchedAt, "2026-07-25T01:00:00.000Z");
+    assert.equal(restoredWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
+    assert.equal((await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"))?.imagePath, "/alpha-poster.jpg");
+    assert.equal((await Database.getServerRecordPosterCache(d1, "beta", "2026-07-25T02:00:00.000Z", "beta-item"))?.imagePath, "/beta-poster.jpg");
+
+    await Database.applyPreparedNodeMutation({
+      previousName: "alpha",
+      previousNode: { target: "https://alpha.example" },
+      nextName: "alpha",
+      nextNode: null,
+      nodeChanged: true
+    }, { kv, db: d1 });
+    const deletedWatch = await Database.getServerLastWatch(d1, ["alpha"]);
+    const deletedSnapshots = await Database.getServerRecordSnapshots(d1, ["alpha"]);
+    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), false);
+    assert.equal(deletedWatch.has("alpha"), false);
+    assert.equal(deletedSnapshots.has("alpha"), false);
+    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"), null);
   } finally {
     database.close();
   }

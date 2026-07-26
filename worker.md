@@ -37,6 +37,7 @@
 - `POST ADMIN_PATH/login` 与 `POST ADMIN_PATH` 保持既有登录和管理 API 契约，细节见 [管理台契约](docs/admin-console.md)。
 - 浏览器使用 Worker 同源 vendor 路径加载依赖；Worker 负责源站重写和 Cache API 缓冲。
 - Emby 节点代理只承载 API、WebSocket 与媒体请求，不反代 `/web` 子树；该边界不影响管理台 `/admin` 的资源交付。
+- 服务器记录的 TMDB 海报密钥由管理台“账号设置”统一预览和保存到 KV，运行时按“KV 配置优先、Worker Secret 兼容兜底”解析；完整安全与回退语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
 - 前端开发和构建先把 `frontend/admin-runtime.template.html` 与显式 runtime enhancements 确定性组合为 `frontend/index.html`。
 
 ## 核心约束
@@ -52,7 +53,7 @@
 9. `prompts/`、`banker/` 和历史对比文件只可用于比对，不进入正式构建或发布链。
 10. 正式发布源固定为 `axuitomo/CF-EMBY-PROXY-UI`，正式版本只认 GitHub Release。
 11. 不在仓库内创建或维护 wiki、知识库镜像及额外文档站点；管理台可以引用外部 WIKI 教程入口。
-12. D1 schema 变更以根 `migrations/` 的 Wrangler 版本化迁移为真相源；`worker.js` 中的运行时建表与补列只承担旧库兼容和首次启动兜底，不得替代正式迁移流程。
+12. 根 `migrations/` 是 D1 schema 版本与结构契约的真相源。生产数据库操作优先使用已登录的项目管理台，其次使用 Cloudflare Dashboard；Wrangler 只用于管理台不可用、旧 binding 不支持 Sessions API、本地验证或灾难恢复。管理台“初始化 DB”必须先取得 Time Travel bookmark，完成白名单兼容修复并复检结构后，才可幂等采纳对应 migration 基线；普通热路径、scheduled 和其他兼容 API 不得登记 migration。
 
 ## 默认工作上下文
 

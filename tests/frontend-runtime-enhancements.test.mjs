@@ -19,7 +19,7 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
   const closureEnd = inlineScript.lastIndexOf('})();');
   assert.notEqual(closureEnd, -1, 'enhancement script must use the expected closure');
   const instrumentedScript = inlineScript.slice(0, closureEnd)
-    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getServerRecordSelectableNodes, buildServerRecordDialogDraft, normalizeServerRecord, getServerRecordExpiryStatus, formatServerRecordExpiry, matchesServerRecordFilters, loadServerRecords, deleteServerRecord, hydrateMediaAggregationState, saveMediaAggregationState, markMediaAggregationDraftDirty, restoreServerRecordDialogFocus, mediaAggregationState, invalidateServerRecordCredentialRequest, isServerRecordCredentialRevealCurrent, handleServerRecordCredentialUsernameInput, bindServerRecordPasswordReveal, scheduleServerRecordCredentialConceal, concealServerRecordCredential, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, serverRecordsUiState };\n'
+    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, patchPosterMetadataAccountSaveChain, getServerRecordSelectableNodes, buildServerRecordDialogDraft, normalizeServerRecord, buildServerRecordCard, getServerRecordExpiryStatus, formatServerRecordExpiry, matchesServerRecordFilters, loadServerRecords, refreshSingleServerRecord, deleteServerRecord, activateServerRecordsRoute, hydrateMediaAggregationState, saveMediaAggregationState, markMediaAggregationDraftDirty, readPosterMetadataState, hydratePosterMetadataState, togglePosterMetadataRemoval, posterMetadataState, restoreServerRecordDialogFocus, mediaAggregationState, invalidateServerRecordCredentialRequest, isServerRecordCredentialRevealCurrent, handleServerRecordCredentialUsernameInput, bindServerRecordPasswordReveal, scheduleServerRecordCredentialConceal, concealServerRecordCredential, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, serverRecordsUiState };\n'
     + inlineScript.slice(closureEnd);
   const window = {
     addEventListener() {},
@@ -47,6 +47,204 @@ test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
 });
 
+function createPosterMetadataAccountTestApp(options = {}) {
+  const calls = [];
+  const confirmations = [];
+  const messages = [];
+  const app = {
+    runtimeConfig: { cfAccountId: options.currentAccountId || 'account-before' },
+    confirmResult: options.confirmResult !== false,
+    failSave: options.failSave === true,
+    getConfigPanelFieldKeys() {
+      return ['cfAccountId'];
+    },
+    collectConfigSectionFromForm() {
+      return { cfAccountId: options.nextAccountId || this.runtimeConfig.cfAccountId };
+    },
+    formatConfigPreviewValue(field, value) {
+      return String(value ?? '');
+    },
+    async prepareConfigChangePreview(section, currentConfig, nextConfig) {
+      const sanitizedConfig = { ...nextConfig };
+      delete sanitizedConfig.tmdbApiKey;
+      const accountChanged = currentConfig.cfAccountId !== sanitizedConfig.cfAccountId;
+      return {
+        sanitizedConfig,
+        migration: null,
+        preview: {
+          hasChanges: accountChanged,
+          message: accountChanged ? '即将保存「账号设置」以下变更：\n• Cloudflare 账号 ID：更新' : '当前分区没有检测到变更，无需保存。'
+        }
+      };
+    },
+    async askConfirm(message) {
+      confirmations.push(message);
+      return this.confirmResult;
+    },
+    async apiCall(action, payload) {
+      calls.push({ action, payload });
+      if (action !== 'saveConfig') return {};
+      if (this.failSave) throw new Error('save failed');
+      const hasTmdbMutation = Object.prototype.hasOwnProperty.call(payload.config, 'tmdbApiKey');
+      const removingTmdbKey = hasTmdbMutation && payload.config.tmdbApiKey === '';
+      const redactedConfig = { ...payload.config, tmdbApiKeyConfigured: !removingTmdbKey };
+      delete redactedConfig.tmdbApiKey;
+      return {
+        config: redactedConfig,
+        posterMetadata: {
+          tmdb: {
+            configured: true,
+            storage: removingTmdbKey ? 'worker_secret' : 'kv_config'
+          }
+        }
+      };
+    },
+    async saveSettings(section, panel = section) {
+      try {
+        const currentConfig = { ...this.runtimeConfig };
+        const fieldKeys = this.getConfigPanelFieldKeys(panel, section);
+        const nextConfig = {
+          ...currentConfig,
+          ...this.collectConfigSectionFromForm(section, { fieldKeys })
+        };
+        const { sanitizedConfig, preview } = await this.prepareConfigChangePreview(section, currentConfig, nextConfig, panel);
+        this.lastPreview = preview;
+        if (!preview.hasChanges || !(await this.askConfirm(preview.message))) return null;
+        const result = await this.apiCall('saveConfig', {
+          config: sanitizedConfig,
+          meta: { section: panel, source: 'ui' }
+        });
+        this.runtimeConfig = result.config;
+        return result;
+      } catch (error) {
+        this.showMessage('账号设置保存失败: ' + error.message, { tone: 'error' });
+        return null;
+      }
+    },
+    showMessage(message, optionsArg) {
+      messages.push({ message, options: optionsArg });
+    }
+  };
+  return { app, calls, confirmations, messages };
+}
+
+function resetPosterMetadataTestState(posterMetadataState, inputValue = '', storage = 'none') {
+  const input = {
+    value: inputValue,
+    focused: false,
+    focus() { this.focused = true; }
+  };
+  posterMetadataState.root = {
+    querySelector(selector) {
+      return selector === '[data-poster-metadata-tmdb-key="1"]' ? input : null;
+    }
+  };
+  posterMetadataState.tmdbConfigured = storage !== 'none';
+  posterMetadataState.tmdbStorage = storage;
+  posterMetadataState.draftKey = '';
+  posterMetadataState.removeRequested = false;
+  posterMetadataState.pending = false;
+  posterMetadataState.hydrated = true;
+  posterMetadataState.loading = false;
+  return input;
+}
+
+test('poster metadata settings live at the account settings bottom and use the unified account save chain', async () => {
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /function syncPosterMetadataPanel[\s\S]*?getElementById\('set-account'\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /settingsRoot\.appendChild\(panel\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-account-settings-save-actions/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /accountSaveActions\.previousElementSibling !== panel/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /app\.saveSettings\?\.\('account'\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /影视海报来源/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /管理台密钥保存至 KV 并优先生效/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /Worker Secret 仅作兼容兜底/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-poster-metadata-save/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('savePosterMetadataSettings'/);
+
+  const { readPosterMetadataState, patchPosterMetadataAccountSaveChain, posterMetadataState } = loadEnhancementTestHooks();
+  assert.deepEqual({ ...readPosterMetadataState({ posterMetadata: { tmdb: { configured: true, storage: 'kv_config' } } }) }, {
+    tmdbConfigured: true,
+    tmdbStorage: 'kv_config'
+  });
+  assert.deepEqual({ ...readPosterMetadataState({ posterMetadata: { tmdb: { configured: true, storage: 'worker_secret' } } }) }, {
+    tmdbConfigured: true,
+    tmdbStorage: 'worker_secret'
+  });
+
+  const tmdbApiKey = 'abcdefghijklmnopqrstuvwxyz123456';
+  const input = resetPosterMetadataTestState(posterMetadataState, tmdbApiKey, 'worker_secret');
+  const { app, calls, confirmations } = createPosterMetadataAccountTestApp();
+  patchPosterMetadataAccountSaveChain(app);
+
+  await app.saveSettings('account');
+  const saveCall = calls.find(call => call.action === 'saveConfig');
+  assert.ok(saveCall);
+  assert.equal(saveCall.payload.meta.section, 'account');
+  assert.equal(saveCall.payload.config.tmdbApiKey, tmdbApiKey);
+  assert.ok(app.getConfigPanelFieldKeys('account', 'account').includes('tmdbApiKey'));
+  assert.match(confirmations[0], /TMDB KV 密钥：新增/);
+  assert.doesNotMatch(confirmations[0], new RegExp(tmdbApiKey));
+  assert.equal(input.value, '');
+  assert.equal(posterMetadataState.draftKey, '');
+  assert.equal(posterMetadataState.removeRequested, false);
+  assert.equal(posterMetadataState.tmdbStorage, 'kv_config');
+  assert.equal(posterMetadataState.pending, false);
+});
+
+test('poster metadata account save preserves a blank key and submits explicit removal without exposing the key', async () => {
+  const { patchPosterMetadataAccountSaveChain, posterMetadataState } = loadEnhancementTestHooks();
+  resetPosterMetadataTestState(posterMetadataState, '', 'kv_config');
+  const ordinary = createPosterMetadataAccountTestApp({ nextAccountId: 'account-after' });
+  patchPosterMetadataAccountSaveChain(ordinary.app);
+  await ordinary.app.saveSettings('account');
+  const ordinarySave = ordinary.calls.find(call => call.action === 'saveConfig');
+  assert.ok(ordinarySave);
+  assert.equal(Object.prototype.hasOwnProperty.call(ordinarySave.payload.config, 'tmdbApiKey'), false);
+
+  resetPosterMetadataTestState(posterMetadataState, '', 'kv_config');
+  posterMetadataState.removeRequested = true;
+  const removal = createPosterMetadataAccountTestApp();
+  patchPosterMetadataAccountSaveChain(removal.app);
+  await removal.app.saveSettings('account');
+  const removalSave = removal.calls.find(call => call.action === 'saveConfig');
+  assert.ok(removalSave);
+  assert.equal(Object.prototype.hasOwnProperty.call(removalSave.payload.config, 'tmdbApiKey'), true);
+  assert.equal(removalSave.payload.config.tmdbApiKey, '');
+  assert.match(removal.confirmations[0], /TMDB KV 密钥：移除/);
+  assert.equal(posterMetadataState.removeRequested, false);
+  assert.equal(posterMetadataState.tmdbStorage, 'worker_secret');
+});
+
+test('poster metadata account save keeps the draft after cancellation, validation failure, or save failure', async () => {
+  const { patchPosterMetadataAccountSaveChain, posterMetadataState } = loadEnhancementTestHooks();
+  const tmdbApiKey = 'abcdefghijklmnopqrstuvwxyz123456';
+
+  const cancelledInput = resetPosterMetadataTestState(posterMetadataState, tmdbApiKey, 'none');
+  const cancelled = createPosterMetadataAccountTestApp({ confirmResult: false });
+  patchPosterMetadataAccountSaveChain(cancelled.app);
+  await cancelled.app.saveSettings('account');
+  assert.equal(cancelled.calls.some(call => call.action === 'saveConfig'), false);
+  assert.equal(cancelledInput.value, tmdbApiKey);
+  assert.equal(posterMetadataState.draftKey, tmdbApiKey);
+
+  const invalidInput = resetPosterMetadataTestState(posterMetadataState, 'invalid key', 'none');
+  const invalid = createPosterMetadataAccountTestApp();
+  patchPosterMetadataAccountSaveChain(invalid.app);
+  await invalid.app.saveSettings('account');
+  assert.equal(invalid.calls.some(call => call.action === 'saveConfig'), false);
+  assert.equal(invalidInput.focused, true);
+  assert.match(invalid.messages[0].message, /有效的 TMDB v3 API Key/);
+
+  const failedInput = resetPosterMetadataTestState(posterMetadataState, tmdbApiKey, 'none');
+  const failed = createPosterMetadataAccountTestApp({ failSave: true });
+  patchPosterMetadataAccountSaveChain(failed.app);
+  await failed.app.saveSettings('account');
+  assert.equal(failed.calls.some(call => call.action === 'saveConfig'), true);
+  assert.equal(failedInput.value, tmdbApiKey);
+  assert.equal(posterMetadataState.draftKey, tmdbApiKey);
+  assert.equal(posterMetadataState.pending, false);
+});
+
 test('server records view is inserted before logs and uses node-backed admin actions', async () => {
   const syncSource = await readFile(new URL('../frontend/scripts/sync-admin-runtime.mjs', import.meta.url), 'utf8');
   assert.match(syncSource, /'nodes',\s*'server-records',\s*'logs'/);
@@ -64,6 +262,29 @@ test('server records view is inserted before logs and uses node-backed admin act
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /name="(?:movies|series|episodes|lastWatched|url|state)"/);
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /累计观看|totalSeconds|formatServerRecordDuration/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /record\.watch\.state === 'ok' \? formatServerRecordDateTime\(record\.watch\.lastWatchedAt\) : '数据不可用'/);
+});
+
+test('server records route releases the desktop settings scroll lock', async () => {
+  const { activateServerRecordsRoute } = loadEnhancementTestHooks();
+  const syncedRoutes = [];
+  const app = {
+    currentHash: '#settings',
+    pageTitle: '设置',
+    sidebarOpen: true,
+    isDesktopSettingsLayout: true,
+    syncViewportState(hash) {
+      syncedRoutes.push(hash);
+      this.isDesktopSettingsLayout = hash === '#settings';
+    }
+  };
+
+  await activateServerRecordsRoute(app, false);
+
+  assert.equal(app.currentHash, '#server-records');
+  assert.equal(app.pageTitle, '服务器记录');
+  assert.equal(app.sidebarOpen, false);
+  assert.equal(app.isDesktopSettingsLayout, false);
+  assert.deepEqual(syncedRoutes, ['#server-records']);
 });
 
 test('server record dialog preserves node settings and allows legacy records to target enabled nodes', () => {
@@ -108,11 +329,21 @@ test('server record dialog preserves node settings and allows legacy records to 
 });
 
 test('server record cards use Worker expiry results and expose the compact status action layout', () => {
-  const { normalizeServerRecord, getServerRecordExpiryStatus, formatServerRecordExpiry } = loadEnhancementTestHooks();
+  const { normalizeServerRecord, buildServerRecordCard, getServerRecordExpiryStatus, formatServerRecordExpiry } = loadEnhancementTestHooks();
   const record = normalizeServerRecord({
     nodeName: 'alpha',
     expiresAt: '',
-    watch: { lastWatchedAt: '2026-07-01T00:00:00.000Z', state: 'ok' },
+    counts: { movies: 4, series: 5, episodes: 6, state: 'ok', source: 'persisted', persisted: true, checkedAt: '2026-07-21T01:02:03.000Z' },
+    watch: {
+      lastWatchedAt: '2026-07-01T00:00:00.000Z',
+      state: 'ok',
+      itemId: 'episode-1',
+      itemName: '第一集',
+      itemType: 'Episode',
+      seriesName: '测试剧集',
+      imageTag: 'poster-1',
+      posterUrl: '/admin/__server-record-poster/alpha?v=1234'
+    },
     expiryEnabled: true,
     expiryMode: 'rolling',
     expiryDays: 45,
@@ -123,11 +354,35 @@ test('server record cards use Worker expiry results and expose the compact statu
   assert.equal(formatServerRecordExpiry(record, status), '3 天过期');
   assert.equal(status.mode, 'rolling');
   assert.equal(status.expiryDays, 45);
+  assert.equal(record.counts.source, 'persisted');
+  assert.equal(record.counts.persisted, true);
+  const card = buildServerRecordCard(record);
+  assert.match(card, /data-server-record-poster src="\/admin\/__server-record-poster\/alpha\?v=1234"/);
+  assert.match(card, /测试剧集 · 第一集/);
+  assert.match(card, /已保存的媒体统计/);
+  assert.match(card, /server-record-split/);
+  assert.match(card, /server-record-info/);
+  assert.match(card, /server-record-card-head[\s\S]*?server-record-card-identity[\s\S]*?server-record-card-refresh/);
+  assert.match(card, /server-record-split[\s\S]*?server-record-watch-poster[\s\S]*?server-record-info[\s\S]*?server-record-watch[\s\S]*?server-record-metrics/);
+  assert.match(card, /2:3 海报框/);
+  assert.doesNotMatch(card, /server-record-transition/);
+  assert.equal(normalizeServerRecord({ nodeName: 'external', watch: { posterUrl: 'https://evil.example/poster.jpg' } }).watch.posterUrl, '');
 
   const unset = normalizeServerRecord({ nodeName: 'unset', expiry: { state: 'unset', daysRemaining: null } });
   assert.equal(unset.expiry.daysRemaining, null);
   assert.equal(getServerRecordExpiryStatus(unset).key, 'disabled');
-  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-refresh title="刷新全部资源统计和预计过期" aria-label="刷新全部资源统计和预计过期"/);
+  const missingWorkerExpiry = normalizeServerRecord({
+    nodeName: 'fixed-without-worker-expiry',
+    expiryEnabled: true,
+    expiryMode: 'fixed',
+    expiresAt: '2020-01-01'
+  });
+  const missingWorkerExpiryStatus = getServerRecordExpiryStatus(missingWorkerExpiry);
+  assert.equal(missingWorkerExpiryStatus.key, 'unset');
+  assert.equal(missingWorkerExpiryStatus.days, null);
+  assert.equal(missingWorkerExpiryStatus.expiresAt, '2020-01-01');
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /new Date\(record\.expiresAt/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-refresh title="刷新服务器状态并保存全部资源统计" aria-label="刷新服务器状态并保存全部资源统计"/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-refresh-one=/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /refreshButton\?\.setAttribute\('aria-busy', 'true'\)/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('getServerRecordsSnapshot', \{ forceRefresh \}\)/);
@@ -152,6 +407,12 @@ test('server record cards use Worker expiry results and expose the compact statu
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-server-record-open=|打开服务器/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-filter-row\{display:grid;grid-template-columns:minmax\(0,1fr\) minmax\(10rem,12rem\);gap:\.75rem;margin-bottom:1\.5rem\}/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-card-actions\{display:grid;grid-template-columns:2\.5rem minmax\(0,1fr\) 2\.5rem/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-grid\{[^}]*minmax\(min\(100%,30rem\),1fr\)/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-split\{[^}]*grid-template-columns:minmax\(7\.5rem,4fr\) minmax\(0,8fr\)[^}]*align-items:center/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-watch-poster\{[^}]*width:100%;aspect-ratio:2\/3/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-watch-poster img\{[^}]*object-fit:contain/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-metrics\{[^}]*grid-template-columns:repeat\(3,minmax\(0,1fr\)\)/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-watch-poster(?:::|:)\w+\{[^}]*gradient/);
 });
 
 test('server record expiry mode filter combines with search and excludes disabled expiry policies', () => {
@@ -280,6 +541,10 @@ test('media aggregation settings expose fixed credentials and shortcut action', 
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-username/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-password/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-progress/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-match-mode/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-first-timeout/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-media-aggregation-grace-period/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /TMDB → IMDb → 严格标题年份/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-admin-node-media-credentials/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /mediaAggregationEmbyCredentialsConfigured/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /else advancedFields\.insertAdjacentElement\('beforebegin', panel\)/);
@@ -548,6 +813,43 @@ test('a manual server-record refresh supersedes an earlier ordinary read', async
   assert.equal(serverRecordsUiState.refreshingAll, false);
 });
 
+test('a full server-record refresh prevents an older single-card response from overwriting it', async () => {
+  const { loadServerRecords, refreshSingleServerRecord, serverRecordsUiState } = loadEnhancementTestHooks();
+  const pending = [];
+  serverRecordsUiState.records = [{ nodeName: 'alpha', displayName: 'Initial alpha' }];
+  const app = {
+    apiCall(action, payload) {
+      assert.equal(action, 'getServerRecordsSnapshot');
+      const request = {};
+      request.promise = new Promise((resolve) => { request.resolve = resolve; });
+      pending.push({ payload, ...request });
+      return request.promise;
+    }
+  };
+
+  const single = refreshSingleServerRecord(app, 'alpha');
+  const full = loadServerRecords(app, { forceRefresh: true });
+  assert.equal(JSON.stringify(pending.map((request) => request.payload)), JSON.stringify([
+    { forceRefresh: true, nodeName: 'alpha' },
+    { forceRefresh: true }
+  ]));
+
+  pending[1].resolve({
+    records: [{ nodeName: 'alpha', displayName: 'Newer full refresh', counts: { movies: 9 } }],
+    availableNodes: [{ nodeName: 'alpha', displayName: 'Newer alpha' }]
+  });
+  await full;
+  pending[0].resolve({
+    records: [{ nodeName: 'alpha', displayName: 'Older single refresh', counts: { movies: 1 } }],
+    availableNodes: [{ nodeName: 'stale-node', displayName: 'Stale node' }]
+  });
+  await single;
+
+  assert.equal(serverRecordsUiState.records[0].displayName, 'Newer full refresh');
+  assert.equal(serverRecordsUiState.records[0].counts.movies, 9);
+  assert.deepEqual(serverRecordsUiState.availableNodes.map((node) => node.nodeName), ['alpha']);
+});
+
 test('server-record removal keeps one confirmation and one write in flight', async () => {
   const { deleteServerRecord, serverRecordsUiState } = loadEnhancementTestHooks();
   let resolveConfirmation;
@@ -593,15 +895,17 @@ test('aggregation save locks the command during confirmation and sends one mutat
   const confirmation = new Promise((resolve) => { resolveConfirmation = resolve; });
   let confirmationCount = 0;
   let saveCount = 0;
+  let savedPayload = null;
   const app = {
     nodes: [{ name: 'alpha' }, { name: 'beta' }],
     askConfirm() {
       confirmationCount += 1;
       return confirmation;
     },
-    async apiCall(action) {
+    async apiCall(action, payload) {
       if (action === 'saveMediaAggregationPolicyShortcuts') {
         saveCount += 1;
+        savedPayload = payload;
         return {};
       }
       assert.equal(action, 'getSettingsBootstrap');
@@ -619,6 +923,9 @@ test('aggregation save locks the command during confirmation and sends one mutat
   resolveConfirmation(true);
   await first;
   assert.equal(saveCount, 1);
+  assert.equal(savedPayload.matchMode, 'title_year');
+  assert.equal(savedPayload.firstResultTimeoutMs, 1500);
+  assert.equal(savedPayload.gracePeriodMs, 800);
   assert.equal(mediaAggregationState.savePending, false);
   assert.equal(mediaAggregationState.loading, false);
 });
@@ -740,18 +1047,20 @@ test('D1 schema dialog includes migrations, columns, and reported issues', () =>
   assert.match(message, /结构问题：\n• missing_column:auth_failures\.expires_at/);
 });
 
-test('initialize DB is the single UI action and reports automatic compatibility changes', async () => {
+test('initialize DB is the single schema mutation action and reports bookmark plus adopted migrations', async () => {
   const { patchSafetyContractMethods, formatD1InitializationResult } = loadEnhancementTestHooks();
   const calls = [];
   const messages = [];
   const result = {
     runtimeCompatibilityReady: true,
-    migrationReady: false,
+    migrationReady: true,
+    recoveryBookmark: 'bookmark-before-init',
+    adoptedMigrations: ['0004_server_watch_stats', '0005_server_record_snapshots'],
     status: {
       runtimeCompatibilityReady: true,
-      migrationReady: false,
-      missingMigrations: ['0004_server_watch_stats'],
-      issues: ['missing_migration:0004_server_watch_stats']
+      migrationReady: true,
+      missingMigrations: [],
+      issues: []
     },
     initialization: {
       createdTables: ['server_last_watch'],
@@ -759,6 +1068,8 @@ test('initialize DB is the single UI action and reports automatic compatibility 
       createdIndexes: [],
       repairedIndexes: ['idx_auth_failures_expires_at'],
       droppedRetiredIndexes: ['idx_proxy_logs_client_ip'],
+      adoptedMigrations: ['0004_server_watch_stats', '0005_server_record_snapshots'],
+      migrationTableCreated: true,
       ftsRecreated: true
     }
   };
@@ -778,10 +1089,46 @@ test('initialize DB is the single UI action and reports automatic compatibility 
 
   assert.deepEqual(calls, ['initLogsDb']);
   assert.equal(messages[0].options.title, '初始化 DB 结果');
-  assert.equal(messages[0].options.tone, 'warning');
+  assert.equal(messages[0].options.tone, 'success');
   assert.match(messages[0].message, /新建表：server_last_watch/);
+  assert.match(messages[0].message, /采纳迁移基线：0004_server_watch_stats、0005_server_record_snapshots/);
+  assert.match(messages[0].message, /初始化前 Time Travel Bookmark：\nbookmark-before-init/);
   assert.match(formatD1InitializationResult(result), /移除旧索引：idx_proxy_logs_client_ip/);
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('initD1Schema'|apiCall\('getD1SchemaStatus'/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /data-admin-runtime-action="d1-schema-bookmark"/);
+});
+
+test('bookmark UI action reads and copies the current Time Travel bookmark without schema actions', async () => {
+  const copied = [];
+  const { patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
+    navigator: {
+      clipboard: {
+        async writeText(value) {
+          copied.push(value);
+        }
+      }
+    }
+  });
+  const calls = [];
+  const messages = [];
+  const app = {
+    async apiCall(action) {
+      calls.push(action);
+      return { bookmark: 'bookmark-current-primary' };
+    },
+    async showMessage(message, options) {
+      messages.push({ message, options });
+    }
+  };
+
+  patchSafetyContractMethods(app);
+  await app.getD1TimeTravelBookmarkFromUi();
+
+  assert.deepEqual(calls, ['getD1TimeTravelBookmark']);
+  assert.deepEqual(copied, ['bookmark-current-primary']);
+  assert.equal(messages[0].options.title, 'D1 Time Travel Bookmark');
+  assert.equal(messages[0].options.tone, 'success');
+  assert.match(messages[0].message, /Bookmark 已复制到剪贴板/);
 });
 
 test('D1 tidy initializes, re-previews, and executes only with the second signed plan', async () => {

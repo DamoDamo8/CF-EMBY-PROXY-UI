@@ -52,6 +52,8 @@ const CACHE_DEFAULTS = Object.freeze({
   PlaybackInfoCacheTotalMaxBytes: 4 * 1024 * 1024,
   MediaAggregationAuthTtlMs: 10 * 60 * 1000,
   MediaAggregationAuthCacheMax: 32,
+  MediaAggregationInstanceMapTtlMs: 5 * 60 * 1000,
+  MediaAggregationInstanceMapMax: 64,
   ServerRecordAuthCacheMax: 32,
   ServerRecordProbeBackoffMax: 512,
   ServerRecordProbeBackoffBaseMs: 1000,
@@ -147,7 +149,10 @@ const PROXY_DEFAULTS = Object.freeze({
   PrewarmPrefetchBytes: 4 * 1024 * 1024,
   DefaultPlaybackInfoMode: "passthrough",
   DefaultRealClientIpMode: "forward",
-  DefaultMediaAuthMode: "auto"
+  DefaultMediaAuthMode: "auto",
+  MediaAggregationMatchMode: "title_year",
+  MediaAggregationFirstResultTimeoutMs: 1500,
+  MediaAggregationGracePeriodMs: 800
 });
 
 const DNS_DEFAULTS = Object.freeze({
@@ -205,6 +210,8 @@ const DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoC
 const DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheTotalMaxBytes;
 const MEDIA_AGGREGATION_AUTH_TTL_MS = CACHE_DEFAULTS.MediaAggregationAuthTtlMs;
 const MEDIA_AGGREGATION_AUTH_CACHE_MAX = CACHE_DEFAULTS.MediaAggregationAuthCacheMax;
+const MEDIA_AGGREGATION_INSTANCE_MAP_TTL_MS = CACHE_DEFAULTS.MediaAggregationInstanceMapTtlMs;
+const MEDIA_AGGREGATION_INSTANCE_MAP_MAX = CACHE_DEFAULTS.MediaAggregationInstanceMapMax;
 const SERVER_RECORD_AUTH_CACHE_MAX = CACHE_DEFAULTS.ServerRecordAuthCacheMax;
 const SERVER_RECORD_PROBE_BACKOFF_MAX = CACHE_DEFAULTS.ServerRecordProbeBackoffMax;
 const SERVER_RECORD_PROBE_BACKOFF_BASE_MS = CACHE_DEFAULTS.ServerRecordProbeBackoffBaseMs;
@@ -215,6 +222,23 @@ const DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgress
 const DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES = CACHE_DEFAULTS.VideoProgressSnapshotMaxBytes;
 const DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnapshotTtlMs;
 const SERVER_RECORDS_PROBE_TIMEOUT_MS = 8000;
+const SERVER_RECORD_POSTER_CONTENT_TYPES = new Set([
+  "image/avif",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp"
+]);
+const SERVER_RECORD_POSTER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000;
+const TMDB_API_ORIGIN = "https://api.themoviedb.org";
+const TMDB_IMAGE_ORIGIN = "https://image.tmdb.org";
+const TMDB_POSTER_IMAGE_SIZE = "w500";
+const TMDB_POSTER_IMAGE_PATH_REGEX = /^\/[A-Za-z0-9_-]{1,128}\.(?:avif|gif|jpe?g|png|webp)$/i;
+const TMDB_NUMERIC_ID_REGEX = /^[1-9][0-9]{0,11}$/;
+const IMDB_ID_REGEX = /^tt[0-9]{5,12}$/i;
+const TMDB_API_KEY_INPUT_REGEX = /^[A-Za-z0-9_-]{16,256}$/;
+const TMDB_JSON_CONTENT_TYPES = new Set(["application/json"]);
 const SERVER_RECORDS_PROBE_CONCURRENCY = 4;
 const DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
@@ -281,6 +305,7 @@ const GLOBAL_CACHE_STATE = {
   NodesIndexCache: null,
   PlaybackInfoResponseCache: new Map(),
   MediaAggregationAuthCache: new Map(),
+  MediaAggregationInstanceMap: new Map(),
   ServerRecordAuthCache: new Map(),
   ServerRecordProbeBackoff: new Map(),
   PlaybackProgressRelay: new Map(),
@@ -309,6 +334,7 @@ const GLOBAL_RUNTIME_STATE = {
       rate: null,
       log: null,
       playbackInfo: null,
+      mediaAggregationInstance: null,
       failover: null,
       progress: null,
       monthlyTraffic: null
@@ -334,6 +360,8 @@ const GLOBAL_DB_READY_STATE = {
   LogsBaseDbReady: new WeakMap(),
   StatsHourlyDbReady: new WeakMap(),
   ServerLastWatchDbReady: new WeakMap(),
+  ServerRecordSnapshotDbReady: new WeakMap(),
+  ServerRecordPosterCacheDbReady: new WeakMap(),
   DnsIpWorkspaceDbReady: new WeakMap(),
   OpsStatusDbReady: new WeakMap(),
   OpsStatusShadowCache: new WeakMap(),
@@ -1489,7 +1517,14 @@ function decodeBase64UrlUtf8(value = "") {
   return new TextDecoder().decode(bytes);
 }
 
-const MEDIA_AGGREGATION_SOURCE_ID_PREFIX = "AGG1";
+const MEDIA_AGGREGATION_SOURCE_ID_PREFIX = "AGG2";
+const MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX = "AGG1";
+const MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS = Object.freeze(["tmdb", "imdb"]);
+const MEDIA_AGGREGATION_SUPPORTED_TYPES = new Set(["movie", "series", "episode"]);
+
+function normalizeMediaAggregationMatchMode(value = "") {
+  return String(value || "").trim().toLowerCase() === "strict" ? "strict" : "title_year";
+}
 
 function readMediaAggregationCredentialPair(source = {}) {
   const username = String(source?.mediaAggregationEmbyUsername ?? "").trim();
@@ -1574,23 +1609,56 @@ function buildMediaAggregationSourceId(nodeName = "", itemId = "", mediaSourceId
   const normalizedMediaSourceId = String(mediaSourceId || "").trim();
   if (!normalizedNodeName || !normalizedItemId || !normalizedMediaSourceId) return "";
   return [
-    MEDIA_AGGREGATION_SOURCE_ID_PREFIX,
+    MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX,
     encodeBase64UrlUtf8(normalizedNodeName),
     encodeBase64UrlUtf8(normalizedItemId),
     encodeBase64UrlUtf8(normalizedMediaSourceId)
   ].join("*");
 }
 
+async function buildMediaAggregationSourceIdV2(secret = "", nodeName = "", itemId = "", mediaSourceId = "", identityHash = "") {
+  const normalizedSecret = String(secret || "");
+  const normalizedNodeName = String(nodeName || "").trim().toLowerCase();
+  const normalizedItemId = String(itemId || "").trim();
+  const normalizedMediaSourceId = String(mediaSourceId || "").trim();
+  const normalizedIdentityHash = String(identityHash || "").trim();
+  if (!normalizedSecret || !normalizedNodeName || !normalizedItemId || !normalizedMediaSourceId || !normalizedIdentityHash) return "";
+  const unsigned = [
+    MEDIA_AGGREGATION_SOURCE_ID_PREFIX,
+    encodeBase64UrlUtf8(normalizedNodeName),
+    encodeBase64UrlUtf8(normalizedItemId),
+    encodeBase64UrlUtf8(normalizedMediaSourceId),
+    normalizedIdentityHash
+  ].join("*");
+  return `${unsigned}*${await Auth.sign(normalizedSecret, unsigned)}`;
+}
+
 function parseMediaAggregationSourceId(value = "") {
   const text = String(value || "").trim();
   const parts = text.split("*");
-  if (parts.length !== 4 || parts[0] !== MEDIA_AGGREGATION_SOURCE_ID_PREFIX) return null;
+  const isLegacy = parts.length === 4 && parts[0] === MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX;
+  const isSigned = parts.length === 6 && parts[0] === MEDIA_AGGREGATION_SOURCE_ID_PREFIX;
+  if (!isLegacy && !isSigned) return null;
   try {
     const nodeName = decodeBase64UrlUtf8(parts[1]).trim().toLowerCase();
     const itemId = decodeBase64UrlUtf8(parts[2]).trim();
     const mediaSourceId = decodeBase64UrlUtf8(parts[3]).trim();
     if (!nodeName || !itemId || !mediaSourceId) return null;
     if (nodeName.length > 128 || itemId.length > 512 || mediaSourceId.length > 1024) return null;
+    if (isSigned) {
+      const identityHash = String(parts[4] || "").trim();
+      const signature = String(parts[5] || "").trim();
+      if (!/^[a-zA-Z0-9_-]{16,128}$/.test(identityHash) || !/^[a-zA-Z0-9_-]{32,128}$/.test(signature)) return null;
+      return {
+        version: "AGG2",
+        nodeName,
+        itemId,
+        mediaSourceId,
+        identityHash,
+        signature,
+        signedPayload: parts.slice(0, 5).join("*")
+      };
+    }
     return { nodeName, itemId, mediaSourceId };
   } catch {
     return null;
@@ -1612,7 +1680,258 @@ function normalizeMediaAggregationProviderIds(providerIds = {}) {
 function mediaAggregationProviderIdsMatch(primaryProviderIds = {}, candidateProviderIds = {}) {
   const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
   const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
-  return ["tmdb", "imdb"].some(key => primary[key] && candidate[key] === primary[key]);
+  let matched = false;
+  for (const key of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
+    if (!primary[key] || !candidate[key]) continue;
+    if (primary[key] !== candidate[key]) return false;
+    matched = true;
+  }
+  return matched;
+}
+
+function normalizeMediaAggregationTitle(value = "") {
+  return String(value || "")
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[\p{P}\p{S}\s]+/gu, "")
+    .trim();
+}
+
+function normalizeMediaAggregationYear(value) {
+  const year = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(year) && year >= 1800 && year <= 3000 ? year : null;
+}
+
+function normalizeMediaAggregationIndex(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const index = Number(value);
+  return Number.isInteger(index) && index >= 0 ? index : null;
+}
+
+function buildMediaAggregationIdentity(item = {}, seriesItem = {}) {
+  const type = String(item?.Type || item?.type || "").trim().toLowerCase();
+  const series = isPlainObject(seriesItem) ? seriesItem : {};
+  return {
+    itemId: String(item?.Id || item?.id || "").trim(),
+    type,
+    providerIds: normalizeMediaAggregationProviderIds(item?.ProviderIds || item?.providerIds),
+    searchName: String(item?.Name || item?.name || item?.OriginalTitle || item?.originalTitle || "").trim(),
+    name: normalizeMediaAggregationTitle(item?.Name || item?.name),
+    originalTitle: normalizeMediaAggregationTitle(item?.OriginalTitle || item?.originalTitle),
+    productionYear: normalizeMediaAggregationYear(item?.ProductionYear || item?.productionYear),
+    seriesId: String(item?.SeriesId || item?.seriesId || series?.Id || series?.id || "").trim(),
+    seriesProviderIds: normalizeMediaAggregationProviderIds(series?.ProviderIds || series?.providerIds || item?.SeriesProviderIds || item?.seriesProviderIds),
+    seriesSearchName: String(series?.Name || series?.name || item?.SeriesName || item?.seriesName || "").trim(),
+    seriesName: normalizeMediaAggregationTitle(series?.Name || series?.name || item?.SeriesName || item?.seriesName),
+    seriesOriginalTitle: normalizeMediaAggregationTitle(series?.OriginalTitle || series?.originalTitle),
+    seriesProductionYear: normalizeMediaAggregationYear(series?.ProductionYear || series?.productionYear || item?.SeriesProductionYear || item?.seriesProductionYear),
+    parentIndexNumber: normalizeMediaAggregationIndex(item?.ParentIndexNumber ?? item?.parentIndexNumber),
+    indexNumber: normalizeMediaAggregationIndex(item?.IndexNumber ?? item?.indexNumber),
+    indexNumberEnd: normalizeMediaAggregationIndex(item?.IndexNumberEnd ?? item?.indexNumberEnd)
+  };
+}
+
+function getMediaAggregationTitleCandidates(identity = {}, series = false) {
+  const values = series
+    ? [identity.seriesName, identity.seriesOriginalTitle]
+    : [identity.name, identity.originalTitle];
+  return [...new Set(values.map(value => normalizeMediaAggregationTitle(value)).filter(Boolean))];
+}
+
+function mediaAggregationTitlesMatch(primary = {}, candidate = {}, series = false) {
+  const primaryTitles = getMediaAggregationTitleCandidates(primary, series);
+  const candidateTitles = new Set(getMediaAggregationTitleCandidates(candidate, series));
+  return primaryTitles.some(title => candidateTitles.has(title));
+}
+
+function resolveMediaAggregationProviderMatch(primaryProviderIds = {}, candidateProviderIds = {}) {
+  const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
+  const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
+  let matchedKey = "";
+  for (const key of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
+    if (!primary[key] || !candidate[key]) continue;
+    if (primary[key] !== candidate[key]) return null;
+    if (!matchedKey) matchedKey = key;
+  }
+  return matchedKey ? { key: matchedKey, value: primary[matchedKey] } : null;
+}
+
+function haveMediaAggregationProviderConflict(primaryProviderIds = {}, candidateProviderIds = {}) {
+  const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
+  const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
+  return MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS.some(key => primary[key] && candidate[key] && primary[key] !== candidate[key]);
+}
+
+function matchMediaAggregationIdentities(primary = {}, candidate = {}, matchMode = "title_year") {
+  const primaryType = String(primary?.type || "").trim().toLowerCase();
+  const candidateType = String(candidate?.type || "").trim().toLowerCase();
+  if (!MEDIA_AGGREGATION_SUPPORTED_TYPES.has(primaryType) || primaryType !== candidateType) return null;
+  const normalizedMode = normalizeMediaAggregationMatchMode(matchMode);
+  if (primaryType === "episode") {
+    if (
+      primary.parentIndexNumber !== candidate.parentIndexNumber
+      || primary.indexNumber !== candidate.indexNumber
+      || primary.indexNumberEnd !== candidate.indexNumberEnd
+      || primary.parentIndexNumber === null
+      || primary.indexNumber === null
+    ) return null;
+    if (haveMediaAggregationProviderConflict(primary.seriesProviderIds, candidate.seriesProviderIds)) return null;
+    const providerMatch = resolveMediaAggregationProviderMatch(primary.seriesProviderIds, candidate.seriesProviderIds);
+    if (providerMatch) {
+      return {
+        status: "matched_episode",
+        strategy: `series_${providerMatch.key}`,
+        fingerprint: {
+          type: primaryType,
+          provider: providerMatch,
+          season: primary.parentIndexNumber,
+          episode: primary.indexNumber,
+          episodeEnd: primary.indexNumberEnd
+        }
+      };
+    }
+    if (
+      normalizedMode === "title_year"
+      && primary.seriesProductionYear !== null
+      && primary.seriesProductionYear === candidate.seriesProductionYear
+      && mediaAggregationTitlesMatch(primary, candidate, true)
+    ) {
+      return {
+        status: "matched_episode",
+        strategy: "series_title_year",
+        fingerprint: {
+          type: primaryType,
+          title: getMediaAggregationTitleCandidates(primary, true).find(title => getMediaAggregationTitleCandidates(candidate, true).includes(title)) || "",
+          year: primary.seriesProductionYear,
+          season: primary.parentIndexNumber,
+          episode: primary.indexNumber,
+          episodeEnd: primary.indexNumberEnd
+        }
+      };
+    }
+    return null;
+  }
+  if (haveMediaAggregationProviderConflict(primary.providerIds, candidate.providerIds)) return null;
+  const providerMatch = resolveMediaAggregationProviderMatch(primary.providerIds, candidate.providerIds);
+  if (providerMatch) {
+    return {
+      status: "matched_provider",
+      strategy: providerMatch.key,
+      fingerprint: { type: primaryType, provider: providerMatch }
+    };
+  }
+  if (
+    normalizedMode === "title_year"
+    && primary.productionYear !== null
+    && primary.productionYear === candidate.productionYear
+    && mediaAggregationTitlesMatch(primary, candidate, false)
+  ) {
+    return {
+      status: "matched_title_year",
+      strategy: "title_year",
+      fingerprint: {
+        type: primaryType,
+        title: getMediaAggregationTitleCandidates(primary).find(title => getMediaAggregationTitleCandidates(candidate).includes(title)) || "",
+        year: primary.productionYear
+      }
+    };
+  }
+  return null;
+}
+
+async function sha256Base64Url(value = "") {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value || "")));
+  return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+async function buildMediaAggregationIdentityDigest(identity = {}) {
+  return await sha256Base64Url(serializeConfigValue(identity));
+}
+
+async function buildMediaAggregationMatchFingerprintHash(match = {}) {
+  return await sha256Base64Url(serializeConfigValue(match?.fingerprint || {}));
+}
+
+async function verifyMediaAggregationSourceSignature(source, secret = "") {
+  if (!source || source.version !== "AGG2" || !secret) return false;
+  return source.signature === await Auth.sign(String(secret), String(source.signedPayload || ""));
+}
+
+function normalizeTmdbPosterId(value = "") {
+  const normalized = String(value || "").trim();
+  return TMDB_NUMERIC_ID_REGEX.test(normalized) ? normalized : "";
+}
+
+function normalizeImdbPosterId(value = "") {
+  const normalized = String(value || "").trim().toLowerCase();
+  return IMDB_ID_REGEX.test(normalized) ? normalized : "";
+}
+
+function normalizeTmdbApiKeyInput(value = "") {
+  const normalized = String(value || "").trim();
+  return TMDB_API_KEY_INPUT_REGEX.test(normalized) ? normalized : "";
+}
+
+function resolveTmdbPosterApiKey(env, runtimeConfig = {}) {
+  return normalizeTmdbApiKeyInput(runtimeConfig?.tmdbApiKey)
+    || String(env?.TMDB_API_KEY || "").trim();
+}
+
+function buildPosterMetadataSettingsState(env, runtimeConfig = {}) {
+  const kvApiKey = normalizeTmdbApiKeyInput(runtimeConfig?.tmdbApiKey);
+  const workerSecret = String(env?.TMDB_API_KEY || "").trim();
+  const storage = kvApiKey ? "kv_config" : (workerSecret ? "worker_secret" : "none");
+  return {
+    tmdb: {
+      configured: storage !== "none",
+      storage
+    },
+    imdb: {
+      configured: true,
+      mode: "tmdb_find"
+    },
+    sourceOrder: ["tmdb_direct", "imdb_tmdb_find", "emby", "placeholder"]
+  };
+}
+
+function normalizeTmdbPosterImagePath(value = "") {
+  const normalized = String(value || "").trim();
+  return TMDB_POSTER_IMAGE_PATH_REGEX.test(normalized) ? normalized : "";
+}
+
+function selectTmdbPosterImagePath(payload = {}) {
+  const posters = Array.isArray(payload?.posters) ? payload.posters : [];
+  const ranked = [];
+  for (const poster of posters) {
+    const imagePath = normalizeTmdbPosterImagePath(poster?.file_path || poster?.filePath);
+    const width = Number(poster?.width);
+    const height = Number(poster?.height);
+    const aspectRatio = Number(poster?.aspect_ratio ?? poster?.aspectRatio);
+    if (!imagePath || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= width) continue;
+    if (Number.isFinite(aspectRatio) && (aspectRatio <= 0 || aspectRatio > 0.8)) continue;
+    const language = String(poster?.iso_639_1 || poster?.iso6391 || "").trim().toLowerCase();
+    const languageRank = language.startsWith("zh") ? 0 : (language === "en" ? 1 : (language ? 3 : 2));
+    ranked.push({
+      imagePath,
+      languageRank,
+      voteCount: Math.max(0, Number(poster?.vote_count ?? poster?.voteCount) || 0),
+      width,
+      height
+    });
+  }
+  ranked.sort((left, right) => left.languageRank - right.languageRank
+    || right.voteCount - left.voteCount
+    || right.height - left.height
+    || right.width - left.width
+    || left.imagePath.localeCompare(right.imagePath));
+  return ranked[0]?.imagePath || "";
+}
+
+function buildTmdbPosterImageUrl(imagePath = "") {
+  const normalizedPath = normalizeTmdbPosterImagePath(imagePath);
+  if (!normalizedPath) return null;
+  const url = new URL(`/t/p/${TMDB_POSTER_IMAGE_SIZE}${normalizedPath}`, TMDB_IMAGE_ORIGIN);
+  return url.origin === TMDB_IMAGE_ORIGIN ? url : null;
 }
 
 function extractPlaybackInfoItemPathState(proxyPath = "") {
@@ -2569,6 +2888,21 @@ function buildUpstreamProxyUrl(targetBase, proxyPath = "/") {
   return baseUrl;
 }
 
+// Probe paths are historically configured from the upstream origin root. When
+// a node target already carries that same base path, remove the duplicate only
+// for probe traffic without changing normal proxy path semantics.
+function buildProbeUpstreamUrl(targetBase, probePath = "/") {
+  const targetRecord = isTargetRecord(targetBase) ? targetBase : createTargetRecord(targetBase);
+  if (!targetRecord) return null;
+  const normalizedProbePath = sanitizeProxyPath(probePath);
+  const basePath = targetRecord.normalizedBasePath;
+  const relativeProbePath = basePath
+    && (normalizedProbePath === basePath || normalizedProbePath.startsWith(`${basePath}/`))
+    ? sanitizeProxyPath(normalizedProbePath.slice(basePath.length) || "/")
+    : normalizedProbePath;
+  return buildUpstreamProxyUrl(targetRecord, relativeProbePath);
+}
+
 function buildFastSegmentUpstreamUrlText(targetRecord, proxyPath = "/", search = "") {
   if (!isTargetRecord(targetRecord)) {
     const legacyUrl = buildUpstreamProxyUrl(targetRecord, proxyPath);
@@ -3351,6 +3685,8 @@ function buildNodeDerivedCacheRevision(nodeName = "", nodeData = {}) {
     orderedTargets: buildOrderedNodeTargetList(nodeData),
     headers: headerEntries,
     playbackInfoMode: String(nodeData?.playbackInfoMode || "").trim().toLowerCase(),
+    mediaAggregationManagedRewrite: nodeData?.mediaAggregationManagedRewrite === true,
+    mediaAggregationCredentialIdentity: hashStableText(`${String(nodeData?.mediaAggregationEmbyUsername || "").trim()}:${String(nodeData?.mediaAggregationEmbyPassword || "")}`),
     mediaAuthMode: String(nodeData?.mediaAuthMode || "").trim().toLowerCase(),
     realClientIpMode: String(nodeData?.realClientIpMode || "").trim().toLowerCase(),
     routingDecisionMode: String(nodeData?.routingDecisionMode || "").trim().toLowerCase(),
@@ -3375,8 +3711,16 @@ function invalidatePlaybackInfoResponseCacheForNodes(nodeNames = []) {
   if (cache instanceof Map) {
     for (const [cacheKey, entry] of cache.entries()) {
       const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-      if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
+      const aggregationNodeNames = normalizeNodeNameList(entry?.mediaAggregationNodes || []);
+      if (!normalizedNames.has(entryNodeName) && !aggregationNodeNames.some(name => normalizedNames.has(name))) continue;
       cache.delete(cacheKey);
+    }
+  }
+  const instanceMap = GLOBALS.MediaAggregationInstanceMap;
+  if (instanceMap instanceof Map) {
+    for (const [cacheKey, entry] of instanceMap.entries()) {
+      const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+      if (entryNodeName && normalizedNames.has(entryNodeName)) instanceMap.delete(cacheKey);
     }
   }
   for (const authCache of [GLOBALS.MediaAggregationAuthCache, GLOBALS.ServerRecordAuthCache]) {
@@ -6729,8 +7073,12 @@ function sanitizeRuntimeConfig(input = {}) {
   sanitized.defaultPlaybackInfoMode = normalizeDefaultPlaybackInfoMode(sanitized.defaultPlaybackInfoMode);
   sanitized.defaultRealClientIpMode = normalizeDefaultRealClientIpMode(sanitized.defaultRealClientIpMode);
   sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
+  sanitized.mediaAggregationMatchMode = normalizeMediaAggregationMatchMode(sanitized.mediaAggregationMatchMode);
   sanitized.scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(sanitized.scheduleUtcOffsetMinutes);
   sanitized.tgDailyReportClockTimes = normalizeScheduleClockTimeList(sanitized.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
+  const tmdbApiKey = normalizeTmdbApiKeyInput(sanitized.tmdbApiKey);
+  if (tmdbApiKey) sanitized.tmdbApiKey = tmdbApiKey;
+  else delete sanitized.tmdbApiKey;
   const localIndexRevision = parseAdminLocalIndexSourceUrl(sanitized.indexUrl);
   sanitized.indexUrl = localIndexRevision ? buildAdminLocalIndexSourceUrl(localIndexRevision) : "";
   delete sanitized.releaseRepo;
@@ -6745,9 +7093,10 @@ const CONFIG_SECRET_FIELDS = [
   "cfApiToken",
   "tgBotToken",
   "mediaAggregationEmbyUsername",
-  "mediaAggregationEmbyPassword"
+  "mediaAggregationEmbyPassword",
+  "tmdbApiKey"
 ];
-const FULL_BACKUP_REDACTED_SECRET_FIELDS = ["cfApiToken", "tgBotToken"];
+const FULL_BACKUP_REDACTED_SECRET_FIELDS = ["cfApiToken", "tgBotToken", "tmdbApiKey"];
 
 function redactRuntimeConfigSecrets(input = {}) {
   const config = sanitizeRuntimeConfig(input);
@@ -6759,6 +7108,13 @@ function redactFullBackupServiceSecrets(input = {}) {
   const config = sanitizeRuntimeConfig(input);
   for (const field of FULL_BACKUP_REDACTED_SECRET_FIELDS) delete config[field];
   return config;
+}
+
+function redactAdminRuntimeConfigTmdbApiKey(input = {}) {
+  const config = sanitizeRuntimeConfig(input);
+  const tmdbApiKeyConfigured = Boolean(String(config.tmdbApiKey || "").trim());
+  delete config.tmdbApiKey;
+  return { ...config, tmdbApiKeyConfigured };
 }
 
 function redactNodeEmbyCredentials(node = {}) {
@@ -7865,6 +8221,10 @@ const CONFIG_ALLOWED_FIELDS = [
   "mediaAggregationEmbyUsername",
   "mediaAggregationEmbyPassword",
   "mediaAggregationBidirectionalProgressEnabled",
+  "mediaAggregationMatchMode",
+  "mediaAggregationFirstResultTimeoutMs",
+  "mediaAggregationGracePeriodMs",
+  "tmdbApiKey",
   "dnsDefaultFallbackCname",
   "defaultHostPrefixCnameTarget",
   "pingTimeout",
@@ -7971,7 +8331,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: {},
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "mediaAggregationEmbyUsername", "tgDailyReportTime"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "mediaAggregationEmbyUsername", "mediaAggregationMatchMode", "tmdbApiKey", "tgDailyReportTime"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList",
     mediaAggregationNodes: "nodeNameList",
@@ -8008,6 +8368,8 @@ const CONFIG_SANITIZE_RULES = {
     prewarmPrefetchBytes: { fallback: Config.Defaults.PrewarmPrefetchBytes, min: 0, max: 64 * 1024 * 1024 },
     playbackInfoCacheTtlSec: { fallback: DEFAULT_PLAYBACK_INFO_CACHE_TTL_SEC, min: 0, max: 60 },
     videoProgressForwardIntervalSec: { fallback: DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC, min: 0, max: 60 },
+    mediaAggregationFirstResultTimeoutMs: { fallback: Config.Defaults.MediaAggregationFirstResultTimeoutMs, min: 100, max: 10000 },
+    mediaAggregationGracePeriodMs: { fallback: Config.Defaults.MediaAggregationGracePeriodMs, min: 0, max: 5000 },
     scheduleUtcOffsetMinutes: { fallback: Config.Defaults.ScheduleUtcOffsetMinutes, min: -12 * 60, max: 14 * 60 }
   },
   numberFields: {
@@ -9572,6 +9934,7 @@ const CacheManager = {
       rate: null,
       log: null,
       playbackInfo: null,
+      mediaAggregationInstance: null,
       failover: null,
       progress: null,
       monthlyTraffic: null
@@ -9614,6 +9977,7 @@ const CacheManager = {
     } else if (state.phase === 5) {
       cleanMap(GLOBALS.PlaybackInfoResponseCache, v => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
       cleanMap(GLOBALS.MediaAggregationAuthCache, v => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationAuth");
+      cleanMap(GLOBALS.MediaAggregationInstanceMap, v => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationInstance");
       cleanMap(GLOBALS.ServerRecordAuthCache, v => !v || (Number(v.expiresAt) || 0) <= now, "serverRecordAuth");
       cleanMap(GLOBALS.ServerRecordProbeBackoff, v => !v || (Number(v.retryAt) || 0) <= now, "serverRecordProbeBackoff");
       state.phase = 6;
@@ -9712,6 +10076,7 @@ const D1TidyPlanner = {
       deletedExpiredAuthFailureCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.AUTH_FAILURES_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
       deletedExpiredDashboardCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_DASH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
       deletedExpiredRuntimeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_RUNTIME_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
+      deletedExpiredServerRecordPosterCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SERVER_RECORD_POSTER_CACHE_TABLE} WHERE expires_at != '' AND expires_at <= ?`, [new Date(context.nowTimestamp).toISOString()]),
       statsHourlyRowCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.STATS_HOURLY_TABLE}`),
       dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
       dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
@@ -9750,6 +10115,7 @@ const D1TidyPlanner = {
       deleteExpiredAuthFailures: facts.deletedExpiredAuthFailureCount > 0,
       deleteExpiredDashboardCache: facts.deletedExpiredDashboardCacheCount > 0,
       deleteExpiredRuntimeCache: facts.deletedExpiredRuntimeCacheCount > 0,
+      deleteExpiredServerRecordPosterCache: facts.deletedExpiredServerRecordPosterCacheCount > 0,
       rebuildStatsHourly: shouldRebuildStatsHourly,
       rebuildLogsFts: shouldRebuildLogsFts,
       rebuildLogsFtsDeferred: context.mode === "scheduled" && hasExpiredLogs && facts.ftsReady && shouldRebuildLogsFts !== true,
@@ -9772,6 +10138,7 @@ const D1TidyPlanner = {
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredAuthFailureCount > 0, "auth_failures", "过期 auth_failures 登录失败计数", [], facts.deletedExpiredAuthFailureCount, "只会删除 expires_at 已过期的登录失败计数。");
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredDashboardCacheCount > 0, "cf_dashboard_cache", "过期 cf_dashboard_cache 仪表盘缓存", [], facts.deletedExpiredDashboardCacheCount, "只会删除 expires_at 已过期的仪表盘缓存。");
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredRuntimeCacheCount > 0, "cf_runtime_cache", "过期 cf_runtime_cache Cloudflare 配额缓存", [], facts.deletedExpiredRuntimeCacheCount, "只会删除 expires_at 已过期的 Cloudflare runtime quota 缓存。");
+    pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredServerRecordPosterCacheCount > 0, "server_record_poster_cache", "过期 server_record_poster_cache 海报解析缓存", [], facts.deletedExpiredServerRecordPosterCacheCount, "只会删除已过期的 TMDB 海报解析结果或短期失败记录，不删除观看或统计数据。");
 
     const rewriteGroups = [
       createTidyPreviewGroup("proxy_stats_hourly", "proxy_stats_hourly 统计表", [], {
@@ -9847,6 +10214,7 @@ const D1TidyPlanner = {
       deletedExpiredAuthFailureCount: facts.deletedExpiredAuthFailureCount,
       deletedExpiredDashboardCacheCount: facts.deletedExpiredDashboardCacheCount,
       deletedExpiredRuntimeCacheCount: facts.deletedExpiredRuntimeCacheCount,
+      deletedExpiredServerRecordPosterCacheCount: facts.deletedExpiredServerRecordPosterCacheCount,
       rebuiltStatsHourly: flags.rebuildStatsHourly === true,
       rebuiltLogsFts: flags.rebuildLogsFts === true,
       alignedStatsWindow: flags.alignStatsWindow === true,
@@ -9896,7 +10264,8 @@ const D1TidyExecutor = {
       [flags.deleteExpiredProbeCache, summary.deletedExpiredProbeCacheCount, "deleteExpiredProbeCache", database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredAuthFailures, summary.deletedExpiredAuthFailureCount, "deleteExpiredAuthFailures", database.AUTH_FAILURES_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredDashboardCache, summary.deletedExpiredDashboardCacheCount, "deleteExpiredDashboardCache", database.CF_DASH_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
-      [flags.deleteExpiredRuntimeCache, summary.deletedExpiredRuntimeCacheCount, "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs]
+      [flags.deleteExpiredRuntimeCache, summary.deletedExpiredRuntimeCacheCount, "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
+      [flags.deleteExpiredServerRecordPosterCache, summary.deletedExpiredServerRecordPosterCacheCount, "deleteExpiredServerRecordPosterCache", database.SERVER_RECORD_POSTER_CACHE_TABLE, "expires_at != '' AND expires_at <= ?", new Date(executionPlan.nowMs).toISOString()]
     ].map(([enabled, count, stepName, tableName, whereClause, bindParam]) => ({
       enabled,
       count,
@@ -10308,6 +10677,8 @@ const Database = {
   LOGS_FTS_INSERT_TRIGGER: "proxy_logs_fts_ai",
   STATS_HOURLY_TABLE: "proxy_stats_hourly",
   SERVER_LAST_WATCH_TABLE: "server_last_watch",
+  SERVER_RECORD_SNAPSHOT_TABLE: "server_record_snapshots",
+  SERVER_RECORD_POSTER_CACHE_TABLE: "server_record_poster_cache",
   AUTH_FAILURES_TABLE: "auth_failures",
   CF_DASH_CACHE_TABLE: "cf_dashboard_cache",
   CF_RUNTIME_CACHE_TABLE: "cf_runtime_cache",
@@ -10315,13 +10686,15 @@ const Database = {
   DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
   DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
   DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
-  D1_SCHEMA_VERSION: 6,
+  D1_SCHEMA_VERSION: 8,
   D1_MIGRATIONS_TABLE: "d1_migrations",
   D1_REQUIRED_MIGRATIONS: [
     "0001_d1_fresh_baseline",
     "0002_d1_historical_compatibility",
     "0003_d1_schema_v5_indexes",
-    "0004_server_watch_stats"
+    "0004_server_watch_stats",
+    "0005_server_record_snapshots",
+    "0006_server_record_poster_cache"
   ],
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
@@ -10358,6 +10731,11 @@ const Database = {
         table: this.CF_RUNTIME_CACHE_TABLE,
         columns: ["expires_at"],
         createSql: `CREATE INDEX idx_cf_runtime_cache_expires_at ON ${this.CF_RUNTIME_CACHE_TABLE} (expires_at)`
+      },
+      idx_server_record_poster_cache_expires_at: {
+        table: this.SERVER_RECORD_POSTER_CACHE_TABLE,
+        columns: ["expires_at"],
+        createSql: `CREATE INDEX idx_server_record_poster_cache_expires_at ON ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (expires_at)`
       },
       idx_dns_ip_pool_items_updated_ip: {
         table: this.DNS_IP_POOL_ITEMS_TABLE,
@@ -10516,6 +10894,34 @@ const Database = {
       [this.SERVER_LAST_WATCH_TABLE]: {
         last_watched_at: "TEXT NOT NULL DEFAULT ''",
         updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.SERVER_RECORD_SNAPSHOT_TABLE]: {
+        movie_count: "INTEGER",
+        series_count: "INTEGER",
+        episode_count: "INTEGER",
+        counts_state: "TEXT NOT NULL DEFAULT 'unavailable'",
+        counts_errors_json: "TEXT NOT NULL DEFAULT '{}'",
+        stats_checked_at: "TEXT NOT NULL DEFAULT ''",
+        last_item_id: "TEXT NOT NULL DEFAULT ''",
+        last_item_name: "TEXT NOT NULL DEFAULT ''",
+        last_item_type: "TEXT NOT NULL DEFAULT ''",
+        last_item_series_name: "TEXT NOT NULL DEFAULT ''",
+        last_item_image_tag: "TEXT NOT NULL DEFAULT ''",
+        last_item_watched_at: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
+      },
+      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: {
+        watched_at: "TEXT NOT NULL DEFAULT ''",
+        item_id: "TEXT NOT NULL DEFAULT ''",
+        tmdb_id: "TEXT NOT NULL DEFAULT ''",
+        imdb_id: "TEXT NOT NULL DEFAULT ''",
+        provider: "TEXT NOT NULL DEFAULT ''",
+        image_path: "TEXT NOT NULL DEFAULT ''",
+        resolved_at: "TEXT NOT NULL DEFAULT ''",
+        expires_at: "TEXT NOT NULL DEFAULT ''",
+        failure_code: "TEXT NOT NULL DEFAULT ''",
+        retry_after: "TEXT NOT NULL DEFAULT ''",
+        updated_at: "TEXT NOT NULL DEFAULT ''"
       }
     };
   },
@@ -10532,7 +10938,9 @@ const Database = {
       [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
       [this.LOGS_TABLE]: ["id"],
       [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
-      [this.SERVER_LAST_WATCH_TABLE]: ["node_name"]
+      [this.SERVER_LAST_WATCH_TABLE]: ["node_name"],
+      [this.SERVER_RECORD_SNAPSHOT_TABLE]: ["node_name"],
+      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: ["node_name"]
     };
   },
   getD1RetiredIndexNames() {
@@ -10965,6 +11373,36 @@ const Database = {
   normalizeD1MigrationName(name = "") {
     return String(name || "").trim().replace(/\.sql$/i, "");
   },
+  async getD1TimeTravelBookmark(db) {
+    if (!db || typeof db.withSession !== "function") {
+      const error = new Error("D1 Time Travel bookmark is unavailable on this binding");
+      error.code = "D1_TIME_TRAVEL_UNAVAILABLE";
+      error.status = 409;
+      error.details = { reason: "sessions_api_unavailable" };
+      throw error;
+    }
+    try {
+      const session = db.withSession("first-primary");
+      if (!session || typeof session.prepare !== "function" || typeof session.getBookmark !== "function") {
+        throw new Error("invalid_d1_session");
+      }
+      await session.prepare("SELECT 1 AS bookmark_probe").run();
+      const bookmark = String(session.getBookmark() || "").trim();
+      if (!bookmark) throw new Error("empty_bookmark");
+      return {
+        bookmark,
+        consistency: "first-primary",
+        capturedAt: new Date().toISOString()
+      };
+    } catch (cause) {
+      if (String(cause?.code || "") === "D1_TIME_TRAVEL_UNAVAILABLE") throw cause;
+      const error = new Error("Unable to capture a D1 Time Travel bookmark");
+      error.code = "D1_TIME_TRAVEL_BOOKMARK_FAILED";
+      error.status = 503;
+      error.details = { cause: getErrorMessage(cause, "bookmark_failed") };
+      throw error;
+    }
+  },
   async readD1AppliedMigrations(db, tableNames = null) {
     const knownTables = tableNames instanceof Set
       ? tableNames
@@ -10972,8 +11410,26 @@ const Database = {
     if (!knownTables.has(this.D1_MIGRATIONS_TABLE)) {
       return { tablePresent: false, tableValid: false, appliedMigrations: [] };
     }
-    const columns = await this.getTableColumns(db, this.D1_MIGRATIONS_TABLE);
-    if (!columns.has("name")) {
+    const definitions = await this.getTableColumnDefinitions(db, this.D1_MIGRATIONS_TABLE);
+    const columns = new Set(definitions.map(column => column.name));
+    const primaryKey = definitions
+      .filter(column => column.primaryKeyOrder > 0)
+      .sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder)
+      .map(column => column.name);
+    const idColumn = definitions.find(column => column.name === "id");
+    let nameUnique = false;
+    for (const index of (await this.getTableIndexDefinitions(db, this.D1_MIGRATIONS_TABLE)).filter(item => item.unique && !item.partial)) {
+      const indexColumns = await this.getIndexKeyColumns(db, index.name);
+      if (serializeConfigValue(indexColumns) === serializeConfigValue(["name"])) {
+        nameUnique = true;
+        break;
+      }
+    }
+    const tableValid = ["id", "name", "applied_at"].every(name => columns.has(name))
+      && serializeConfigValue(primaryKey) === serializeConfigValue(["id"])
+      && idColumn?.type === "INTEGER"
+      && nameUnique;
+    if (!tableValid) {
       return { tablePresent: true, tableValid: false, appliedMigrations: [] };
     }
     const rows = await db.prepare(`SELECT name FROM ${quoteSqlIdentifier(this.D1_MIGRATIONS_TABLE)} ORDER BY name ASC`).all();
@@ -10984,6 +11440,53 @@ const Database = {
         .map(row => this.normalizeD1MigrationName(row?.name))
         .filter(Boolean))]
     };
+  },
+  async adoptVerifiedD1Migrations(db, migrationState = null) {
+    let currentState = migrationState || await this.readD1AppliedMigrations(db);
+    if (currentState.tablePresent && !currentState.tableValid) {
+      const error = new Error("Existing d1_migrations table does not match the managed migration contract");
+      error.code = "D1_MIGRATION_TABLE_INVALID";
+      error.status = 409;
+      error.details = { tableName: this.D1_MIGRATIONS_TABLE };
+      throw error;
+    }
+    let migrationTableCreated = false;
+    if (!currentState.tablePresent) {
+      await db.prepare(`CREATE TABLE IF NOT EXISTS ${quoteSqlIdentifier(this.D1_MIGRATIONS_TABLE)} (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )`).run();
+      migrationTableCreated = true;
+      currentState = await this.readD1AppliedMigrations(db);
+    }
+    if (!currentState.tableValid) {
+      const error = new Error("Managed d1_migrations table could not be verified");
+      error.code = "D1_MIGRATION_TABLE_INVALID";
+      error.status = 409;
+      error.details = { tableName: this.D1_MIGRATIONS_TABLE, migrationTableCreated };
+      throw error;
+    }
+    const applied = new Set(currentState.appliedMigrations);
+    const adoptedMigrations = this.D1_REQUIRED_MIGRATIONS.filter(name => !applied.has(name));
+    if (adoptedMigrations.length) {
+      const statements = adoptedMigrations.map(name => db.prepare(
+        `INSERT OR IGNORE INTO ${quoteSqlIdentifier(this.D1_MIGRATIONS_TABLE)} (name) VALUES (?)`
+      ).bind(`${name}.sql`));
+      if (typeof db.batch === "function") await db.batch(statements);
+      else for (const statement of statements) await statement.run();
+    }
+    const finalState = await this.readD1AppliedMigrations(db);
+    const finalApplied = new Set(finalState.appliedMigrations);
+    const missingMigrations = this.D1_REQUIRED_MIGRATIONS.filter(name => !finalApplied.has(name));
+    if (!finalState.tableValid || missingMigrations.length) {
+      const error = new Error("Verified D1 migration baseline could not be recorded");
+      error.code = "D1_MIGRATION_ADOPTION_FAILED";
+      error.status = 503;
+      error.details = { missingMigrations, migrationTableCreated, adoptedMigrations };
+      throw error;
+    }
+    return { migrationTableCreated, adoptedMigrations };
   },
   async getD1SchemaStatus(db) {
     if (!db) {
@@ -11020,7 +11523,9 @@ const Database = {
       this.DNS_IP_PROBE_CACHE_TABLE,
       this.LOGS_TABLE,
       this.STATS_HOURLY_TABLE,
-      this.SERVER_LAST_WATCH_TABLE
+      this.SERVER_LAST_WATCH_TABLE,
+      this.SERVER_RECORD_SNAPSHOT_TABLE,
+      this.SERVER_RECORD_POSTER_CACHE_TABLE
     ];
     const requiredIndexes = this.getD1RuntimeIndexContract();
     const requiredColumns = {
@@ -11035,7 +11540,17 @@ const Database = {
       [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo", "probe_status", "latency_ms", "cf_ray", "colo_code", "city_name", "country_code", "country_name", "probed_at", "expires_at"],
       [this.LOGS_TABLE]: ["id", "timestamp", "node_name", "request_path", "request_method", "status_code", "response_time", "client_ip", "inbound_colo", "outbound_colo", "user_agent", "referer", "category", "error_detail", "detail_json", "created_at", "inbound_ip", "outbound_ip"],
       [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"],
-      [this.SERVER_LAST_WATCH_TABLE]: ["node_name", "last_watched_at", "updated_at"]
+      [this.SERVER_LAST_WATCH_TABLE]: ["node_name", "last_watched_at", "updated_at"],
+      [this.SERVER_RECORD_SNAPSHOT_TABLE]: [
+        "node_name", "movie_count", "series_count", "episode_count", "counts_state",
+        "counts_errors_json", "stats_checked_at", "last_item_id", "last_item_name",
+        "last_item_type", "last_item_series_name", "last_item_image_tag",
+        "last_item_watched_at", "updated_at"
+      ],
+      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: [
+        "node_name", "watched_at", "item_id", "tmdb_id", "imdb_id", "provider",
+        "image_path", "resolved_at", "expires_at", "failure_code", "retry_after", "updated_at"
+      ]
     };
     const requiredPrimaryKeys = this.getD1RequiredPrimaryKeyContract();
     const issues = [];
@@ -11256,12 +11771,13 @@ const Database = {
       throw error;
     }
     const profile = options.includeFts === true ? "logs-fts" : "logs-core";
+    const operationKey = `${profile}:${options.adoptMigrations === true ? "adopt" : "compat"}:${options.requireBookmark === true ? "bookmark" : "no-bookmark"}`;
     let state = GLOBALS.D1DatabaseInitReady.get(db);
     if (!state || !(state.inFlight instanceof Map)) {
       state = { tail: Promise.resolve(), inFlight: new Map() };
       GLOBALS.D1DatabaseInitReady.set(db, state);
     }
-    let initTask = state.inFlight.get(profile);
+    let initTask = state.inFlight.get(operationKey);
     if (!initTask) {
       const previousTask = Promise.resolve(state.tail).catch(() => {});
       initTask = previousTask.then(() => this.runD1DatabaseInitialization(db, {
@@ -11270,7 +11786,7 @@ const Database = {
         failOnIncompatible: false
       }));
       state.tail = initTask.catch(() => {});
-      state.inFlight.set(profile, initTask);
+      state.inFlight.set(operationKey, initTask);
     }
     try {
       const result = await initTask;
@@ -11288,11 +11804,13 @@ const Database = {
       }
       return result;
     } finally {
-      if (state.inFlight.get(profile) === initTask) state.inFlight.delete(profile);
+      if (state.inFlight.get(operationKey) === initTask) state.inFlight.delete(operationKey);
     }
   },
   async runD1DatabaseInitialization(db, options = {}) {
     const profile = options.includeFts === true ? "logs-fts" : "logs-core";
+    const adoptMigrations = options.adoptMigrations === true;
+    const requireBookmark = options.requireBookmark === true || adoptMigrations;
     this.invalidateD1SchemaReadiness(db, "all");
     const tablesBefore = await this.getD1TableNameSet(db);
     try {
@@ -11327,39 +11845,78 @@ const Database = {
       }
       return result;
     }
-    const adjustedColumns = await this.ensureD1KnownColumns(db);
-    const bootstrap = await this.bootstrapD1Schema(db, profile);
-    const adjustedAfterCreate = await this.ensureD1KnownColumns(db);
-    const indexChanges = await this.repairD1RuntimeIndexes(db);
-    const tablesAfter = await this.getD1TableNameSet(db);
-    const createdTables = [...tablesAfter].filter(name => !tablesBefore.has(name));
-    GLOBALS.LogsReadinessProbeCache.delete(db);
-    const status = await this.getD1SchemaStatus(db);
-    const result = {
-      profile,
-      runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
-      migrationReady: status.migrationReady === true,
-      schemaVersion: status.schemaVersion,
-      createdTables,
-      adjustedColumns: [...new Set([...adjustedColumns, ...adjustedAfterCreate])],
-      ...indexChanges,
-      ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
-      ftsRecreated: bootstrap.ftsResult?.recreated === true,
-      steps: bootstrap.steps,
-      status
-    };
-    if (options.failOnIncompatible === true && result.runtimeCompatibilityReady !== true) {
-      const error = new Error("D1 schema remains incompatible after automatic repair");
-      error.code = "D1_SCHEMA_INCOMPATIBLE";
-      error.status = 409;
-      error.details = {
-        issues: status.issues,
-        autoRepairPolicy: status.autoRepairPolicy,
-        result
+    let migrationStateBefore = null;
+    if (adoptMigrations) {
+      migrationStateBefore = await this.readD1AppliedMigrations(db, tablesBefore);
+      if (migrationStateBefore.tablePresent && !migrationStateBefore.tableValid) {
+        const error = new Error("Existing d1_migrations table does not match the managed migration contract");
+        error.code = "D1_MIGRATION_TABLE_INVALID";
+        error.status = 409;
+        error.details = { tableName: this.D1_MIGRATIONS_TABLE, phase: "preflight" };
+        throw error;
+      }
+    }
+    const bookmarkState = requireBookmark ? await this.getD1TimeTravelBookmark(db) : null;
+    try {
+      const adjustedColumns = await this.ensureD1KnownColumns(db);
+      const bootstrap = await this.bootstrapD1Schema(db, profile);
+      const adjustedAfterCreate = await this.ensureD1KnownColumns(db);
+      const indexChanges = await this.repairD1RuntimeIndexes(db);
+      const tablesAfter = await this.getD1TableNameSet(db);
+      const createdTables = [...tablesAfter].filter(name => !tablesBefore.has(name));
+      GLOBALS.LogsReadinessProbeCache.delete(db);
+      let status = await this.getD1SchemaStatus(db);
+      let migrationAdoption = { migrationTableCreated: false, adoptedMigrations: [] };
+      if (adoptMigrations && status.runtimeCompatibilityReady === true) {
+        migrationAdoption = await this.adoptVerifiedD1Migrations(db, migrationStateBefore);
+        status = await this.getD1SchemaStatus(db);
+      }
+      const result = {
+        profile,
+        runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
+        migrationReady: status.migrationReady === true,
+        schemaVersion: status.schemaVersion,
+        recoveryBookmark: String(bookmarkState?.bookmark || ""),
+        bookmarkCapturedAt: String(bookmarkState?.capturedAt || ""),
+        migrationTableCreated: migrationAdoption.migrationTableCreated === true,
+        adoptedMigrations: migrationAdoption.adoptedMigrations,
+        createdTables,
+        adjustedColumns: [...new Set([...adjustedColumns, ...adjustedAfterCreate])],
+        ...indexChanges,
+        ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
+        ftsRecreated: bootstrap.ftsResult?.recreated === true,
+        steps: bootstrap.steps,
+        status
       };
+      if (options.failOnIncompatible === true && result.runtimeCompatibilityReady !== true) {
+        const error = new Error("D1 schema remains incompatible after automatic repair");
+        error.code = "D1_SCHEMA_INCOMPATIBLE";
+        error.status = 409;
+        error.details = {
+          issues: status.issues,
+          autoRepairPolicy: status.autoRepairPolicy,
+          result
+        };
+        throw error;
+      }
+      if (adoptMigrations && result.migrationReady !== true) {
+        const error = new Error("D1 migration baseline remains incomplete after managed initialization");
+        error.code = "D1_MIGRATION_ADOPTION_FAILED";
+        error.status = 503;
+        error.details = { issues: status.issues, result };
+        throw error;
+      }
+      return result;
+    } catch (error) {
+      if (bookmarkState?.bookmark && error && typeof error === "object") {
+        error.details = {
+          ...(isPlainObject(error.details) ? error.details : {}),
+          recoveryBookmark: bookmarkState.bookmark,
+          bookmarkCapturedAt: bookmarkState.capturedAt
+        };
+      }
       throw error;
     }
-    return result;
   },
   async probeLogsReadiness(db, options = {}) {
     if (!db) {
@@ -11540,15 +12097,92 @@ const Database = {
       if (GLOBALS.ServerLastWatchDbReady.get(db) === initTask) GLOBALS.ServerLastWatchDbReady.delete(db);
     }
   },
-  async upsertServerLastWatch(db, nodeName = "", lastWatchedAt = "") {
+  async ensureServerRecordSnapshotSchema(db) {
+    if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "serverRecordSnapshotSchema")) return true;
+    let initTask = GLOBALS.ServerRecordSnapshotDbReady.get(db);
+    if (!initTask) {
+      initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+        node_name TEXT PRIMARY KEY,
+        movie_count INTEGER,
+        series_count INTEGER,
+        episode_count INTEGER,
+        counts_state TEXT NOT NULL DEFAULT 'unavailable',
+        counts_errors_json TEXT NOT NULL DEFAULT '{}',
+        stats_checked_at TEXT NOT NULL DEFAULT '',
+        last_item_id TEXT NOT NULL DEFAULT '',
+        last_item_name TEXT NOT NULL DEFAULT '',
+        last_item_type TEXT NOT NULL DEFAULT '',
+        last_item_series_name TEXT NOT NULL DEFAULT '',
+        last_item_image_tag TEXT NOT NULL DEFAULT '',
+        last_item_watched_at TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL
+      )`).run().then(() => {
+        this.markD1SchemaReady(db, "serverRecordSnapshotSchema");
+        return true;
+      }).catch(error => {
+        GLOBALS.ServerRecordSnapshotDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.ServerRecordSnapshotDbReady.set(db, initTask);
+    }
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.ServerRecordSnapshotDbReady.get(db) === initTask) GLOBALS.ServerRecordSnapshotDbReady.delete(db);
+    }
+  },
+  async ensureServerRecordPosterCacheSchema(db) {
+    if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "serverRecordPosterCacheSchema")) return true;
+    let initTask = GLOBALS.ServerRecordPosterCacheDbReady.get(db);
+    if (!initTask) {
+      initTask = (async () => {
+        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
+          node_name TEXT PRIMARY KEY,
+          watched_at TEXT NOT NULL,
+          item_id TEXT NOT NULL,
+          tmdb_id TEXT NOT NULL DEFAULT '',
+          imdb_id TEXT NOT NULL DEFAULT '',
+          provider TEXT NOT NULL DEFAULT '',
+          image_path TEXT NOT NULL DEFAULT '',
+          resolved_at TEXT NOT NULL DEFAULT '',
+          expires_at TEXT NOT NULL DEFAULT '',
+          failure_code TEXT NOT NULL DEFAULT '',
+          retry_after TEXT NOT NULL DEFAULT '',
+          updated_at TEXT NOT NULL
+        )`).run();
+        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_server_record_poster_cache_expires_at ON ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (expires_at)`).run();
+        this.markD1SchemaReady(db, "serverRecordPosterCacheSchema");
+        return true;
+      })().catch(error => {
+        GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
+        throw error;
+      });
+      GLOBALS.ServerRecordPosterCacheDbReady.set(db, initTask);
+    }
+    try {
+      return await initTask;
+    } finally {
+      if (GLOBALS.ServerRecordPosterCacheDbReady.get(db) === initTask) GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
+    }
+  },
+  async upsertServerLastWatch(db, nodeName = "", lastWatchedAt = "", media = {}) {
     const normalizedName = String(nodeName || "").trim().toLowerCase();
     if (!db || !normalizedName) return false;
     const watchedAtMs = Date.parse(String(lastWatchedAt || "").trim());
     if (!Number.isFinite(watchedAtMs)) return false;
     const watchedAt = new Date(watchedAtMs).toISOString();
     await this.ensureServerLastWatchSchema(db);
+    await this.ensureServerRecordSnapshotSchema(db);
     const updatedAt = new Date().toISOString();
-    await db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+    const normalizedMedia = isPlainObject(media) ? media : {};
+    const itemId = String(normalizedMedia.itemId || "").trim().slice(0, 256);
+    const itemName = String(normalizedMedia.itemName || "").trim().slice(0, 256);
+    const itemType = String(normalizedMedia.itemType || "").trim().slice(0, 64);
+    const seriesName = String(normalizedMedia.seriesName || "").trim().slice(0, 256);
+    const imageTag = String(normalizedMedia.imageTag || "").trim().slice(0, 256);
+    const lastWatchStatement = db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
       node_name, last_watched_at, updated_at
     ) VALUES (?, ?, ?)
     ON CONFLICT(node_name) DO UPDATE SET
@@ -11559,7 +12193,21 @@ const Database = {
       updated_at = CASE
         WHEN excluded.last_watched_at > ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at THEN excluded.updated_at
         ELSE ${this.SERVER_LAST_WATCH_TABLE}.updated_at
-      END`).bind(normalizedName, watchedAt, updatedAt).run();
+      END`).bind(normalizedName, watchedAt, updatedAt);
+    const snapshotStatement = db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+      node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
+      last_item_image_tag, last_item_watched_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(node_name) DO UPDATE SET
+      last_item_id = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_id ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_id END,
+      last_item_name = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_name ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_name END,
+      last_item_type = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_type ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_type END,
+      last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END,
+      last_item_image_tag = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_image_tag ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_image_tag END,
+      last_item_watched_at = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_watched_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at END,
+      updated_at = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.updated_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`)
+      .bind(normalizedName, itemId, itemName, itemType, seriesName, imageTag, watchedAt, updatedAt);
+    await db.batch([lastWatchStatement, snapshotStatement]);
     return true;
   },
   async getServerLastWatch(db, nodeNames = []) {
@@ -11583,6 +12231,410 @@ const Database = {
       }
     }
     return result;
+  },
+  async getServerRecordPosterCache(db, nodeName = "", watchedAt = "", itemId = "") {
+    const normalizedName = String(nodeName || "").trim().toLowerCase();
+    const normalizedWatchedAt = String(watchedAt || "").trim();
+    const normalizedItemId = String(itemId || "").trim();
+    if (!db || !normalizedName || !normalizedWatchedAt || !normalizedItemId) return null;
+    await this.ensureServerRecordPosterCacheSchema(db);
+    const row = await db.prepare(`SELECT
+      node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
+      resolved_at, expires_at, failure_code, retry_after, updated_at
+      FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE}
+      WHERE node_name = ? AND watched_at = ? AND item_id = ?
+      LIMIT 1`).bind(normalizedName, normalizedWatchedAt, normalizedItemId).first();
+    if (!row) return null;
+    return {
+      nodeName: String(row?.node_name || "").trim().toLowerCase(),
+      watchedAt: String(row?.watched_at || "").trim(),
+      itemId: String(row?.item_id || "").trim(),
+      tmdbId: normalizeTmdbPosterId(row?.tmdb_id),
+      imdbId: normalizeImdbPosterId(row?.imdb_id),
+      provider: String(row?.provider || "").trim().toLowerCase(),
+      imagePath: normalizeTmdbPosterImagePath(row?.image_path),
+      resolvedAt: String(row?.resolved_at || "").trim(),
+      expiresAt: String(row?.expires_at || "").trim(),
+      failureCode: String(row?.failure_code || "").trim().toLowerCase(),
+      retryAfter: String(row?.retry_after || "").trim(),
+      updatedAt: String(row?.updated_at || "").trim()
+    };
+  },
+  async setServerRecordPosterCache(db, entry = {}) {
+    const nodeName = String(entry?.nodeName || entry?.node_name || "").trim().toLowerCase();
+    const watchedAt = String(entry?.watchedAt || entry?.watched_at || "").trim();
+    const itemId = String(entry?.itemId || entry?.item_id || "").trim().slice(0, 512);
+    const expiresAtMs = Date.parse(String(entry?.expiresAt || entry?.expires_at || "").trim());
+    if (!db || !nodeName || !watchedAt || !itemId || !Number.isFinite(expiresAtMs)) return false;
+    const now = new Date().toISOString();
+    const imagePath = normalizeTmdbPosterImagePath(entry?.imagePath || entry?.image_path);
+    const providerValue = String(entry?.provider || "").trim().toLowerCase();
+    const provider = imagePath && ["tmdb_direct", "tmdb_imdb_find"].includes(providerValue)
+      ? providerValue
+      : "";
+    const failureCode = imagePath ? "" : String(entry?.failureCode || entry?.failure_code || "tmdb_unavailable")
+      .trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "_").slice(0, 96);
+    const retryAfterMs = imagePath ? NaN : Date.parse(String(entry?.retryAfter || entry?.retry_after || "").trim());
+    const expiresAt = new Date(expiresAtMs).toISOString();
+    const retryAfter = Number.isFinite(retryAfterMs) ? new Date(retryAfterMs).toISOString() : "";
+    await this.ensureServerRecordPosterCacheSchema(db);
+    await db.prepare(`INSERT INTO ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
+      node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
+      resolved_at, expires_at, failure_code, retry_after, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(node_name) DO UPDATE SET
+      watched_at = excluded.watched_at,
+      item_id = excluded.item_id,
+      tmdb_id = excluded.tmdb_id,
+      imdb_id = excluded.imdb_id,
+      provider = excluded.provider,
+      image_path = excluded.image_path,
+      resolved_at = excluded.resolved_at,
+      expires_at = excluded.expires_at,
+      failure_code = excluded.failure_code,
+      retry_after = excluded.retry_after,
+      updated_at = excluded.updated_at`).bind(
+      nodeName,
+      watchedAt,
+      itemId,
+      normalizeTmdbPosterId(entry?.tmdbId || entry?.tmdb_id),
+      normalizeImdbPosterId(entry?.imdbId || entry?.imdb_id),
+      provider,
+      imagePath,
+      now,
+      expiresAt,
+      failureCode,
+      retryAfter,
+      now
+    ).run();
+    return true;
+  },
+  async persistServerRecordProbeSnapshots(db, entries = []) {
+    if (!db) return 0;
+    const snapshots = (Array.isArray(entries) ? entries : []).map(entry => {
+      const nodeName = String(entry?.nodeName || "").trim().toLowerCase();
+      const counts = isPlainObject(entry?.counts) ? entry.counts : {};
+      const normalizeCount = value => value !== null && value !== undefined && value !== ""
+        && Number.isFinite(Number(value)) && Number(value) >= 0
+        ? Math.trunc(Number(value))
+        : null;
+      const movieCount = normalizeCount(counts.movies);
+      const seriesCount = normalizeCount(counts.series);
+      const episodeCount = normalizeCount(counts.episodes);
+      if (!nodeName || [movieCount, seriesCount, episodeCount].every(value => value === null)) return null;
+      const errors = isPlainObject(counts.errors) ? counts.errors : {};
+      const checkedAtMs = Date.parse(String(entry?.checkedAt || "").trim());
+      return {
+        nodeName,
+        movieCount,
+        seriesCount,
+        episodeCount,
+        countsState: [movieCount, seriesCount, episodeCount].every(value => value !== null) ? "ok" : "partial",
+        countsErrorsJson: JSON.stringify(errors),
+        statsCheckedAt: Number.isFinite(checkedAtMs) ? new Date(checkedAtMs).toISOString() : new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+    }).filter(Boolean);
+    if (!snapshots.length) return 0;
+    await this.ensureServerRecordSnapshotSchema(db);
+    let written = 0;
+    for (let offset = 0; offset < snapshots.length; offset += 50) {
+      const statements = snapshots.slice(offset, offset + 50).map(snapshot => db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+        node_name, movie_count, series_count, episode_count, counts_state,
+        counts_errors_json, stats_checked_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(node_name) DO UPDATE SET
+        movie_count = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.movie_count ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.movie_count END,
+        series_count = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.series_count ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.series_count END,
+        episode_count = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.episode_count ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.episode_count END,
+        counts_state = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.counts_state ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.counts_state END,
+        counts_errors_json = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.counts_errors_json ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.counts_errors_json END,
+        stats_checked_at = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.stats_checked_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at END,
+        updated_at = CASE WHEN excluded.stats_checked_at >= ${this.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.updated_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`)
+        .bind(
+          snapshot.nodeName,
+          snapshot.movieCount,
+          snapshot.seriesCount,
+          snapshot.episodeCount,
+          snapshot.countsState,
+          snapshot.countsErrorsJson,
+          snapshot.statsCheckedAt,
+          snapshot.updatedAt
+        ));
+      await db.batch(statements);
+      written += statements.length;
+    }
+    return written;
+  },
+  async getServerRecordSnapshots(db, nodeNames = []) {
+    const names = this.normalizeNodeIndex(nodeNames);
+    const result = new Map();
+    if (!db || names.length === 0) return result;
+    await this.ensureServerRecordSnapshotSchema(db);
+    for (let offset = 0; offset < names.length; offset += 90) {
+      const chunk = names.slice(offset, offset + 90);
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = await db.prepare(`SELECT
+        node_name, movie_count, series_count, episode_count, counts_state,
+        counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+        last_item_type, last_item_series_name, last_item_image_tag,
+        last_item_watched_at, updated_at
+        FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE}
+        WHERE node_name IN (${placeholders})`).bind(...chunk).all();
+      for (const row of rows?.results || []) {
+        const name = String(row?.node_name || "").trim().toLowerCase();
+        if (!name) continue;
+        let countErrors = {};
+        try {
+          const parsed = JSON.parse(String(row?.counts_errors_json || "{}"));
+          if (isPlainObject(parsed)) countErrors = parsed;
+        } catch {}
+        const normalizeStoredCount = value => value === null || value === undefined || !Number.isFinite(Number(value))
+          ? null
+          : Math.max(0, Math.trunc(Number(value)));
+        result.set(name, {
+          counts: {
+            movies: normalizeStoredCount(row?.movie_count),
+            series: normalizeStoredCount(row?.series_count),
+            episodes: normalizeStoredCount(row?.episode_count),
+            state: String(row?.counts_state || "unavailable").trim(),
+            errors: countErrors,
+            checkedAt: String(row?.stats_checked_at || "").trim(),
+            source: "persisted"
+          },
+          lastItem: {
+            itemId: String(row?.last_item_id || "").trim(),
+            itemName: String(row?.last_item_name || "").trim(),
+            itemType: String(row?.last_item_type || "").trim(),
+            seriesName: String(row?.last_item_series_name || "").trim(),
+            imageTag: String(row?.last_item_image_tag || "").trim(),
+            watchedAt: String(row?.last_item_watched_at || "").trim()
+          },
+          updatedAt: String(row?.updated_at || "").trim()
+        });
+      }
+    }
+    return result;
+  },
+  getServerRecordNodeLifecycle(mutation = {}) {
+    if (mutation?.nodeChanged !== true) return null;
+    const previousName = String(mutation?.previousName || "").trim().toLowerCase();
+    const nextName = String(mutation?.nextName || "").trim().toLowerCase();
+    if (!previousName) return null;
+    if (!mutation?.nextNode) {
+      return { type: "delete", previousName, nextName: previousName, names: [previousName] };
+    }
+    if (!nextName || previousName === nextName) return null;
+    return { type: "rename", previousName, nextName, names: [previousName, nextName] };
+  },
+  async readServerRecordNodeLifecycleRows(db, nodeNames = []) {
+    const names = this.normalizeNodeIndex(nodeNames);
+    const rows = { lastWatch: [], snapshots: [], posterCache: [] };
+    if (!db || names.length === 0) return rows;
+    await this.ensureServerLastWatchSchema(db);
+    await this.ensureServerRecordSnapshotSchema(db);
+    await this.ensureServerRecordPosterCacheSchema(db);
+    const placeholders = names.map(() => "?").join(", ");
+    const [lastWatchRows, snapshotRows, posterCacheRows] = await Promise.all([
+      db.prepare(`SELECT node_name, last_watched_at, updated_at
+        FROM ${this.SERVER_LAST_WATCH_TABLE}
+        WHERE node_name IN (${placeholders})`).bind(...names).all(),
+      db.prepare(`SELECT
+        node_name, movie_count, series_count, episode_count, counts_state,
+        counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+        last_item_type, last_item_series_name, last_item_image_tag,
+        last_item_watched_at, updated_at
+        FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE}
+        WHERE node_name IN (${placeholders})`).bind(...names).all(),
+      db.prepare(`SELECT
+        node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
+        resolved_at, expires_at, failure_code, retry_after, updated_at
+        FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE}
+        WHERE node_name IN (${placeholders})`).bind(...names).all()
+    ]);
+    rows.lastWatch = (lastWatchRows?.results || []).map(row => ({ ...row }));
+    rows.snapshots = (snapshotRows?.results || []).map(row => ({ ...row }));
+    rows.posterCache = (posterCacheRows?.results || []).map(row => ({ ...row }));
+    return rows;
+  },
+  getNewestServerRecordLifecycleRow(rows = [], timestampField = "") {
+    let newest = null;
+    let newestTimestamp = -1;
+    for (const row of Array.isArray(rows) ? rows : []) {
+      if (!row) continue;
+      const timestamp = Date.parse(String(row?.[timestampField] || "").trim());
+      if (!Number.isFinite(timestamp)) continue;
+      if (!newest || timestamp > newestTimestamp) {
+        newest = row;
+        newestTimestamp = timestamp;
+      }
+    }
+    return newest;
+  },
+  buildMergedServerRecordLifecycleRows(lifecycle = {}, before = {}) {
+    if (lifecycle?.type !== "rename") return { lastWatch: null, snapshot: null };
+    const nextName = String(lifecycle.nextName || "").trim().toLowerCase();
+    const lastWatchRows = Array.isArray(before?.lastWatch) ? before.lastWatch : [];
+    const snapshotRows = Array.isArray(before?.snapshots) ? before.snapshots : [];
+    const newestWatch = this.getNewestServerRecordLifecycleRow(lastWatchRows, "last_watched_at");
+    const newestCounts = this.getNewestServerRecordLifecycleRow(snapshotRows, "stats_checked_at");
+    const watchedAt = String(newestWatch?.last_watched_at || "").trim();
+    const matchingMedia = watchedAt
+      ? snapshotRows.filter(row => String(row?.last_item_watched_at || "").trim() === watchedAt)
+      : [];
+    const newestMedia = this.getNewestServerRecordLifecycleRow(matchingMedia, "updated_at");
+    const lastWatch = newestWatch
+      ? {
+          node_name: nextName,
+          last_watched_at: watchedAt,
+          updated_at: String(newestWatch.updated_at || new Date().toISOString()).trim()
+        }
+      : null;
+    if (!newestCounts && !newestMedia) return { lastWatch, snapshot: null };
+    const snapshotUpdatedAt = this.getNewestServerRecordLifecycleRow(
+      [newestCounts, newestMedia].filter(Boolean),
+      "updated_at"
+    );
+    return {
+      lastWatch,
+      snapshot: {
+        node_name: nextName,
+        movie_count: newestCounts?.movie_count ?? null,
+        series_count: newestCounts?.series_count ?? null,
+        episode_count: newestCounts?.episode_count ?? null,
+        counts_state: String(newestCounts?.counts_state || "unavailable").trim() || "unavailable",
+        counts_errors_json: String(newestCounts?.counts_errors_json || "{}").trim() || "{}",
+        stats_checked_at: String(newestCounts?.stats_checked_at || "").trim(),
+        last_item_id: String(newestMedia?.last_item_id || "").trim(),
+        last_item_name: String(newestMedia?.last_item_name || "").trim(),
+        last_item_type: String(newestMedia?.last_item_type || "").trim(),
+        last_item_series_name: String(newestMedia?.last_item_series_name || "").trim(),
+        last_item_image_tag: String(newestMedia?.last_item_image_tag || "").trim(),
+        last_item_watched_at: String(newestMedia?.last_item_watched_at || "").trim(),
+        updated_at: String(snapshotUpdatedAt?.updated_at || new Date().toISOString()).trim()
+      }
+    };
+  },
+  buildServerRecordNodeLifecycleRestoreStatements(db, lifecycle = {}, before = {}) {
+    const names = this.normalizeNodeIndex(lifecycle?.names || []);
+    if (!names.length) return [];
+    const placeholders = names.map(() => "?").join(", ");
+    const statements = [
+      db.prepare(`DELETE FROM ${this.SERVER_LAST_WATCH_TABLE} WHERE node_name IN (${placeholders})`).bind(...names),
+      db.prepare(`DELETE FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE} WHERE node_name IN (${placeholders})`).bind(...names),
+      db.prepare(`DELETE FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE} WHERE node_name IN (${placeholders})`).bind(...names)
+    ];
+    for (const row of Array.isArray(before?.lastWatch) ? before.lastWatch : []) {
+      statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+        node_name, last_watched_at, updated_at
+      ) VALUES (?, ?, ?)`)
+        .bind(String(row?.node_name || "").trim().toLowerCase(), String(row?.last_watched_at || "").trim(), String(row?.updated_at || "").trim()));
+    }
+    for (const row of Array.isArray(before?.snapshots) ? before.snapshots : []) {
+      statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+        node_name, movie_count, series_count, episode_count, counts_state,
+        counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+        last_item_type, last_item_series_name, last_item_image_tag,
+        last_item_watched_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(
+          String(row?.node_name || "").trim().toLowerCase(),
+          row?.movie_count ?? null,
+          row?.series_count ?? null,
+          row?.episode_count ?? null,
+          String(row?.counts_state || "unavailable").trim() || "unavailable",
+          String(row?.counts_errors_json || "{}").trim() || "{}",
+          String(row?.stats_checked_at || "").trim(),
+          String(row?.last_item_id || "").trim(),
+          String(row?.last_item_name || "").trim(),
+          String(row?.last_item_type || "").trim(),
+          String(row?.last_item_series_name || "").trim(),
+          String(row?.last_item_image_tag || "").trim(),
+          String(row?.last_item_watched_at || "").trim(),
+          String(row?.updated_at || "").trim()
+        ));
+    }
+    for (const row of Array.isArray(before?.posterCache) ? before.posterCache : []) {
+      statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
+        node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
+        resolved_at, expires_at, failure_code, retry_after, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .bind(
+          String(row?.node_name || "").trim().toLowerCase(),
+          String(row?.watched_at || "").trim(),
+          String(row?.item_id || "").trim(),
+          String(row?.tmdb_id || "").trim(),
+          String(row?.imdb_id || "").trim(),
+          String(row?.provider || "").trim(),
+          String(row?.image_path || "").trim(),
+          String(row?.resolved_at || "").trim(),
+          String(row?.expires_at || "").trim(),
+          String(row?.failure_code || "").trim(),
+          String(row?.retry_after || "").trim(),
+          String(row?.updated_at || "").trim()
+        ));
+    }
+    return statements;
+  },
+  async applyServerRecordNodeLifecycleMutation(mutation = {}, db = null) {
+    const lifecycle = this.getServerRecordNodeLifecycle(mutation);
+    if (!lifecycle || !db) return false;
+    const before = await this.readServerRecordNodeLifecycleRows(db, lifecycle.names);
+    const statements = this.buildServerRecordNodeLifecycleRestoreStatements(db, lifecycle, {});
+    if (lifecycle.type === "rename") {
+      const merged = this.buildMergedServerRecordLifecycleRows(lifecycle, before);
+      if (merged.lastWatch) {
+        statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+          node_name, last_watched_at, updated_at
+        ) VALUES (?, ?, ?)`)
+          .bind(merged.lastWatch.node_name, merged.lastWatch.last_watched_at, merged.lastWatch.updated_at));
+      }
+      if (merged.snapshot) {
+        statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+          node_name, movie_count, series_count, episode_count, counts_state,
+          counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+          last_item_type, last_item_series_name, last_item_image_tag,
+          last_item_watched_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          .bind(
+            merged.snapshot.node_name,
+            merged.snapshot.movie_count,
+            merged.snapshot.series_count,
+            merged.snapshot.episode_count,
+            merged.snapshot.counts_state,
+            merged.snapshot.counts_errors_json,
+            merged.snapshot.stats_checked_at,
+            merged.snapshot.last_item_id,
+            merged.snapshot.last_item_name,
+            merged.snapshot.last_item_type,
+            merged.snapshot.last_item_series_name,
+            merged.snapshot.last_item_image_tag,
+            merged.snapshot.last_item_watched_at,
+            merged.snapshot.updated_at
+          ));
+      }
+    }
+    await db.batch(statements);
+    mutation.serverRecordNodeLifecycle = { lifecycle, before };
+    return true;
+  },
+  async rollbackServerRecordNodeLifecycleMutation(mutation = {}, db = null) {
+    const applied = mutation?.serverRecordNodeLifecycle;
+    if (!db || !applied?.lifecycle) return false;
+    await this.ensureServerLastWatchSchema(db);
+    await this.ensureServerRecordSnapshotSchema(db);
+    await this.ensureServerRecordPosterCacheSchema(db);
+    await db.batch(this.buildServerRecordNodeLifecycleRestoreStatements(db, applied.lifecycle, applied.before));
+    delete mutation.serverRecordNodeLifecycle;
+    return true;
+  },
+  buildServerRecordPosterUrl(env, nodeName = "", snapshot = {}) {
+    const normalizedName = String(nodeName || "").trim().toLowerCase();
+    const itemId = String(snapshot?.itemId || "").trim();
+    if (!normalizedName || !itemId) return "";
+    const adminPath = getAdminPath(env).replace(/\/+$/, "") || "/admin";
+    const revision = hashStableText(`${String(snapshot?.watchedAt || "")}|${String(snapshot?.imageTag || "")}`);
+    return `${adminPath}/__server-record-poster/${encodeURIComponent(normalizedName)}?v=${encodeURIComponent(revision)}`;
   },
   normalizeD1SchemaProfile(profile = "") {
     const normalizedProfile = String(profile || "").trim().toLowerCase();
@@ -11612,6 +12664,8 @@ const Database = {
       GLOBALS.CfDashboardCacheDbReady.delete(db);
       GLOBALS.CfRuntimeCacheDbReady.delete(db);
       GLOBALS.ServerLastWatchDbReady.delete(db);
+      GLOBALS.ServerRecordSnapshotDbReady.delete(db);
+      GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
     }
   },
   async bootstrapD1Schema(db, profile = "logs-core") {
@@ -11634,7 +12688,9 @@ const Database = {
       { name: "ensureAuthFailuresTable", run: () => this.ensureAuthFailuresTable(db) },
       { name: "ensureCfDashboardCacheTable", run: () => this.ensureCfDashboardCacheTable(db) },
       { name: "ensureCfRuntimeCacheTable", run: () => this.ensureCfRuntimeCacheTable(db) },
-      { name: "ensureServerLastWatchSchema", run: () => this.ensureServerLastWatchSchema(db) }
+      { name: "ensureServerLastWatchSchema", run: () => this.ensureServerLastWatchSchema(db) },
+      { name: "ensureServerRecordSnapshotSchema", run: () => this.ensureServerRecordSnapshotSchema(db) },
+      { name: "ensureServerRecordPosterCacheSchema", run: () => this.ensureServerRecordPosterCacheSchema(db) }
     ];
     const logSteps = [
       { name: "ensureLogsBaseSchema", run: () => this.ensureLogsBaseSchema(db) },
@@ -14207,6 +15263,7 @@ const Database = {
       })),
       activeLineId,
       playbackInfoMode: normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode),
+      mediaAggregationManagedRewrite: rawNode.mediaAggregationManagedRewrite === true,
       mediaAuthMode: normalizeNodeMediaAuthMode(rawNode.mediaAuthMode),
       mediaAggregationEmbyCredentialsConfigured: hasConfiguredMediaAggregationNodeCredentials(rawNode),
       realClientIpMode: normalizeNodeRealClientIpMode(rawNode.realClientIpMode),
@@ -16270,6 +17327,7 @@ const Database = {
       deletedExpiredProbeCacheCount: Math.max(0, Number(summary.deletedExpiredProbeCacheCount) || 0),
       deletedExpiredAuthFailureCount: Math.max(0, Number(summary.deletedExpiredAuthFailureCount) || 0),
       deletedExpiredDashboardCacheCount: Math.max(0, Number(summary.deletedExpiredDashboardCacheCount) || 0),
+      deletedExpiredServerRecordPosterCacheCount: Math.max(0, Number(summary.deletedExpiredServerRecordPosterCacheCount) || 0),
       preservedLogCount: Math.max(0, Number(summary.preservedLogCount) || 0),
       rebuiltStatsHourly: summary.rebuiltStatsHourly === true,
       rebuiltLogsFts: summary.rebuiltLogsFts === true,
@@ -17167,8 +18225,13 @@ const Database = {
         String(prevConfig.mediaAggregationEmbyUsername || "") !== String(nextConfig.mediaAggregationEmbyUsername || "")
         || String(prevConfig.mediaAggregationEmbyPassword || "") !== String(nextConfig.mediaAggregationEmbyPassword || "")
         || serializeConfigValue(prevConfig.mediaAggregationNodes || []) !== serializeConfigValue(nextConfig.mediaAggregationNodes || [])
+        || String(prevConfig.mediaAggregationMatchMode || "") !== String(nextConfig.mediaAggregationMatchMode || "")
+        || Number(prevConfig.mediaAggregationFirstResultTimeoutMs) !== Number(nextConfig.mediaAggregationFirstResultTimeoutMs)
+        || Number(prevConfig.mediaAggregationGracePeriodMs) !== Number(nextConfig.mediaAggregationGracePeriodMs)
       ) {
         GLOBALS.MediaAggregationAuthCache.clear();
+        GLOBALS.MediaAggregationInstanceMap.clear();
+        GLOBALS.PlaybackInfoResponseCache.clear();
       }
       await this.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig, nextConfig });
       return nextConfig;
@@ -17814,6 +18877,359 @@ const Database = {
       clearTimeout(timeoutId);
     }
   },
+  async buildServerRecordPosterImageResponse(upstream, requestMethod = "GET") {
+    const contentType = String(upstream?.headers?.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
+    if (!upstream?.ok || !SERVER_RECORD_POSTER_CONTENT_TYPES.has(contentType)) {
+      try { await upstream?.body?.cancel?.(); } catch {}
+      return null;
+    }
+    const responseHeaders = new Headers({
+      "Content-Type": upstream.headers.get("Content-Type") || "image/jpeg",
+      "Cache-Control": "private, max-age=300, stale-while-revalidate=60",
+      "Content-Security-Policy": "default-src 'none'; sandbox",
+      "X-Content-Type-Options": "nosniff",
+      "Cross-Origin-Resource-Policy": "same-origin",
+      "Vary": "Cookie"
+    });
+    for (const headerName of ["Content-Length", "ETag", "Last-Modified"]) {
+      const value = upstream.headers.get(headerName);
+      if (value) responseHeaders.set(headerName, value);
+    }
+    return new Response(String(requestMethod || "GET").toUpperCase() === "HEAD" ? null : upstream.body, {
+      status: 200,
+      headers: responseHeaders
+    });
+  },
+  async fetchTmdbPosterJson(env, apiPath = "", query = {}, runtimeConfig = {}) {
+    const apiKey = resolveTmdbPosterApiKey(env, runtimeConfig);
+    if (!apiKey) return { ok: false, failureCode: "tmdb_secret_missing" };
+    let url;
+    try {
+      url = new URL(String(apiPath || ""), TMDB_API_ORIGIN);
+      if (url.origin !== TMDB_API_ORIGIN || !url.pathname.startsWith("/3/")) {
+        return { ok: false, failureCode: "tmdb_request_invalid" };
+      }
+    } catch {
+      return { ok: false, failureCode: "tmdb_request_invalid" };
+    }
+    url.searchParams.set("api_key", apiKey);
+    for (const [name, value] of Object.entries(isPlainObject(query) ? query : {})) {
+      if (value !== undefined && value !== null && String(value).trim()) url.searchParams.set(name, String(value));
+    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("tmdb_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
+    try {
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+        redirect: "error",
+        signal: controller.signal
+      });
+      const contentType = String(response.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
+      if (!response.ok) {
+        try { await response.body?.cancel?.(); } catch {}
+        return { ok: false, failureCode: response.status === 429 ? "tmdb_rate_limited" : (response.status === 404 ? "tmdb_not_found" : "tmdb_http_error") };
+      }
+      if (!TMDB_JSON_CONTENT_TYPES.has(contentType)) {
+        try { await response.body?.cancel?.(); } catch {}
+        return { ok: false, failureCode: "tmdb_invalid_mime" };
+      }
+      const body = await readResponseTextWithLimit(response, MEDIA_AGGREGATION_RESPONSE_MAX_BYTES);
+      if (body.exceeded || !body.text.trim()) return { ok: false, failureCode: "tmdb_invalid_json" };
+      try {
+        return { ok: true, json: JSON.parse(body.text) };
+      } catch {
+        return { ok: false, failureCode: "tmdb_invalid_json" };
+      }
+    } catch (error) {
+      const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
+      return { ok: false, failureCode: timedOut ? "tmdb_timeout" : "tmdb_network_error" };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+  async fetchTmdbPosterImage(imagePath = "", requestMethod = "GET") {
+    const url = buildTmdbPosterImageUrl(imagePath);
+    if (!url) return { response: null, failureCode: "tmdb_invalid_image_path" };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort("tmdb_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
+    try {
+      const upstream = await fetch(url.toString(), {
+        method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
+        headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8" },
+        cache: "no-store",
+        redirect: "error",
+        signal: controller.signal
+      });
+      const response = await this.buildServerRecordPosterImageResponse(upstream, requestMethod);
+      return {
+        response,
+        failureCode: response ? "" : (upstream.status === 429 ? "tmdb_rate_limited" : "tmdb_invalid_image")
+      };
+    } catch (error) {
+      const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
+      return { response: null, failureCode: timedOut ? "tmdb_timeout" : "tmdb_network_error" };
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  },
+  async resolveTmdbPosterImagePath(env, mediaKind = "", tmdbId = "", runtimeConfig = {}) {
+    const normalizedId = normalizeTmdbPosterId(tmdbId);
+    const type = String(mediaKind || "").trim().toLowerCase() === "movie" ? "movie" : "tv";
+    if (!normalizedId) return { imagePath: "", failureCode: "tmdb_id_invalid" };
+    const result = await this.fetchTmdbPosterJson(
+      env,
+      `/3/${type}/${encodeURIComponent(normalizedId)}/images`,
+      { include_image_language: "zh,en,null" },
+      runtimeConfig
+    );
+    if (!result.ok) return { imagePath: "", failureCode: result.failureCode };
+    const imagePath = selectTmdbPosterImagePath(result.json);
+    return imagePath ? { imagePath, failureCode: "" } : { imagePath: "", failureCode: "tmdb_poster_not_found" };
+  },
+  async resolveTmdbPosterFromImdb(env, mediaKind = "", imdbId = "", runtimeConfig = {}) {
+    const normalizedImdbId = normalizeImdbPosterId(imdbId);
+    const type = String(mediaKind || "").trim().toLowerCase() === "movie" ? "movie" : "tv";
+    if (!normalizedImdbId) return { tmdbId: "", imagePath: "", failureCode: "imdb_id_invalid" };
+    const findResult = await this.fetchTmdbPosterJson(
+      env,
+      `/3/find/${encodeURIComponent(normalizedImdbId)}`,
+      { external_source: "imdb_id" },
+      runtimeConfig
+    );
+    if (!findResult.ok) return { tmdbId: "", imagePath: "", failureCode: findResult.failureCode };
+    const candidates = type === "movie" ? findResult.json?.movie_results : findResult.json?.tv_results;
+    const tmdbId = normalizeTmdbPosterId(Array.isArray(candidates) ? candidates[0]?.id : "");
+    if (!tmdbId) return { tmdbId: "", imagePath: "", failureCode: "tmdb_find_not_found" };
+    const imageResult = await this.resolveTmdbPosterImagePath(env, type, tmdbId, runtimeConfig);
+    return { tmdbId, ...imageResult };
+  },
+  async getServerRecordPosterMetadata(nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "") {
+    const normalizedItemId = String(itemId || "").trim();
+    if (!normalizedItemId) return null;
+    for (const targetRecord of targetRecords) {
+      const headers = new Headers(baseHeaders);
+      if (credentials.configured) {
+        stripSensitiveProxyAuthHeaders(headers);
+        headers.delete("Cookie");
+        const auth = await this.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
+        if (!auth?.token) continue;
+        headers.set("X-Emby-Token", auth.token);
+      }
+      let metadataResult;
+      try {
+        metadataResult = await this.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(normalizedItemId)}`, headers, {
+          expectJson: true,
+          query: { Fields: "ProviderIds,SeriesProviderIds,SeriesId,SeriesName,ParentIndexNumber,IndexNumber" }
+        });
+      } catch {
+        continue;
+      }
+      if (!metadataResult?.ok || metadataResult.parseError || !isPlainObject(metadataResult.json)) continue;
+      const metadata = metadataResult.json;
+      const type = String(metadata?.Type || metadata?.type || "").trim().toLowerCase();
+      if (type === "movie" || type === "series") {
+        return {
+          mediaKind: type === "movie" ? "movie" : "tv",
+          providerIds: normalizeMediaAggregationProviderIds(metadata?.ProviderIds || metadata?.providerIds),
+          tmdbId: "",
+          imdbId: ""
+        };
+      }
+      if (type !== "episode") return { mediaKind: "", providerIds: {}, tmdbId: "", imdbId: "" };
+      const seriesProviderIds = normalizeMediaAggregationProviderIds(metadata?.SeriesProviderIds || metadata?.seriesProviderIds);
+      if (Object.keys(seriesProviderIds).length) {
+        return { mediaKind: "tv", providerIds: seriesProviderIds, tmdbId: "", imdbId: "" };
+      }
+      const seriesId = String(metadata?.SeriesId || metadata?.seriesId || "").trim();
+      if (!seriesId) return { mediaKind: "tv", providerIds: {}, tmdbId: "", imdbId: "" };
+      let seriesResult;
+      try {
+        seriesResult = await this.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(seriesId)}`, headers, {
+          expectJson: true,
+          query: { Fields: "ProviderIds,ParentIndexNumber,IndexNumber" }
+        });
+      } catch {
+        continue;
+      }
+      if (!seriesResult?.ok || seriesResult.parseError || !isPlainObject(seriesResult.json)) continue;
+      return {
+        mediaKind: "tv",
+        providerIds: normalizeMediaAggregationProviderIds(seriesResult.json?.ProviderIds || seriesResult.json?.providerIds),
+        tmdbId: "",
+        imdbId: ""
+      };
+    }
+    return null;
+  },
+  async persistServerRecordPosterCache(db, entry = {}) {
+    try {
+      return await this.setServerRecordPosterCache(db, entry);
+    } catch {
+      return false;
+    }
+  },
+  async resolveServerRecordTmdbPoster(env, db, nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "", watchedAt = "", requestMethod = "GET", runtimeConfig = {}) {
+    if (!resolveTmdbPosterApiKey(env, runtimeConfig)) return null;
+    const now = nowMs();
+    let cached = null;
+    try {
+      cached = await this.getServerRecordPosterCache(db, nodeName, watchedAt, itemId);
+    } catch {}
+    const cacheExpiresAt = Date.parse(String(cached?.expiresAt || ""));
+    if (cached && Number.isFinite(cacheExpiresAt) && cacheExpiresAt > now) {
+      if (cached.imagePath && ["tmdb_direct", "tmdb_imdb_find"].includes(cached.provider)) {
+        const imageResult = await this.fetchTmdbPosterImage(cached.imagePath, requestMethod);
+        if (imageResult.response) return imageResult.response;
+        await this.persistServerRecordPosterCache(db, {
+          nodeName,
+          watchedAt,
+          itemId,
+          tmdbId: cached.tmdbId,
+          imdbId: cached.imdbId,
+          expiresAt: new Date(now + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString(),
+          retryAfter: new Date(now + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString(),
+          failureCode: imageResult.failureCode
+        });
+        return null;
+      }
+      const retryAfter = Date.parse(String(cached.retryAfter || ""));
+      if (cached.failureCode && Number.isFinite(retryAfter) && retryAfter > now) return null;
+    }
+
+    const metadata = await this.getServerRecordPosterMetadata(nodeName, node, targetRecords, baseHeaders, credentials, itemId);
+    if (!metadata?.mediaKind) return null;
+    const providerIds = normalizeMediaAggregationProviderIds(metadata.providerIds);
+    const directTmdbId = normalizeTmdbPosterId(providerIds.tmdb);
+    const imdbId = normalizeImdbPosterId(providerIds.imdb);
+    const negativeCache = async (failureCode, tmdbId = directTmdbId) => {
+      const retryAt = new Date(nowMs() + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString();
+      await this.persistServerRecordPosterCache(db, {
+        nodeName,
+        watchedAt,
+        itemId,
+        tmdbId,
+        imdbId,
+        expiresAt: retryAt,
+        retryAfter: retryAt,
+        failureCode
+      });
+    };
+    if (directTmdbId) {
+      const resolution = await this.resolveTmdbPosterImagePath(env, metadata.mediaKind, directTmdbId, runtimeConfig);
+      if (resolution.imagePath) {
+        const imageResult = await this.fetchTmdbPosterImage(resolution.imagePath, requestMethod);
+        if (imageResult.response) {
+          await this.persistServerRecordPosterCache(db, {
+            nodeName,
+            watchedAt,
+            itemId,
+            tmdbId: directTmdbId,
+            imdbId,
+            provider: "tmdb_direct",
+            imagePath: resolution.imagePath,
+            expiresAt: new Date(nowMs() + SERVER_RECORD_POSTER_CACHE_TTL_MS).toISOString()
+          });
+          return imageResult.response;
+        }
+        await negativeCache(imageResult.failureCode);
+        return null;
+      }
+      if (resolution.failureCode !== "tmdb_poster_not_found" && resolution.failureCode !== "tmdb_not_found") {
+        await negativeCache(resolution.failureCode);
+        return null;
+      }
+    }
+    if (imdbId) {
+      const resolution = await this.resolveTmdbPosterFromImdb(env, metadata.mediaKind, imdbId, runtimeConfig);
+      if (resolution.imagePath) {
+        const imageResult = await this.fetchTmdbPosterImage(resolution.imagePath, requestMethod);
+        if (imageResult.response) {
+          await this.persistServerRecordPosterCache(db, {
+            nodeName,
+            watchedAt,
+            itemId,
+            tmdbId: resolution.tmdbId,
+            imdbId,
+            provider: "tmdb_imdb_find",
+            imagePath: resolution.imagePath,
+            expiresAt: new Date(nowMs() + SERVER_RECORD_POSTER_CACHE_TTL_MS).toISOString()
+          });
+          return imageResult.response;
+        }
+        await negativeCache(imageResult.failureCode, resolution.tmdbId);
+        return null;
+      }
+      await negativeCache(resolution.failureCode, resolution.tmdbId);
+      return null;
+    }
+    await negativeCache(directTmdbId ? "tmdb_poster_not_found" : "tmdb_provider_ids_missing");
+    return null;
+  },
+  async getServerRecordEmbyPosterResponse(nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "", requestMethod = "GET") {
+    for (const targetRecord of targetRecords) {
+      const headers = new Headers(baseHeaders);
+      if (credentials.configured) {
+        stripSensitiveProxyAuthHeaders(headers);
+        headers.delete("Cookie");
+        const auth = await this.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
+        if (!auth?.token) continue;
+        headers.set("X-Emby-Token", auth.token);
+      }
+      headers.set("Accept", "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8");
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort("server_record_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
+      try {
+        const posterUrl = buildUpstreamProxyUrl(targetRecord, `/Items/${encodeURIComponent(String(itemId || "").trim())}/Images/Primary`);
+        const upstream = await fetch(posterUrl.toString(), {
+          method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
+          headers,
+          cache: "no-store",
+          redirect: "error",
+          signal: controller.signal
+        });
+        const response = await this.buildServerRecordPosterImageResponse(upstream, requestMethod);
+        if (response) return response;
+      } catch {} finally {
+        clearTimeout(timeoutId);
+      }
+    }
+    return null;
+  },
+  async getServerRecordPosterResponse(env, nodeName = "", requestMethod = "GET") {
+    const normalizedName = String(nodeName || "").trim().toLowerCase();
+    const db = this.getDB(env);
+    if (!db || !normalizedName) return null;
+    const [snapshots, lastWatchByNode] = await Promise.all([
+      this.getServerRecordSnapshots(db, [normalizedName]),
+      this.getServerLastWatch(db, [normalizedName])
+    ]);
+    const lastItem = snapshots.get(normalizedName)?.lastItem || {};
+    const itemId = String(lastItem.itemId || "").trim();
+    const watchedAt = String(lastItem.watchedAt || "").trim();
+    const lastWatchedAt = String(lastWatchByNode.get(normalizedName)?.lastWatchedAt || "").trim();
+    if (!itemId || !watchedAt || watchedAt !== lastWatchedAt) return null;
+    const node = await this.getNodeForRead(normalizedName, env);
+    if (!node || normalizeServerRecordSettings(node?.serverRecord).enabled !== true) return null;
+    const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
+    if (!targetRecords.length) return null;
+    const baseHeaders = this.buildServerRecordRequestHeaders(node);
+    const credentials = resolveServerRecordCredentials(node);
+    let runtimeConfig = {};
+    try {
+      runtimeConfig = await getRuntimeConfigStrict(env);
+    } catch {}
+    try {
+      const tmdbResponse = await this.resolveServerRecordTmdbPoster(
+        env, db, normalizedName, node, targetRecords, baseHeaders, credentials, itemId, watchedAt, requestMethod, runtimeConfig
+      );
+      if (tmdbResponse) return tmdbResponse;
+    } catch {}
+    return await this.getServerRecordEmbyPosterResponse(
+      normalizedName, node, targetRecords, baseHeaders, credentials, itemId, requestMethod
+    );
+  },
   normalizeServerRecordRuntimeError(error = null, status = 0) {
     if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
     if (status === 401 || status === 403) return "unauthorized";
@@ -17903,6 +19319,7 @@ const Database = {
     let latencyMs = null;
     let detailsLimited = false;
     let unauthorizedTarget = null;
+    let unauthorizedTargetCount = 0;
     for (const targetRecord of targetRecords) {
       try {
         const ping = await this.fetchServerRecordEndpoint(targetRecord, "/System/Ping", headers);
@@ -17917,6 +19334,7 @@ const Database = {
           if (!unauthorizedTarget) {
             unauthorizedTarget = { targetRecord, latencyMs: ping.latencyMs, status: ping.status };
           }
+          unauthorizedTargetCount += 1;
           continue;
         }
         runtimeState = "offline";
@@ -17927,7 +19345,7 @@ const Database = {
       }
     }
 
-    if (!selectedTarget && unauthorizedTarget) {
+    if (!selectedTarget && unauthorizedTarget && unauthorizedTargetCount === targetRecords.length) {
       selectedTarget = unauthorizedTarget.targetRecord;
       latencyMs = unauthorizedTarget.latencyMs;
       runtimeState = "unauthorized";
@@ -18055,8 +19473,9 @@ const Database = {
     const value = await runSingleFlight(buildSingleFlightKey(["server-record-probe", name, revision]), async () => {
       const probeValue = await this.probeServerRecord(name, node);
       const errorCode = String(probeValue?.runtime?.errorCode || "").trim().toLowerCase();
-      const retryableFailure = String(probeValue?.runtime?.state || "") === "offline"
-        && ["timeout", "upstream_unavailable"].includes(errorCode);
+      const runtimeState = String(probeValue?.runtime?.state || "").trim().toLowerCase();
+      const retryableFailure = (runtimeState === "timeout" && errorCode === "server_record_timeout")
+        || (runtimeState === "offline" && ["server_record_network_error", "upstream_unavailable"].includes(errorCode));
       if (retryableFailure) {
         const previous = GLOBALS.ServerRecordProbeBackoff.get(backoffKey);
         const failures = previous?.revision === revision ? Math.max(0, Number(previous.failures) || 0) + 1 : 1;
@@ -18135,6 +19554,23 @@ const Database = {
       });
     }
 
+    let recordSnapshots = new Map();
+    let snapshotState = options.db ? "ok" : "unavailable";
+    if (options.db && recordNodes.length > 0) {
+      try {
+        const persistable = [...probes.entries()].map(([nodeName, probe]) => ({
+          nodeName,
+          counts: probe?.counts,
+          checkedAt: probe?.runtime?.checkedAt
+        }));
+        if (persistable.length) await this.persistServerRecordProbeSnapshots(options.db, persistable);
+        recordSnapshots = await this.getServerRecordSnapshots(options.db, recordNodes.map(node => node.nodeName));
+      } catch (error) {
+        snapshotState = "unavailable";
+        console.error("server record snapshot persistence failed", error);
+      }
+    }
+
     let lastWatchByNode = new Map();
     let watchState = options.db ? "ok" : "unavailable";
     if (options.db && recordNodes.length > 0) {
@@ -18148,7 +19584,39 @@ const Database = {
     return {
       records: recordNodes.map((summary) => {
         const probe = probes.get(summary.nodeName) || {};
+        const storedSnapshot = recordSnapshots.get(summary.nodeName) || {};
+        const liveCounts = isPlainObject(probe.counts) ? probe.counts : {};
+        const hasLiveCounts = [liveCounts.movies, liveCounts.series, liveCounts.episodes]
+          .some(value => value !== null && value !== undefined && value !== ""
+            && Number.isFinite(Number(value)) && Number(value) >= 0);
+        const counts = hasLiveCounts
+          ? {
+              ...liveCounts,
+              checkedAt: String(probe?.runtime?.checkedAt || ""),
+              source: "live",
+              persisted: snapshotState === "ok"
+            }
+          : storedSnapshot?.counts
+            ? {
+                ...storedSnapshot.counts,
+                source: "persisted",
+                persisted: true,
+                refreshErrors: isPlainObject(liveCounts.errors) ? liveCounts.errors : {}
+              }
+            : {
+                movies: null,
+                series: null,
+                episodes: null,
+                state: "unavailable",
+                errors: {},
+                checkedAt: "",
+                source: "unavailable",
+                persisted: false
+              };
         const watch = lastWatchByNode.get(summary.nodeName) || {};
+        const lastItem = isPlainObject(storedSnapshot?.lastItem) ? storedSnapshot.lastItem : {};
+        const lastItemMatchesWatch = !!String(lastItem.itemId || "").trim()
+          && String(lastItem.watchedAt || "").trim() === String(watch.lastWatchedAt || "").trim();
         const probeRequested = probedNodeNames.has(summary.nodeName);
         return {
           ...summary,
@@ -18157,18 +19625,25 @@ const Database = {
             checkedAt: "",
             errorCode: probeRequested ? "node_not_found" : "manual_refresh_required"
           },
-          counts: probe.counts || { movies: null, series: null, episodes: null, state: "unavailable", errors: {} },
+          counts,
           probe: probe.probe || { source: probeRequested ? "live" : "not_checked", retryAt: "" },
           watch: {
             lastWatchedAt: String(watch.lastWatchedAt || ""),
-            state: watchState
+            state: watchState,
+            itemId: lastItemMatchesWatch ? String(lastItem.itemId || "") : "",
+            itemName: lastItemMatchesWatch ? String(lastItem.itemName || "") : "",
+            itemType: lastItemMatchesWatch ? String(lastItem.itemType || "") : "",
+            seriesName: lastItemMatchesWatch ? String(lastItem.seriesName || "") : "",
+            imageTag: lastItemMatchesWatch ? String(lastItem.imageTag || "") : "",
+            posterUrl: lastItemMatchesWatch ? this.buildServerRecordPosterUrl(env, summary.nodeName, lastItem) : ""
           },
           expiry: buildServerRecordExpiry(summary, watch.lastWatchedAt, config, options?.now || new Date())
         };
       }),
       availableNodes,
       refreshedAt: new Date().toISOString(),
-      cacheTtlMs: DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS
+      cacheTtlMs: DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
+      persistence: { state: snapshotState }
     };
   },
   async pingTarget(target, timeoutMs, options = {}) {
@@ -18178,15 +19653,20 @@ const Database = {
     try {
       const resolvedTarget = String(target || "").trim();
       if (!resolvedTarget) return 9999;
-      let probeTarget = resolvedTarget;
-      const probePath = String(options?.probePath || "").trim();
-      if (probePath) {
-        const targetRecord = createTargetRecord(resolvedTarget);
-        if (!targetRecord) return 9999;
-        probeTarget = buildUpstreamProxyUrl(targetRecord, normalizeNodeLineHeadProbePath(probePath)).toString();
+      const targetRecord = createTargetRecord(resolvedTarget);
+      if (!targetRecord) return 9999;
+      const probePath = normalizeNodeLineHeadProbePath(options?.probePath, DEFAULT_NODE_LINE_HEAD_PROBE_PATH);
+      const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
+      if (!probeUrl) return 9999;
+
+      let response = await fetch(probeUrl.toString(), { method: "HEAD", signal: controller.signal });
+      if (response.status === 405 || response.status === 501) {
+        try { response.body?.cancel?.(); } catch {}
+        response = await fetch(probeUrl.toString(), { method: "GET", signal: controller.signal });
       }
-      await fetch(probeTarget, { method: "HEAD", signal: controller.signal });
-      return nowMs() - startedAt;
+      const healthy = response.ok;
+      try { response.body?.cancel?.(); } catch {}
+      return healthy ? nowMs() - startedAt : 9999;
     } catch {
       return 9999;
     } finally {
@@ -18253,6 +19733,9 @@ const Database = {
     const normalizedPlaybackInfoMode = normalizeNodePlaybackInfoMode(n.playbackInfoMode);
     if (String(n.playbackInfoMode || "") !== normalizedPlaybackInfoMode) changed = true;
     n.playbackInfoMode = normalizedPlaybackInfoMode;
+    const normalizedMediaAggregationManagedRewrite = n.mediaAggregationManagedRewrite === true;
+    if (n.mediaAggregationManagedRewrite !== normalizedMediaAggregationManagedRewrite) changed = true;
+    n.mediaAggregationManagedRewrite = normalizedMediaAggregationManagedRewrite;
     const normalizedMediaAuthMode = normalizeNodeMediaAuthMode(n.mediaAuthMode);
     if (String(n.mediaAuthMode || "") !== normalizedMediaAuthMode) changed = true;
     n.mediaAuthMode = normalizedMediaAuthMode;
@@ -18399,6 +19882,9 @@ const Database = {
       remarkColor: rawNode?.remarkColor !== undefined ? String(rawNode.remarkColor || "").trim() : (existingNode.remarkColor || ""),
       displayName: rawNode?.displayName !== undefined ? String(rawNode.displayName || "").trim() : (existingNode.displayName || ""),
       playbackInfoMode: rawNode?.playbackInfoMode !== undefined ? normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode) : normalizeNodePlaybackInfoMode(existingNode.playbackInfoMode),
+      mediaAggregationManagedRewrite: rawNode?.mediaAggregationManagedRewrite !== undefined
+        ? rawNode.mediaAggregationManagedRewrite === true
+        : (rawNode?.playbackInfoMode !== undefined ? false : existingNode.mediaAggregationManagedRewrite === true),
       mediaAuthMode: rawNode?.mediaAuthMode !== undefined ? normalizeNodeMediaAuthMode(rawNode.mediaAuthMode) : normalizeNodeMediaAuthMode(existingNode.mediaAuthMode),
       mediaAggregationEmbyUsername: rawNode?.mediaAggregationEmbyUsername !== undefined
         ? String(rawNode.mediaAggregationEmbyUsername || "").trim()
@@ -18582,6 +20068,7 @@ const Database = {
   async applyPreparedNodeMutation(mutation = {}, options = {}) {
     const kv = options.kv;
     if (!kv || mutation?.nodeChanged !== true) return false;
+    const db = options.db || (options.env ? this.getDB(options.env) : null);
     const previousName = String(mutation?.previousName || "").trim().toLowerCase();
     const nextName = String(mutation?.nextName || "").trim().toLowerCase();
     if (mutation?.nextNode) {
@@ -18592,12 +20079,14 @@ const Database = {
     if (previousName && nextName && previousName !== nextName) {
       await kv.delete(`${this.PREFIX}${previousName}`);
     }
+    await this.applyServerRecordNodeLifecycleMutation(mutation, db);
     this.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
     return true;
   },
   async rollbackPreparedNodeMutation(mutation = {}, options = {}) {
     const kv = options.kv;
     if (!kv || mutation?.nodeChanged !== true) return false;
+    const db = options.db || (options.env ? this.getDB(options.env) : null);
     const previousName = String(mutation?.previousName || "").trim().toLowerCase();
     const nextName = String(mutation?.nextName || "").trim().toLowerCase();
     if (previousName) {
@@ -18610,6 +20099,7 @@ const Database = {
     if (nextName && nextName !== previousName) {
       await kv.delete(`${this.PREFIX}${nextName}`);
     }
+    await this.rollbackServerRecordNodeLifecycleMutation(mutation, db);
     this.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
     return true;
   },
@@ -18832,7 +20322,7 @@ const Database = {
   // - 面板统计 / 运行状态：getDashboardStats / getMonthlyTrafficStats / getRuntimeStatus
   // - 配置与备份：loadConfig / previewConfig / saveConfig / uploadAdminIndex / updateWorkerAndAdminIndex / exportConfig / exportSettings / importSettings / importFull
   // - 节点治理：list / saveOrImport / delete / pingNode / getServerRecordsSnapshot / saveServerRecordSettings
-  // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
+  // - 运维动作：getLogs / clearLogs / getD1SchemaStatus / getD1TimeTravelBookmark / initD1Schema / initLogsDb / initLogsFts / purgeCache / tidyKvData / testTelegram / sendDailyReport
   // 设计意图：
   // - 维持单文件部署，但把“动作分发”和“动作实现”拆成两个认知层次。
   // - 新增 action 时，优先在这里挂处理器，再在 handleApi 做最小派发。
@@ -18880,7 +20370,7 @@ const Database = {
       try {
         const config = await getRuntimeConfigStrict(env);
         const revisions = await Database.getAdminRevisionsForRead({ env, kv, db }, { ctx, config });
-        return jsonResponse({ config, revisions });
+        return jsonResponse({ config: redactAdminRuntimeConfigTmdbApiKey(config), revisions });
       } catch (error) {
         throw remapAdminReadKvError(error, "CONFIG_READ_FAILED", "设置读取失败：KV 读取异常", "admin.read.config");
       }
@@ -18891,9 +20381,13 @@ const Database = {
         ? data.config
         : {};
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-      const prepared = await Database.prepareRuntimeConfigPersistence(rawConfig, { env, kv, ctx });
+      const currentConfig = await getRuntimeConfigStrict(env);
+      const prepared = await Database.prepareRuntimeConfigPersistence(
+        mergeMissingRuntimeConfigSecrets(rawConfig, currentConfig),
+        { env, kv, ctx }
+      );
       return jsonResponse({
-        config: prepared.nextConfig,
+        config: redactAdminRuntimeConfigTmdbApiKey(prepared.nextConfig),
         migration: collectLegacyRuntimeConfigState(rawConfig),
         hostPrefixDnsSyncCount: prepared.dnsPlans.length
       });
@@ -18980,13 +20474,14 @@ const Database = {
           adminPath: getAdminPath(env),
           loginPath: getAdminLoginPath(env),
           initHealth,
-          config,
+          config: redactAdminRuntimeConfigTmdbApiKey(config),
           hostDomain: resolveConfiguredHost(env),
           legacyHost: resolveConfiguredLegacyHost(env),
           contract: buildAdminUiContract(),
           nodes,
           configSnapshots,
           shell: buildAdminShellState(env, initHealth, config),
+          posterMetadata: buildPosterMetadataSettingsState(env, config),
           runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object"
             ? runtimeStatusPayload.status
             : withAdminShellRuntimeStatus({}, env, config, initHealth),
@@ -19051,12 +20546,13 @@ const Database = {
       }
 
       return jsonResponse({
-        config,
+        config: redactAdminRuntimeConfigTmdbApiKey(config),
         hostDomain: resolveConfiguredHost(env),
         legacyHost: resolveConfiguredLegacyHost(env),
         contract: buildAdminUiContract(),
         nodes,
         configSnapshots,
+        posterMetadata: buildPosterMetadataSettingsState(env, config),
         runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
         revisions,
         generatedAt: new Date().toISOString()
@@ -19227,6 +20723,61 @@ const Database = {
       }
     },
 
+    async savePosterMetadataSettings(data, { env, ctx, kv }) {
+      if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+      const operation = String(data?.operation || "set").trim().toLowerCase() === "remove" ? "remove" : "set";
+      const tmdbApiKey = operation === "set" ? normalizeTmdbApiKeyInput(data?.tmdbApiKey) : "";
+      if (operation === "set" && !tmdbApiKey) {
+        return jsonError(
+          "TMDB_API_KEY_INVALID",
+          "请输入有效的 TMDB v3 API Key",
+          400
+        );
+      }
+
+      let currentConfig;
+      try {
+        currentConfig = await getRuntimeConfigStrict(env);
+      } catch (error) {
+        throw remapAdminReadKvError(
+          error,
+          "TMDB_POSTER_CONFIG_READ_FAILED",
+          "TMDB 密钥配置读取失败：KV 读取异常",
+          "admin.write.tmdb_poster"
+        );
+      }
+
+      try {
+        const nextConfig = { ...currentConfig };
+        if (operation === "remove") delete nextConfig.tmdbApiKey;
+        else nextConfig.tmdbApiKey = tmdbApiKey;
+        const savedConfig = await Database.persistRuntimeConfig(nextConfig, {
+          env,
+          kv,
+          ctx,
+          snapshotMeta: {
+            reason: operation === "remove" ? "remove_tmdb_poster_key" : "save_tmdb_poster_key",
+            section: "account",
+            source: "poster_metadata",
+            actor: "admin"
+          }
+        });
+        return jsonResponse({
+          success: true,
+          posterMetadata: buildPosterMetadataSettingsState(env, savedConfig),
+          config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+          revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
+        });
+      } catch (error) {
+        return jsonError(
+          operation === "remove" ? "TMDB_POSTER_KEY_REMOVE_FAILED" : "TMDB_POSTER_KEY_SAVE_FAILED",
+          "TMDB 密钥保存失败，请稍后重试",
+          normalizeErrorStatus(error?.status, 500),
+          isPlainObject(error?.details) ? error.details : null
+        );
+      }
+    },
+
     async updateWorkerAndAdminIndex(data, { env, request, kv, ctx }) {
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
       let config;
@@ -19365,15 +20916,16 @@ const Database = {
           revision: persistedIndex.record.revision,
           uploadedAt: persistedIndex.record.uploadedAt
         },
-        config: persistedIndex.config,
+        config: redactAdminRuntimeConfigTmdbApiKey(persistedIndex.config),
         revisions: await Database.getAdminRevisions(env, { ctx, config: persistedIndex.config })
       });
     },
 
     async saveConfig(data, { env, ctx, kv, meta }) {
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+      const currentConfig = await getRuntimeConfigStrict(env);
       const savedConfig = data.config
-        ? await Database.persistRuntimeConfig(data.config, {
+        ? await Database.persistRuntimeConfig(mergeMissingRuntimeConfigSecrets(data.config, currentConfig), {
             env,
             kv,
             ctx,
@@ -19384,10 +20936,11 @@ const Database = {
               actor: "admin"
             }
           })
-        : await getRuntimeConfig(env);
+        : currentConfig;
       return jsonResponse({
         success: true,
-        config: savedConfig,
+        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+        posterMetadata: buildPosterMetadataSettingsState(env, savedConfig),
         revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
       });
     },
@@ -19415,7 +20968,7 @@ const Database = {
           fileName: persisted.record.fileName,
           bytes: persisted.record.bytes,
           uploadedAt: persisted.record.uploadedAt,
-          config: persisted.config,
+          config: redactAdminRuntimeConfigTmdbApiKey(persisted.config),
           revisions: await Database.getAdminRevisions(env, { ctx, config: persisted.config })
         });
       } catch (error) {
@@ -19524,7 +21077,7 @@ const Database = {
       ]);
       return jsonResponse({
         success: true,
-        config: savedConfig,
+        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
         configSnapshots,
         revisions,
         generatedAt: new Date().toISOString()
@@ -19592,7 +21145,7 @@ const Database = {
         const restoredConfig = await Database.restoreTidyKvMigrationSnapshot(snapshot, { env, kv, ctx });
         return jsonResponse({
           success: true,
-          config: restoredConfig,
+          config: redactAdminRuntimeConfigTmdbApiKey(restoredConfig),
           restoredSnapshotId: snapshotId,
           restoredMigrationPayload: true,
           revisions: await Database.getAdminRevisions(env, { ctx, config: restoredConfig })
@@ -19614,7 +21167,7 @@ const Database = {
       });
       return jsonResponse({
         success: true,
-        config: savedConfig,
+        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
         restoredSnapshotId: snapshotId,
         revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
       });
@@ -20104,7 +21657,7 @@ const Database = {
         success: true,
         selectedNodeNames,
         updatedNodeCount,
-        config: savedConfig,
+        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
         nodes: summaryNodes,
         revisions: await Database.getAdminRevisions(env, {
           ctx,
@@ -20133,12 +21686,24 @@ const Database = {
         const nextBidirectionalProgressEnabled = Object.prototype.hasOwnProperty.call(data || {}, "bidirectionalProgressEnabled")
           ? data.bidirectionalProgressEnabled === true
           : currentConfig.mediaAggregationBidirectionalProgressEnabled === true;
+        const nextMatchMode = Object.prototype.hasOwnProperty.call(data || {}, "matchMode")
+          ? normalizeMediaAggregationMatchMode(data.matchMode)
+          : normalizeMediaAggregationMatchMode(currentConfig.mediaAggregationMatchMode);
+        const nextFirstResultTimeoutMs = Object.prototype.hasOwnProperty.call(data || {}, "firstResultTimeoutMs")
+          ? clampIntegerConfig(data.firstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 10000)
+          : clampIntegerConfig(currentConfig.mediaAggregationFirstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 10000);
+        const nextGracePeriodMs = Object.prototype.hasOwnProperty.call(data || {}, "gracePeriodMs")
+          ? clampIntegerConfig(data.gracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5000)
+          : clampIntegerConfig(currentConfig.mediaAggregationGracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5000);
         const nextAggregationConfig = {
           ...currentConfig,
           mediaAggregationNodes: selectedNodeNames,
           mediaAggregationEmbyUsername: nextAggregationUsername,
           mediaAggregationEmbyPassword: nextAggregationPassword,
-          mediaAggregationBidirectionalProgressEnabled: nextBidirectionalProgressEnabled
+          mediaAggregationBidirectionalProgressEnabled: nextBidirectionalProgressEnabled,
+          mediaAggregationMatchMode: nextMatchMode,
+          mediaAggregationFirstResultTimeoutMs: nextFirstResultTimeoutMs,
+          mediaAggregationGracePeriodMs: nextGracePeriodMs
         };
         const missingCredentialNames = selectedNodeNames.filter((nodeName) => {
           const node = (Array.isArray(currentNodes) ? currentNodes : [])
@@ -20160,15 +21725,21 @@ const Database = {
           const nodeName = String(rawNode.name || "").trim().toLowerCase();
           if (!nodeName) continue;
           const currentMode = normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode);
-          const nextMode = selectedKeys.has(nodeName)
+          const managedRewrite = rawNode.mediaAggregationManagedRewrite === true;
+          const selected = selectedKeys.has(nodeName);
+          const nextMode = selected
             ? "rewrite"
-            : (currentMode === "rewrite" ? "inherit" : currentMode);
-          if (nextMode === currentMode) continue;
+            : (managedRewrite && currentMode === "rewrite" ? "inherit" : currentMode);
+          const nextManagedRewrite = selected
+            ? (managedRewrite || currentMode !== "rewrite")
+            : false;
+          if (nextMode === currentMode && nextManagedRewrite === managedRewrite) continue;
           const { name: _ignoredName, ...nodeData } = rawNode;
           const mutation = Database.buildPreparedNodeMutation({
             name: nodeName,
             ...nodeData,
-            playbackInfoMode: nextMode
+            playbackInfoMode: nextMode,
+            mediaAggregationManagedRewrite: nextManagedRewrite
           }, rawNode, { previousName: nodeName, nextName: nodeName });
           if (!mutation) continue;
           mutation.nextNode = Database.normalizeNode(nodeName, mutation.nextNode || {}, { dropLegacyDirectRouting: true }).data;
@@ -20238,7 +21809,7 @@ const Database = {
           success: true,
           selectedNodeNames,
           updatedNodeCount: preparedMutations.length,
-          config: savedConfig,
+          config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
           nodes: summaryNodes,
           revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig, nodes: summaryNodes })
         });
@@ -21483,6 +23054,11 @@ const Database = {
       return jsonResponse({ success: true, status: await Database.getD1SchemaStatus(db) });
     },
 
+    async getD1TimeTravelBookmark(data, { db }) {
+      if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+      return jsonResponse({ success: true, ...(await Database.getD1TimeTravelBookmark(db)) });
+    },
+
     async initD1Schema(data, { db }) {
       if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
       const initialization = await Database.initializeD1Database(db, { includeFts: true });
@@ -21500,7 +23076,12 @@ const Database = {
 
     async initLogsDb(data, { db }) {
       if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-      const initialization = await Database.initializeD1Database(db, { includeFts: true });
+      const initialization = await Database.initializeD1Database(db, {
+        includeFts: true,
+        adoptMigrations: true,
+        requireBookmark: true,
+        failOnIncompatible: true
+      });
       const schemaStatus = initialization.status;
       const ftsReady = schemaStatus.ftsReady === true;
       const statsReady = schemaStatus.tables?.[Database.STATS_HOURLY_TABLE] === true;
@@ -21522,6 +23103,9 @@ const Database = {
         categoryEnabled: true,
         ftsReady,
         statsReady,
+        recoveryBookmark: initialization.recoveryBookmark,
+        bookmarkCapturedAt: initialization.bookmarkCapturedAt,
+        adoptedMigrations: initialization.adoptedMigrations,
         initialization,
         steps: initialization.steps,
         status: schemaStatus,
@@ -22670,7 +24254,17 @@ const Proxy = {
     const probePath = failoverContext?.probePath || normalizeHedgeProbePath(execution?.hedgeProbePath, DEFAULT_HEDGE_PROBE_PATH);
     const probeTimeoutMs = Math.max(250, Number(failoverContext?.probeTimeoutMs) || DEFAULT_HEDGE_PROBE_TIMEOUT_MS);
     const targetKey = buildTargetRecordKey(targetRecord);
-    const probeUrl = buildUpstreamProxyUrl(targetRecord, probePath);
+    const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
+    if (!probeUrl) {
+      return {
+        ok: false,
+        status: 0,
+        targetRecord,
+        targetKey,
+        reason: "invalid_probe_target",
+        elapsedMs: 0
+      };
+    }
     const startedAt = nowMs();
     let response = null;
     let methodUsed = "HEAD";
@@ -22682,11 +24276,12 @@ const Proxy = {
         response = await this.performFailoverProbeRequest(execution, probeUrl, "GET", probeTimeoutMs, options.parentSignal || null);
       }
       const elapsedMs = Math.max(0, nowMs() - startedAt);
-      if (response.status === 200) {
+      if (response.ok) {
+        const status = response.status;
         try { response.body?.cancel?.(); } catch {}
         return {
           ok: true,
-          status: 200,
+          status,
           targetRecord,
           targetKey,
           methodUsed,
@@ -22754,7 +24349,7 @@ const Proxy = {
         parentSignal: winnerAbortController.signal
       });
       attempts.push(result);
-      if (!winner && result?.ok === true && Number(result?.status) === 200) {
+      if (!winner && result?.ok === true) {
         winner = result;
         try { winnerAbortController.abort("probe_winner"); } catch {}
       }
@@ -23345,8 +24940,8 @@ const Proxy = {
   },
   async fetchMediaAggregationJson(execution, node, proxyPath, search = "", options = {}) {
     const { targetRecords } = this.parseTargetRecords(node, execution?.finalOrigin || "*");
-    const targetRecord = targetRecords[0];
-    if (!targetRecord) return null;
+    const targetRecord = options.targetRecord || targetRecords[0];
+    if (!targetRecord) return { ok: false, status: "network_error", retryable: false, statusCode: 0 };
     const targetUrl = buildUpstreamProxyUrl(targetRecord, proxyPath);
     targetUrl.search = String(search || "");
     const headers = this.buildMediaAggregationRequestHeaders(execution, node, targetUrl, options.auth || null);
@@ -23363,39 +24958,61 @@ const Proxy = {
     }
     let upstream;
     try {
+      const deadlineAt = Number(options.deadlineAt || execution?.mediaAggregationDeadlineAt) || 0;
+      const remainingMs = deadlineAt > 0 ? deadlineAt - nowMs() : 10000;
+      if (remainingMs <= 0) return { ok: false, status: "timeout", retryable: false, statusCode: 0, targetRecord };
       upstream = await this.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
         timeoutMs: Math.min(
           Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS),
-          10000
+          10000,
+          Math.max(1, remainingMs)
         ),
         requestLifecycle: null
       });
       const response = upstream.response;
       if (!response.ok) {
         try { await response.body?.cancel?.(); } catch {}
-        return null;
+        const statusCode = Number(response.status) || 0;
+        const retryable = statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
+        const status = statusCode === 401 || statusCode === 403
+          ? "auth_failed"
+          : (statusCode === 400 || statusCode === 422 ? "query_unsupported" : (statusCode === 408 ? "timeout" : "network_error"));
+        return { ok: false, status, retryable, statusCode, targetRecord, finalUrl: upstream.finalUrl };
       }
       const bodyResult = await readResponseTextWithLimit(response, MEDIA_AGGREGATION_RESPONSE_MAX_BYTES);
-      if (bodyResult.exceeded) return null;
+      if (bodyResult.exceeded) return { ok: false, status: "response_too_large", retryable: false, statusCode: response.status, targetRecord, finalUrl: upstream.finalUrl };
       let payload = null;
-      try { payload = JSON.parse(bodyResult.text || ""); } catch { return null; }
-      return { payload, targetRecord, finalUrl: upstream.finalUrl };
-    } catch {
-      return null;
+      try { payload = JSON.parse(bodyResult.text || ""); } catch {
+        return { ok: false, status: "invalid_json", retryable: false, statusCode: response.status, targetRecord, finalUrl: upstream.finalUrl };
+      }
+      return { ok: true, payload, targetRecord, finalUrl: upstream.finalUrl, statusCode: response.status };
+    } catch (error) {
+      return {
+        ok: false,
+        status: String(error?.code || "").toUpperCase() === "UPSTREAM_TIMEOUT" ? "timeout" : "network_error",
+        retryable: true,
+        statusCode: 0,
+        targetRecord
+      };
     } finally {
       try { upstream?.releaseFetchController?.(); } catch {}
     }
   },
-  async getMediaAggregationAuth(execution, nodeName, node, apiPrefix = "") {
+  async getMediaAggregationAuth(execution, nodeName, node, apiPrefix = "", preferredTargetRecord = null) {
     const credentials = resolveMediaAggregationCredentials(node, execution?.currentConfig || {});
     const username = credentials.username;
     const password = credentials.password;
     if (!credentials.configured || !nodeName || !node) return null;
     const nodeRevision = buildNodeDerivedCacheRevision(nodeName, node);
+    const { targetRecords } = this.parseTargetRecords(node, "*");
+    const targetRecord = preferredTargetRecord || targetRecords[0];
+    if (!targetRecord) return null;
+    const targetIdentity = String(targetRecord?.originText || targetRecord?.targetUrl || "");
     const cacheKey = `media-aggregation-auth:${hashStableText(serializeConfigValue({
       nodeName,
       nodeRevision,
       apiPrefix: String(apiPrefix || ""),
+      targetIdentity,
       credentialSource: credentials.source,
       username: hashStableText(username),
       password: hashStableText(password)
@@ -23412,9 +25029,6 @@ const Proxy = {
         touchMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey);
         return current;
       }
-      const { targetRecords } = this.parseTargetRecords(node, "*");
-      const targetRecord = targetRecords[0];
-      if (!targetRecord) return null;
       const loginUrl = buildUpstreamProxyUrl(targetRecord, `${String(apiPrefix || "")}/Users/AuthenticateByName`);
       const headers = this.buildMediaAggregationRequestHeaders(execution, node, loginUrl, null);
       stripSensitiveProxyAuthHeaders(headers);
@@ -23423,52 +25037,75 @@ const Proxy = {
       headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
       let upstream;
       try {
+        const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
+        const remainingMs = deadlineAt > 0 ? deadlineAt - nowMs() : 10000;
+        if (remainingMs <= 0) {
+          execution.mediaAggregationLastAuthStatus = "timeout";
+          return null;
+        }
         upstream = await this.performFetchWithTimeout(loginUrl, async () => ({
           method: "POST",
           headers,
           body: JSON.stringify({ Username: username, Pw: password }),
           redirect: "manual"
         }), {
-          timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+          timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000, Math.max(1, remainingMs)),
           requestLifecycle: null
         });
         const bodyResult = await readResponseTextWithLimit(upstream.response, 64 * 1024);
-        if (!upstream.response.ok || bodyResult.exceeded) return null;
-        const payload = JSON.parse(bodyResult.text || "{}");
+        if (!upstream.response.ok || bodyResult.exceeded) {
+          execution.mediaAggregationLastAuthStatus = bodyResult.exceeded
+            ? "response_too_large"
+            : (upstream.response.status === 408
+                ? "timeout"
+                : ([425, 429].includes(upstream.response.status) || upstream.response.status >= 500 ? "network_error" : "auth_failed"));
+          return null;
+        }
+        let payload;
+        try { payload = JSON.parse(bodyResult.text || "{}"); }
+        catch {
+          execution.mediaAggregationLastAuthStatus = "invalid_json";
+          return null;
+        }
         const token = String(payload?.AccessToken || payload?.accessToken || payload?.SessionInfo?.AccessToken || "").trim();
-        if (!token) return null;
+        if (!token) {
+          execution.mediaAggregationLastAuthStatus = "auth_failed";
+          return null;
+        }
         const entry = {
           nodeName,
           nodeRevision,
           token,
           userId: String(payload?.User?.Id || payload?.user?.Id || "").trim(),
+          targetRecord,
           expiresAt: nowMs() + MEDIA_AGGREGATION_AUTH_TTL_MS
         };
         setBoundedMapEntry(GLOBALS.MediaAggregationAuthCache, cacheKey, entry, MEDIA_AGGREGATION_AUTH_CACHE_MAX);
         return entry;
-      } catch {
+      } catch (error) {
+        execution.mediaAggregationLastAuthStatus = String(error?.code || "").toUpperCase() === "UPSTREAM_TIMEOUT" ? "timeout" : "network_error";
         return null;
       } finally {
         try { upstream?.releaseFetchController?.(); } catch {}
       }
     });
   },
-  async resolveMediaAggregationPrimaryProviderIds(execution, payload, upstreamState) {
-    const directProviderIds = normalizeMediaAggregationProviderIds(payload?.ProviderIds || payload?.providerIds);
-    if (Object.keys(directProviderIds).length) return directProviderIds;
+  async resolveMediaAggregationPrimaryIdentity(execution, payload, upstreamState) {
     const itemPathState = extractPlaybackInfoItemPathState(execution?.proxyPath || "");
     const itemId = String(execution?.mediaAggregationItemId || itemPathState.itemId || "").trim();
-    if (!itemId) return {};
+    let item = isPlainObject(payload) ? payload : {};
+    if (!itemId) return buildMediaAggregationIdentity(item);
     const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
     const itemPath = `${prefix}/Items/${encodeURIComponent(itemId)}`;
     const metadataParams = new URLSearchParams();
     for (const [key, value] of execution?.requestUrl?.searchParams?.entries?.() || []) {
       if (MEDIA_REDIRECT_AUTH_QUERY_KEYS.has(normalizeWorkerCacheParamName(key))) metadataParams.set(key, value);
     }
-    metadataParams.set("Fields", "ProviderIds");
+    metadataParams.set("Fields", "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd");
     metadataParams.set("UserData", "false");
-    const targetBase = upstreamState?.activeTargetBase instanceof URL ? upstreamState.activeTargetBase : null;
-    if (!targetBase) return {};
+    const activeTargetBase = upstreamState?.activeTargetBase;
+    const targetBase = activeTargetBase instanceof URL || isTargetRecord(activeTargetBase) ? activeTargetBase : null;
+    if (!targetBase) return buildMediaAggregationIdentity(item);
     const itemUrl = buildUpstreamProxyUrl(targetBase, itemPath);
     itemUrl.search = metadataParams.toString();
     const fetchOptions = {
@@ -23477,94 +25114,450 @@ const Proxy = {
       redirect: "manual"
     };
     try {
+      const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
+      const remainingMs = deadlineAt > 0 ? Math.max(1, deadlineAt - nowMs()) : 10000;
       const response = await this.performFetchWithTimeout(itemUrl, async () => fetchOptions, {
-        timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+        timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000, remainingMs),
         requestLifecycle: null
       });
       const bodyResult = await readResponseTextWithLimit(response.response, 64 * 1024);
       const parsed = bodyResult.exceeded ? null : JSON.parse(bodyResult.text || "{}");
       try { response.response.body?.cancel?.(); } catch {}
-      return normalizeMediaAggregationProviderIds(parsed?.ProviderIds || parsed?.providerIds || parsed?.Items?.[0]?.ProviderIds);
+      const parsedItem = parsed?.Items?.[0] || parsed;
+      if (isPlainObject(parsedItem)) item = { ...parsedItem, ...item, ProviderIds: item?.ProviderIds || parsedItem?.ProviderIds };
     } catch {
-      return {};
+      // The PlaybackInfo body may already contain enough identity to aggregate safely.
     }
+    let seriesItem = {};
+    const initialIdentity = buildMediaAggregationIdentity(item);
+    if (initialIdentity.type === "episode" && initialIdentity.seriesId) {
+      const seriesUrl = buildUpstreamProxyUrl(targetBase, `${prefix}/Items/${encodeURIComponent(initialIdentity.seriesId)}`);
+      seriesUrl.search = new URLSearchParams({ Fields: "ProviderIds,Name,OriginalTitle,ProductionYear", UserData: "false" }).toString();
+      let seriesResponse;
+      try {
+        const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
+        const remainingMs = deadlineAt > 0 ? Math.max(1, deadlineAt - nowMs()) : 10000;
+        seriesResponse = await this.performFetchWithTimeout(seriesUrl, async () => ({
+          method: "GET",
+          headers: this.buildMediaAggregationRequestHeaders(execution, execution.node, seriesUrl, null),
+          redirect: "manual"
+        }), {
+          timeoutMs: Math.min(Math.max(1000, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000, remainingMs),
+          requestLifecycle: null
+        });
+        const bodyResult = await readResponseTextWithLimit(seriesResponse.response, 64 * 1024);
+        if (!bodyResult.exceeded) seriesItem = JSON.parse(bodyResult.text || "{}");
+      } catch {
+        seriesItem = {};
+      } finally {
+        try { seriesResponse?.releaseFetchController?.(); } catch {}
+      }
+    }
+    return buildMediaAggregationIdentity(item, seriesItem);
+  },
+  buildMediaAggregationInstanceMapKey(primaryDigest = "", nodeName = "", nodeRevision = "") {
+    return `media-aggregation-instance:${hashStableText(`${String(primaryDigest)}:${String(nodeName).toLowerCase()}:${String(nodeRevision)}`)}`;
+  },
+  readMediaAggregationInstance(primaryDigest = "", nodeName = "", nodeRevision = "") {
+    const key = this.buildMediaAggregationInstanceMapKey(primaryDigest, nodeName, nodeRevision);
+    const entry = GLOBALS.MediaAggregationInstanceMap.get(key);
+    if (!entry || Number(entry.expiresAt) <= nowMs()) {
+      if (entry) GLOBALS.MediaAggregationInstanceMap.delete(key);
+      return null;
+    }
+    touchMapEntry(GLOBALS.MediaAggregationInstanceMap, key);
+    return entry;
+  },
+  cacheMediaAggregationInstance(primaryDigest = "", nodeName = "", nodeRevision = "", itemId = "", identityHash = "", status = "") {
+    if (!primaryDigest || !nodeName || !nodeRevision || !itemId || !identityHash) return;
+    const key = this.buildMediaAggregationInstanceMapKey(primaryDigest, nodeName, nodeRevision);
+    setBoundedMapEntry(GLOBALS.MediaAggregationInstanceMap, key, {
+      nodeName: String(nodeName).trim().toLowerCase(),
+      itemId: String(itemId).trim(),
+      identityHash: String(identityHash).trim(),
+      status: String(status || "").trim(),
+      expiresAt: nowMs() + MEDIA_AGGREGATION_INSTANCE_MAP_TTL_MS
+    }, MEDIA_AGGREGATION_INSTANCE_MAP_MAX);
+  },
+  async fetchMediaAggregationItemIdentity(execution, node, targetRecord, auth, prefix, itemId) {
+    const fields = "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd,MediaSources";
+    const itemResult = await this.fetchMediaAggregationJson(
+      execution,
+      node,
+      `${prefix}/Items/${encodeURIComponent(String(itemId || ""))}`,
+      new URLSearchParams({ Fields: fields, UserData: "false" }).toString(),
+      { auth, targetRecord, deadlineAt: execution?.mediaAggregationDeadlineAt }
+    );
+    if (!itemResult || itemResult.ok === false) return { ok: false, status: itemResult?.status || "network_error", retryable: itemResult?.retryable === true };
+    const item = itemResult?.payload?.Items?.[0] || itemResult?.payload;
+    if (!isPlainObject(item) || !String(item?.Id || itemId || "").trim()) return { ok: false, status: "no_match", retryable: false };
+    let seriesItem = {};
+    const partialIdentity = buildMediaAggregationIdentity(item);
+    if (partialIdentity.type === "episode" && partialIdentity.seriesId) {
+      const seriesResult = await this.fetchMediaAggregationJson(
+        execution,
+        node,
+        `${prefix}/Items/${encodeURIComponent(partialIdentity.seriesId)}`,
+        new URLSearchParams({ Fields: "ProviderIds,Name,OriginalTitle,ProductionYear", UserData: "false" }).toString(),
+        { auth, targetRecord, deadlineAt: execution?.mediaAggregationDeadlineAt }
+      );
+      if (!seriesResult || seriesResult.ok === false) return { ok: false, status: seriesResult?.status || "network_error", retryable: seriesResult?.retryable === true };
+      seriesItem = seriesResult?.payload?.Items?.[0] || seriesResult?.payload || {};
+    }
+    return { ok: true, item, seriesItem, identity: buildMediaAggregationIdentity(item, seriesItem), targetRecord, finalUrl: itemResult.finalUrl };
+  },
+  async queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, params) {
+    const result = await this.fetchMediaAggregationJson(execution, node, `${prefix}/Items`, params.toString(), {
+      auth,
+      targetRecord,
+      deadlineAt: execution?.mediaAggregationDeadlineAt
+    });
+    if (!result || result.ok === false) return { ok: false, status: result?.status || "network_error", retryable: result?.retryable === true, items: [], result };
+    return {
+      ok: true,
+      status: "ok",
+      retryable: false,
+      items: Array.isArray(result?.payload?.Items) ? result.payload.Items : [],
+      result
+    };
+  },
+  async findMediaAggregationCandidate(execution, node, targetRecord, auth, prefix, primaryIdentity, matchMode) {
+    const fields = "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd,MediaSources";
+    const queryByProviderOrTitle = async (identity, itemType, seriesSearch = false) => {
+      const providerIds = seriesSearch ? identity.seriesProviderIds : identity.providerIds;
+      let unsupported = false;
+      const collectedItems = [];
+      let lastResult = null;
+      for (const providerKey of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
+        if (!providerIds?.[providerKey]) continue;
+        const params = new URLSearchParams({
+          Recursive: "true",
+          IncludeItemTypes: itemType,
+          Fields: fields,
+          AnyProviderIdEquals: `${providerKey}.${providerIds[providerKey]}`,
+          Limit: "10",
+          UserData: "false"
+        });
+        const queried = await this.queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, params);
+        if (!queried.ok) {
+          if (queried.status === "query_unsupported") {
+            unsupported = true;
+            break;
+          }
+          return queried;
+        }
+        collectedItems.push(...queried.items);
+        lastResult = queried.result || lastResult;
+      }
+      if (normalizeMediaAggregationMatchMode(matchMode) !== "title_year" && !unsupported) {
+        return { ok: true, status: collectedItems.length ? "ok" : "no_match", retryable: false, items: collectedItems, result: lastResult };
+      }
+      const searchTerm = String(seriesSearch ? identity.seriesSearchName : identity.searchName).trim();
+      if (!searchTerm) return { ok: true, status: collectedItems.length ? "ok" : (unsupported ? "query_unsupported" : "no_match"), retryable: false, items: collectedItems, result: lastResult };
+      const titleParams = new URLSearchParams({
+        Recursive: "true",
+        IncludeItemTypes: itemType,
+        Fields: fields,
+        SearchTerm: searchTerm,
+        Limit: "20",
+        UserData: "false"
+      });
+      const titleResult = await this.queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, titleParams);
+      if (!titleResult.ok) {
+        if (collectedItems.length) return { ok: true, status: "ok", retryable: false, items: collectedItems, result: lastResult };
+        return titleResult;
+      }
+      return {
+        ok: true,
+        status: collectedItems.length || titleResult.items.length ? "ok" : (unsupported ? "query_unsupported" : "no_match"),
+        retryable: false,
+        items: [...collectedItems, ...titleResult.items],
+        result: titleResult.result || lastResult
+      };
+    };
+
+    if (primaryIdentity.type === "episode") {
+      const seriesCandidates = await queryByProviderOrTitle(primaryIdentity, "Series", true);
+      if (!seriesCandidates.ok) return seriesCandidates;
+      for (const seriesItem of seriesCandidates.items) {
+        const shellIdentity = buildMediaAggregationIdentity({
+          Type: "Episode",
+          ParentIndexNumber: primaryIdentity.parentIndexNumber,
+          IndexNumber: primaryIdentity.indexNumber,
+          IndexNumberEnd: primaryIdentity.indexNumberEnd,
+          SeriesId: seriesItem?.Id,
+          SeriesName: seriesItem?.Name
+        }, seriesItem);
+        if (!matchMediaAggregationIdentities(primaryIdentity, shellIdentity, matchMode)) continue;
+        const episodeParams = new URLSearchParams({
+          Season: String(primaryIdentity.parentIndexNumber),
+          Fields: fields,
+          UserData: "false"
+        });
+        const episodesResult = await this.fetchMediaAggregationJson(
+          execution,
+          node,
+          `${prefix}/Shows/${encodeURIComponent(String(seriesItem?.Id || ""))}/Episodes`,
+          episodeParams.toString(),
+          { auth, targetRecord, deadlineAt: execution?.mediaAggregationDeadlineAt }
+        );
+        if (!episodesResult || episodesResult.ok === false) {
+          return { ok: false, status: episodesResult?.status || "network_error", retryable: episodesResult?.retryable === true, items: [] };
+        }
+        for (const episodeItem of Array.isArray(episodesResult?.payload?.Items) ? episodesResult.payload.Items : []) {
+          const identity = buildMediaAggregationIdentity(episodeItem, seriesItem);
+          const match = matchMediaAggregationIdentities(primaryIdentity, identity, matchMode);
+          if (match) return { ok: true, status: match.status, item: episodeItem, identity, match, queryResult: episodesResult };
+        }
+      }
+      return { ok: true, status: "no_match", retryable: false };
+    }
+
+    const candidates = await queryByProviderOrTitle(primaryIdentity, primaryIdentity.type === "movie" ? "Movie" : "Series", false);
+    if (!candidates.ok) return candidates;
+    for (const item of candidates.items) {
+      const identity = buildMediaAggregationIdentity(item);
+      const match = matchMediaAggregationIdentities(primaryIdentity, identity, matchMode);
+      if (match) return { ok: true, status: match.status, item, identity, match, queryResult: candidates.result };
+    }
+    return { ok: true, status: candidates.status === "query_unsupported" ? "query_unsupported" : "no_match", retryable: false };
+  },
+  async buildMediaAggregationInjectedSources(execution, backupName, backupNode, targetRecord, auth, prefix, candidate, primaryIdentity) {
+    let sourcePayload = candidate.item;
+    if (!Array.isArray(sourcePayload?.MediaSources) || !sourcePayload.MediaSources.length) {
+      const playbackQuery = new URLSearchParams({ UserId: auth.userId || "", AutoOpenLiveStream: "false" }).toString();
+      const playbackResult = await this.fetchMediaAggregationJson(
+        execution,
+        backupNode,
+        `${prefix}/Items/${encodeURIComponent(String(candidate.item?.Id || ""))}/PlaybackInfo`,
+        playbackQuery,
+        { auth, targetRecord, deadlineAt: execution?.mediaAggregationDeadlineAt }
+      );
+      if (!playbackResult || playbackResult.ok === false) return { ok: false, status: playbackResult?.status || "network_error", retryable: playbackResult?.retryable === true };
+      sourcePayload = playbackResult.payload || sourcePayload;
+      candidate.queryResult = playbackResult;
+    }
+    const sources = Array.isArray(sourcePayload?.MediaSources) ? sourcePayload.MediaSources : [];
+    if (!sources.length) return { ok: true, status: "no_match", sources: [] };
+    const identityHash = await buildMediaAggregationMatchFingerprintHash(candidate.match);
+    const backupTargetBase = targetRecord?.targetUrl || candidate.queryResult?.targetRecord?.targetUrl || null;
+    const backupExecution = {
+      ...execution,
+      node: backupNode,
+      nodeName: backupName,
+      nodeKey: backupNode.secret || "",
+      entryMode: normalizeNodeEntryMode(backupNode.entryMode),
+      proxyPath: `${prefix}/Items/${encodeURIComponent(String(candidate.item.Id))}/PlaybackInfo`,
+      playbackInfoRewriteUrlMode: "relative",
+      requestUrl: new URL(execution.requestUrl.toString()),
+      rawRequestUrl: new URL(execution.rawRequestUrl?.toString?.() || execution.requestUrl.toString())
+    };
+    const rewritten = this.rewritePlaybackInfoPayload(
+      backupExecution,
+      { MediaSources: sources },
+      backupTargetBase,
+      candidate.queryResult?.finalUrl || backupTargetBase
+    ).payload;
+    const injected = [];
+    for (const [index, source] of (Array.isArray(rewritten?.MediaSources) ? rewritten.MediaSources : sources).entries()) {
+      if (!isPlainObject(source)) continue;
+      const sourceId = String(sources[index]?.Id || source?.Id || "").trim();
+      const magicId = await buildMediaAggregationSourceIdV2(
+        execution?.env?.JWT_SECRET,
+        backupName,
+        String(candidate.item.Id),
+        sourceId,
+        identityHash
+      );
+      if (!magicId) continue;
+      injected.push({
+        ...source,
+        Id: magicId,
+        Name: `${String(backupNode.displayName || backupName).trim() || backupName} · ${String(source.Name || "版本").trim() || "版本"}`
+      });
+    }
+    return { ok: true, status: candidate.match.status, sources: injected, identityHash };
+  },
+  async aggregateMediaAggregationNode(execution, backupName, primaryIdentity, primaryDigest, prefix, matchMode) {
+    const startedAt = nowMs();
+    const backupNode = await Database.getNode(backupName, execution.env, execution.ctx);
+    if (!backupNode) return { nodeName: backupName, status: "no_match", sources: [], elapsedMs: nowMs() - startedAt };
+    const nodeRevision = buildNodeDerivedCacheRevision(backupName, backupNode);
+    const mapped = this.readMediaAggregationInstance(primaryDigest, backupName, nodeRevision);
+    const { targetRecords } = this.parseTargetRecords(backupNode, execution?.finalOrigin || "*");
+    let lastStatus = "network_error";
+    for (const targetRecord of targetRecords) {
+      const nodeExecution = { ...execution, mediaAggregationLastAuthStatus: "" };
+      const auth = await this.getMediaAggregationAuth(nodeExecution, backupName, backupNode, prefix, targetRecord);
+      if (!auth) {
+        lastStatus = nodeExecution.mediaAggregationLastAuthStatus || "auth_failed";
+        continue;
+      }
+      let candidate = null;
+      if (mapped?.itemId) {
+        const mappedItem = await this.fetchMediaAggregationItemIdentity(nodeExecution, backupNode, targetRecord, auth, prefix, mapped.itemId);
+        if (mappedItem.ok) {
+          const match = matchMediaAggregationIdentities(primaryIdentity, mappedItem.identity, matchMode);
+          if (match) candidate = { item: mappedItem.item, identity: mappedItem.identity, match, queryResult: mappedItem };
+          else GLOBALS.MediaAggregationInstanceMap.delete(this.buildMediaAggregationInstanceMapKey(primaryDigest, backupName, nodeRevision));
+        } else if (mappedItem.retryable) {
+          lastStatus = mappedItem.status;
+          continue;
+        } else {
+          GLOBALS.MediaAggregationInstanceMap.delete(this.buildMediaAggregationInstanceMapKey(primaryDigest, backupName, nodeRevision));
+        }
+      }
+      if (!candidate) {
+        const found = await this.findMediaAggregationCandidate(nodeExecution, backupNode, targetRecord, auth, prefix, primaryIdentity, matchMode);
+        if (!found.ok) {
+          lastStatus = found.status || "network_error";
+          if (found.retryable) continue;
+          return { nodeName: backupName, status: lastStatus, sources: [], elapsedMs: nowMs() - startedAt };
+        }
+        if (!found.item || !found.match) {
+          return { nodeName: backupName, status: found.status || "no_match", sources: [], elapsedMs: nowMs() - startedAt };
+        }
+        candidate = found;
+      }
+      const built = await this.buildMediaAggregationInjectedSources(nodeExecution, backupName, backupNode, targetRecord, auth, prefix, candidate, primaryIdentity);
+      if (!built.ok) {
+        lastStatus = built.status || "network_error";
+        if (built.retryable) continue;
+        return { nodeName: backupName, status: lastStatus, sources: [], elapsedMs: nowMs() - startedAt };
+      }
+      if (!built.sources.length) return { nodeName: backupName, status: "no_match", sources: [], elapsedMs: nowMs() - startedAt };
+      this.cacheMediaAggregationInstance(primaryDigest, backupName, nodeRevision, candidate.item.Id, built.identityHash, built.status);
+      return {
+        nodeName: backupName,
+        status: built.status,
+        itemId: String(candidate.item.Id),
+        identityHash: built.identityHash,
+        sources: built.sources,
+        elapsedMs: nowMs() - startedAt,
+        cacheHit: !!mapped
+      };
+    }
+    return { nodeName: backupName, status: lastStatus, sources: [], elapsedMs: nowMs() - startedAt };
+  },
+  async collectMediaAggregationResults(tasks, options = {}) {
+    const settled = [];
+    let resolveFirstMatch;
+    const firstMatch = new Promise(resolve => { resolveFirstMatch = resolve; });
+    const wrapped = tasks.map((task, index) => Promise.resolve()
+      .then(task)
+      .catch(() => ({ nodeName: String(options.nodeNames?.[index] || ""), status: "network_error", sources: [] }))
+      .then(result => {
+        settled.push(result);
+        if (Array.isArray(result?.sources) && result.sources.length) resolveFirstMatch(result);
+        return result;
+      }));
+    const all = Promise.all(wrapped);
+    const raceWithTimeout = async (promises, timeoutMs) => {
+      let timeoutId;
+      try {
+        return await Promise.race([
+          ...promises,
+          new Promise(resolve => { timeoutId = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0), "timeout"); })
+        ]);
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+      }
+    };
+    const firstState = await raceWithTimeout([firstMatch.then(() => "matched"), all.then(() => "all")], options.firstResultTimeoutMs);
+    if (firstState === "matched" && settled.length < wrapped.length && Number(options.gracePeriodMs) > 0) {
+      await raceWithTimeout([all], options.gracePeriodMs);
+    }
+    const foregroundResults = settled.slice();
+    const pendingCount = Math.max(0, wrapped.length - foregroundResults.length);
+    if (pendingCount > 0 && options.ctx?.waitUntil) {
+      const remainingMs = Math.max(0, Number(options.hardDeadlineAt) - nowMs());
+      options.ctx.waitUntil(raceWithTimeout([all], remainingMs).catch(() => {}));
+    }
+    return { foregroundResults, pendingCount };
   },
   async aggregateMediaSources(execution, payload, upstreamState) {
     const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
     const currentName = String(execution?.nodeName || "").trim().toLowerCase();
     if (selectedNames.length < 2 || !selectedNames.includes(currentName)) return { payload, state: "disabled" };
-    const providerIds = await this.resolveMediaAggregationPrimaryProviderIds(execution, payload, upstreamState);
-    if (!Object.keys(providerIds).length) return { payload, state: "provider_ids_missing" };
+    const foregroundStartedAt = nowMs();
+    const matchMode = normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode);
+    const primaryIdentity = await this.resolveMediaAggregationPrimaryIdentity(execution, payload, upstreamState);
+    const hasStrongIdentity = primaryIdentity.type === "episode"
+      ? Object.keys(primaryIdentity.seriesProviderIds || {}).length > 0
+      : Object.keys(primaryIdentity.providerIds || {}).length > 0;
+    const hasTitleIdentity = primaryIdentity.type === "episode"
+      ? !!(primaryIdentity.seriesName && primaryIdentity.seriesProductionYear !== null)
+      : !!(primaryIdentity.name && primaryIdentity.productionYear !== null);
+    if (!MEDIA_AGGREGATION_SUPPORTED_TYPES.has(primaryIdentity.type) || (!hasStrongIdentity && !(matchMode === "title_year" && hasTitleIdentity))) {
+      execution.mediaAggregationDiagnostic = {
+        status: "primary_identity_missing",
+        matchMode,
+        attemptedNodes: 0,
+        matchedNodes: 0,
+        pendingNodes: 0,
+        foregroundElapsedMs: nowMs() - foregroundStartedAt,
+        nodes: []
+      };
+      execution.mediaAggregationCacheable = false;
+      return { payload, state: "primary_identity_missing" };
+    }
     const backupNames = selectedNames.filter(name => name !== currentName).slice(0, MEDIA_AGGREGATION_BACKUP_MAX);
     const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-    const providerKey = providerIds.tmdb ? "tmdb" : "imdb";
-    const providerValue = providerIds[providerKey];
-    const results = await Promise.allSettled(backupNames.map(async (backupName) => {
-      const backupNode = await Database.getNode(backupName, execution.env, execution.ctx);
-      if (!backupNode) return null;
-      const auth = await this.getMediaAggregationAuth(execution, backupName, backupNode, prefix);
-      if (!auth) return null;
-      const query = new URLSearchParams({
-        Recursive: "true",
-        IncludeItemTypes: "Movie,Series,Episode",
-        Fields: "ProviderIds,MediaSources",
-        AnyProviderIdEquals: `${providerKey}.${providerValue}`,
-        Limit: "10",
-        UserData: "false"
-      }).toString();
-      const listResult = await this.fetchMediaAggregationJson(execution, backupNode, `${prefix}/Items`, query, { auth });
-      const items = Array.isArray(listResult?.payload?.Items) ? listResult.payload.Items : [];
-      const match = items.find(item => mediaAggregationProviderIdsMatch(providerIds, item?.ProviderIds || item?.providerIds));
-      if (!match?.Id) return null;
-      let sourcePayload = match;
-      if (!Array.isArray(sourcePayload.MediaSources) || !sourcePayload.MediaSources.length) {
-        const playbackQuery = new URLSearchParams({ UserId: auth.userId, AutoOpenLiveStream: "false" }).toString();
-        const playbackResult = await this.fetchMediaAggregationJson(
-          execution,
-          backupNode,
-          `${prefix}/Items/${encodeURIComponent(String(match.Id))}/PlaybackInfo`,
-          playbackQuery,
-          { auth }
-        );
-        sourcePayload = playbackResult?.payload || sourcePayload;
+    const primaryDigest = await buildMediaAggregationIdentityDigest(primaryIdentity);
+    const hardDeadlineAt = nowMs() + 10000;
+    execution.mediaAggregationDeadlineAt = hardDeadlineAt;
+    const firstResultTimeoutMs = clampIntegerConfig(
+      execution?.currentConfig?.mediaAggregationFirstResultTimeoutMs,
+      Config.Defaults.MediaAggregationFirstResultTimeoutMs,
+      100,
+      10000
+    );
+    const gracePeriodMs = clampIntegerConfig(
+      execution?.currentConfig?.mediaAggregationGracePeriodMs,
+      Config.Defaults.MediaAggregationGracePeriodMs,
+      0,
+      5000
+    );
+    const collected = await this.collectMediaAggregationResults(
+      backupNames.map(backupName => () => this.aggregateMediaAggregationNode(execution, backupName, primaryIdentity, primaryDigest, prefix, matchMode)),
+      { nodeNames: backupNames, firstResultTimeoutMs, gracePeriodMs, hardDeadlineAt, ctx: execution?.ctx }
+    );
+    const resultByNode = new Map(collected.foregroundResults.map(result => [String(result?.nodeName || "").toLowerCase(), result]));
+    const nodeDiagnostics = backupNames.map(nodeName => {
+      const result = resultByNode.get(nodeName);
+      return result
+        ? { nodeName, status: String(result.status || "no_match"), elapsedMs: Math.max(0, Math.round(Number(result.elapsedMs) || 0)), cacheHit: result.cacheHit === true }
+        : { nodeName, status: "timeout", elapsedMs: nowMs() - foregroundStartedAt, pending: true };
+    });
+    const injectedSources = [];
+    const dedupe = new Set();
+    for (const result of collected.foregroundResults) {
+      for (const source of Array.isArray(result?.sources) ? result.sources : []) {
+        const parsed = parseMediaAggregationSourceId(source?.Id);
+        const key = `${parsed?.nodeName || result.nodeName}:${parsed?.itemId || result.itemId}:${parsed?.mediaSourceId || source?.Id || ""}`;
+        if (dedupe.has(key)) continue;
+        dedupe.add(key);
+        injectedSources.push(source);
       }
-      const sources = Array.isArray(sourcePayload.MediaSources) ? sourcePayload.MediaSources : [];
-      if (!sources.length) return null;
-      const backupTargetBase = listResult?.targetRecord?.targetUrl || null;
-      const backupExecution = {
-        ...execution,
-        node: backupNode,
-        nodeName: backupName,
-        nodeKey: backupNode.secret || "",
-        entryMode: normalizeNodeEntryMode(backupNode.entryMode),
-        proxyPath: `${prefix}/Items/${encodeURIComponent(String(match.Id))}/PlaybackInfo`,
-        playbackInfoRewriteUrlMode: "relative",
-        requestUrl: new URL(execution.requestUrl.toString()),
-        rawRequestUrl: new URL(execution.rawRequestUrl?.toString?.() || execution.requestUrl.toString())
-      };
-      const rewritten = this.rewritePlaybackInfoPayload(
-        backupExecution,
-        { MediaSources: sources },
-        backupTargetBase,
-        listResult?.finalUrl || backupTargetBase
-      ).payload;
-      const injected = (Array.isArray(rewritten?.MediaSources) ? rewritten.MediaSources : sources).map((source, index) => {
-        if (!isPlainObject(source)) return null;
-        const sourceId = String(sources[index]?.Id || source?.Id || "").trim();
-        const magicId = buildMediaAggregationSourceId(backupName, String(match.Id), sourceId);
-        if (!magicId) return null;
-        return {
-          ...source,
-          Id: magicId,
-          Name: `${String(backupNode.displayName || backupName).trim() || backupName} · ${String(source.Name || "版本").trim() || "版本"}`
-        };
-      }).filter(Boolean);
-      return injected;
-    }));
-    const injectedSources = results
-      .filter(result => result.status === "fulfilled" && Array.isArray(result.value))
-      .flatMap(result => result.value);
-    if (!injectedSources.length) return { payload, state: "no_backup_match" };
+    }
+    const failureStatuses = new Set(["auth_failed", "query_unsupported", "response_too_large", "timeout", "network_error", "invalid_json"]);
+    const hasFailure = nodeDiagnostics.some(node => failureStatuses.has(node.status));
+    const overallStatus = injectedSources.length
+      ? (collected.pendingCount > 0 || hasFailure ? "applied_partial" : "applied_complete")
+      : (collected.pendingCount > 0 ? "background_pending" : (hasFailure ? "all_failed" : "no_match"));
+    execution.mediaAggregationDiagnostic = {
+      status: overallStatus,
+      matchMode,
+      attemptedNodes: backupNames.length,
+      matchedNodes: collected.foregroundResults.filter(result => Array.isArray(result?.sources) && result.sources.length).length,
+      pendingNodes: collected.pendingCount,
+      foregroundElapsedMs: nowMs() - foregroundStartedAt,
+      firstResultTimeoutMs,
+      gracePeriodMs,
+      nodes: nodeDiagnostics
+    };
+    execution.mediaAggregationCacheable = collected.pendingCount === 0 && !hasFailure;
+    if (!injectedSources.length) return { payload, state: overallStatus === "no_match" ? "no_backup_match" : overallStatus };
     return {
       payload: { ...payload, MediaSources: [...(Array.isArray(payload.MediaSources) ? payload.MediaSources : []), ...injectedSources] },
       state: "applied",
@@ -23626,14 +25619,20 @@ const Proxy = {
         const routedSource = execution.mediaAggregationSource;
         routedPayload = {
           ...routedPayload,
-          MediaSources: routedPayload.MediaSources.map(source => {
+          MediaSources: await Promise.all(routedPayload.MediaSources.map(async source => {
             if (!isPlainObject(source)) return source;
             const rawId = String(source.Id || "").trim();
             const rawParsed = parseMediaAggregationSourceId(rawId);
             const sourceId = rawParsed?.mediaSourceId || rawId;
-            const magicId = buildMediaAggregationSourceId(routedSource.nodeName, routedSource.itemId, sourceId);
+            const magicId = await buildMediaAggregationSourceIdV2(
+              execution?.env?.JWT_SECRET,
+              routedSource.nodeName,
+              routedSource.itemId,
+              sourceId,
+              routedSource.identityHash
+            );
             return magicId ? { ...source, Id: magicId } : source;
-          })
+          }))
         };
       }
       const aggregationResult = execution?.mediaAggregationRouted === true
@@ -23850,8 +25849,21 @@ const Proxy = {
         ),
         this.buildProgressRelayDiagnosticDetail(execution)
       ),
-      this.buildRouteContextDiagnosticDetail(execution)
+      this.appendLogDiagnosticDetail(
+        this.buildRouteContextDiagnosticDetail(execution),
+        this.buildMediaAggregationDiagnosticDetail(execution)
+      )
     );
+  },
+  buildMediaAggregationDiagnosticDetail(execution) {
+    const diagnostic = execution?.mediaAggregationDiagnostic;
+    if (!diagnostic || typeof diagnostic !== "object") return "";
+    const parts = [`MediaAggregation=${String(diagnostic.status || execution?.mediaAggregationState || "unknown")}`];
+    parts.push(`AggregationMatch=${normalizeMediaAggregationMatchMode(diagnostic.matchMode)}`);
+    parts.push(`AggregationNodes=${Math.max(0, Number(diagnostic.matchedNodes) || 0)}/${Math.max(0, Number(diagnostic.attemptedNodes) || 0)}`);
+    if (Number(diagnostic.pendingNodes) > 0) parts.push(`AggregationPending=${Math.max(0, Number(diagnostic.pendingNodes) || 0)}`);
+    if (Number(diagnostic.foregroundElapsedMs) >= 0) parts.push(`AggregationElapsed=${Math.max(0, Math.round(Number(diagnostic.foregroundElapsedMs) || 0))}ms`);
+    return parts.join(" | ");
   },
   buildProgressRelayDiagnosticDetail(execution) {
     if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true) return "";
@@ -23990,6 +26002,23 @@ const Proxy = {
         : null,
       playbackInfoRewrite: execution?.requestTraits?.isPlaybackInfoRequest === true
         ? String(options.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim() || null
+        : null,
+      mediaAggregation: execution?.mediaAggregationDiagnostic && typeof execution.mediaAggregationDiagnostic === "object"
+        ? {
+            status: String(execution.mediaAggregationDiagnostic.status || "").trim() || null,
+            matchMode: normalizeMediaAggregationMatchMode(execution.mediaAggregationDiagnostic.matchMode),
+            attemptedNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.attemptedNodes) || 0)),
+            matchedNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.matchedNodes) || 0)),
+            pendingNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.pendingNodes) || 0)),
+            foregroundElapsedMs: Math.max(0, Math.round(Number(execution.mediaAggregationDiagnostic.foregroundElapsedMs) || 0)),
+            nodes: (Array.isArray(execution.mediaAggregationDiagnostic.nodes) ? execution.mediaAggregationDiagnostic.nodes : []).slice(0, MEDIA_AGGREGATION_BACKUP_MAX).map(node => ({
+              nodeName: String(node?.nodeName || "").trim().toLowerCase(),
+              status: String(node?.status || "").trim(),
+              elapsedMs: Math.max(0, Math.round(Number(node?.elapsedMs) || 0)),
+              cacheHit: node?.cacheHit === true,
+              pending: node?.pending === true
+            }))
+          }
         : null,
       playbackUrlMode: String(options.playbackUrlMode || execution?.playbackUrlMode || "").trim() || null,
       playbackFallback: String(options.playbackFallback || execution?.playbackFallback || "").trim() || null,
@@ -25026,6 +27055,28 @@ const Proxy = {
     };
     return hashStableText(serializeConfigValue(signature));
   },
+  async prepareMediaAggregationPlaybackInfoCacheRevision(execution) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
+    const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
+    const currentName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (selectedNames.length < 2 || !selectedNames.includes(currentName)) {
+      execution.mediaAggregationPoolRevision = "disabled";
+      return execution.mediaAggregationPoolRevision;
+    }
+    let summaries = [];
+    try { summaries = await CacheManager.getNodesList(execution.env, execution.ctx); }
+    catch { summaries = []; }
+    const summaryByName = new Map((Array.isArray(summaries) ? summaries : []).map(summary => [String(summary?.name || "").trim().toLowerCase(), summary]));
+    const payload = {
+      revision: "media-aggregation-v2",
+      matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
+      firstResultTimeoutMs: clampIntegerConfig(execution?.currentConfig?.mediaAggregationFirstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 10000),
+      gracePeriodMs: clampIntegerConfig(execution?.currentConfig?.mediaAggregationGracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5000),
+      nodes: selectedNames.map(name => ({ name, cacheRevision: String(summaryByName.get(name)?.cacheRevision || "missing") }))
+    };
+    execution.mediaAggregationPoolRevision = hashStableText(serializeConfigValue(payload));
+    return execution.mediaAggregationPoolRevision;
+  },
   buildPlaybackInfoCacheKey(execution, transport = null) {
     if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
     if (execution.playbackInfoCacheEnabled !== true || Number(execution.playbackInfoCacheTtlSec) <= 0) {
@@ -25046,6 +27097,7 @@ const Proxy = {
     const payload = {
       nodeName: String(execution?.nodeName || "").trim(),
       nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
+      mediaAggregationNodes: normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []),
       requestMethod,
       proxyPath: String(execution?.proxyPath || "").trim(),
       query: String(execution?.requestUrl?.search || "").trim(),
@@ -25055,6 +27107,7 @@ const Proxy = {
       playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative"),
       mediaAggregationNodes: normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []),
       mediaAggregationAuthIdentity: hashStableText(`${String(execution?.currentConfig?.mediaAggregationEmbyUsername || "")}:${String(execution?.currentConfig?.mediaAggregationEmbyPassword || "")}`),
+      mediaAggregationPoolRevision: String(execution?.mediaAggregationPoolRevision || "unprepared"),
       mediaAggregationRouted: execution?.mediaAggregationRouted === true
     };
     const cacheKey = `playback-info:${hashStableText(serializeConfigValue(payload))}`;
@@ -25063,6 +27116,10 @@ const Proxy = {
   },
   async storePlaybackInfoResponseCache(execution, response, transport = null) {
     if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return false;
+    if (execution?.mediaAggregationCacheable === false) {
+      execution.playbackInfoCacheState = "skip_partial_aggregation";
+      return false;
+    }
     const cacheKey = execution.playbackInfoCacheKey || this.buildPlaybackInfoCacheKey(execution, transport);
     if (!cacheKey) return false;
     if (!response || !(response.status >= 200 && response.status < 300)) return false;
@@ -25090,6 +27147,9 @@ const Proxy = {
       nodeName: String(execution?.nodeName || "").trim().toLowerCase(),
       nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
       playbackInfoRewrite: String(execution?.playbackInfoRewrite || "").trim(),
+      mediaAggregationDiagnostic: execution?.mediaAggregationDiagnostic && typeof execution.mediaAggregationDiagnostic === "object"
+        ? execution.mediaAggregationDiagnostic
+        : null,
       status: response.status,
       statusText: response.statusText,
       headers: [...responseHeaders.entries()],
@@ -25121,6 +27181,9 @@ const Proxy = {
     cache.set(cacheKey, cacheEntry);
     execution.playbackInfoCacheState = "hit";
     execution.playbackInfoRewrite = String(cacheEntry?.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim();
+    execution.mediaAggregationDiagnostic = cacheEntry?.mediaAggregationDiagnostic && typeof cacheEntry.mediaAggregationDiagnostic === "object"
+      ? cacheEntry.mediaAggregationDiagnostic
+      : execution.mediaAggregationDiagnostic;
     const cachedResponse = new Response(
       execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""),
       {
@@ -25251,7 +27314,26 @@ const Proxy = {
       parseError: parsedPayload.parseError === true
     };
   },
-  scheduleServerLastWatch(execution) {
+  resolveServerLastWatchMedia(execution, transport = null) {
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    if (parsedPayload.parseError === true) return {};
+    const rawItem = getCaseInsensitivePayloadValue(parsedPayload.body, ["Item"]);
+    const item = normalizeCaseInsensitiveObject(isPlainObject(rawItem) ? rawItem : {});
+    const imageTags = normalizeCaseInsensitiveObject(isPlainObject(item.imagetags) ? item.imagetags : {});
+    const pickTopLevel = names => {
+      const fromQuery = getCaseInsensitivePayloadValue(parsedPayload.query, names);
+      if (String(fromQuery || "").trim()) return fromQuery;
+      return getCaseInsensitivePayloadValue(parsedPayload.body, names);
+    };
+    return {
+      itemId: String(pickTopLevel(["ItemId"]) || getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim(),
+      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || pickTopLevel(["ItemName", "Name"]) || "").trim(),
+      itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || pickTopLevel(["ItemType"]) || "").trim(),
+      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || pickTopLevel(["SeriesName"]) || "").trim(),
+      imageTag: String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(item, ["PrimaryImageTag"]) || "").trim()
+    };
+  },
+  scheduleServerLastWatch(execution, transport = null) {
     if (execution?.requestTraits?.isPlaybackStoppedRequest !== true) return false;
     if (String(execution?.requestMethod || "").toUpperCase() !== "POST") return false;
     if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
@@ -25262,7 +27344,8 @@ const Proxy = {
     if (!nodeName) return false;
     const requestStartedAt = Number(execution?.startTime);
     const eventAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
-    const task = Database.upsertServerLastWatch(db, nodeName, new Date(eventAtMs).toISOString())
+    const media = this.resolveServerLastWatchMedia(execution, transport);
+    const task = Database.upsertServerLastWatch(db, nodeName, new Date(eventAtMs).toISOString(), media)
       .catch((error) => {
         console.error("server last watch write failed", error);
       });
@@ -26419,6 +28502,98 @@ const Proxy = {
     } catch {}
     return { body: null, bodyText: "" };
   },
+  clearMediaAggregationSourceSelection(execution, transport, status = "stale_source_fallback") {
+    execution?.requestUrl?.searchParams?.delete?.("MediaSourceId");
+    if (transport?.preparedBodyMode === "buffered") {
+      const contentType = String(transport.newHeaders?.get("Content-Type") || "").toLowerCase();
+      const rawBodyText = String(transport.preparedBodyText || decodeBufferedBodyText(transport.preparedBody));
+      let bodyText = rawBodyText;
+      try {
+        if (contentType.includes("application/json")) {
+          const payload = JSON.parse(rawBodyText || "{}");
+          if (isPlainObject(payload)) {
+            for (const key of Object.keys(payload)) {
+              if (key.toLowerCase() === "mediasourceid") delete payload[key];
+            }
+            bodyText = JSON.stringify(payload);
+          }
+        } else if (contentType.includes("application/x-www-form-urlencoded")) {
+          const params = new URLSearchParams(rawBodyText);
+          for (const key of [...params.keys()]) {
+            if (key.toLowerCase() === "mediasourceid") params.delete(key);
+          }
+          bodyText = params.toString();
+        }
+      } catch {}
+      if (bodyText !== rawBodyText) {
+        transport.preparedBodyText = bodyText;
+        transport.preparedBody = new TextEncoder().encode(bodyText);
+        transport.newHeaders?.set?.("Content-Length", String(transport.preparedBody.byteLength));
+        if (transport.transportTemplate) transport.transportTemplate.baseHeaderEntries = [...transport.newHeaders.entries()];
+      }
+    }
+    execution.mediaAggregationState = status;
+    execution.mediaAggregationDiagnostic = {
+      status,
+      matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
+      attemptedNodes: 0,
+      matchedNodes: 0,
+      pendingNodes: 0,
+      foregroundElapsedMs: 0,
+      nodes: []
+    };
+    execution.mediaAggregationCacheable = false;
+  },
+  async resolveMediaAggregationPrimaryRouteIdentity(execution, itemId) {
+    const { targetRecords } = this.parseTargetRecords(execution?.node, execution?.finalOrigin || "*");
+    for (const targetRecord of targetRecords) {
+      const identity = await this.resolveMediaAggregationPrimaryIdentity(
+        { ...execution, mediaAggregationItemId: itemId },
+        {},
+        { activeTargetBase: targetRecord }
+      );
+      if (MEDIA_AGGREGATION_SUPPORTED_TYPES.has(identity?.type)) return identity;
+    }
+    return null;
+  },
+  async validateMediaAggregationPlaybackSource(execution, source, primaryItemId, targetNode) {
+    const version = String(source?.version || "AGG1");
+    if (version === "AGG2" && !await verifyMediaAggregationSourceSignature(source, execution?.env?.JWT_SECRET)) {
+      return { ok: false, status: "stale_source_fallback" };
+    }
+    execution.mediaAggregationDeadlineAt = nowMs() + 10000;
+    const primaryIdentity = await this.resolveMediaAggregationPrimaryRouteIdentity(execution, primaryItemId);
+    if (!primaryIdentity) return { ok: false, status: "stale_source_fallback" };
+    const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
+    const matchMode = normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode);
+    const { targetRecords } = this.parseTargetRecords(targetNode, execution?.finalOrigin || "*");
+    for (const targetRecord of targetRecords) {
+      const localExecution = { ...execution, mediaAggregationLastAuthStatus: "" };
+      const auth = await this.getMediaAggregationAuth(localExecution, source.nodeName, targetNode, prefix, targetRecord);
+      if (!auth) continue;
+      const candidate = await this.fetchMediaAggregationItemIdentity(localExecution, targetNode, targetRecord, auth, prefix, source.itemId);
+      if (!candidate.ok) {
+        if (candidate.retryable) continue;
+        return { ok: false, status: "stale_source_fallback" };
+      }
+      const match = matchMediaAggregationIdentities(primaryIdentity, candidate.identity, matchMode);
+      if (!match) return { ok: false, status: "stale_source_fallback" };
+      const identityHash = await buildMediaAggregationMatchFingerprintHash(match);
+      if (version === "AGG2" && identityHash !== source.identityHash) return { ok: false, status: "stale_source_fallback" };
+      const availableSources = Array.isArray(candidate.item?.MediaSources) ? candidate.item.MediaSources : [];
+      if (availableSources.length && !availableSources.some(item => String(item?.Id || "").trim() === source.mediaSourceId)) {
+        return { ok: false, status: "stale_source_fallback" };
+      }
+      return {
+        ok: true,
+        auth,
+        targetRecord,
+        source: { ...source, version, identityHash },
+        status: version === "AGG1" ? "legacy_revalidated" : "validated"
+      };
+    }
+    return { ok: false, status: "stale_source_fallback" };
+  },
   async maybeScheduleMediaAggregationProgressMirror(execution, transport) {
     if (execution?.currentConfig?.mediaAggregationBidirectionalProgressEnabled !== true) return;
     if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true || !execution?.ctx?.waitUntil) return;
@@ -26430,7 +28605,7 @@ const Proxy = {
       || ""
     ).trim();
     const source = parseMediaAggregationSourceId(mediaSourceId);
-    if (!source) return;
+    if (!source || source.version !== "AGG2" || !await verifyMediaAggregationSourceSignature(source, execution?.env?.JWT_SECRET)) return;
     const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
     const currentName = String(execution?.nodeName || "").trim().toLowerCase();
     if (!selectedNames.includes(currentName) || !selectedNames.includes(source.nodeName) || source.nodeName === currentName) return;
@@ -26439,38 +28614,36 @@ const Proxy = {
       const backupNode = await Database.getNode(source.nodeName, execution.env, execution.ctx);
       if (!backupNode) return;
       const apiPrefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-      const auth = await this.getMediaAggregationAuth(execution, source.nodeName, backupNode, apiPrefix);
-      if (!auth) return;
       const { targetRecords } = this.parseTargetRecords(backupNode, execution.finalOrigin || "*");
-      const targetRecord = targetRecords[0];
-      if (!targetRecord) return;
-      const targetUrl = buildUpstreamProxyUrl(targetRecord, execution.proxyPath || "/");
-      targetUrl.search = execution.requestUrl.search;
-      targetUrl.searchParams.set("ItemId", source.itemId);
-      targetUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
-      if (auth.userId) targetUrl.searchParams.set("UserId", auth.userId);
-      const headers = this.buildMediaAggregationRequestHeaders(execution, backupNode, targetUrl, auth);
-      const bodyState = this.buildMediaAggregationRoutedBody(transport, source);
-      const fetchOptions = {
-        method: execution.requestMethod,
-        headers,
-        redirect: "manual"
-      };
-      if (bodyState.bodyText && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") {
-        fetchOptions.body = bodyState.bodyText;
-        headers.set("Content-Type", String(transport.newHeaders?.get("Content-Type") || "application/json"));
-      }
-      let upstream;
-      try {
-        upstream = await this.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
-          timeoutMs: Math.min(Math.max(1000, Number(execution.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
-          requestLifecycle: null
-        });
-        try { await upstream.response.body?.cancel?.(); } catch {}
-      } catch {
-        // Progress mirroring is best effort and never changes the primary response.
-      } finally {
-        try { upstream?.releaseFetchController?.(); } catch {}
+      for (const targetRecord of targetRecords) {
+        const auth = await this.getMediaAggregationAuth(execution, source.nodeName, backupNode, apiPrefix, targetRecord);
+        if (!auth) continue;
+        const targetUrl = buildUpstreamProxyUrl(targetRecord, execution.proxyPath || "/");
+        targetUrl.search = execution.requestUrl.search;
+        targetUrl.searchParams.set("ItemId", source.itemId);
+        targetUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
+        if (auth.userId) targetUrl.searchParams.set("UserId", auth.userId);
+        const headers = this.buildMediaAggregationRequestHeaders(execution, backupNode, targetUrl, auth);
+        const bodyState = this.buildMediaAggregationRoutedBody(transport, source);
+        const fetchOptions = { method: execution.requestMethod, headers, redirect: "manual" };
+        if (bodyState.bodyText && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") {
+          fetchOptions.body = bodyState.bodyText;
+          headers.set("Content-Type", String(transport.newHeaders?.get("Content-Type") || "application/json"));
+        }
+        let upstream;
+        try {
+          upstream = await this.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
+            timeoutMs: Math.min(Math.max(1000, Number(execution.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 10000),
+            requestLifecycle: null
+          });
+          const status = Number(upstream.response.status) || 0;
+          try { await upstream.response.body?.cancel?.(); } catch {}
+          if (!(status === 408 || status === 425 || status === 429 || status >= 500)) break;
+        } catch {
+          // Try the next configured line; progress mirroring never changes the primary response.
+        } finally {
+          try { upstream?.releaseFetchController?.(); } catch {}
+        }
       }
     })();
     execution.ctx.waitUntil(task.catch(() => {}));
@@ -26497,23 +28670,33 @@ const Proxy = {
       || ""
     ).trim();
     const source = parseMediaAggregationSourceId(mediaSourceId);
-    if (!source || !itemId || source.nodeName === currentName || !selectedNames.includes(source.nodeName)) return null;
+    if (!source) {
+      if (/^AGG[12]\*/.test(mediaSourceId)) this.clearMediaAggregationSourceSelection(execution, transport);
+      return null;
+    }
+    if (!itemId || source.nodeName === currentName || !selectedNames.includes(source.nodeName)) {
+      this.clearMediaAggregationSourceSelection(execution, transport);
+      return null;
+    }
     if (execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD" && transport?.preparedBodyMode !== "buffered") return null;
     const targetNode = await Database.getNode(source.nodeName, execution.env, execution.ctx);
-    if (!targetNode) return null;
-    const auth = await this.getMediaAggregationAuth(
-      execution,
-      source.nodeName,
-      targetNode,
-      resolveMediaAggregationApiPrefix(execution?.proxyPath || "")
-    );
-    if (!auth) return null;
-    const routedPath = itemPathState.rewritePath(source.itemId);
+    if (!targetNode) {
+      this.clearMediaAggregationSourceSelection(execution, transport);
+      return null;
+    }
+    const validation = await this.validateMediaAggregationPlaybackSource(execution, source, itemId, targetNode);
+    if (!validation.ok) {
+      this.clearMediaAggregationSourceSelection(execution, transport, validation.status);
+      return null;
+    }
+    const validatedSource = validation.source;
+    const auth = validation.auth;
+    const routedPath = itemPathState.rewritePath(validatedSource.itemId);
     const routedUrl = new URL(execution.requestUrl.toString());
-    routedUrl.searchParams.set("ItemId", source.itemId);
-    routedUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
+    routedUrl.searchParams.set("ItemId", validatedSource.itemId);
+    routedUrl.searchParams.set("MediaSourceId", validatedSource.mediaSourceId);
     if (auth.userId) routedUrl.searchParams.set("UserId", auth.userId);
-    const routedBody = this.buildMediaAggregationRoutedBody(transport, source);
+    const routedBody = this.buildMediaAggregationRoutedBody(transport, validatedSource);
     const headers = new Headers(execution.request.headers);
     headers.delete("Content-Length");
     if (routedBody.bodyText) headers.set("Content-Length", String(new TextEncoder().encode(routedBody.bodyText).byteLength));
@@ -26541,10 +28724,27 @@ const Proxy = {
     );
     if (routedExecution.invalidResponse) return null;
     routedExecution.mediaAggregationRouted = true;
-    routedExecution.mediaAggregationItemId = source.itemId;
-    routedExecution.mediaAggregationSource = source;
-    const { targetRecords, invalidResponse } = this.parseTargetRecords(routedExecution.node, routedExecution.finalOrigin);
+    routedExecution.mediaAggregationItemId = validatedSource.itemId;
+    routedExecution.mediaAggregationSource = validatedSource;
+    routedExecution.mediaAggregationState = validation.status;
+    routedExecution.mediaAggregationDiagnostic = {
+      status: "routed_playback",
+      matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
+      attemptedNodes: 1,
+      matchedNodes: 1,
+      pendingNodes: 0,
+      foregroundElapsedMs: 0,
+      nodes: [{ nodeName: validatedSource.nodeName, status: validation.status, elapsedMs: 0 }]
+    };
+    const parsedTargets = this.parseTargetRecords(routedExecution.node, routedExecution.finalOrigin);
+    const invalidResponse = parsedTargets.invalidResponse;
     if (invalidResponse) return null;
+    const selectedTargetIdentity = String(validation.targetRecord?.originText || validation.targetRecord?.targetUrl || "");
+    const targetRecords = parsedTargets.targetRecords.slice().sort((left, right) => {
+      const leftMatch = String(left?.originText || left?.targetUrl || "") === selectedTargetIdentity ? 1 : 0;
+      const rightMatch = String(right?.originText || right?.targetUrl || "") === selectedTargetIdentity ? 1 : 0;
+      return rightMatch - leftMatch;
+    });
     const routedTransport = await this.buildProxyRequestState(
       routedExecution.request,
       routedExecution.node,
@@ -26671,7 +28871,6 @@ const Proxy = {
       cachedTargetRecords: execution.playbackRouteHotTargetRecords
     });
     if (invalidResponse) return invalidResponse;
-    this.scheduleServerLastWatch(execution);
     let failoverTargetRecords = this.prepareFailoverOverlay(execution, targetRecords);
     execution.defaultOutboundColo = "";
 
@@ -26691,6 +28890,7 @@ const Proxy = {
           effectiveMediaAuthMode: execution.effectiveMediaAuthMode
         }
       );
+      this.scheduleServerLastWatch(execution, transport);
       const aggregationRoute = await this.resolveMediaAggregationPlaybackRoute(execution, transport);
       if (aggregationRoute) {
         execution = aggregationRoute.execution;
@@ -26699,6 +28899,7 @@ const Proxy = {
         failoverTargetRecords = this.prepareFailoverOverlay(execution, targetRecords);
         transport.retryTargetRecords = failoverTargetRecords;
       }
+      await this.prepareMediaAggregationPlaybackInfoCacheRevision(execution);
       const playbackInfoCachedResponse = await this.tryServePlaybackInfoResponseCache(execution, transport);
       if (playbackInfoCachedResponse) return playbackInfoCachedResponse;
       const buildFetchOptions = this.createBuildFetchOptions(execution, transport);
@@ -27066,6 +29267,7 @@ const ADMIN_REMOTE_SHELL_SOURCE_HASH_HEADER = "X-Admin-Shell-Source-Hash";
 const ADMIN_RELEASE_PROXY_PATH_SEGMENT = "__release";
 const ADMIN_RELEASE_VENDOR_PATH_SEGMENT = "vendor";
 const ADMIN_WARM_PATH_SEGMENT = "__warm";
+const ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT = "__server-record-poster";
 const ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN = "https://admin-release-vendor-cache.invalid";
 const ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN = "https://admin-release-vendor-manifest.invalid";
 const ADMIN_RELEASE_VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -28582,6 +30784,42 @@ function isAdminWarmRoute(pathname = "", adminPath = "/admin") {
   return normalizedPathname.toLowerCase() === `${normalizedAdminPath}/${ADMIN_WARM_PATH_SEGMENT}`.toLowerCase();
 }
 
+function resolveAdminServerRecordPosterRouteMatch(pathname = "", adminPath = "/admin") {
+  const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
+  const normalizedPathname = sanitizeProxyPath(pathname || "/");
+  const prefix = `${normalizedAdminPath}/${ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT}/`;
+  if (!normalizedPathname.toLowerCase().startsWith(prefix.toLowerCase())) return null;
+  const rawNodeName = normalizedPathname.slice(prefix.length);
+  if (!rawNodeName || rawNodeName.includes("/")) return null;
+  try {
+    const nodeName = decodeURIComponent(rawNodeName).trim().toLowerCase();
+    return nodeName && nodeName.length <= 128 && !nodeName.includes("/") ? { nodeName } : null;
+  } catch {
+    return null;
+  }
+}
+
+function buildAdminServerRecordPosterErrorResponse(status = 404) {
+  return new Response(null, {
+    status,
+    headers: {
+      "Cache-Control": "no-store, max-age=0",
+      "X-Content-Type-Options": "nosniff"
+    }
+  });
+}
+
+async function renderAdminServerRecordPoster(request, env, routeMatch = null) {
+  if (!routeMatch?.nodeName) return buildAdminServerRecordPosterErrorResponse(404);
+  try {
+    return await Database.getServerRecordPosterResponse(env, routeMatch.nodeName, request.method)
+      || buildAdminServerRecordPosterErrorResponse(404);
+  } catch (error) {
+    console.error("server record poster route failed", error);
+    return buildAdminServerRecordPosterErrorResponse(502);
+  }
+}
+
 function getAdminRemoteShellCachedAt(response) {
   const cachedAt = Number.parseInt(String(response?.headers?.get?.(ADMIN_REMOTE_SHELL_CACHED_AT_HEADER) || ""), 10);
   return Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : 0;
@@ -30044,6 +32282,14 @@ const RuntimeEntry = {
       return renderLandingPage(env, routeContext.initHealth);
     }
 
+    const adminServerRecordPosterRoute = isGetOrHead
+      ? resolveAdminServerRecordPosterRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
+      : null;
+    if (adminServerRecordPosterRoute) {
+      if (!(await Auth.verifyRequest(request, env))) return buildAdminServerRecordPosterErrorResponse(401);
+      return renderAdminServerRecordPoster(request, env, adminServerRecordPosterRoute);
+    }
+
     const adminReleaseVendorRoute = isGetOrHead
       ? resolveAdminReleaseVendorRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
       : null;
@@ -30472,13 +32718,23 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     createTargetRecord,
     isTargetRecord,
     buildMediaAggregationSourceId,
+    buildMediaAggregationSourceIdV2,
     parseMediaAggregationSourceId,
     normalizeMediaAggregationProviderIds,
     mediaAggregationProviderIdsMatch,
+    normalizeMediaAggregationTitle,
+    buildMediaAggregationIdentity,
+    matchMediaAggregationIdentities,
+    buildMediaAggregationMatchFingerprintHash,
+    verifyMediaAggregationSourceSignature,
+    normalizeTmdbApiKeyInput,
+    resolveTmdbPosterApiKey,
+    buildPosterMetadataSettingsState,
     readMediaAggregationCredentialPair,
     resolveMediaAggregationCredentials,
     hasConfiguredMediaAggregationNodeCredentials,
     buildUpstreamProxyUrl,
+    buildProbeUpstreamUrl,
     buildFastSegmentUpstreamUrlText,
     shouldUseSegmentFastUpstreamBuilder,
     isEmbyWebProxyPath,
@@ -30515,6 +32771,8 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     isMutableJsdelivrGithubAssetUrl,
     renderAdminReleaseVendorAsset,
     isAdminWarmRoute,
+    resolveAdminServerRecordPosterRouteMatch,
+    renderAdminServerRecordPoster,
     renderAdminWarmResponse,
     warmAdminReleaseVendorEntries,
     buildAdminWarmSubrequest,
