@@ -132,7 +132,7 @@ function createDeferred() {
   return { promise, resolve };
 }
 
-test("D1 migrations build the fresh v8 baseline in order", async () => {
+test("D1 migrations build the fresh v9 baseline in order", async () => {
   const migrations = await loadMigrations();
   assert.deepEqual(migrations.map(migration => migration.filename), [
     "0001_d1_fresh_baseline.sql",
@@ -140,7 +140,8 @@ test("D1 migrations build the fresh v8 baseline in order", async () => {
     "0003_d1_schema_v5_indexes.sql",
     "0004_server_watch_stats.sql",
     "0005_server_record_snapshots.sql",
-    "0006_server_record_poster_cache.sql"
+    "0006_server_record_poster_cache.sql",
+    "0007_server_watch_lifecycle.sql"
   ]);
   assert.ok(migrations.every(migration => !/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i.test(executableSql(migration.sql))));
 
@@ -171,7 +172,14 @@ test("D1 migrations build the fresh v8 baseline in order", async () => {
     for (const columnName of REQUIRED_LOG_COLUMNS.keys()) {
       assert.ok(getColumns(database, "proxy_logs").has(columnName), `missing fresh column ${columnName}`);
     }
-    assert.deepEqual([...getColumns(database, "server_last_watch")].sort(), ["last_watched_at", "node_name", "updated_at"]);
+    assert.deepEqual([...getColumns(database, "server_last_watch")].sort(), [
+      "last_watched_at",
+      "node_name",
+      "playback_event_phase",
+      "playback_session_fingerprint",
+      "playback_session_strength",
+      "updated_at"
+    ]);
     assert.deepEqual([...getColumns(database, "server_record_snapshots")].sort(), [
       "counts_errors_json",
       "counts_state",
@@ -205,13 +213,13 @@ test("D1 migrations build the fresh v8 baseline in order", async () => {
     assert.ok(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_time"));
     assert.ok(getIndexes(database, "dns_ip_probe_cache").has("idx_dns_ip_probe_cache_colo_ip_expires"));
     assert.ok(getIndexes(database, "server_record_poster_cache").has("idx_server_record_poster_cache_expires_at"));
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 6);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 7);
 
     const d1 = createD1Adapter(database);
     const status = await Database.getD1SchemaStatus(d1);
     assert.equal(status.runtimeCompatibilityReady, true);
     assert.equal(status.migrationReady, true);
-    assert.equal(status.schemaVersion, 8);
+    assert.equal(status.schemaVersion, 9);
   } finally {
     database.close();
   }
@@ -393,7 +401,7 @@ test("initialize DB repairs known columns and named indexes without losing legac
   }
 });
 
-test("managed initialization captures a bookmark before writes, adopts v8 migrations, and preserves 0005 rows", async () => {
+test("managed initialization captures a bookmark before writes, adopts v9 migrations, and preserves 0005 rows", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     database.exec(await readFile(new URL("0005_server_record_snapshots.sql", MIGRATIONS_URL), "utf8"));
@@ -426,9 +434,9 @@ test("managed initialization captures a bookmark before writes, adopts v8 migrat
     assert.deepEqual(initialized.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
     assert.equal(initialized.runtimeCompatibilityReady, true);
     assert.equal(initialized.migrationReady, true);
-    assert.equal(initialized.schemaVersion, 8);
+    assert.equal(initialized.schemaVersion, 9);
     assert.equal(initialized.status.missingMigrations.length, 0);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
     const preservedSnapshot = database.prepare("SELECT node_name, movie_count, last_item_id FROM server_record_snapshots").get();
     assert.equal(preservedSnapshot.node_name, "persisted-node");
     assert.equal(preservedSnapshot.movie_count, 12);
@@ -444,7 +452,7 @@ test("managed initialization captures a bookmark before writes, adopts v8 migrat
     assert.deepEqual(repeated.adoptedMigrations, []);
     assert.equal(repeated.migrationTableCreated, false);
     assert.equal(repeated.migrationReady, true);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM server_record_snapshots").get().total, 1);
   } finally {
     database.close();
@@ -517,7 +525,7 @@ test("Time Travel bookmark admin action is read-only", async () => {
   }
 });
 
-test("initLogsDb admin action returns a managed v8 baseline and recovery bookmark", async () => {
+test("initLogsDb admin action returns a managed v9 baseline and recovery bookmark", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     const d1 = createD1Adapter(database, { bookmark: "bookmark-from-init-api" });
@@ -527,12 +535,12 @@ test("initLogsDb admin action returns a managed v8 baseline and recovery bookmar
     assert.equal(payload.success, true);
     assert.equal(payload.runtimeCompatibilityReady, true);
     assert.equal(payload.migrationReady, true);
-    assert.equal(payload.schemaVersion, 8);
+    assert.equal(payload.schemaVersion, 9);
     assert.equal(payload.recoveryBookmark, "bookmark-from-init-api");
     assert.deepEqual(payload.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
     assert.equal(payload.initialization.migrationTableCreated, true);
     assert.equal(payload.status.missingMigrations.length, 0);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 6);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
   } finally {
     database.close();
   }
@@ -858,7 +866,129 @@ test("scheduled D1 tidy fails before deletion when key contracts drift", async (
   }
 });
 
-test("runtime D1 SQL executes against the fresh v8 schema", async () => {
+test("server watch lifecycle enforces strong and weak D1 admission gates", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const media = (itemId, itemName) => ({ itemId, itemName, itemType: "Movie", imageTag: `${itemId}-poster` });
+    const write = (nodeName, eventAt, phase, sessionFingerprint, sessionStrength, itemId, itemName = itemId) => (
+      Database.upsertServerWatchLifecycle(d1, {
+        nodeName,
+        eventAt,
+        phase,
+        sessionFingerprint,
+        sessionStrength,
+        media: itemId ? media(itemId, itemName) : {}
+      })
+    );
+
+    const base = Date.parse("2026-07-26T12:00:00.000Z");
+    const at = offsetMs => new Date(base + offsetMs).toISOString();
+    assert.equal((await write("strong-node", at(0), "started", "strong-a", "strong", "item-a", "Initial")).admitted, true);
+    assert.equal((await write("strong-node", at(1000), "started", "strong-a", "strong", "item-a", "Duplicate")).admitted, false);
+    assert.equal((await write("strong-node", at(2000), "progress", "strong-a", "strong", "item-a", "Progress duplicate")).admitted, false);
+    assert.equal((await write("strong-node", at(3000), "progress", "strong-b", "strong", "item-b", "Fallback")).admitted, true);
+    assert.equal((await write("strong-node", at(4000), "stopped", "strong-b", "strong", "item-b", "Final")).admitted, true);
+    assert.equal((await write("strong-node", at(3500), "stopped", "strong-b", "strong", "item-a", "Stale stop")).admitted, false);
+
+    const strongWatch = database.prepare(`SELECT last_watched_at, playback_session_fingerprint,
+      playback_session_strength, playback_event_phase FROM server_last_watch WHERE node_name = ?`).get("strong-node");
+    assert.deepEqual({ ...strongWatch }, {
+      last_watched_at: at(4000),
+      playback_session_fingerprint: "strong-b",
+      playback_session_strength: "strong",
+      playback_event_phase: "stopped"
+    });
+    const strongSnapshot = database.prepare(`SELECT last_item_id, last_item_name, last_item_watched_at
+      FROM server_record_snapshots WHERE node_name = ?`).get("strong-node");
+    assert.deepEqual({ ...strongSnapshot }, {
+      last_item_id: "item-b",
+      last_item_name: "Final",
+      last_item_watched_at: at(4000)
+    });
+
+    assert.equal((await write("weak-stop-node", at(0), "started", "weak-a", "weak", "item-a")).admitted, true);
+    assert.equal((await write("weak-stop-node", at(1000), "started", "weak-a", "weak", "item-a", "Replay")).admitted, true);
+    assert.equal((await write("weak-stop-node", at(2000), "stopped", "weak-a", "weak", "item-a")).admitted, true);
+    assert.equal((await write("weak-stop-node", at(9 * 60_000), "progress", "weak-a", "weak", "item-a")).admitted, false);
+    assert.equal((await write("weak-stop-node", at(2000 + 10 * 60_000), "progress", "weak-a", "weak", "item-a")).admitted, false);
+    assert.equal((await write("weak-stop-node", at(11 * 60_000), "progress", "weak-a", "weak", "item-a")).admitted, true);
+
+    assert.equal((await write("weak-open-node", at(0), "progress", "weak-b", "weak", "item-b")).admitted, true);
+    assert.equal((await write("weak-open-node", at(11 * 60 * 60_000), "progress", "weak-b", "weak", "item-b")).admitted, false);
+    assert.equal((await write("weak-open-node", at(12 * 60 * 60_000), "progress", "weak-b", "weak", "item-b")).admitted, false);
+    assert.equal((await write("weak-open-node", at(13 * 60 * 60_000), "progress", "weak-b", "weak", "item-b")).admitted, true);
+  } finally {
+    database.close();
+  }
+});
+
+test("server watch lifecycle keeps snapshots coupled to admitted writes across duplicate and concurrent events", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    applyMigrations(database, await loadMigrations());
+    const d1 = createD1Adapter(database);
+    const eventAt = "2026-07-26T13:00:00.000Z";
+    const event = itemName => ({
+      nodeName: "parallel-node",
+      eventAt,
+      phase: "progress",
+      sessionFingerprint: "parallel-session",
+      sessionStrength: "strong",
+      media: { itemId: "parallel-item", itemName, itemType: "Movie" }
+    });
+    const [first, second] = await Promise.all([
+      Database.upsertServerWatchLifecycle(d1, event("Accepted media")),
+      Database.upsertServerWatchLifecycle(d1, event("Rejected overwrite"))
+    ]);
+    assert.deepEqual([first.admitted, second.admitted], [true, false]);
+    assert.deepEqual(
+      { ...database.prepare(`SELECT last_item_name, last_item_watched_at
+        FROM server_record_snapshots WHERE node_name = ?`).get("parallel-node") },
+      { last_item_name: "Accepted media", last_item_watched_at: eventAt }
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test("server watch lifecycle falls back safely against a v8 table", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(await readFile(new URL("0004_server_watch_stats.sql", MIGRATIONS_URL), "utf8"));
+    database.exec(await readFile(new URL("0005_server_record_snapshots.sql", MIGRATIONS_URL), "utf8"));
+    const d1 = createD1Adapter(database);
+    const startedAt = "2026-07-26T14:00:00.000Z";
+    const stoppedAt = "2026-07-26T14:30:00.000Z";
+    const common = {
+      nodeName: "v8-node",
+      sessionFingerprint: "legacy-session",
+      sessionStrength: "strong",
+      media: { itemId: "legacy-item", itemName: "Legacy movie", itemType: "Movie" }
+    };
+
+    const started = await Database.upsertServerWatchLifecycle(d1, { ...common, eventAt: startedAt, phase: "started" });
+    const progress = await Database.upsertServerWatchLifecycle(d1, {
+      ...common,
+      eventAt: "2026-07-26T14:10:00.000Z",
+      phase: "progress"
+    });
+    const stopped = await Database.upsertServerWatchLifecycle(d1, { ...common, eventAt: stoppedAt, phase: "stopped" });
+    assert.deepEqual(started, { admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" });
+    assert.deepEqual(progress, { admitted: false, schemaVersion: 8, reason: "schema_v8_progress_disabled" });
+    assert.deepEqual(stopped, { admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" });
+    assert.equal(getColumns(database, "server_last_watch").has("playback_event_phase"), false);
+    assert.equal(database.prepare("SELECT last_watched_at FROM server_last_watch WHERE node_name = ?").get("v8-node").last_watched_at, stoppedAt);
+    GLOBALS.ServerRecordWatchSessions.set("v8-pending", { nodeName: "v8-node" });
+    Database.invalidateD1SchemaReadiness(d1);
+    assert.equal(GLOBALS.ServerRecordWatchSessions.size, 0);
+  } finally {
+    database.close();
+  }
+});
+
+test("runtime D1 SQL executes against the fresh v9 schema", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     applyMigrations(database, await loadMigrations());

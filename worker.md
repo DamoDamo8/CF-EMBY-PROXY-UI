@@ -1,6 +1,6 @@
 # Repository Runtime Guide
 
-版本：13.2
+版本：13.3
 
 默认语言：中文
 
@@ -38,6 +38,7 @@
 - 浏览器使用 Worker 同源 vendor 路径加载依赖；Worker 负责源站重写和 Cache API 缓冲。
 - Emby 节点代理只承载 API、WebSocket 与媒体请求，不反代 `/web` 子树；该边界不影响管理台 `/admin` 的资源交付。
 - 服务器记录的 TMDB 海报密钥由管理台“账号设置”统一预览和保存到 KV，运行时按“KV 配置优先、Worker Secret 兼容兜底”解析；完整安全与回退语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
+- 服务器记录使用 D1 v9 播放生命周期：`Playing` 即时更新上次观看，首次 `Progress` 在缺少 Playing 时兜底，`Stopped` 推进最终时间；完整去重与 v8 兼容语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
 - 前端开发和构建先把 `frontend/admin-runtime.template.html` 与显式 runtime enhancements 确定性组合为 `frontend/index.html`。
 
 ## 核心约束

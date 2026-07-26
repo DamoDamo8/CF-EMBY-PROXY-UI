@@ -12,6 +12,7 @@ const {
   GLOBALS,
   Database,
   CacheManager,
+  Logger,
   Proxy,
   RuntimeEntry,
   isEmbyWebProxyPath,
@@ -5322,6 +5323,110 @@ test("unknown-length control requests stay streamed instead of being cloned into
     {}
   );
   assert.equal(transport.preparedBodyMode, "stream");
+  const execution = {
+    requestMethod: "POST",
+    requestUrl: new URL("https://worker.test/Sessions/Playing/Progress?ItemId=query-item"),
+    request
+  };
+  const parsed = Proxy.parsePlaybackSessionControlPayload(execution, transport);
+  assert.equal(parsed.parseError, true);
+  assert.equal(parsed.parseMode, "stream");
+  assert.equal(parsed.parseErrorReason, "unbuffered_body");
+  assert.equal(parsed.query.itemid, "query-item");
+
+  const oversizedRequest = new Request("https://worker.test/Sessions/Playing?ItemId=oversized-query", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": String(256 * 1024 + 1)
+    },
+    body: JSON.stringify({ ItemId: "body-item" })
+  });
+  const oversizedTransport = await Proxy.buildProxyRequestState(
+    oversizedRequest,
+    {},
+    "/Sessions/Playing",
+    new URL(oversizedRequest.url),
+    "203.0.113.1",
+    {
+      isPlaybackInfoRequest: false,
+      isPlaybackSessionControlRequest: true,
+      isBigStream: false,
+      isSmartStrmMedia: false,
+      isSegment: false,
+      isManifest: false,
+      isWsUpgrade: false
+    },
+    false,
+    [],
+    {}
+  );
+  assert.equal(oversizedTransport.preparedBodyMode, "stream");
+  const oversizedParsed = Proxy.parsePlaybackSessionControlPayload({
+    requestMethod: "POST",
+    requestUrl: new URL(oversizedRequest.url),
+    request: oversizedRequest
+  }, oversizedTransport);
+  assert.equal(oversizedParsed.parseErrorReason, "unbuffered_body");
+  assert.equal(oversizedParsed.query.itemid, "oversized-query");
+});
+
+test("Hills text/plain playback controls parse bounded JSON without changing transport", () => {
+  const bodyText = JSON.stringify({
+    SessionId: "hills-session",
+    ItemId: "episode-86802",
+    Item: { Name: "Episode 1", Type: "Episode", SeriesName: "Series 1" }
+  });
+  const execution = {
+    nodeName: "nay",
+    requestMethod: "POST",
+    requestUrl: new URL("https://worker.test/Sessions/Playing"),
+    request: new Request("https://worker.test/Sessions/Playing", { method: "POST" })
+  };
+  const transport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: bodyText,
+    preparedBody: new TextEncoder().encode(bodyText),
+    newHeaders: new Headers({ "Content-Type": "text/plain", "Content-Length": String(bodyText.length) })
+  };
+  const parsed = Proxy.parsePlaybackSessionControlPayload(execution, transport);
+  const media = Proxy.resolveServerLastWatchMedia(execution, transport);
+  assert.equal(parsed.parseError, false);
+  assert.equal(parsed.parseMode, "text_plain_json");
+  assert.deepEqual(media, {
+    itemId: "episode-86802",
+    itemName: "Episode 1",
+    itemType: "Episode",
+    seriesName: "Series 1",
+    imageTag: ""
+  });
+  assert.equal(transport.preparedBodyText, bodyText);
+  assert.equal(transport.newHeaders.get("Content-Type"), "text/plain");
+
+  const invalidExecution = {
+    ...execution,
+    playbackSessionControlPayload: null,
+    requestUrl: new URL("https://worker.test/Sessions/Playing?ItemId=query-fallback")
+  };
+  const invalid = Proxy.parsePlaybackSessionControlPayload(invalidExecution, {
+    ...transport,
+    preparedBodyText: "not-json"
+  });
+  assert.equal(invalid.parseError, true);
+  assert.equal(invalid.parseMode, "text_plain_invalid");
+  assert.equal(invalid.query.itemid, "query-fallback");
+
+  const arrayExecution = {
+    ...execution,
+    playbackSessionControlPayload: null
+  };
+  const arrayPayload = Proxy.parsePlaybackSessionControlPayload(arrayExecution, {
+    ...transport,
+    preparedBodyText: JSON.stringify([{ ItemId: "array-item" }])
+  });
+  assert.equal(arrayPayload.parseError, true);
+  assert.equal(arrayPayload.parseMode, "text_plain_invalid");
+  assert.deepEqual(arrayPayload.body, {});
 });
 
 test("playback progress relay enforces its bounded session table on insertion", () => {
@@ -5354,7 +5459,8 @@ test("incremental isolate cleanup covers nonessential proxy-adjacent caches", ()
       lastProbeResult: null
     }],
     [7, GLOBALS.PlaybackProgressRelay, "stale-progress", { lastTouchedAt: now - 120000 }],
-    [8, GLOBALS.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }]
+    [8, GLOBALS.ServerRecordWatchSessions, "stale-watch", { lastSeenAt: now - 31 * 60 * 1000 }],
+    [9, GLOBALS.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }]
   ];
   for (const [phase, cache, key, value] of staleCases) {
     cache.clear();
@@ -5556,6 +5662,20 @@ test("playback session keys are partitioned by node even when Emby session ids m
   assert.equal(first.sessionKey, "server-a|session:shared-session");
   assert.equal(second.sessionKey, "server-b|session:shared-session");
   assert.notEqual(first.sessionKey, second.sessionKey);
+  assert.match(first.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
+  assert.match(first.sessionFingerprint, /^[0-9a-f]{16}$/);
+  assert.notEqual(first.sessionFingerprint, second.sessionFingerprint);
+
+  const deviceTransport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: JSON.stringify({ DeviceId: "device-strong-value", ItemId: "movie-device" }),
+    newHeaders: new Headers({ "Content-Type": "application/json" })
+  };
+  const device = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-a"), deviceTransport);
+  assert.equal(device.sessionStrength, "weak");
+  assert.match(device.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
+  assert.match(device.sessionFingerprint, /^[0-9a-f]{16}$/);
+  assert.doesNotMatch(`${device.sessionIdentityFingerprint}:${device.sessionFingerprint}`, /device-strong-value|movie-device/);
 
   const makeFallbackExecution = (proxyPath) => ({
     ...makeExecution("server-a"),
@@ -5575,99 +5695,367 @@ test("playback session keys are partitioned by node even when Emby session ids m
   const stopped = Proxy.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing/Stopped"), fallbackTransport);
   assert.equal(started.sessionKey, stopped.sessionKey);
   assert.doesNotMatch(started.sessionKey, /private|device-1|movie-1/);
+  assert.match(started.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
+  assert.match(started.sessionFingerprint, /^[0-9a-f]{16}$/);
+  assert.doesNotMatch(`${started.sessionIdentityFingerprint}:${started.sessionFingerprint}`, /private|device-1|movie-1/);
 });
 
-test("only enabled-node Stopped requests schedule the last-watch write", async () => {
+test("server record playback context requires matching PlaybackInfo and item details", async () => {
   const tasks = [];
   const writes = [];
-  const originalUpsert = Database.upsertServerLastWatch;
-  Database.upsertServerLastWatch = async (_db, nodeName, lastWatchedAt, media) => {
-    writes.push({ nodeName, lastWatchedAt, media });
-    return true;
+  const originalUpsert = Database.upsertServerWatchLifecycle;
+  Database.upsertServerWatchLifecycle = async (_db, event) => {
+    writes.push(event);
+    return { admitted: true, schemaVersion: 9 };
   };
-  const makeExecution = (nodeName, traits, options = {}) => ({
-    nodeName,
-    node: { serverRecord: { enabled: options.enabled !== false } },
-    startTime: options.startTime || 123_456,
-    requestMethod: options.requestMethod || "POST",
-    requestTraits: traits,
-    env: options.withDb === false ? {} : { DB: {} },
-    ctx: { waitUntil(task) { tasks.push(task); } }
+  GLOBALS.ServerRecordWatchSessions.clear();
+  GLOBALS.ServerRecordPlaybackContexts.clear();
+  const makeExecution = (nodeName, method, proxyPath, search = "", traits = {}) => {
+    const url = `https://proxy.test${proxyPath}${search}`;
+    return {
+      nodeName,
+      node: { serverRecord: { enabled: true } },
+      startTime: 123_456,
+      requestMethod: method,
+      proxyPath,
+      requestUrl: new URL(url),
+      request: new Request(url, {
+        method,
+        headers: { "X-Emby-Device-Id": "device-context" }
+      }),
+      requestTraits: traits,
+      env: { DB: {} },
+      ctx: { waitUntil(task) { tasks.push(task); } }
+    };
+  };
+  const detailPayload = {
+    Id: "episode-context",
+    Name: "Context episode",
+    Type: "Episode",
+    SeriesName: "Context series",
+    ImageTags: { Primary: "context-poster" }
+  };
+  const detailExecution = () => makeExecution(
+    "server-a",
+    "GET",
+    "/Users/user-a/Items/episode-context",
+    "?DeviceId=device-context"
+  );
+  const playbackExecution = () => makeExecution(
+    "server-a",
+    "POST",
+    "/Items/episode-context/PlaybackInfo",
+    "?IsPlayback=true&DeviceId=device-context",
+    { isPlaybackInfoRequest: true }
+  );
+  const lifecycleExecution = () => makeExecution(
+    "server-a",
+    "POST",
+    "/Sessions/Playing",
+    "?DeviceId=device-context",
+    { isPlaybackStartedRequest: true }
+  );
+  const lifecycleTransport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: JSON.stringify({ SessionId: "context-session", DeviceId: "device-context" }),
+    newHeaders: new Headers({ "Content-Type": "text/plain" })
+  };
+  try {
+    assert.equal(
+      Proxy.observeServerRecordPlaybackItemDetails(
+        detailExecution(),
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+      ),
+      true
+    );
+    await Promise.all(tasks.splice(0));
+    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
+
+    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    const verified = Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport);
+    assert.deepEqual(verified, {
+      itemId: "episode-context",
+      itemName: "Context episode",
+      itemType: "Episode",
+      seriesName: "Context series",
+      imageTag: "context-poster"
+    });
+    const lifecycle = lifecycleExecution();
+    assert.equal(Proxy.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
+    await Promise.all(tasks.splice(0));
+    assert.equal(writes.length, 1);
+    assert.deepEqual(writes[0].media, verified);
+    assert.equal(lifecycle.serverWatchLifecycleDiagnostic.decision, "fallback_playback_context");
+
+    const directLifecycle = lifecycleExecution();
+    const directTransport = {
+      ...lifecycleTransport,
+      preparedBodyText: JSON.stringify({
+        SessionId: "context-session-direct",
+        DeviceId: "device-context",
+        ItemId: "episode-context",
+        ItemName: "Event title"
+      })
+    };
+    assert.equal(Proxy.scheduleServerWatchLifecycle(directLifecycle, directTransport), true);
+    await Promise.all(tasks.splice(0));
+    assert.equal(writes.length, 2);
+    assert.deepEqual(writes[1].media, {
+      ...verified,
+      itemName: "Event title"
+    });
+    assert.equal(directLifecycle.serverWatchLifecycleDiagnostic.decision, "scheduled");
+
+    GLOBALS.ServerRecordPlaybackContexts.clear();
+    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    assert.equal(
+      Proxy.observeServerRecordPlaybackItemDetails(
+        detailExecution(),
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+      ),
+      true
+    );
+    await Promise.all(tasks.splice(0));
+    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport)?.itemId, "episode-context");
+
+    GLOBALS.ServerRecordPlaybackContexts.clear();
+    assert.equal(
+      Proxy.observeServerRecordPlaybackItemDetails(
+        detailExecution(),
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+      ),
+      true
+    );
+    assert.equal(
+      Proxy.observeServerRecordPlaybackItemDetails(
+        makeExecution("server-a", "GET", "/Items/episode-context/Images/Primary", "?DeviceId=device-context"),
+        new Response("image", { headers: { "Content-Type": "image/jpeg" } })
+      ),
+      false
+    );
+    await Promise.all(tasks.splice(0));
+    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    assert.equal(
+      Proxy.getServerRecordPlaybackContextMedia(
+        makeExecution("server-b", "POST", "/Sessions/Playing", "?DeviceId=device-context", { isPlaybackStartedRequest: true }),
+        lifecycleTransport
+      ),
+      null
+    );
+    assert.equal(
+      Proxy.getServerRecordPlaybackContextMedia(
+        makeExecution("server-a", "POST", "/Sessions/Playing", "?DeviceId=other-device", { isPlaybackStartedRequest: true }),
+        { ...lifecycleTransport, preparedBodyText: JSON.stringify({ DeviceId: "other-device" }) }
+      ),
+      null
+    );
+    assert.equal(
+      Proxy.observeServerRecordPlaybackItemDetails(
+        detailExecution(),
+        new Response("not-json", { headers: { "Content-Type": "text/plain" } })
+      ),
+      false
+    );
+  } finally {
+    Database.upsertServerWatchLifecycle = originalUpsert;
+    GLOBALS.ServerRecordWatchSessions.clear();
+    GLOBALS.ServerRecordPlaybackContexts.clear();
+  }
+});
+
+test("server watch lifecycle records Playing, dedupes Progress, and finalizes STOP", async () => {
+  const tasks = [];
+  const writes = [];
+  const originalUpsert = Database.upsertServerWatchLifecycle;
+  Database.upsertServerWatchLifecycle = async (_db, event) => {
+    writes.push(event);
+    return { admitted: true, schemaVersion: 9 };
+  };
+  GLOBALS.ServerRecordWatchSessions.clear();
+  const makeExecution = (nodeName, phase, options = {}) => {
+    const path = phase === "started" ? "/Sessions/Playing"
+      : phase === "progress" ? "/Sessions/Playing/Progress"
+        : phase === "stopped" ? "/Sessions/Playing/Stopped" : "/Sessions/Ping";
+    return {
+      nodeName,
+      node: { serverRecord: { enabled: options.enabled !== false } },
+      startTime: options.startTime || 123_456,
+      requestMethod: options.requestMethod || "POST",
+      requestUrl: new URL(`https://proxy.test${path}`),
+      request: new Request(`https://proxy.test${path}`, { method: options.requestMethod || "POST" }),
+      requestTraits: {
+        isPlaybackStartedRequest: phase === "started",
+        isPlaybackProgressRequest: phase === "progress",
+        isPlaybackStoppedRequest: phase === "stopped"
+      },
+      env: options.withDb === false ? {} : { DB: {} },
+      ctx: { waitUntil(task) { tasks.push(task); } }
+    };
+  };
+  const transport = body => ({
+    preparedBodyMode: "buffered",
+    newHeaders: new Headers({ "Content-Type": "text/plain" }),
+    preparedBodyText: JSON.stringify(body)
   });
   try {
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStartedRequest: true })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackProgressRequest: true })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackPingRequest: true })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { requestMethod: "GET" })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { requestMethod: "HEAD" })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { enabled: false })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }, { withDb: false })), false);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-a", { isPlaybackStoppedRequest: true }), {
-      preparedBodyMode: "buffered",
-      newHeaders: new Headers({ "Content-Type": "application/json" }),
-      preparedBodyText: JSON.stringify({
-        ItemId: "episode-1",
-        Item: {
-          Name: "Episode one",
-          Type: "Episode",
-          SeriesName: "Series one",
-          ImageTags: { Primary: "poster-1" }
-        }
-      })
-    }), true);
-    assert.equal(Proxy.scheduleServerLastWatch(makeExecution("server-b", { isPlaybackStoppedRequest: true }, { startTime: 234_567 }), {
-      preparedBodyMode: "buffered",
-      newHeaders: new Headers({ "Content-Type": "application/json" }),
-      preparedBodyText: JSON.stringify({
-        ItemId: "movie-2",
-        ItemName: "Movie two",
-        ItemType: "Movie"
-      })
-    }), true);
-    await Promise.all(tasks);
-    assert.deepEqual(writes, [
-      {
-        nodeName: "server-a",
-        lastWatchedAt: new Date(123_456).toISOString(),
-        media: {
-          itemId: "episode-1",
-          itemName: "Episode one",
-          itemType: "Episode",
-          seriesName: "Series one",
-          imageTag: "poster-1"
-        }
-      },
-      {
-        nodeName: "server-b",
-        lastWatchedAt: new Date(234_567).toISOString(),
-        media: {
-          itemId: "movie-2",
-          itemName: "Movie two",
-          itemType: "Movie",
-          seriesName: "",
-          imageTag: ""
-        }
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "ping")), false);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { requestMethod: "GET" })), false);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { enabled: false })), false);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { withDb: false })), false);
+    const startedBody = {
+      SessionId: "session-a",
+      ItemId: "episode-1",
+      Item: {
+        Name: "Episode one",
+        Type: "Episode",
+        SeriesName: "Series one",
+        ImageTags: { Primary: "poster-1" }
       }
+    };
+    const startedExecution = makeExecution("server-a", "started");
+    assert.equal(Proxy.scheduleServerWatchLifecycle(startedExecution, transport(startedBody)), true);
+    for (let index = 0; index < 200; index += 1) {
+      assert.equal(Proxy.scheduleServerWatchLifecycle(
+        makeExecution("server-a", "progress", { startTime: 124_456 + index }),
+        transport(startedBody)
+      ), false);
+    }
+    const changedItemBody = {
+      ...startedBody,
+      ItemId: "episode-2",
+      Item: { ...startedBody.Item, Name: "Episode two", ImageTags: { Primary: "poster-2" } }
+    };
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 130_000 }), transport(changedItemBody)), true);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { startTime: 234_567 }), transport({ SessionId: "session-a" })), true);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_567 }), transport(changedItemBody)), false);
+    const nextItemBody = {
+      ...startedBody,
+      ItemId: "episode-3",
+      Item: { ...startedBody.Item, Name: "Episode three", ImageTags: { Primary: "poster-3" } }
+    };
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_568 }), transport(nextItemBody)), true);
+    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-b", "progress", { startTime: 345_678 }), transport({
+      PlaySessionId: "play-b",
+      ItemId: "movie-2",
+      ItemName: "Movie two",
+      ItemType: "Movie"
+    })), true);
+    await Promise.all(tasks);
+    assert.equal(writes.length, 5);
+    assert.deepEqual(writes.map(write => [write.nodeName, write.phase, write.eventAt]), [
+      ["server-a", "started", new Date(123_456).toISOString()],
+      ["server-a", "progress", new Date(130_000).toISOString()],
+      ["server-a", "stopped", new Date(234_567).toISOString()],
+      ["server-a", "progress", new Date(235_568).toISOString()],
+      ["server-b", "progress", new Date(345_678).toISOString()]
     ]);
+    assert.notEqual(writes[0].sessionFingerprint, writes[1].sessionFingerprint);
+    assert.deepEqual(writes[2].media, writes[1].media);
+    assert.notEqual(writes[2].sessionFingerprint, writes[3].sessionFingerprint);
+    assert.match(writes[3].sessionFingerprint, /^[0-9a-f]{16}$/);
+    assert.equal(writes[0].sessionStrength, "strong");
+    assert.equal(writes[4].sessionStrength, "strong");
+    const watchLogDetail = Proxy.buildStructuredLogDetail(startedExecution, { statusCode: 200 });
+    assert.equal(watchLogDetail.watchPhase, "started");
+    assert.equal(watchLogDetail.watchDecision, "scheduled");
+    assert.equal(watchLogDetail.watchParseMode, "text_plain_json");
+    assert.equal(watchLogDetail.watchSessionStrength, "strong");
+    assert.doesNotMatch(JSON.stringify(watchLogDetail), /session-a|episode-1|Episode one|poster-1/);
     const handleSource = Proxy.handle.toString();
     const transportPosition = handleSource.indexOf("transport = await this.buildProxyRequestState");
-    const schedulePosition = handleSource.indexOf("this.scheduleServerLastWatch(execution, transport)");
+    const schedulePosition = handleSource.indexOf("this.scheduleServerWatchLifecycle(execution, transport)");
     const upstreamPosition = handleSource.indexOf("this.executeUpstreamFlow");
     assert.ok(transportPosition >= 0 && transportPosition < schedulePosition);
     assert.ok(schedulePosition < upstreamPosition);
   } finally {
-    Database.upsertServerLastWatch = originalUpsert;
+    Database.upsertServerWatchLifecycle = originalUpsert;
+    GLOBALS.ServerRecordWatchSessions.clear();
+  }
+});
+
+test("server watch access logs wait for final D1 decisions without blocking scheduling", async () => {
+  const originalUpsert = Database.upsertServerWatchLifecycle;
+  const originalLoggerRecord = Logger.record;
+  const originalConsoleError = console.error;
+  const recorded = [];
+  Logger.record = (_env, _ctx, logData) => { recorded.push(logData); };
+  console.error = () => {};
+  GLOBALS.ServerRecordWatchSessions.clear();
+  const cases = [
+    {
+      nodeName: "watch-log-v8",
+      settle(deferred) { deferred.resolve({ admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" }); },
+      expectedDecision: "schema_v8_fallback"
+    },
+    {
+      nodeName: "watch-log-deduped",
+      settle(deferred) { deferred.resolve({ admitted: false, schemaVersion: 9, reason: "deduped_or_stale" }); },
+      expectedDecision: "deduped"
+    },
+    {
+      nodeName: "watch-log-failed",
+      settle(deferred) { deferred.reject(new Error("d1 failed")); },
+      expectedDecision: "d1_unavailable"
+    }
+  ];
+  try {
+    for (const [index, testCase] of cases.entries()) {
+      const deferred = createDeferred();
+      Database.upsertServerWatchLifecycle = () => deferred.promise;
+      const tasks = [];
+      const startTime = Date.now() - 25;
+      const execution = {
+        nodeName: testCase.nodeName,
+        node: { serverRecord: { enabled: true } },
+        startTime,
+        requestMethod: "POST",
+        proxyPath: "/Sessions/Playing",
+        requestUrl: new URL("https://proxy.test/Sessions/Playing"),
+        request: new Request("https://proxy.test/Sessions/Playing", { method: "POST" }),
+        requestTraits: { isPlaybackStartedRequest: true },
+        env: { DB: {} },
+        ctx: { waitUntil(task) { tasks.push(task); } }
+      };
+      const transport = {
+        preparedBodyMode: "buffered",
+        preparedBodyText: JSON.stringify({ SessionId: `session-${index}`, ItemId: `item-${index}` }),
+        newHeaders: new Headers({ "Content-Type": "application/json" })
+      };
+      const beforeCount = recorded.length;
+      assert.equal(Proxy.scheduleServerWatchLifecycle(execution, transport), true);
+      assert.ok(execution.serverWatchLifecycleTask instanceof Promise);
+      Proxy.recordAccessLog(execution, {
+        statusCode: 200,
+        detailJson: Proxy.buildStructuredLogDetail(execution, { statusCode: 200 })
+      });
+      Proxy.recordAccessLog(execution, {
+        statusCode: 200,
+        detailJson: Proxy.buildStructuredLogDetail(execution, { statusCode: 200 })
+      });
+      assert.equal(recorded.length, beforeCount);
+      const capturedResponseTime = Date.now() - startTime;
+      testCase.settle(deferred);
+      await Promise.all(tasks);
+      assert.equal(recorded.length, beforeCount + 1);
+      assert.equal(recorded.at(-1).detailJson.watchDecision, testCase.expectedDecision);
+      assert.ok(recorded.at(-1).responseTime <= capturedResponseTime + 10);
+    }
+  } finally {
+    Database.upsertServerWatchLifecycle = originalUpsert;
+    Logger.record = originalLoggerRecord;
+    console.error = originalConsoleError;
+    GLOBALS.ServerRecordWatchSessions.clear();
   }
 });
 
 test("last-watch D1 failures stay detached from the proxy response path", async () => {
   const tasks = [];
-  const originalUpsert = Database.upsertServerLastWatch;
+  const originalUpsert = Database.upsertServerWatchLifecycle;
   const originalConsoleError = console.error;
-  Database.upsertServerLastWatch = async () => { throw new Error("d1 unavailable"); };
+  Database.upsertServerWatchLifecycle = async () => { throw new Error("d1 unavailable"); };
   console.error = () => {};
   try {
-    const scheduled = Proxy.scheduleServerLastWatch({
+    const execution = {
       nodeName: "server-a",
       node: { serverRecord: { enabled: true } },
       startTime: 123_456,
@@ -5675,11 +6063,13 @@ test("last-watch D1 failures stay detached from the proxy response path", async 
       requestTraits: { isPlaybackStoppedRequest: true },
       env: { DB: {} },
       ctx: { waitUntil(task) { tasks.push(task); } }
-    });
+    };
+    const scheduled = Proxy.scheduleServerWatchLifecycle(execution);
     assert.equal(scheduled, true);
     await assert.doesNotReject(Promise.all(tasks));
+    assert.equal(execution.serverWatchLifecycleDiagnostic.decision, "d1_unavailable");
   } finally {
-    Database.upsertServerLastWatch = originalUpsert;
+    Database.upsertServerWatchLifecycle = originalUpsert;
     console.error = originalConsoleError;
   }
 });
@@ -5961,20 +6351,26 @@ test("server record probes coalesce concurrent refreshes and back off retryable 
   }
 });
 
-test("node invalidation clears server record auth tokens without a PlaybackInfo cache entry", () => {
+test("node invalidation clears server record auth and watch sessions without a PlaybackInfo cache entry", () => {
   GLOBALS.PlaybackInfoResponseCache.clear();
   GLOBALS.ServerRecordAuthCache.clear();
+  GLOBALS.ServerRecordWatchSessions.clear();
   GLOBALS.ServerRecordAuthCache.set("server-record-auth:alpha", {
     nodeName: "alpha",
     token: "short-lived-token",
     expiresAt: Date.now() + 60000
   });
+  GLOBALS.ServerRecordWatchSessions.set("watch-alpha", { nodeName: "alpha", lastSeenAt: Date.now() });
+  GLOBALS.ServerRecordWatchSessions.set("watch-beta", { nodeName: "beta", lastSeenAt: Date.now() });
   try {
     Database.invalidateNodeCaches("alpha");
     assert.equal(GLOBALS.ServerRecordAuthCache.has("server-record-auth:alpha"), false);
+    assert.equal(GLOBALS.ServerRecordWatchSessions.has("watch-alpha"), false);
+    assert.equal(GLOBALS.ServerRecordWatchSessions.has("watch-beta"), true);
   } finally {
     GLOBALS.PlaybackInfoResponseCache.clear();
     GLOBALS.ServerRecordAuthCache.clear();
+    GLOBALS.ServerRecordWatchSessions.clear();
   }
 });
 

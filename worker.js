@@ -221,6 +221,10 @@ const MEDIA_AGGREGATION_RESPONSE_MAX_BYTES = CACHE_DEFAULTS.MediaAggregationResp
 const DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgressForwardIntervalSec;
 const DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES = CACHE_DEFAULTS.VideoProgressSnapshotMaxBytes;
 const DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnapshotTtlMs;
+const SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
+const SERVER_RECORD_WATCH_TERMINAL_TTL_MS = 10 * 60 * 1000;
+const SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS = 12 * 60 * 60 * 1000;
+const SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const SERVER_RECORDS_PROBE_TIMEOUT_MS = 8000;
 const SERVER_RECORD_POSTER_CONTENT_TYPES = new Set([
   "image/avif",
@@ -309,6 +313,8 @@ const GLOBAL_CACHE_STATE = {
   ServerRecordAuthCache: new Map(),
   ServerRecordProbeBackoff: new Map(),
   PlaybackProgressRelay: new Map(),
+  ServerRecordWatchSessions: new Map(),
+  ServerRecordPlaybackContexts: new Map(),
   ServerRecordsSnapshotCache: new Map(),
   DashboardMonthlyTrafficCache: new Map(),
   SingleFlightTasks: new Map(),
@@ -1947,6 +1953,15 @@ function extractPlaybackInfoItemPathState(proxyPath = "") {
       return safeItemId ? `${match[1]}${safeItemId}${match[3]}` : normalizedPath;
     }
   };
+}
+
+function extractUserItemDetailsPathState(proxyPath = "") {
+  const normalizedPath = sanitizeProxyPath(proxyPath);
+  const match = /^(?:.*\/)?users\/[^/]+\/items\/([^/]+)\/?$/i.exec(normalizedPath);
+  if (!match) return { itemId: "" };
+  let itemId = String(match[1] || "").trim();
+  try { itemId = decodeURIComponent(itemId); } catch {}
+  return { itemId };
 }
 
 function resolveMediaAggregationApiPrefix(proxyPath = "") {
@@ -3785,6 +3800,28 @@ function invalidatePlaybackProgressRelayForNodes(nodeNames = []) {
   }
 }
 
+function invalidateServerRecordWatchSessionsForNodes(nodeNames = []) {
+  const normalizedNames = normalizeNodeNameSet(nodeNames);
+  if (!normalizedNames.size) return;
+  const sessions = GLOBALS.ServerRecordWatchSessions;
+  if (!(sessions instanceof Map) || sessions.size <= 0) return;
+  for (const [sessionKey, entry] of sessions.entries()) {
+    const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+    if (entryNodeName && normalizedNames.has(entryNodeName)) sessions.delete(sessionKey);
+  }
+}
+
+function invalidateServerRecordPlaybackContextsForNodes(nodeNames = []) {
+  const normalizedNames = normalizeNodeNameSet(nodeNames);
+  if (!normalizedNames.size) return;
+  const contexts = GLOBALS.ServerRecordPlaybackContexts;
+  if (!(contexts instanceof Map) || contexts.size <= 0) return;
+  for (const [contextKey, entry] of contexts.entries()) {
+    const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
+    if (entryNodeName && normalizedNames.has(entryNodeName)) contexts.delete(contextKey);
+  }
+}
+
 function buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath = "/", options = {}) {
   try {
     const identityPartition = String(options.identityPartition || "").trim();
@@ -3928,6 +3965,17 @@ function hashStableText(input = "") {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(36);
+}
+
+function hashServerWatchFingerprint(input = "") {
+  const bytes = new TextEncoder().encode(String(input || ""));
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  for (const byte of bytes) {
+    hash ^= BigInt(byte);
+    hash = BigInt.asUintN(64, hash * prime);
+  }
+  return hash.toString(16).padStart(16, "0");
 }
 
 async function sha256HexText(input = "") {
@@ -10036,11 +10084,24 @@ const CacheManager = {
       cleanMap(GLOBALS.PlaybackProgressRelay, v => {
         if (!v || v.pendingSnapshot || v.activeFlushPromise) return !v;
         const terminalUntil = Number(v.terminalTombstoneUntil) || 0;
-        if (terminalUntil > 0) return terminalUntil <= now;
+        if (terminalUntil > 0) return terminalUntil < now;
         const touchedAt = Number(v.lastTouchedAt || v.lastForwardAt) || 0;
         return touchedAt > 0 && (touchedAt + staleWindowMs) <= now;
       }, "progress");
       state.phase = 8;
+    } else if (state.phase === 8) {
+      cleanMap(GLOBALS.ServerRecordWatchSessions, v => {
+        if (!v || typeof v !== "object") return true;
+        const terminalUntil = Number(v.terminalUntil) || 0;
+        if (terminalUntil > 0) return terminalUntil <= now;
+        const touchedAt = Number(v.lastSeenAt || v.firstSeenAt) || 0;
+        return touchedAt > 0 && (touchedAt + SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS) <= now;
+      }, "serverRecordWatch");
+      cleanMap(GLOBALS.ServerRecordPlaybackContexts, v => {
+        const expiresAt = Number(v?.expiresAt) || 0;
+        return !v || expiresAt <= now;
+      }, "serverRecordPlaybackContext");
+      state.phase = 9;
     } else {
       cleanMap(GLOBALS.DashboardMonthlyTrafficCache, v => !v || (Number(v.staleUntil) || 0) <= now, "monthlyTraffic");
       state.phase = 0;
@@ -10720,7 +10781,7 @@ const Database = {
   DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
   DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
   DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
-  D1_SCHEMA_VERSION: 8,
+  D1_SCHEMA_VERSION: 9,
   D1_MIGRATIONS_TABLE: "d1_migrations",
   D1_REQUIRED_MIGRATIONS: [
     "0001_d1_fresh_baseline",
@@ -10728,7 +10789,8 @@ const Database = {
     "0003_d1_schema_v5_indexes",
     "0004_server_watch_stats",
     "0005_server_record_snapshots",
-    "0006_server_record_poster_cache"
+    "0006_server_record_poster_cache",
+    "0007_server_watch_lifecycle"
   ],
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
@@ -10927,6 +10989,9 @@ const Database = {
       },
       [this.SERVER_LAST_WATCH_TABLE]: {
         last_watched_at: "TEXT NOT NULL DEFAULT ''",
+        playback_session_fingerprint: "TEXT NOT NULL DEFAULT ''",
+        playback_session_strength: "TEXT NOT NULL DEFAULT ''",
+        playback_event_phase: "TEXT NOT NULL DEFAULT 'stopped'",
         updated_at: "TEXT NOT NULL DEFAULT ''"
       },
       [this.SERVER_RECORD_SNAPSHOT_TABLE]: {
@@ -11574,7 +11639,10 @@ const Database = {
       [this.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo", "probe_status", "latency_ms", "cf_ray", "colo_code", "city_name", "country_code", "country_name", "probed_at", "expires_at"],
       [this.LOGS_TABLE]: ["id", "timestamp", "node_name", "request_path", "request_method", "status_code", "response_time", "client_ip", "inbound_colo", "outbound_colo", "user_agent", "referer", "category", "error_detail", "detail_json", "created_at", "inbound_ip", "outbound_ip"],
       [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour", "request_count", "play_count", "playback_info_count", "updated_at"],
-      [this.SERVER_LAST_WATCH_TABLE]: ["node_name", "last_watched_at", "updated_at"],
+      [this.SERVER_LAST_WATCH_TABLE]: [
+        "node_name", "last_watched_at", "playback_session_fingerprint",
+        "playback_session_strength", "playback_event_phase", "updated_at"
+      ],
       [this.SERVER_RECORD_SNAPSHOT_TABLE]: [
         "node_name", "movie_count", "series_count", "episode_count", "counts_state",
         "counts_errors_json", "stats_checked_at", "last_item_id", "last_item_name",
@@ -12115,6 +12183,9 @@ const Database = {
       initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SERVER_LAST_WATCH_TABLE} (
         node_name TEXT PRIMARY KEY,
         last_watched_at TEXT NOT NULL,
+        playback_session_fingerprint TEXT NOT NULL DEFAULT '',
+        playback_session_strength TEXT NOT NULL DEFAULT '',
+        playback_event_phase TEXT NOT NULL DEFAULT 'stopped',
         updated_at TEXT NOT NULL
       )`).run().then(() => {
         this.markD1SchemaReady(db, "serverLastWatchSchema");
@@ -12243,6 +12314,127 @@ const Database = {
       .bind(normalizedName, itemId, itemName, itemType, seriesName, imageTag, watchedAt, updatedAt);
     await db.batch([lastWatchStatement, snapshotStatement]);
     return true;
+  },
+  async hasServerWatchLifecycleSchema(db) {
+    if (!db) return false;
+    if (this.isD1SchemaReadyCached(db, "serverWatchLifecycleSchema")) return true;
+    const columns = await this.getTableColumns(db, this.SERVER_LAST_WATCH_TABLE);
+    const ready = [
+      "playback_session_fingerprint",
+      "playback_session_strength",
+      "playback_event_phase"
+    ].every(name => columns.has(name));
+    if (ready) this.markD1SchemaReady(db, "serverWatchLifecycleSchema");
+    return ready;
+  },
+  async upsertServerWatchLifecycle(db, event = {}) {
+    const nodeName = String(event?.nodeName || "").trim().toLowerCase();
+    const eventAtMs = Date.parse(String(event?.eventAt || "").trim());
+    const phaseValue = String(event?.phase || "").trim().toLowerCase();
+    const phase = ["started", "progress", "stopped"].includes(phaseValue) ? phaseValue : "";
+    const sessionFingerprint = String(event?.sessionFingerprint || "").trim().slice(0, 128);
+    const strengthValue = String(event?.sessionStrength || "").trim().toLowerCase();
+    const sessionStrength = strengthValue === "strong" ? "strong" : "weak";
+    const media = isPlainObject(event?.media) ? event.media : {};
+    const itemId = String(media.itemId || "").trim().slice(0, 256);
+    if (!db || !nodeName || !phase || !Number.isFinite(eventAtMs)) {
+      return { admitted: false, schemaVersion: null, reason: "invalid_event" };
+    }
+    if (phase !== "stopped" && !itemId) {
+      return { admitted: false, schemaVersion: null, reason: "item_id_missing" };
+    }
+    const eventAt = new Date(eventAtMs).toISOString();
+    await this.ensureServerLastWatchSchema(db);
+    await this.ensureServerRecordSnapshotSchema(db);
+    if (!await this.hasServerWatchLifecycleSchema(db)) {
+      if (phase === "progress") {
+        return { admitted: false, schemaVersion: 8, reason: "schema_v8_progress_disabled" };
+      }
+      await this.upsertServerLastWatch(db, nodeName, eventAt, media);
+      return { admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" };
+    }
+    const updatedAt = new Date().toISOString();
+    const itemName = String(media.itemName || "").trim().slice(0, 256);
+    const itemType = String(media.itemType || "").trim().slice(0, 64);
+    const seriesName = String(media.seriesName || "").trim().slice(0, 256);
+    const imageTag = String(media.imageTag || "").trim().slice(0, 256);
+    const terminalCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_TERMINAL_TTL_MS).toISOString();
+    const abandonedCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS).toISOString();
+    const lastWatchStatement = db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+      node_name, last_watched_at, playback_session_fingerprint,
+      playback_session_strength, playback_event_phase, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(node_name) DO UPDATE SET
+      last_watched_at = excluded.last_watched_at,
+      playback_session_fingerprint = excluded.playback_session_fingerprint,
+      playback_session_strength = excluded.playback_session_strength,
+      playback_event_phase = excluded.playback_event_phase,
+      updated_at = excluded.updated_at
+    WHERE excluded.last_watched_at > ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at
+      AND (
+        ? = 'stopped'
+        OR (? = 'started' AND (
+          ? = 'weak'
+          OR excluded.playback_session_fingerprint != ${this.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint
+        ))
+        OR (? = 'strong' AND excluded.playback_session_fingerprint != ${this.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint)
+        OR (? = 'weak' AND (
+          excluded.playback_session_fingerprint != ${this.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint
+          OR (${this.SERVER_LAST_WATCH_TABLE}.playback_event_phase = 'stopped' AND ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at < ?)
+          OR (${this.SERVER_LAST_WATCH_TABLE}.playback_event_phase != 'stopped' AND ${this.SERVER_LAST_WATCH_TABLE}.last_watched_at < ?)
+        ))
+      )`).bind(
+      nodeName,
+      eventAt,
+      sessionFingerprint,
+      sessionStrength,
+      phase,
+      updatedAt,
+      phase,
+      phase,
+      sessionStrength,
+      sessionStrength,
+      sessionStrength,
+      terminalCutoff,
+      abandonedCutoff
+    );
+    const snapshotStatement = db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
+      node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
+      last_item_image_tag, last_item_watched_at, updated_at
+    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?
+    WHERE changes() > 0 AND EXISTS (
+      SELECT 1 FROM ${this.SERVER_LAST_WATCH_TABLE}
+      WHERE node_name = ? AND last_watched_at = ?
+        AND playback_session_fingerprint = ? AND playback_event_phase = ?
+    )
+    ON CONFLICT(node_name) DO UPDATE SET
+      last_item_id = excluded.last_item_id,
+      last_item_name = excluded.last_item_name,
+      last_item_type = excluded.last_item_type,
+      last_item_series_name = excluded.last_item_series_name,
+      last_item_image_tag = excluded.last_item_image_tag,
+      last_item_watched_at = excluded.last_item_watched_at,
+      updated_at = excluded.updated_at`).bind(
+      nodeName,
+      itemId,
+      itemName,
+      itemType,
+      seriesName,
+      imageTag,
+      eventAt,
+      updatedAt,
+      nodeName,
+      eventAt,
+      sessionFingerprint,
+      phase
+    );
+    const results = await db.batch([lastWatchStatement, snapshotStatement]);
+    const changes = Number(results?.[0]?.meta?.changes ?? results?.[0]?.changes ?? 0) || 0;
+    return {
+      admitted: changes > 0,
+      schemaVersion: this.D1_SCHEMA_VERSION,
+      reason: changes > 0 ? "admitted" : "deduped_or_stale"
+    };
   },
   async getServerLastWatch(db, nodeNames = []) {
     const names = this.normalizeNodeIndex(nodeNames);
@@ -12463,14 +12655,19 @@ const Database = {
   },
   async readServerRecordNodeLifecycleRows(db, nodeNames = []) {
     const names = this.normalizeNodeIndex(nodeNames);
-    const rows = { lastWatch: [], snapshots: [], posterCache: [] };
+    const rows = { lastWatch: [], snapshots: [], posterCache: [], watchLifecycleSchemaReady: false };
     if (!db || names.length === 0) return rows;
     await this.ensureServerLastWatchSchema(db);
     await this.ensureServerRecordSnapshotSchema(db);
     await this.ensureServerRecordPosterCacheSchema(db);
+    const watchLifecycleSchemaReady = await this.hasServerWatchLifecycleSchema(db);
+    rows.watchLifecycleSchemaReady = watchLifecycleSchemaReady;
     const placeholders = names.map(() => "?").join(", ");
     const [lastWatchRows, snapshotRows, posterCacheRows] = await Promise.all([
-      db.prepare(`SELECT node_name, last_watched_at, updated_at
+      db.prepare(`SELECT node_name, last_watched_at,
+        ${watchLifecycleSchemaReady ? "playback_session_fingerprint" : "'' AS playback_session_fingerprint"},
+        ${watchLifecycleSchemaReady ? "playback_session_strength" : "'' AS playback_session_strength"},
+        ${watchLifecycleSchemaReady ? "playback_event_phase" : "'stopped' AS playback_event_phase"}, updated_at
         FROM ${this.SERVER_LAST_WATCH_TABLE}
         WHERE node_name IN (${placeholders})`).bind(...names).all(),
       db.prepare(`SELECT
@@ -12521,6 +12718,9 @@ const Database = {
       ? {
           node_name: nextName,
           last_watched_at: watchedAt,
+          playback_session_fingerprint: String(newestWatch.playback_session_fingerprint || "").trim(),
+          playback_session_strength: String(newestWatch.playback_session_strength || "").trim(),
+          playback_event_phase: String(newestWatch.playback_event_phase || "stopped").trim() || "stopped",
           updated_at: String(newestWatch.updated_at || new Date().toISOString()).trim()
         }
       : null;
@@ -12559,10 +12759,26 @@ const Database = {
       db.prepare(`DELETE FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE} WHERE node_name IN (${placeholders})`).bind(...names)
     ];
     for (const row of Array.isArray(before?.lastWatch) ? before.lastWatch : []) {
+      const values = [
+        String(row?.node_name || "").trim().toLowerCase(),
+        String(row?.last_watched_at || "").trim()
+      ];
+      if (before?.watchLifecycleSchemaReady === true) {
+        values.push(
+          String(row?.playback_session_fingerprint || "").trim(),
+          String(row?.playback_session_strength || "").trim(),
+          String(row?.playback_event_phase || "stopped").trim() || "stopped"
+        );
+      }
+      values.push(String(row?.updated_at || "").trim());
+      const lifecycleColumns = before?.watchLifecycleSchemaReady === true
+        ? ", playback_session_fingerprint, playback_session_strength, playback_event_phase"
+        : "";
+      const lifecyclePlaceholders = before?.watchLifecycleSchemaReady === true ? ", ?, ?, ?" : "";
       statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
-        node_name, last_watched_at, updated_at
-      ) VALUES (?, ?, ?)`)
-        .bind(String(row?.node_name || "").trim().toLowerCase(), String(row?.last_watched_at || "").trim(), String(row?.updated_at || "").trim()));
+        node_name, last_watched_at${lifecycleColumns}, updated_at
+      ) VALUES (?, ?${lifecyclePlaceholders}, ?)`)
+        .bind(...values));
     }
     for (const row of Array.isArray(before?.snapshots) ? before.snapshots : []) {
       statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
@@ -12618,10 +12834,25 @@ const Database = {
     if (lifecycle.type === "rename") {
       const merged = this.buildMergedServerRecordLifecycleRows(lifecycle, before);
       if (merged.lastWatch) {
-        statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
-          node_name, last_watched_at, updated_at
-        ) VALUES (?, ?, ?)`)
-          .bind(merged.lastWatch.node_name, merged.lastWatch.last_watched_at, merged.lastWatch.updated_at));
+        if (before.watchLifecycleSchemaReady === true) {
+          statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+            node_name, last_watched_at, playback_session_fingerprint,
+            playback_session_strength, playback_event_phase, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`)
+            .bind(
+              merged.lastWatch.node_name,
+              merged.lastWatch.last_watched_at,
+              merged.lastWatch.playback_session_fingerprint,
+              merged.lastWatch.playback_session_strength,
+              merged.lastWatch.playback_event_phase,
+              merged.lastWatch.updated_at
+            ));
+        } else {
+          statements.push(db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
+            node_name, last_watched_at, updated_at
+          ) VALUES (?, ?, ?)`)
+            .bind(merged.lastWatch.node_name, merged.lastWatch.last_watched_at, merged.lastWatch.updated_at));
+        }
       }
       if (merged.snapshot) {
         statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
@@ -12688,6 +12919,8 @@ const Database = {
     }
     if (normalizedScope === "all") {
       this.clearD1SchemaReady(db);
+      GLOBALS.ServerRecordWatchSessions.clear();
+      GLOBALS.ServerRecordPlaybackContexts.clear();
       const opsStatusState = GLOBALS.OpsStatusShadowCache.get(db);
       if (opsStatusState?.payloadCache instanceof Map) opsStatusState.payloadCache.clear();
       GLOBALS.AdminShellStatusWriteState.delete(db);
@@ -15770,6 +16003,8 @@ const Database = {
       invalidateNodeCacheTokens(normalizedNames);
       invalidatePlaybackInfoResponseCacheForNodes(normalizedNames);
       invalidatePlaybackProgressRelayForNodes(normalizedNames);
+      invalidateServerRecordWatchSessionsForNodes(normalizedNames);
+      invalidateServerRecordPlaybackContextsForNodes(normalizedNames);
     }
     if (options.invalidateList) {
       GLOBALS.NodesListCache = null;
@@ -26062,6 +26297,10 @@ const Proxy = {
       progressIntervalSec: Number.isFinite(Number(options.progressIntervalSec))
         ? Math.max(0, Math.trunc(Number(options.progressIntervalSec)))
         : Math.max(0, Math.trunc(Number(execution?.videoProgressForwardIntervalSec) || 0)),
+      watchPhase: String(execution?.serverWatchLifecycleDiagnostic?.phase || "").trim() || null,
+      watchDecision: String(execution?.serverWatchLifecycleDiagnostic?.decision || "").trim() || null,
+      watchParseMode: String(execution?.serverWatchLifecycleDiagnostic?.parseMode || "").trim() || null,
+      watchSessionStrength: String(execution?.serverWatchLifecycleDiagnostic?.sessionStrength || "").trim() || null,
       rangeRequest: !!String(execution?.request?.headers?.get("Range") || "").trim(),
       upstreamHost: String(options.upstreamHost || options.upstreamUrlHost || options.finalUrl?.hostname || "").trim(),
       upstreamStatus
@@ -26729,7 +26968,7 @@ const Proxy = {
     throw lastError || new Error("upstream_fetch_failed");
   },
   recordAccessLog(execution, payload = {}) {
-    Logger.record(execution.env, execution.ctx, {
+    const logData = {
       nodeName: execution.nodeName,
       requestPath: execution.proxyPath,
       requestMethod: execution.requestMethod,
@@ -26740,7 +26979,32 @@ const Proxy = {
       userAgent: execution.request.headers.get("User-Agent"),
       referer: execution.request.headers.get("Referer"),
       ...payload
-    });
+    };
+    const record = () => {
+      const diagnostic = execution?.serverWatchLifecycleDiagnostic;
+      if (diagnostic && isPlainObject(logData.detailJson)) {
+        logData.detailJson = {
+          ...logData.detailJson,
+          watchPhase: String(diagnostic.phase || "").trim() || null,
+          watchDecision: String(diagnostic.decision || "").trim() || null,
+          watchParseMode: String(diagnostic.parseMode || "").trim() || null,
+          watchSessionStrength: String(diagnostic.sessionStrength || "").trim() || null
+        };
+      }
+      Logger.record(execution.env, execution.ctx, logData);
+    };
+    const lifecycleTask = execution?.serverWatchLifecycleTask;
+    if (lifecycleTask) {
+      if (execution?.serverWatchAccessLogScheduled === true) return;
+      execution.serverWatchAccessLogScheduled = true;
+      if (execution?.serverWatchLifecycleDiagnostic?.finalized !== true
+        && execution?.ctx && typeof execution.ctx.waitUntil === "function") {
+        const deferredLogTask = Promise.resolve(lifecycleTask).catch(() => {}).then(record);
+        execution.ctx.waitUntil(deferredLogTask);
+        return;
+      }
+    }
+    record();
   },
   async flushCriticalLogsIfNeeded(execution) {
     const requestTraits = execution?.requestTraits || {};
@@ -27218,6 +27482,7 @@ const Proxy = {
     execution.mediaAggregationDiagnostic = cacheEntry?.mediaAggregationDiagnostic && typeof cacheEntry.mediaAggregationDiagnostic === "object"
       ? cacheEntry.mediaAggregationDiagnostic
       : execution.mediaAggregationDiagnostic;
+    this.recordServerRecordPlaybackInfoIntent(execution, transport);
     const cachedResponse = new Response(
       execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""),
       {
@@ -27277,7 +27542,9 @@ const Proxy = {
     const result = {
       query: queryPayload,
       body: {},
-      parseError: false
+      parseError: false,
+      parseMode: "query_only",
+      parseErrorReason: ""
     };
     const requestMethod = execution.requestMethod;
     if (requestMethod === "GET" || requestMethod === "HEAD") {
@@ -27286,6 +27553,8 @@ const Proxy = {
     }
     if (transport?.preparedBodyMode === "stream") {
       result.parseError = true;
+      result.parseMode = "stream";
+      result.parseErrorReason = "unbuffered_body";
       if (execution) execution.playbackSessionControlPayload = result;
       return result;
     }
@@ -27295,10 +27564,14 @@ const Proxy = {
       return result;
     }
     const contentType = String(transport?.newHeaders?.get("Content-Type") || execution?.request?.headers?.get("Content-Type") || "").toLowerCase();
+    const mimeType = contentType.split(";", 1)[0].trim();
     try {
-      if (contentType.includes("application/json")) {
-        result.body = normalizeCaseInsensitiveObject(JSON.parse(rawBodyText));
-      } else if (contentType.includes("application/x-www-form-urlencoded")) {
+      if (mimeType === "application/json" || mimeType === "text/json" || mimeType === "text/plain" || /^application\/[a-z0-9!#$&^_.+-]+\+json$/i.test(mimeType)) {
+        const parsedBody = JSON.parse(rawBodyText);
+        if (!isPlainObject(parsedBody)) throw new TypeError("playback_control_body_not_object");
+        result.body = normalizeCaseInsensitiveObject(parsedBody);
+        result.parseMode = mimeType === "text/plain" ? "text_plain_json" : "json";
+      } else if (mimeType === "application/x-www-form-urlencoded") {
         const formPayload = {};
         for (const [key, value] of new URLSearchParams(rawBodyText).entries()) {
           const normalizedKey = String(key || "").trim().toLowerCase();
@@ -27306,9 +27579,16 @@ const Proxy = {
           formPayload[normalizedKey] = value;
         }
         result.body = formPayload;
+        result.parseMode = "form";
+      } else {
+        result.parseError = true;
+        result.parseMode = "unsupported";
+        result.parseErrorReason = "unsupported_content_type";
       }
     } catch {
       result.parseError = true;
+      result.parseMode = mimeType === "text/plain" ? "text_plain_invalid" : "invalid";
+      result.parseErrorReason = "invalid_body";
     }
     if (execution) execution.playbackSessionControlPayload = result;
     return result;
@@ -27327,10 +27607,20 @@ const Proxy = {
     const itemId = pickValue(["ItemId"]);
     const nodeName = String(execution?.nodeName || "unknown").trim().toLowerCase() || "unknown";
     let sessionKey = "";
-    if (sessionId) sessionKey = `session:${sessionId}`;
-    else if (playSessionId) sessionKey = `play:${playSessionId}`;
-    else if (deviceId && itemId) sessionKey = `device-item:${deviceId}:${itemId}`;
-    else {
+    let sessionIdentity = "";
+    let sessionStrength = "weak";
+    if (sessionId) {
+      sessionKey = `session:${sessionId}`;
+      sessionIdentity = `session:${sessionId}`;
+      sessionStrength = "strong";
+    } else if (playSessionId) {
+      sessionKey = `play:${playSessionId}`;
+      sessionIdentity = `play:${playSessionId}`;
+      sessionStrength = "strong";
+    } else if (deviceId) {
+      sessionKey = `device-item:${deviceId}:${itemId}`;
+      sessionIdentity = `device:${deviceId}`;
+    } else {
       const requestHeaders = execution?.request?.headers;
       const credentialIdentity = [
         requestHeaders?.get?.("Authorization"),
@@ -27341,16 +27631,21 @@ const Proxy = {
         execution?.clientIp,
         itemId
       ].map(value => String(value || "").trim()).join("|");
-      sessionKey = `fallback:${hashStableText(credentialIdentity)}`;
+      sessionKey = `fallback:${hashServerWatchFingerprint(credentialIdentity)}`;
+      sessionIdentity = sessionKey;
     }
+    const sessionIdentityFingerprint = hashServerWatchFingerprint(`${nodeName}|${sessionIdentity}`);
     return {
       sessionKey: `${nodeName}|${sessionKey}`,
+      sessionIdentityFingerprint,
+      sessionFingerprint: hashServerWatchFingerprint(`${sessionIdentityFingerprint}|${itemId}`),
+      sessionStrength,
+      itemId,
       parseError: parsedPayload.parseError === true
     };
   },
   resolveServerLastWatchMedia(execution, transport = null) {
     const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
-    if (parsedPayload.parseError === true) return {};
     const rawItem = getCaseInsensitivePayloadValue(parsedPayload.body, ["Item"]);
     const item = normalizeCaseInsensitiveObject(isPlainObject(rawItem) ? rawItem : {});
     const imageTags = normalizeCaseInsensitiveObject(isPlainObject(item.imagetags) ? item.imagetags : {});
@@ -27367,24 +27662,312 @@ const Proxy = {
       imageTag: String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(item, ["PrimaryImageTag"]) || "").trim()
     };
   },
-  scheduleServerLastWatch(execution, transport = null) {
-    if (execution?.requestTraits?.isPlaybackStoppedRequest !== true) return false;
+  resolveServerRecordPlaybackContextKeys(execution, transport = null) {
+    const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
+    if (!nodeName) return [];
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    const pick = names => {
+      const fromQuery = getCaseInsensitivePayloadValue(parsedPayload.query, names);
+      if (String(fromQuery || "").trim()) return String(fromQuery).trim();
+      const fromBody = getCaseInsensitivePayloadValue(parsedPayload.body, names);
+      return String(fromBody || "").trim();
+    };
+    const requestHeaders = execution?.request?.headers;
+    const deviceId = pick(["DeviceId"])
+      || String(requestHeaders?.get?.("X-Emby-Device-Id") || requestHeaders?.get?.("X-Emby-DeviceId") || "").trim();
+    const identities = [
+      ["session", pick(["SessionId"])],
+      ["play", pick(["PlaySessionId", "CurrentPlaySessionId"])],
+      ["device", deviceId]
+    ];
+    const keys = new Set();
+    for (const [kind, value] of identities) {
+      if (!value) continue;
+      keys.add(`${nodeName}|${kind}:${hashServerWatchFingerprint(value)}`);
+    }
+    return [...keys];
+  },
+  cleanupServerRecordPlaybackContexts(now = nowMs()) {
+    const contexts = GLOBALS.ServerRecordPlaybackContexts;
+    if (!(contexts instanceof Map)) return;
+    for (const [contextKey, entry] of contexts.entries()) {
+      if ((Number(entry?.expiresAt) || 0) <= now) contexts.delete(contextKey);
+    }
+  },
+  updateServerRecordPlaybackContexts(execution, transport, update) {
+    const contextKeys = this.resolveServerRecordPlaybackContextKeys(execution, transport);
+    if (!contextKeys.length || typeof update !== "function") return false;
+    const contexts = GLOBALS.ServerRecordPlaybackContexts;
+    if (!(contexts instanceof Map)) return false;
+    const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
+    const now = nowMs();
+    this.cleanupServerRecordPlaybackContexts(now);
+    const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+    for (const contextKey of contextKeys) {
+      const existing = contexts.get(contextKey);
+      const next = update(
+        existing && Number(existing.expiresAt) > now ? existing : null,
+        now,
+        nodeName
+      );
+      if (!next || typeof next !== "object") continue;
+      setBoundedMapEntry(contexts, contextKey, {
+        ...next,
+        nodeName,
+        lastSeenAt: now,
+        expiresAt: now + SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS
+      }, maxEntries);
+    }
+    return true;
+  },
+  recordServerRecordPlaybackInfoIntent(execution, transport = null) {
+    if (execution?.requestTraits?.isPlaybackInfoRequest !== true
+      || String(execution?.requestMethod || "").toUpperCase() !== "POST"
+      || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+    const isPlayback = [...(execution?.requestUrl?.searchParams?.entries?.() || [])]
+      .some(([key, value]) => String(key || "").trim().toLowerCase() === "isplayback" && String(value || "").trim().toLowerCase() === "true");
+    const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim();
+    if (!isPlayback || !itemId) return false;
+    return this.updateServerRecordPlaybackContexts(execution, transport, (existing, now) => {
+      const details = existing?.details && String(existing.details.itemId || "") === itemId
+        ? existing.details
+        : null;
+      return {
+        intent: { itemId, observedAt: now },
+        details,
+        verifiedMedia: details?.media || null
+      };
+    });
+  },
+  buildServerRecordPlaybackContextMedia(payload, expectedItemId = "") {
+    const item = normalizeCaseInsensitiveObject(isPlainObject(payload) ? payload : {});
+    const itemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim();
+    if (!itemId || itemId !== String(expectedItemId || "").trim()) return null;
+    const imageTags = normalizeCaseInsensitiveObject(isPlainObject(item.imagetags) ? item.imagetags : {});
+    return {
+      itemId,
+      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim(),
+      itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim(),
+      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim(),
+      imageTag: String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(item, ["PrimaryImageTag"]) || "").trim()
+    };
+  },
+  recordServerRecordPlaybackItemDetails(execution, media = {}) {
+    const itemId = String(media?.itemId || "").trim();
+    if (!itemId || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+    return this.updateServerRecordPlaybackContexts(execution, null, (existing, now) => {
+      const details = { itemId, media: { ...media }, observedAt: now };
+      const intent = existing?.intent && String(existing.intent.itemId || "") === itemId
+        ? existing.intent
+        : null;
+      return {
+        intent,
+        details,
+        verifiedMedia: intent ? details.media : null
+      };
+    });
+  },
+  observeServerRecordPlaybackItemDetails(execution, response) {
+    if (String(execution?.requestMethod || "").toUpperCase() !== "GET"
+      || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true
+      || !(Number(response?.status) >= 200 && Number(response?.status) < 300)
+      || !String(response?.headers?.get?.("Content-Type") || "").toLowerCase().includes("json")
+      || !execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
+    const itemId = String(extractUserItemDetailsPathState(execution?.proxyPath || "").itemId || "").trim();
+    if (!itemId || !this.resolveServerRecordPlaybackContextKeys(execution).length) return false;
+    let responseCopy;
+    try { responseCopy = response.clone(); } catch { return false; }
+    const task = readResponseTextWithLimit(responseCopy, DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES)
+      .then(body => {
+        if (body.exceeded || !body.text.trim()) return false;
+        let payload;
+        try { payload = JSON.parse(body.text); } catch { return false; }
+        const media = this.buildServerRecordPlaybackContextMedia(payload, itemId);
+        return media ? this.recordServerRecordPlaybackItemDetails(execution, media) : false;
+      })
+      .catch(() => false);
+    execution.ctx.waitUntil(task);
+    return true;
+  },
+  getServerRecordPlaybackContextMedia(execution, transport = null, expectedItemId = "") {
+    const contexts = GLOBALS.ServerRecordPlaybackContexts;
+    if (!(contexts instanceof Map)) return null;
+    const now = nowMs();
+    this.cleanupServerRecordPlaybackContexts(now);
+    const expected = String(expectedItemId || "").trim();
+    for (const contextKey of this.resolveServerRecordPlaybackContextKeys(execution, transport)) {
+      const context = contexts.get(contextKey);
+      const media = context?.verifiedMedia;
+      if (!media || (expected && String(media.itemId || "") !== expected)) continue;
+      touchMapEntry(contexts, contextKey);
+      return { ...media };
+    }
+    return null;
+  },
+  mergeServerWatchMedia(primary = {}, fallback = {}) {
+    const current = isPlainObject(primary) ? primary : {};
+    const previous = isPlainObject(fallback) ? fallback : {};
+    const currentItemId = String(current.itemId || "").trim();
+    const previousItemId = String(previous.itemId || "").trim();
+    if (currentItemId && previousItemId && currentItemId !== previousItemId) return { ...current };
+    const pick = key => String(current[key] || previous[key] || "").trim();
+    return {
+      itemId: pick("itemId"),
+      itemName: pick("itemName"),
+      itemType: pick("itemType"),
+      seriesName: pick("seriesName"),
+      imageTag: pick("imageTag")
+    };
+  },
+  cleanupServerRecordWatchSessions(now = nowMs()) {
+    const sessions = GLOBALS.ServerRecordWatchSessions;
+    if (!(sessions instanceof Map)) return;
+    for (const [sessionKey, entry] of sessions.entries()) {
+      const terminalUntil = Number(entry?.terminalUntil) || 0;
+      const lastSeenAt = Number(entry?.lastSeenAt || entry?.firstSeenAt) || 0;
+      if ((terminalUntil > 0 && terminalUntil < now)
+        || (terminalUntil <= 0 && lastSeenAt > 0 && lastSeenAt + SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS <= now)) {
+        sessions.delete(sessionKey);
+      }
+    }
+    const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+    while (sessions.size > maxEntries) sessions.delete(sessions.keys().next().value);
+  },
+  scheduleServerWatchLifecycle(execution, transport = null) {
+    const traits = execution?.requestTraits || {};
+    const phase = traits.isPlaybackStoppedRequest === true
+      ? "stopped"
+      : traits.isPlaybackStartedRequest === true
+        ? "started"
+        : traits.isPlaybackProgressRequest === true
+          ? "progress"
+          : "";
+    if (!phase) return false;
     if (String(execution?.requestMethod || "").toUpperCase() !== "POST") return false;
     if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
     const db = Database.getDB(execution?.env);
-    if (!db) return false;
+    const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
+    const sessionInfo = this.resolvePlaybackProgressSessionKey(execution, transport);
+    let media = this.resolveServerLastWatchMedia(execution, transport);
+    const directItemId = String(media.itemId || "").trim();
+    const contextMedia = phase === "stopped"
+      ? null
+      : this.getServerRecordPlaybackContextMedia(execution, transport, directItemId);
+    const usedPlaybackContext = !directItemId && !!contextMedia;
+    if (contextMedia) {
+      media = directItemId
+        ? this.mergeServerWatchMedia(media, contextMedia)
+        : contextMedia;
+    }
+    const diagnostic = {
+      phase,
+      decision: "",
+      parseMode: String(parsedPayload.parseMode || "query_only"),
+      sessionStrength: String(sessionInfo.sessionStrength || "weak"),
+      finalized: false
+    };
+    execution.serverWatchLifecycleDiagnostic = diagnostic;
+    if (!db) {
+      diagnostic.decision = "d1_unavailable";
+      diagnostic.finalized = true;
+      return false;
+    }
     if (!execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
     const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
     if (!nodeName) return false;
     const requestStartedAt = Number(execution?.startTime);
     const eventAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
-    const media = this.resolveServerLastWatchMedia(execution, transport);
-    const task = Database.upsertServerLastWatch(db, nodeName, new Date(eventAtMs).toISOString(), media)
+    const sessions = GLOBALS.ServerRecordWatchSessions;
+    this.cleanupServerRecordWatchSessions(eventAtMs);
+    const identityKey = String(sessionInfo.sessionIdentityFingerprint || "");
+    let entry = identityKey ? sessions.get(identityKey) : null;
+    if (phase === "stopped" && entry) media = this.mergeServerWatchMedia(media, entry.media);
+    const itemId = String(media.itemId || "").trim();
+    if (phase !== "stopped" && !itemId) {
+      diagnostic.decision = parsedPayload.parseErrorReason === "unbuffered_body" ? "skipped_unbuffered" : "skipped_no_item";
+      diagnostic.finalized = true;
+      return false;
+    }
+    const sessionFingerprint = itemId
+      ? hashServerWatchFingerprint(`${identityKey}|${itemId}`)
+      : String(entry?.sessionFingerprint || sessionInfo.sessionFingerprint || "");
+    if (phase === "progress" && entry) {
+      entry.lastSeenAt = eventAtMs;
+      if (Number(entry.terminalUntil) >= eventAtMs
+        && String(entry.sessionFingerprint || "") === sessionFingerprint) {
+        diagnostic.decision = "late_progress_after_stop";
+        diagnostic.finalized = true;
+        touchMapEntry(sessions, identityKey);
+        return false;
+      }
+      if (String(entry.itemId || "") === itemId && String(entry.writeState || "") !== "failed") {
+        diagnostic.decision = "deduped";
+        diagnostic.finalized = true;
+        touchMapEntry(sessions, identityKey);
+        return false;
+      }
+    }
+    if (phase === "started" && entry && sessionInfo.sessionStrength === "strong"
+      && String(entry.itemId || "") === itemId && Number(entry.terminalUntil || 0) <= 0
+      && String(entry.writeState || "") !== "failed") {
+      entry.lastSeenAt = eventAtMs;
+      diagnostic.decision = "deduped";
+      diagnostic.finalized = true;
+      touchMapEntry(sessions, identityKey);
+      return false;
+    }
+    entry = {
+      nodeName,
+      sessionFingerprint,
+      sessionStrength: sessionInfo.sessionStrength,
+      itemId,
+      media: { ...media },
+      writeState: "pending",
+      firstSeenAt: phase === "started" || !entry || String(entry.sessionFingerprint || "") !== sessionFingerprint
+        ? eventAtMs
+        : (Number(entry.firstSeenAt) || eventAtMs),
+      lastSeenAt: eventAtMs,
+      terminalAt: phase === "stopped" ? eventAtMs : 0,
+      terminalUntil: phase === "stopped" ? eventAtMs + SERVER_RECORD_WATCH_TERMINAL_TTL_MS : 0
+    };
+    if (identityKey) {
+      setBoundedMapEntry(
+        sessions,
+        identityKey,
+        entry,
+        Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1)
+      );
+    }
+    diagnostic.decision = usedPlaybackContext
+      ? "fallback_playback_context"
+      : phase === "progress" ? "fallback_progress" : "scheduled";
+    const task = Database.upsertServerWatchLifecycle(db, {
+      nodeName,
+      eventAt: new Date(eventAtMs).toISOString(),
+      phase,
+      sessionFingerprint,
+      sessionStrength: sessionInfo.sessionStrength,
+      media
+    }).then(result => {
+      entry.writeState = "written";
+      if (Number(result?.schemaVersion) === 8) diagnostic.decision = "schema_v8_fallback";
+      else if (result?.admitted === false) diagnostic.decision = "deduped";
+      return result;
+    })
       .catch((error) => {
-        console.error("server last watch write failed", error);
+        entry.writeState = "failed";
+        diagnostic.decision = "d1_unavailable";
+        console.error("server watch lifecycle write failed", error);
+      })
+      .finally(() => {
+        diagnostic.finalized = true;
       });
+    execution.serverWatchLifecycleTask = task;
     execution.ctx.waitUntil(task);
     return true;
+  },
+  scheduleServerLastWatch(execution, transport = null) {
+    return this.scheduleServerWatchLifecycle(execution, transport);
   },
   buildPlaybackProgressRelayEntry(intervalMs = 0, waitUntilCtx = null) {
     return {
@@ -28298,7 +28881,7 @@ const Proxy = {
       redirectTrace
     };
   },
-  async buildSuccessResponse(execution, buildFetchOptions, upstreamState) {
+  async buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport = null) {
     let finalUpstreamState = execution?.requestTraits?.isPlaybackInfoRequest === true
       ? await this.maybeRewritePlaybackInfoResponse(execution, upstreamState)
       : upstreamState;
@@ -28436,8 +29019,10 @@ const Proxy = {
       }));
     }
     if (execution.requestTraits.isPlaybackInfoRequest === true) {
+      this.recordServerRecordPlaybackInfoIntent(execution, transport);
       await this.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
     }
+    this.observeServerRecordPlaybackItemDetails(execution, finalUpstreamState.response);
     await this.maybePrewarmMetadataResponse(
       execution.request,
       finalUpstreamState.response,
@@ -28924,7 +29509,7 @@ const Proxy = {
           effectiveMediaAuthMode: execution.effectiveMediaAuthMode
         }
       );
-      this.scheduleServerLastWatch(execution, transport);
+      this.scheduleServerWatchLifecycle(execution, transport);
       const aggregationRoute = await this.resolveMediaAggregationPlaybackRoute(execution, transport);
       if (aggregationRoute) {
         execution = aggregationRoute.execution;
@@ -28944,7 +29529,7 @@ const Proxy = {
       await this.maybeScheduleMediaAggregationProgressMirror(execution, transport);
       execution.requestLifecycle = createProxyRequestLifecycle(execution.request?.signal);
       const upstreamState = await this.executeUpstreamFlow(execution, transport, buildFetchOptions);
-      const response = await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState);
+      const response = await this.buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport);
       return response;
     } catch (err) {
       return this.buildErrorResponse(execution, err);
