@@ -850,6 +850,79 @@ test('a full server-record refresh prevents an older single-card response from o
   assert.deepEqual(serverRecordsUiState.availableNodes.map((node) => node.nodeName), ['alpha']);
 });
 
+test('ordinary server-record reloads keep session runtime but never overlay D1 counts', async () => {
+  const { loadServerRecords, serverRecordsUiState } = loadEnhancementTestHooks();
+  serverRecordsUiState.records = [{
+    nodeName: 'alpha',
+    displayName: 'Alpha',
+    runtime: { state: 'online', latencyMs: 42, version: '4.8', checkedAt: '2026-07-25T01:00:00.000Z', errorCode: '' },
+    counts: {
+      movies: 1,
+      series: 2,
+      episodes: 3,
+      state: 'ok',
+      errors: {},
+      checkedAt: '2026-07-25T01:00:00.000Z',
+      source: 'live',
+      persisted: false
+    },
+    watch: { lastWatchedAt: '2026-07-25T00:00:00.000Z', state: 'ok', itemId: 'old', itemName: 'Old', itemType: 'Movie', seriesName: '', imageTag: '', posterUrl: '' },
+    tags: [],
+    expiryEnabled: false,
+    expiryMode: 'rolling',
+    expiresAt: '',
+    expiryDays: 30
+  }];
+  const app = {
+    async apiCall(action, payload) {
+      assert.equal(action, 'getServerRecordsSnapshot');
+      assert.equal(payload?.forceRefresh, false);
+      return {
+        records: [{
+          nodeName: 'alpha',
+          displayName: 'Alpha',
+          runtime: { state: 'not_checked' },
+          counts: {
+            movies: 10,
+            series: 20,
+            episodes: 30,
+            state: 'ok',
+            errors: {},
+            checkedAt: '2026-07-25T02:00:00.000Z',
+            source: 'persisted',
+            persisted: true
+          },
+          watch: {
+            lastWatchedAt: '2026-07-25T01:30:00.000Z',
+            state: 'ok',
+            itemId: 'new-item',
+            itemName: 'New Title',
+            itemType: 'Movie',
+            seriesName: '',
+            imageTag: 'tag',
+            posterUrl: '/admin/__server-record-poster/alpha'
+          }
+        }],
+        availableNodes: [{ nodeName: 'alpha', displayName: 'Alpha' }]
+      };
+    }
+  };
+
+  await loadServerRecords(app, { forceRefresh: false });
+  const record = serverRecordsUiState.records[0];
+  assert.equal(record.runtime.state, 'online');
+  assert.equal(record.runtime.latencyMs, 42);
+  assert.equal(record.counts.movies, 10);
+  assert.equal(record.counts.series, 20);
+  assert.equal(record.counts.episodes, 30);
+  assert.equal(record.counts.source, 'persisted');
+  assert.equal(record.counts.persisted, true);
+  assert.equal(record.counts.checkedAt, '2026-07-25T02:00:00.000Z');
+  assert.equal(record.watch.itemId, 'new-item');
+  assert.equal(record.watch.itemName, 'New Title');
+  assert.equal(record.watch.posterUrl, '/admin/__server-record-poster/alpha');
+});
+
 test('server-record removal keeps one confirmation and one write in flight', async () => {
   const { deleteServerRecord, serverRecordsUiState } = loadEnhancementTestHooks();
   let resolveConfirmation;

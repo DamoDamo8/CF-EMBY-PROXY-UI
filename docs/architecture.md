@@ -60,7 +60,8 @@ flowchart LR
 
 ### 节点探针
 
-- 管理台节点健康检查与线路故障转移共用专用探针 URL 解析。节点目标自带子路径时，探针路径仅在以该子路径完整段开头时剥离一次重复前缀：例如目标 `https://origin/emby` 配合 `/emby/System/Ping` 实际请求 `/emby/System/Ping`；根路径节点和不匹配前缀保持原样。常规 API 与媒体代理仍使用原有 URL 拼接，不受此规则影响。
+- 管理台节点健康检查与线路故障转移共用专用探针 URL 解析（`buildProbeUpstreamUrl`）。探针路径历史上从上游 origin 根配置（默认 `/emby/system/ping`），与节点 target 自带的 base 可能重叠；**仅探针流量**做去重，常规 API 与媒体代理仍走 `buildUpstreamProxyUrl`，不受此规则影响。
+- 去重顺序：① 大小写不敏感地剥离与 `normalizedBasePath` 完全一致的前缀（例如目标 `/Emby` + 探针 `/emby/system/ping` → `/Emby/system/ping`）；② 若未剥到整段 base，且 base **尾段**与探针 **首段**同为共享 Emby 根段（`emby` / `mediabrowser`，大小写不敏感），再剥探针首段一次（例如目标 `/proxy/emby` + 默认 `/emby/system/ping` → `/proxy/emby/system/ping`）。根路径节点、相对探针（如 `/System/Ping`）以及 base 尾段不在共享集合内的路径保持原样拼接。
 - 健康检查默认请求节点 HEAD 探针而不是节点根路径；只有最终 HTTP `200-299` 才返回正常延迟，其他状态、网络错误和超时均返回既有失败哨兵值。HEAD 收到 `405` 或 `501` 时释放响应体后以相同 URL 回退一次 GET；其他非 2xx 不回退。故障转移使用相同 URL 解析与 2xx 成功标准。
 
 ## Worker 壳

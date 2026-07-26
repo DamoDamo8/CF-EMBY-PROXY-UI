@@ -1449,8 +1449,10 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       const previousRecords = new Map(serverRecordsUiState.records.map((record) => [record.nodeName, record]));
       serverRecordsUiState.records = (Array.isArray(result?.records) ? result.records : []).map(normalizeServerRecord).filter((record) => record.nodeName).map((record) => {
         const previous = previousRecords.get(record.nodeName);
+        // Ordinary reads return runtime=not_checked. Keep the session probe badge only;
+        // never overlay D1-backed counts/watch/poster with a previous live view.
         if (forceRefresh || record.runtime.state !== 'not_checked' || !previous || previous.runtime.state === 'not_checked') return record;
-        return { ...record, runtime: previous.runtime, counts: previous.counts };
+        return { ...record, runtime: previous.runtime };
       });
       serverRecordsUiState.availableNodes = (Array.isArray(result?.availableNodes) ? result.availableNodes : []).map(normalizeAvailableServerRecordNode).filter((node) => node.nodeName);
       serverRecordsUiState.loaded = true;

@@ -76,8 +76,14 @@ assert.ok(RuntimeEntry && typeof RuntimeEntry === "object", "missing Node test h
 test("node probes preserve target base paths and require a successful response", async () => {
   const rootTarget = createTargetRecord("https://origin.example");
   const embyTarget = createTargetRecord("https://origin.example/emby");
+  const mixedCaseTarget = createTargetRecord("https://origin.example/Emby");
+  const nestedTarget = createTargetRecord("https://origin.example/proxy/emby");
+  const mediaTarget = createTargetRecord("https://origin.example/media");
   assert.ok(rootTarget);
   assert.ok(embyTarget);
+  assert.ok(mixedCaseTarget);
+  assert.ok(nestedTarget);
+  assert.ok(mediaTarget);
   assert.equal(
     buildProbeUpstreamUrl(rootTarget, "/emby/System/Info/Public").toString(),
     "https://origin.example/emby/System/Info/Public"
@@ -91,8 +97,36 @@ test("node probes preserve target base paths and require a successful response",
     "https://origin.example/emby/System/Info/Public"
   );
   assert.equal(
+    buildProbeUpstreamUrl(mixedCaseTarget, "/emby/system/ping").toString(),
+    "https://origin.example/Emby/system/ping"
+  );
+  assert.equal(
+    buildProbeUpstreamUrl(embyTarget, "/EMBY/system/ping").toString(),
+    "https://origin.example/emby/system/ping"
+  );
+  assert.equal(
+    buildProbeUpstreamUrl(nestedTarget, "/emby/system/ping").toString(),
+    "https://origin.example/proxy/emby/system/ping"
+  );
+  assert.equal(
+    buildProbeUpstreamUrl(nestedTarget, "/proxy/emby/system/ping").toString(),
+    "https://origin.example/proxy/emby/system/ping"
+  );
+  assert.equal(
+    buildProbeUpstreamUrl(nestedTarget, "/PROXY/EMBY/system/ping").toString(),
+    "https://origin.example/proxy/emby/system/ping"
+  );
+  assert.equal(
+    buildProbeUpstreamUrl(mediaTarget, "/emby/system/ping").toString(),
+    "https://origin.example/media/emby/system/ping"
+  );
+  assert.equal(
     buildUpstreamProxyUrl(embyTarget, "/System/Info/Public").toString(),
     "https://origin.example/emby/System/Info/Public"
+  );
+  assert.equal(
+    buildUpstreamProxyUrl(nestedTarget, "/emby/system/ping").toString(),
+    "https://origin.example/proxy/emby/emby/system/ping"
   );
 
   const responses = [404, 204, 405, 204, 501, 503, 503];

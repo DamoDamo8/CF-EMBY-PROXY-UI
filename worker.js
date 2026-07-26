@@ -2888,18 +2888,52 @@ function buildUpstreamProxyUrl(targetBase, proxyPath = "/") {
   return baseUrl;
 }
 
-// Probe paths are historically configured from the upstream origin root. When
-// a node target already carries that same base path, remove the duplicate only
-// for probe traffic without changing normal proxy path semantics.
+// Probe paths are historically configured from the upstream origin root. When a
+// node target already carries that base (or a nested path ending in a shared
+// Emby root segment), remove the duplicate only for probe traffic. Normal API
+// and media proxy path semantics stay on buildUpstreamProxyUrl.
+const PROBE_SHARED_ROOT_SEGMENTS = new Set(["emby", "mediabrowser"]);
+
+function splitProxyPathSegments(path = "/") {
+  return sanitizeProxyPath(path).split("/").filter(Boolean);
+}
+
+function stripCaseInsensitiveProbeBasePrefix(probePath = "/", basePath = "") {
+  const normalizedProbePath = sanitizeProxyPath(probePath);
+  const normalizedBasePath = String(basePath || "").trim();
+  if (!normalizedBasePath || normalizedBasePath === "/") return null;
+  const probeLower = normalizedProbePath.toLowerCase();
+  const baseLower = normalizedBasePath.toLowerCase();
+  if (probeLower !== baseLower && !probeLower.startsWith(`${baseLower}/`)) return null;
+  // Path segments are ASCII; equal lowercased length keeps original casing on the remainder.
+  return sanitizeProxyPath(normalizedProbePath.slice(normalizedBasePath.length) || "/");
+}
+
+function stripSharedProbeRootSegment(probePath = "/", basePath = "") {
+  const baseSegments = splitProxyPathSegments(basePath);
+  const probeSegments = splitProxyPathSegments(probePath);
+  if (!baseSegments.length || !probeSegments.length) return null;
+  const baseTail = String(baseSegments[baseSegments.length - 1] || "").toLowerCase();
+  const probeHead = String(probeSegments[0] || "").toLowerCase();
+  if (!baseTail || baseTail !== probeHead || !PROBE_SHARED_ROOT_SEGMENTS.has(baseTail)) return null;
+  return sanitizeProxyPath(`/${probeSegments.slice(1).join("/")}` || "/");
+}
+
 function buildProbeUpstreamUrl(targetBase, probePath = "/") {
   const targetRecord = isTargetRecord(targetBase) ? targetBase : createTargetRecord(targetBase);
   if (!targetRecord) return null;
   const normalizedProbePath = sanitizeProxyPath(probePath);
   const basePath = targetRecord.normalizedBasePath;
-  const relativeProbePath = basePath
-    && (normalizedProbePath === basePath || normalizedProbePath.startsWith(`${basePath}/`))
-    ? sanitizeProxyPath(normalizedProbePath.slice(basePath.length) || "/")
-    : normalizedProbePath;
+  let relativeProbePath = normalizedProbePath;
+  if (basePath) {
+    const strippedFullBase = stripCaseInsensitiveProbeBasePrefix(normalizedProbePath, basePath);
+    if (strippedFullBase !== null) {
+      relativeProbePath = strippedFullBase;
+    } else {
+      const strippedSharedRoot = stripSharedProbeRootSegment(normalizedProbePath, basePath);
+      if (strippedSharedRoot !== null) relativeProbePath = strippedSharedRoot;
+    }
+  }
   return buildUpstreamProxyUrl(targetRecord, relativeProbePath);
 }
 
