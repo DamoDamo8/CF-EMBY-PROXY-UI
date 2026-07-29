@@ -245,10 +245,13 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #view-server-records .server-record-detail-label{color:var(--record-muted)}#view-server-records .server-record-detail-value{max-width:65%;color:var(--record-text);font-weight:550;text-align:right;overflow-wrap:anywhere}
 #view-server-records .server-record-detail-value.is-warning{color:#e11d48}
 #view-server-records .server-record-watch{display:grid;min-width:0;gap:.2rem;border:1px solid var(--record-border);border-radius:max(6px,calc(var(--ui-control-radius-px) - 1px));background:var(--record-soft);padding:.75rem}
-#view-server-records .server-record-watch-poster{position:relative;width:100%;aspect-ratio:2/3;overflow:hidden;border:1px solid var(--record-border);border-radius:max(6px,calc(var(--ui-control-radius-px) + 2px));background:var(--record-soft);color:#94a3b8}
-#view-server-records .server-record-watch-poster img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#view-server-records .server-record-watch-poster{position:relative;box-sizing:content-box;width:calc(100% - 2px);aspect-ratio:2/3;overflow:hidden;border:1px solid var(--record-border);border-radius:0;background:var(--record-soft);color:#94a3b8}
+#view-server-records .server-record-watch-poster img{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain}
 #view-server-records .server-record-watch-poster img[hidden]{display:none}
 #view-server-records .server-record-watch-placeholder{display:flex;width:100%;height:100%;flex-direction:column;align-items:center;justify-content:center;gap:.35rem;color:var(--record-muted);font-size:.625rem;font-weight:600;text-align:center}
+#view-server-records .server-record-watch-placeholder[data-state="loading"] svg{animation:spin 1s linear infinite}
+#view-server-records .server-record-watch-placeholder[data-state="error"]{padding:.5rem;color:#be123c}
+.dark #view-server-records .server-record-watch-placeholder[data-state="error"]{color:#fda4af}
 #view-server-records .server-record-watch-placeholder svg{width:2rem;height:2rem;stroke-width:1.5}
 #view-server-records .server-record-watch-label{font-size:.625rem;line-height:.9rem;font-weight:700;color:#4f46e5;text-transform:uppercase}.dark #view-server-records .server-record-watch-label{color:#818cf8}
 #view-server-records .server-record-watch-title{display:-webkit-box;overflow:hidden;color:var(--record-text);font-size:.8125rem;line-height:1.15rem;font-weight:700;overflow-wrap:anywhere;-webkit-box-orient:vertical;-webkit-line-clamp:2}
@@ -335,7 +338,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   let shellFrameId = 0;
   let nodeModalWasOpen = false;
   let patchedSafetyContractApp = null;
-  let patchedPosterMetadataAccountApp = null;
   let patchedMediaAggregationNodeApp = null;
   let patchedServerRecordsApp = null;
   const dashboardTrafficState = {
@@ -398,15 +400,42 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   };
   const posterMetadataState = {
     root: null,
-    tmdbConfigured: false,
-    tmdbStorage: 'none',
-    draftKey: '',
-    removeRequested: false,
+    tmdbTokenConfigured: false,
+    tmdbTokenSource: 'none',
+    doubanOriginConfigured: false,
+    doubanOriginSource: 'none',
+    doubanTokenConfigured: false,
+    doubanTokenSource: 'none',
+    tmdbToken: '',
+    doubanOrigin: '',
+    doubanToken: '',
+    clearTmdbToken: false,
+    clearDoubanToken: false,
+    dirty: false,
+    savePending: false,
     hydrated: false,
     loading: false,
     loadAttempted: false,
-    pending: false,
     hydrationSeq: 0
+  };
+  const POSTER_CACHE_KEY = 'server-record-poster:v1';
+  const POSTER_CACHE_PREFIX = 'server-record-poster:';
+  const POSTER_CACHE_SUCCESS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  const POSTER_CACHE_FAILURE_TTL_MS = 30 * 60 * 1000;
+  const POSTER_CACHE_LIMIT = 256;
+  const POSTER_REQUEST_TIMEOUT_MS = 8000;
+  const POSTER_IMAGE_MAX_BYTES = 5 * 1024 * 1024;
+  const POSTER_MAX_CONCURRENCY = 16;
+  const posterBrowserState = {
+    app: null,
+    config: null,
+    configPromise: null,
+    observer: null,
+    queue: [],
+    active: 0,
+    jobs: new Map(),
+    objectUrls: new Map(),
+    cacheInitialized: false
   };
   const serverRecordsUiState = {
     records: [],
@@ -426,6 +455,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     deletingNodes: [],
     loadSeq: 0,
     nodeRefreshSeq: new Map(),
+    posterRefreshSeq: 0,
+    posterRefreshTokens: new Map(),
     dialogTrigger: null,
     saving: false,
     error: ''
@@ -1203,6 +1234,472 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  function refreshServerRecordPosters(nodeNames = []) {
+    const names = [...new Set((Array.isArray(nodeNames) ? nodeNames : [nodeNames])
+      .map((name) => String(name || '').trim().toLowerCase())
+      .filter(Boolean))];
+    if (!names.length) return;
+    const token = (Number(serverRecordsUiState.posterRefreshSeq) || 0) + 1;
+    serverRecordsUiState.posterRefreshSeq = token;
+    for (const name of names) serverRecordsUiState.posterRefreshTokens.set(name, token);
+  }
+
+  function createPosterError(provider = 'browser', code = 'NETWORK') {
+    const error = new Error(code);
+    error.provider = String(provider || 'browser');
+    error.code = String(code || 'NETWORK');
+    return error;
+  }
+
+  function normalizePosterSearchText(value = '') {
+    return String(value || '').normalize('NFKC').trim().replace(/\\s+/g, ' ').toLowerCase();
+  }
+
+  function normalizePosterSearch(value = {}) {
+    const mediaType = String(value?.mediaType || '').trim().toLowerCase();
+    const year = Number(value?.year);
+    return {
+      itemId: String(value?.itemId || '').trim().slice(0, 256),
+      mediaType: mediaType === 'movie' || mediaType === 'tv' ? mediaType : '',
+      title: String(value?.title || '').trim().slice(0, 256),
+      originalTitle: String(value?.originalTitle || '').trim().slice(0, 256),
+      year: Number.isInteger(year) && year >= 1800 && year <= 3000 ? year : null,
+      watchedAt: String(value?.watchedAt || '').trim()
+    };
+  }
+
+  function isUsablePosterSearch(search = {}) {
+    return Boolean(search.mediaType && search.title);
+  }
+
+  async function hashPosterSearchIdentity(search = {}) {
+    const identity = JSON.stringify([
+      String(search.itemId || ''),
+      String(search.mediaType || ''),
+      normalizePosterSearchText(search.title),
+      normalizePosterSearchText(search.originalTitle),
+      search.year ?? null
+    ]);
+    const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+    return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  function initializePosterCacheStorage(storage = window.localStorage) {
+    if (posterBrowserState.cacheInitialized || !storage) return;
+    posterBrowserState.cacheInitialized = true;
+    try {
+      const oldKeys = [];
+      for (let index = 0; index < storage.length; index += 1) {
+        const key = storage.key(index);
+        if (key && key.startsWith(POSTER_CACHE_PREFIX) && key !== POSTER_CACHE_KEY) oldKeys.push(key);
+      }
+      for (const key of oldKeys) storage.removeItem(key);
+    } catch {}
+  }
+
+  function readPosterCache(storage = window.localStorage, now = Date.now()) {
+    initializePosterCacheStorage(storage);
+    try {
+      const parsed = JSON.parse(storage?.getItem(POSTER_CACHE_KEY) || '{"entries":{}}');
+      const source = parsed?.entries && typeof parsed.entries === 'object' && !Array.isArray(parsed.entries) ? parsed.entries : {};
+      const entries = {};
+      for (const [key, entry] of Object.entries(source)) {
+        if (!/^[a-f0-9]{64}$/.test(key) || !entry || typeof entry !== 'object') continue;
+        if (!['success', 'failure'].includes(entry.status) || !Number.isFinite(Number(entry.expiresAt)) || Number(entry.expiresAt) <= now) continue;
+        entries[key] = entry;
+      }
+      return entries;
+    } catch {
+      try { storage?.removeItem(POSTER_CACHE_KEY); } catch {}
+      return {};
+    }
+  }
+
+  function writePosterCache(entries = {}, storage = window.localStorage) {
+    try {
+      const retained = Object.entries(entries)
+        .sort((left, right) => Number(right[1]?.accessedAt || 0) - Number(left[1]?.accessedAt || 0))
+        .slice(0, POSTER_CACHE_LIMIT);
+      storage?.setItem(POSTER_CACHE_KEY, JSON.stringify({ entries: Object.fromEntries(retained) }));
+    } catch {}
+  }
+
+  function readPosterCacheEntry(key, options = {}) {
+    const entries = readPosterCache(options.storage, options.now);
+    const entry = entries[key];
+    if (!entry || (entry.status === 'failure' && options.bypassFailure === true)) return null;
+    if (entry.status === 'failure') return entry;
+    entry.accessedAt = Number(options.now) || Date.now();
+    writePosterCache(entries, options.storage);
+    return entry;
+  }
+
+  function writePosterCacheEntry(key, entry, options = {}) {
+    const now = Number(options.now) || Date.now();
+    const entries = readPosterCache(options.storage, now);
+    entries[key] = {
+      ...entry,
+      expiresAt: now + (entry.status === 'success' ? POSTER_CACHE_SUCCESS_TTL_MS : POSTER_CACHE_FAILURE_TTL_MS),
+      accessedAt: now
+    };
+    writePosterCache(entries, options.storage);
+    return entries[key];
+  }
+
+  function normalizePosterBrowserConfig(payload = {}) {
+    let doubanOrigin = '';
+    try {
+      const parsed = new URL(String(payload?.douban?.origin || '').trim());
+      if (parsed.protocol === 'https:' && !parsed.username && !parsed.password && !parsed.search && !parsed.hash && parsed.pathname === '/') doubanOrigin = parsed.origin;
+    } catch {}
+    const tmdbToken = String(payload?.tmdb?.token || '').trim().replace(/^Bearer\\s+/i, '').trim();
+    const validTmdbToken = /^[a-f0-9]{32}$/i.test(tmdbToken) ? '' : tmdbToken;
+    const doubanToken = String(payload?.douban?.token || '').trim();
+    return {
+      tmdb: { configured: payload?.tmdb?.configured === true && Boolean(validTmdbToken), token: validTmdbToken },
+      douban: { configured: payload?.douban?.configured === true && Boolean(doubanOrigin && doubanToken), origin: doubanOrigin, token: doubanToken }
+    };
+  }
+
+  function getPosterBrowserConfigOnce(app) {
+    if (posterBrowserState.configPromise) return posterBrowserState.configPromise;
+    posterBrowserState.configPromise = Promise.resolve(app?.apiCall?.('getPosterBrowserConfig')).then((payload) => {
+      posterBrowserState.config = normalizePosterBrowserConfig(payload);
+      return posterBrowserState.config;
+    }, () => {
+      throw createPosterError('browser', 'AUTH');
+    });
+    return posterBrowserState.configPromise;
+  }
+
+  async function fetchPosterResource(url, options = {}, provider = 'browser', parentSignal = null) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const abort = () => controller.abort();
+    if (parentSignal?.aborted) abort();
+    else parentSignal?.addEventListener?.('abort', abort, { once: true });
+    const timer = window.setTimeout(() => { timedOut = true; controller.abort(); }, POSTER_REQUEST_TIMEOUT_MS);
+    try {
+      return await window.fetch(url, { ...options, redirect: 'error', signal: controller.signal });
+    } catch (error) {
+      if (parentSignal?.aborted) throw createPosterError(provider, 'CANCELED');
+      if (timedOut) throw createPosterError(provider, 'TIMEOUT');
+      if (String(error?.message || '').toLowerCase().includes('redirect')) throw createPosterError(provider, 'REDIRECT');
+      throw createPosterError(provider, 'CORS');
+    } finally {
+      window.clearTimeout(timer);
+      parentSignal?.removeEventListener?.('abort', abort);
+    }
+  }
+
+  function classifyPosterHttpError(provider, response) {
+    if (response?.status === 401 || response?.status === 403) return createPosterError(provider, 'AUTH');
+    if (response?.status === 429) return createPosterError(provider, 'RATE_LIMIT');
+    return createPosterError(provider, 'HTTP');
+  }
+
+  function normalizeTmdbPosterPath(value = '') {
+    const path = String(value || '').trim();
+    return path.startsWith('/') && /^[A-Za-z0-9._/-]{1,255}$/.test(path.slice(1)) && !path.includes('..') ? path : '';
+  }
+
+  function selectTmdbBrowserPosterCandidate(search = {}, results = []) {
+    const expectedNames = new Set([normalizePosterSearchText(search.title), normalizePosterSearchText(search.originalTitle)].filter(Boolean));
+    const expectedYear = search.year ?? null;
+    const exact = (Array.isArray(results) ? results : []).slice(0, 3).filter((candidate) => {
+      if (!candidate || typeof candidate !== 'object') return false;
+      const names = search.mediaType === 'movie'
+        ? [candidate.title, candidate.original_title]
+        : [candidate.name, candidate.original_name];
+      if (!names.some((name) => expectedNames.has(normalizePosterSearchText(name)))) return false;
+      const date = String(search.mediaType === 'movie' ? candidate.release_date : candidate.first_air_date || '').trim();
+      const year = /^[0-9]{4}/.test(date) ? Number(date.slice(0, 4)) : null;
+      return expectedYear === null || year === expectedYear;
+    }).map((candidate) => ({ candidate, posterPath: normalizeTmdbPosterPath(candidate.poster_path) }))
+      .filter((match) => match.posterPath);
+    if (exact.length > 1) throw createPosterError('tmdb', 'AMBIGUOUS');
+    return exact[0] ? { provider: 'tmdb', posterPath: exact[0].posterPath } : null;
+  }
+
+  async function searchTmdbBrowserPoster(search, config, signal) {
+    if (!config?.tmdb?.configured) throw createPosterError('tmdb', 'NOT_CONFIGURED');
+    const titles = [...new Set([search.title, search.originalTitle].map((title) => String(title || '').trim()).filter(Boolean))];
+    for (const title of titles) {
+      const url = new URL('https://api.themoviedb.org/3/search/' + (search.mediaType === 'movie' ? 'movie' : 'tv'));
+      url.searchParams.set('query', title);
+      url.searchParams.set('language', 'zh-CN');
+      url.searchParams.set('include_adult', 'true');
+      if (search.year !== null) url.searchParams.set(search.mediaType === 'movie' ? 'year' : 'first_air_date_year', String(search.year));
+      const response = await fetchPosterResource(url.toString(), {
+        headers: { Authorization: 'Bearer ' + config.tmdb.token, Accept: 'application/json' }
+      }, 'tmdb', signal);
+      if (!response.ok) throw classifyPosterHttpError('tmdb', response);
+      let payload;
+      try { payload = await response.json(); } catch { throw createPosterError('tmdb', 'INVALID_RESPONSE'); }
+      const match = selectTmdbBrowserPosterCandidate(search, payload?.results);
+      if (match) return match;
+    }
+    throw createPosterError('tmdb', 'NO_RESULT');
+  }
+
+  async function resolveDoubanBrowserPoster(search, config, signal) {
+    if (!config?.douban?.configured) throw createPosterError('douban', 'NOT_CONFIGURED');
+    const response = await fetchPosterResource(config.douban.origin + '/v1/posters/resolve', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + config.douban.token, Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mediaType: search.mediaType, title: search.title, originalTitle: search.originalTitle, year: search.year })
+    }, 'douban', signal);
+    if (!response.ok) throw classifyPosterHttpError('douban', response);
+    let payload;
+    try { payload = await response.json(); } catch { throw createPosterError('douban', 'INVALID_RESPONSE'); }
+    const subjectId = String(payload?.subjectId || payload?.subject_id || '').trim();
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(subjectId)) throw createPosterError('douban', 'NO_RESULT');
+    return { provider: 'douban', subjectId };
+  }
+
+  function sniffPosterImageMime(bytes) {
+    const has = (...values) => values.every((value, index) => bytes[index] === value);
+    if (bytes.length >= 3 && has(255, 216, 255)) return 'image/jpeg';
+    if (bytes.length >= 8 && has(137, 80, 78, 71, 13, 10, 26, 10)) return 'image/png';
+    const ascii = (start, length) => String.fromCharCode(...bytes.slice(start, start + length));
+    if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(ascii(0, 6))) return 'image/gif';
+    if (bytes.length >= 12 && ascii(0, 4) === 'RIFF' && ascii(8, 4) === 'WEBP') return 'image/webp';
+    if (bytes.length >= 16 && ascii(4, 4) === 'ftyp') {
+      const brands = ascii(8, Math.min(bytes.length - 8, 56));
+      if (brands.includes('avif') || brands.includes('avis')) return 'image/avif';
+    }
+    return '';
+  }
+
+  async function readValidatedPosterBlob(response, provider) {
+    if (!response.ok) throw classifyPosterHttpError(provider, response);
+    const mime = String(response.headers?.get?.('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+    if (!['image/jpeg', 'image/png', 'image/webp', 'image/avif', 'image/gif'].includes(mime)) throw createPosterError(provider, 'MIME');
+    const declaredLength = Number(response.headers?.get?.('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > POSTER_IMAGE_MAX_BYTES) throw createPosterError(provider, 'TOO_LARGE');
+    const chunks = [];
+    let size = 0;
+    if (response.body?.getReader) {
+      const reader = response.body.getReader();
+      try {
+        while (true) {
+          const part = await reader.read();
+          if (part.done) break;
+          const chunk = part.value instanceof Uint8Array ? part.value : new Uint8Array(part.value || []);
+          size += chunk.byteLength;
+          if (size > POSTER_IMAGE_MAX_BYTES) {
+            await reader.cancel?.();
+            throw createPosterError(provider, 'TOO_LARGE');
+          }
+          chunks.push(chunk);
+        }
+      } finally {
+        reader.releaseLock?.();
+      }
+    } else {
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      if (bytes.byteLength > POSTER_IMAGE_MAX_BYTES) throw createPosterError(provider, 'TOO_LARGE');
+      chunks.push(bytes);
+      size = bytes.byteLength;
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    if (sniffPosterImageMime(bytes) !== mime) throw createPosterError(provider, 'SIGNATURE');
+    return new Blob([bytes], { type: mime });
+  }
+
+  function posterDescriptorKey(descriptor = {}) {
+    return descriptor.provider === 'tmdb'
+      ? 'tmdb:' + String(descriptor.posterPath || '')
+      : 'douban:' + String(descriptor.subjectId || '');
+  }
+
+  async function fetchPosterImage(descriptor, config, signal) {
+    const provider = descriptor?.provider;
+    let url = '';
+    let headers = { Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif' };
+    if (provider === 'tmdb') {
+      const posterPath = normalizeTmdbPosterPath(descriptor.posterPath);
+      if (!posterPath) throw createPosterError('tmdb', 'INVALID_RESPONSE');
+      url = 'https://image.tmdb.org/t/p/w500' + posterPath;
+    } else if (provider === 'douban') {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(String(descriptor.subjectId || ''))) throw createPosterError('douban', 'INVALID_RESPONSE');
+      url = config.douban.origin + '/v1/posters/' + encodeURIComponent(descriptor.subjectId);
+      headers = { ...headers, Authorization: 'Bearer ' + config.douban.token };
+    } else {
+      throw createPosterError('browser', 'INVALID_RESPONSE');
+    }
+    const response = await fetchPosterResource(url, { headers }, provider, signal);
+    return await readValidatedPosterBlob(response, provider);
+  }
+
+  async function resolvePosterBlob(search, config, signal, cachedDescriptor = null) {
+    const failedResources = new Set();
+    let lastError = createPosterError('browser', 'NO_RESULT');
+    if (cachedDescriptor) {
+      try {
+        return { descriptor: cachedDescriptor, blob: await fetchPosterImage(cachedDescriptor, config, signal) };
+      } catch (error) {
+        if (error?.code === 'CANCELED') throw error;
+        lastError = error;
+        failedResources.add(posterDescriptorKey(cachedDescriptor));
+      }
+    }
+    for (const resolveDescriptor of [searchTmdbBrowserPoster, resolveDoubanBrowserPoster]) {
+      try {
+        const descriptor = await resolveDescriptor(search, config, signal);
+        if (failedResources.has(posterDescriptorKey(descriptor))) continue;
+        return { descriptor, blob: await fetchPosterImage(descriptor, config, signal) };
+      } catch (error) {
+        if (error?.code === 'CANCELED') throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  function setPosterPlaceholder(element, state = 'idle', provider = '', code = '') {
+    const placeholder = element?.querySelector?.('[data-server-record-poster-placeholder]');
+    const image = element?.querySelector?.('img');
+    if (!placeholder) return;
+    placeholder.dataset.state = state;
+    placeholder.hidden = state === 'success';
+    if (image && state !== 'success') image.hidden = true;
+    const icon = state === 'loading' ? 'loader-circle' : state === 'error' ? 'image-off' : 'image';
+    const text = state === 'loading' ? '正在加载海报' : state === 'error' ? (provider + ' · ' + code) : '等待加载';
+    placeholder.innerHTML = '<i data-lucide="' + icon + '" aria-hidden="true"></i><span>' + escapeServerRecordHtml(text) + '</span>';
+    scheduleIconRefresh(element);
+  }
+
+  function releasePosterElement(element, abort = true) {
+    const job = posterBrowserState.jobs.get(element);
+    if (job && abort) job.controller.abort();
+    posterBrowserState.jobs.delete(element);
+    posterBrowserState.observer?.unobserve?.(element);
+    const objectUrl = posterBrowserState.objectUrls.get(element);
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    posterBrowserState.objectUrls.delete(element);
+  }
+
+  function releasePosterElements(root = document) {
+    const elements = [];
+    if (root?.matches?.('[data-server-record-poster]')) elements.push(root);
+    root?.querySelectorAll?.('[data-server-record-poster]')?.forEach?.((element) => elements.push(element));
+    for (const element of elements) releasePosterElement(element);
+    posterBrowserState.queue = posterBrowserState.queue.filter((job) => !elements.includes(job.element));
+  }
+
+  function clearPosterBrowserSession(clearCredentials = false) {
+    releasePosterElements(document);
+    posterBrowserState.queue = [];
+    posterBrowserState.observer?.disconnect?.();
+    posterBrowserState.observer = null;
+    if (clearCredentials) {
+      posterBrowserState.config = null;
+      posterBrowserState.configPromise = null;
+    }
+  }
+
+  async function runPosterJob(job) {
+    const { element, search, app, bypassFailure, refreshToken, controller } = job;
+    if (!element?.isConnected || controller.signal.aborted) return;
+    setPosterPlaceholder(element, 'loading');
+    let cacheKey = '';
+    try {
+      if (!isUsablePosterSearch(search)) throw createPosterError('browser', 'MISSING_METADATA');
+      cacheKey = await hashPosterSearchIdentity(search);
+      const cached = readPosterCacheEntry(cacheKey, { bypassFailure });
+      if (cached?.status === 'failure') {
+        setPosterPlaceholder(element, 'error', cached.provider, cached.code);
+        return;
+      }
+      const cachedDescriptor = cached?.status === 'success'
+        ? (cached.provider === 'tmdb' ? { provider: 'tmdb', posterPath: cached.posterPath } : { provider: 'douban', subjectId: cached.subjectId })
+        : null;
+      const config = await getPosterBrowserConfigOnce(app);
+      const result = await resolvePosterBlob(search, config, controller.signal, cachedDescriptor);
+      if (controller.signal.aborted || !element.isConnected) return;
+      const objectUrl = URL.createObjectURL(result.blob);
+      if (controller.signal.aborted || !element.isConnected) { URL.revokeObjectURL(objectUrl); return; }
+      const previousUrl = posterBrowserState.objectUrls.get(element);
+      if (previousUrl) URL.revokeObjectURL(previousUrl);
+      posterBrowserState.objectUrls.set(element, objectUrl);
+      const image = element.querySelector('img');
+      if (image) { image.src = objectUrl; image.hidden = false; }
+      setPosterPlaceholder(element, 'success');
+      writePosterCacheEntry(cacheKey, {
+        status: 'success',
+        provider: result.descriptor.provider,
+        itemId: search.itemId,
+        ...(result.descriptor.provider === 'tmdb' ? { posterPath: result.descriptor.posterPath } : { subjectId: result.descriptor.subjectId })
+      });
+    } catch (error) {
+      if (error?.code === 'CANCELED' || controller.signal.aborted || !element?.isConnected) return;
+      const provider = String(error?.provider || 'browser');
+      const code = String(error?.code || 'NETWORK');
+      if (cacheKey) writePosterCacheEntry(cacheKey, { status: 'failure', provider, code, itemId: search.itemId });
+      setPosterPlaceholder(element, 'error', provider, code);
+      console.error('server record poster failed', { provider, code });
+    } finally {
+      posterBrowserState.jobs.delete(element);
+      const nodeName = String(element?.dataset?.serverRecordPoster || '').trim().toLowerCase();
+      if (refreshToken && Number(serverRecordsUiState.posterRefreshTokens.get(nodeName)) === refreshToken && !controller.signal.aborted) {
+        serverRecordsUiState.posterRefreshTokens.delete(nodeName);
+      }
+    }
+  }
+
+  function drainPosterQueue() {
+    while (posterBrowserState.active < POSTER_MAX_CONCURRENCY && posterBrowserState.queue.length) {
+      const job = posterBrowserState.queue.shift();
+      if (!job?.element?.isConnected || job.controller.signal.aborted) continue;
+      posterBrowserState.active += 1;
+      posterBrowserState.jobs.set(job.element, job);
+      Promise.resolve(runPosterJob(job)).finally(() => {
+        posterBrowserState.active = Math.max(0, posterBrowserState.active - 1);
+        drainPosterQueue();
+      });
+    }
+  }
+
+  function queuePosterElement(element, app) {
+    if (!element || posterBrowserState.jobs.has(element) || posterBrowserState.queue.some((job) => job.element === element)) return;
+    const nodeName = String(element.dataset.serverRecordPoster || '').trim().toLowerCase();
+    const record = serverRecordsUiState.records.find((item) => item.nodeName === nodeName);
+    if (!record) return;
+    const refreshToken = Number(serverRecordsUiState.posterRefreshTokens.get(nodeName)) || 0;
+    posterBrowserState.queue.push({
+      element,
+      search: normalizePosterSearch(record.watch.posterSearch),
+      app,
+      bypassFailure: refreshToken > 0,
+      refreshToken,
+      controller: new AbortController()
+    });
+    drainPosterQueue();
+  }
+
+  function bindServerRecordPosterCards(view, app) {
+    posterBrowserState.app = app;
+    const cards = [...(view?.querySelectorAll?.('[data-server-record-poster]') || [])];
+    if (!cards.length) return;
+    if (typeof window.IntersectionObserver !== 'function') {
+      cards.forEach((element) => queuePosterElement(element, app));
+      return;
+    }
+    if (!posterBrowserState.observer) {
+      posterBrowserState.observer = new window.IntersectionObserver((entries) => {
+        for (const entry of entries) {
+          if (!entry.isIntersecting) continue;
+          posterBrowserState.observer.unobserve(entry.target);
+          queuePosterElement(entry.target, posterBrowserState.app);
+        }
+      }, { rootMargin: '160px 0px' });
+    }
+    cards.forEach((element) => posterBrowserState.observer.observe(element));
+  }
+
   function normalizeServerRecordTags(values = []) {
     const source = Array.isArray(values) ? values : String(values || '').split(/[,，\\r\\n]+/);
     const tags = [];
@@ -1265,8 +1762,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         itemName: String(watch.itemName || '').trim().slice(0, 256),
         itemType: String(watch.itemType || '').trim().slice(0, 64),
         seriesName: String(watch.seriesName || '').trim().slice(0, 256),
-        imageTag: String(watch.imageTag || '').trim().slice(0, 256),
-        posterUrl: String(watch.posterUrl || '').trim().startsWith('/') ? String(watch.posterUrl).trim() : ''
+        posterSearch: normalizePosterSearch(watch.posterSearch)
       },
       expiry: {
         enabled: expiryEnabled,
@@ -1437,6 +1933,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     serverRecordsUiState.loading = true;
     serverRecordsUiState.refreshingAll = forceRefresh;
     serverRecordsUiState.error = '';
+    if (forceRefresh) refreshServerRecordPosters(serverRecordsUiState.records.map((record) => record.nodeName));
     renderServerRecordsView(app);
     const refreshButton = document.querySelector('[data-server-record-refresh]');
     if (forceRefresh) {
@@ -1487,6 +1984,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       && serverRecordsUiState.loadSeq === loadSeq
       && !serverRecordsUiState.deletingNodes.includes(normalizedNodeName);
     serverRecordsUiState.refreshingNodes = [...serverRecordsUiState.refreshingNodes, normalizedNodeName];
+    refreshServerRecordPosters([normalizedNodeName]);
     renderServerRecordsView(app);
     try {
       const result = await app.apiCall('getServerRecordsSnapshot', { forceRefresh: true, nodeName: normalizedNodeName });
@@ -1592,9 +2090,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const lastWatchedText = record.watch.state === 'ok' ? formatServerRecordDateTime(record.watch.lastWatchedAt) : '数据不可用';
     const watchTitle = record.watch.itemName
       ? (record.watch.seriesName && record.watch.seriesName !== record.watch.itemName ? record.watch.seriesName + ' · ' + record.watch.itemName : record.watch.itemName)
-      : (record.watch.itemId ? '最近观看媒体' : '尚未记录媒体');
-    const watchPoster = '<div class="server-record-watch-poster"><span class="server-record-watch-placeholder" aria-hidden="true"><i data-lucide="image"></i><span>2:3 海报框</span></span>'
-      + (record.watch.posterUrl ? '<img data-server-record-poster src="' + escapeServerRecordHtml(record.watch.posterUrl) + '" alt="' + escapeServerRecordHtml(watchTitle + ' 海报') + '" loading="lazy" decoding="async" referrerpolicy="no-referrer">' : '') + '</div>';
+      : (record.watch.itemId ? '媒体 #' + record.watch.itemId : '尚未记录媒体');
+    const watchPoster = '<div class="server-record-watch-poster" data-server-record-poster="' + escapeServerRecordHtml(record.nodeName) + '"><span class="server-record-watch-placeholder" data-server-record-poster-placeholder data-state="idle" role="status" aria-live="polite" aria-atomic="true"><i data-lucide="image" aria-hidden="true"></i><span>等待加载</span></span><img alt="' + escapeServerRecordHtml(watchTitle + ' 海报') + '" decoding="async" referrerpolicy="no-referrer" hidden></div>';
     const watchSection = '<div class="server-record-watch"><span class="server-record-watch-label">上次观看</span><strong class="server-record-watch-title" title="' + escapeServerRecordHtml(watchTitle) + '">' + escapeServerRecordHtml(watchTitle) + '</strong><span class="server-record-watch-time">' + escapeServerRecordHtml(lastWatchedText) + '</span></div>';
     const expiryDateText = expiry.expiresAt || '等待播放记录';
     const expirySection = expiryEnabled ? '<div class="server-record-expiry' + warningClass + '"><div class="server-record-expiry-head"><span class="server-record-expiry-label">预计过期</span><span class="server-record-expiry-mode">' + escapeServerRecordHtml(formatServerRecordExpiryMode(expiry)) + '</span></div><div class="server-record-expiry-body"><strong class="server-record-expiry-date">' + escapeServerRecordHtml(expiryDateText) + '</strong><span class="server-record-expiry-remaining">' + escapeServerRecordHtml(formatServerRecordExpiry(record, expiry)) + '</span></div></div>' : '';
@@ -1656,7 +2153,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const legacyRecords = readLegacyServerRecords();
     const query = serverRecordsUiState.query;
     const expiryModeFilter = serverRecordsUiState.expiryModeFilter;
-    const renderSignature = JSON.stringify([query, expiryModeFilter, records, legacyRecords, serverRecordsUiState.loading, serverRecordsUiState.refreshingAll, serverRecordsUiState.refreshingNodes, serverRecordsUiState.deletingNodes, serverRecordsUiState.error]);
+    const renderSignature = JSON.stringify([query, expiryModeFilter, records, legacyRecords, serverRecordsUiState.loading, serverRecordsUiState.refreshingAll, serverRecordsUiState.refreshingNodes, serverRecordsUiState.deletingNodes, serverRecordsUiState.posterRefreshSeq, serverRecordsUiState.error]);
     if (view.dataset.serverRecordRenderSignature === renderSignature) return;
     view.dataset.serverRecordRenderSignature = renderSignature;
     const visible = records.filter((record) => matchesServerRecordFilters(record, query, expiryModeFilter));
@@ -1669,10 +2166,9 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     grid.setAttribute('aria-busy', serverRecordsUiState.loading || serverRecordsUiState.refreshingAll ? 'true' : 'false');
     const cards = [...visible.map((record) => buildServerRecordCard(record)), ...visibleLegacy.map((record) => buildLegacyServerRecordCard(record))];
     const emptyText = serverRecordsUiState.error ? escapeServerRecordHtml(serverRecordsUiState.error) : (serverRecordsUiState.loading ? '正在加载服务器记录' : (records.length || legacyRecords.length ? '没有匹配的服务器记录' : '暂无服务器记录'));
+    releasePosterElements(grid);
     grid.innerHTML = cards.length ? cards.join('') : '<div class="server-record-empty"><span class="server-record-empty-icon"><i data-lucide="server" class="w-5 h-5" aria-hidden="true"></i></span><p class="font-medium text-slate-700 dark:text-slate-200">' + emptyText + '</p></div>';
-    grid.querySelectorAll('[data-server-record-poster]').forEach((image) => {
-      image.addEventListener('error', () => { image.hidden = true; }, { once: true });
-    });
+    bindServerRecordPosterCards(view, app);
     scheduleIconRefresh(view);
   }
 
@@ -2149,6 +2645,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
   function setServerRecordsViewActive(active) {
     document.getElementById('view-server-records')?.classList.toggle('active', active === true);
+    if (active !== true) clearPosterBrowserSession(false);
   }
 
   function activateServerRecordsRoute(app, syncHash = true) {
@@ -2174,6 +2671,14 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     patchedServerRecordsApp = app;
     const navigate = typeof app.navigate === 'function' ? app.navigate.bind(app) : null;
     const handleExternalHashNavigation = typeof app.handleExternalHashNavigation === 'function' ? app.handleExternalHashNavigation.bind(app) : null;
+    for (const methodName of ['logout', 'signOut']) {
+      if (typeof app[methodName] !== 'function') continue;
+      const method = app[methodName].bind(app);
+      app[methodName] = function clearPosterCredentialsBeforeLogout(...args) {
+        clearPosterBrowserSession(true);
+        return method(...args);
+      };
+    }
     app.navigate = function navigateWithServerRecords(rawHash) {
       if (String(rawHash || '').trim() === serverRecordsHash) return activateServerRecordsRoute(this, true);
       setServerRecordsViewActive(false);
@@ -2262,88 +2767,76 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   function readPosterMetadataState(payload = {}) {
-    const metadata = payload?.posterMetadata && typeof payload.posterMetadata === 'object'
-      ? payload.posterMetadata
+    const bindings = payload?.posterBrowserBindings && typeof payload.posterBrowserBindings === 'object'
+      ? payload.posterBrowserBindings
       : {};
-    const tmdbStorage = ['kv_config', 'worker_secret'].includes(metadata?.tmdb?.storage)
-      ? metadata.tmdb.storage
-      : 'none';
+    const config = payload?.config && typeof payload.config === 'object' ? payload.config : {};
+    const source = (value, configured) => ['admin', 'binding'].includes(String(value || ''))
+      ? String(value)
+      : (configured ? 'binding' : 'none');
     return {
-      tmdbConfigured: metadata?.tmdb?.configured === true,
-      tmdbStorage
+      tmdbTokenConfigured: bindings.tmdbTokenConfigured === true,
+      tmdbTokenSource: source(bindings.tmdbTokenSource, bindings.tmdbTokenConfigured === true),
+      doubanOriginConfigured: bindings.doubanOriginConfigured === true,
+      doubanOriginSource: source(bindings.doubanOriginSource, bindings.doubanOriginConfigured === true),
+      doubanTokenConfigured: bindings.doubanTokenConfigured === true,
+      doubanTokenSource: source(bindings.doubanTokenSource, bindings.doubanTokenConfigured === true),
+      doubanOrigin: String(config.doubanBrowserOrigin || '')
     };
-  }
-
-  const TMDB_API_KEY_INPUT_REGEX = /^[A-Za-z0-9_-]{16,256}$/;
-
-  function getPosterMetadataKeyInput() {
-    return posterMetadataState.root?.querySelector?.('[data-poster-metadata-tmdb-key="1"]') || null;
-  }
-
-  function syncPosterMetadataDraftFromInput() {
-    const input = getPosterMetadataKeyInput();
-    if (input) posterMetadataState.draftKey = String(input.value || '').trim();
-    if (posterMetadataState.draftKey) posterMetadataState.removeRequested = false;
-    return posterMetadataState.draftKey;
-  }
-
-  function getPosterMetadataAccountMutation() {
-    const tmdbApiKey = syncPosterMetadataDraftFromInput();
-    if (posterMetadataState.removeRequested) return { type: 'remove', tmdbApiKey: '' };
-    if (tmdbApiKey) return { type: posterMetadataState.tmdbStorage === 'kv_config' ? 'replace' : 'add', tmdbApiKey };
-    return null;
   }
 
   function applyPosterMetadataStatePayload(payload = {}) {
     const nextState = readPosterMetadataState(payload);
-    posterMetadataState.tmdbConfigured = nextState.tmdbConfigured;
-    posterMetadataState.tmdbStorage = nextState.tmdbStorage;
+    posterMetadataState.tmdbTokenConfigured = nextState.tmdbTokenConfigured;
+    posterMetadataState.tmdbTokenSource = nextState.tmdbTokenSource;
+    posterMetadataState.doubanOriginConfigured = nextState.doubanOriginConfigured;
+    posterMetadataState.doubanOriginSource = nextState.doubanOriginSource;
+    posterMetadataState.doubanTokenConfigured = nextState.doubanTokenConfigured;
+    posterMetadataState.doubanTokenSource = nextState.doubanTokenSource;
+    posterMetadataState.tmdbToken = '';
+    posterMetadataState.doubanOrigin = nextState.doubanOrigin;
+    posterMetadataState.doubanToken = '';
+    posterMetadataState.clearTmdbToken = false;
+    posterMetadataState.clearDoubanToken = false;
+    posterMetadataState.dirty = false;
     posterMetadataState.hydrated = true;
     return nextState;
   }
 
-  function togglePosterMetadataRemoval(app) {
-    if (posterMetadataState.pending) return;
-    if (!posterMetadataState.removeRequested && posterMetadataState.tmdbStorage !== 'kv_config') return;
-    posterMetadataState.removeRequested = !posterMetadataState.removeRequested;
-    posterMetadataState.draftKey = '';
-    const input = getPosterMetadataKeyInput();
-    if (input) input.value = '';
-    syncPosterMetadataPanel(app);
+  function posterMetadataSourceLabel(source = 'none') {
+    return source === 'admin' ? '管理台设置' : (source === 'binding' ? 'Cloudflare Dashboard' : '未配置');
   }
 
-  function hideOriginalAccountSaveButton(settingsRoot, panel) {
-    settingsRoot.querySelectorAll?.('button').forEach((button) => {
-      if (panel.contains?.(button)
-        || button.getAttribute('data-account-settings-save') === '1'
-        || String(button.textContent || '').trim() !== '保存账号设置') return;
-      button.hidden = true;
-      button.tabIndex = -1;
-      button.setAttribute('aria-hidden', 'true');
-      button.setAttribute('data-account-save-replaced', '1');
+  async function savePosterMetadataSettings(app) {
+    if (!app || posterMetadataState.loading || posterMetadataState.savePending) return;
+    const accepted = await app.askConfirm?.('保存影视海报来源设置？', {
+      title: '保存影视海报来源',
+      tone: 'warning',
+      confirmText: '保存'
     });
-  }
-
-  function syncAccountSettingsSaveActions(settingsRoot, panel, app) {
-    let actions = document.getElementById('account-settings-save-actions');
-    if (!actions) {
-      actions = document.createElement('div');
-      actions.id = 'account-settings-save-actions';
-      actions.setAttribute('data-account-settings-save-actions', '1');
-      actions.className = 'flex flex-wrap items-center justify-end gap-2 border-t border-slate-200 pt-4 dark:border-slate-800';
-      actions.innerHTML = '<button data-account-settings-save="1" type="button" class="inline-flex min-h-10 items-center justify-center rounded-control bg-brand-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-700"><i data-lucide="save" class="mr-2 h-4 w-4" aria-hidden="true"></i>保存账号设置</button>';
-      actions.querySelector('[data-account-settings-save="1"]')?.addEventListener('click', () => {
-        void app.saveSettings?.('account');
+    if (accepted === false) return;
+    posterMetadataState.savePending = true;
+    syncPosterMetadataPanel(app);
+    try {
+      const result = await app.apiCall('savePosterBrowserSettings', {
+        ...(posterMetadataState.tmdbToken ? { tmdbToken: posterMetadataState.tmdbToken } : {}),
+        doubanOrigin: posterMetadataState.doubanOrigin,
+        ...(posterMetadataState.doubanToken ? { doubanToken: posterMetadataState.doubanToken } : {}),
+        clearTmdbToken: posterMetadataState.clearTmdbToken,
+        clearDoubanToken: posterMetadataState.clearDoubanToken
       });
-      scheduleIconRefresh(actions);
+      if (result?.revisions) app.applyAdminRevisions?.(result.revisions);
+      if (result?.config && typeof result.config === 'object') app.runtimeConfig = result.config;
+      clearPosterBrowserSession(true);
+      applyPosterMetadataStatePayload(result);
+      app.showMessage?.('影视海报来源设置已保存', { tone: 'success' });
+    } catch (error) {
+      console.error('savePosterMetadataSettings failed', error);
+      app.showMessage?.('影视海报来源保存失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+    } finally {
+      posterMetadataState.savePending = false;
+      syncPosterMetadataPanel(app);
     }
-    if (panel.nextElementSibling !== actions) panel.insertAdjacentElement('afterend', actions);
-    const saveButton = actions.querySelector('[data-account-settings-save="1"]');
-    if (saveButton) {
-      saveButton.disabled = posterMetadataState.pending === true;
-      saveButton.setAttribute('aria-busy', posterMetadataState.pending === true ? 'true' : 'false');
-    }
-    return actions;
   }
 
   function syncPosterMetadataPanel(app) {
@@ -2356,60 +2849,58 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       panel.setAttribute('data-poster-metadata-panel', '1');
       panel.className = 'ui-settings-panel settings-block h-full';
       panel.innerHTML = '<div class="ui-block-head"><div><div class="ui-section-kicker">POSTER METADATA</div><div class="ui-section-title">影视海报来源</div></div><i data-lucide="image" class="h-4 w-4 text-sky-600" aria-hidden="true"></i></div>'
-        + '<div data-poster-metadata-grid="1"><label class="block text-xs text-slate-500">TMDB v3 API Key<input data-poster-metadata-tmdb-key="1" type="password" autocomplete="new-password" spellcheck="false" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /></label><div><span class="block text-xs text-slate-500">IMDb 识别</span><span data-poster-metadata-imdb="1" data-poster-metadata-status="1" class="mt-1">经 TMDB Find 解析</span></div></div>'
-        + '<div class="mt-3"><span data-poster-metadata-tmdb-status="1" data-poster-metadata-status="1">TMDB 密钥未配置</span><p class="mt-2 text-xs leading-5 text-slate-500">TMDB 直接 ID → IMDb ID 经 TMDB Find → Emby → 占位海报</p></div>'
-        + '<div data-poster-metadata-actions="1"><p class="text-xs leading-5 text-slate-500">管理台密钥保存至 KV 并优先生效；Worker Secret 仅作兼容兜底。快照与默认导出会自动脱敏。</p><div class="flex flex-wrap gap-2"><button data-poster-metadata-remove="1" type="button" class="settings-secondary-btn min-h-10 px-4 py-2 text-sm font-medium">移除 KV 密钥</button></div></div>';
-      panel.querySelector('[data-poster-metadata-tmdb-key="1"]')?.addEventListener('input', (event) => {
-        posterMetadataState.draftKey = String(event.currentTarget?.value || '').trim();
-        if (posterMetadataState.draftKey) posterMetadataState.removeRequested = false;
-        syncPosterMetadataPanel(app);
+        + '<div data-poster-metadata-grid="1"><label class="block text-xs text-slate-500">TMDB API 读取访问令牌（Bearer）<input data-poster-metadata-tmdb-token="1" type="password" autocomplete="new-password" placeholder="eyJ..." class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /><span data-poster-binding="tmdbToken" data-poster-metadata-status="1" class="mt-1">未配置</span><span class="mt-2 flex items-center gap-2"><input data-poster-metadata-clear-tmdb="1" type="checkbox" class="h-4 w-4 rounded" />清除管理台值</span></label><label class="block text-xs text-slate-500">豆瓣服务 Origin<input data-poster-metadata-douban-origin="1" type="url" inputmode="url" placeholder="https://poster.example.com" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /><span data-poster-binding="doubanOrigin" data-poster-metadata-status="1" class="mt-1">未配置</span></label><label class="block text-xs text-slate-500">豆瓣 Browser Token<input data-poster-metadata-douban-token="1" type="password" autocomplete="new-password" class="mt-1 w-full border border-slate-200 bg-white p-2 text-sm outline-none dark:border-slate-700 dark:bg-slate-900 dark:text-white" /><span data-poster-binding="doubanToken" data-poster-metadata-status="1" class="mt-1">未配置</span><span class="mt-2 flex items-center gap-2"><input data-poster-metadata-clear-douban="1" type="checkbox" class="h-4 w-4 rounded" />清除管理台值</span></label></div><div data-poster-metadata-actions="1"><span></span><button data-poster-metadata-save="1" type="button" class="inline-flex min-h-10 items-center justify-center border border-sky-300 px-4 py-2 text-sm font-medium text-sky-700 transition hover:bg-sky-50 dark:border-sky-800 dark:text-sky-300 dark:hover:bg-sky-950/40"><i data-lucide="save" class="mr-2 h-4 w-4" aria-hidden="true"></i>保存海报来源</button></div>';
+      panel.querySelector('[data-poster-metadata-tmdb-token="1"]')?.addEventListener('input', (event) => {
+        posterMetadataState.tmdbToken = String(event.target?.value || '');
+        posterMetadataState.clearTmdbToken = false;
+        posterMetadataState.dirty = true;
       });
-      panel.querySelector('[data-poster-metadata-remove="1"]')?.addEventListener('click', () => {
-        togglePosterMetadataRemoval(app);
+      panel.querySelector('[data-poster-metadata-douban-origin="1"]')?.addEventListener('input', (event) => {
+        posterMetadataState.doubanOrigin = String(event.target?.value || '');
+        posterMetadataState.dirty = true;
       });
-      mountSensitiveInputToggle(panel.querySelector('[data-poster-metadata-tmdb-key="1"]'));
+      panel.querySelector('[data-poster-metadata-douban-token="1"]')?.addEventListener('input', (event) => {
+        posterMetadataState.doubanToken = String(event.target?.value || '');
+        posterMetadataState.clearDoubanToken = false;
+        posterMetadataState.dirty = true;
+      });
+      panel.querySelector('[data-poster-metadata-clear-tmdb="1"]')?.addEventListener('change', (event) => {
+        posterMetadataState.clearTmdbToken = event.target?.checked === true;
+        posterMetadataState.dirty = true;
+      });
+      panel.querySelector('[data-poster-metadata-clear-douban="1"]')?.addEventListener('change', (event) => {
+        posterMetadataState.clearDoubanToken = event.target?.checked === true;
+        posterMetadataState.dirty = true;
+      });
+      panel.querySelector('[data-poster-metadata-save="1"]')?.addEventListener('click', () => savePosterMetadataSettings(app));
+      mountSensitiveInputToggle(panel.querySelector('[data-poster-metadata-tmdb-token="1"]'));
+      mountSensitiveInputToggle(panel.querySelector('[data-poster-metadata-douban-token="1"]'));
       scheduleIconRefresh(panel);
     }
     if (panel.parentElement !== settingsRoot) settingsRoot.appendChild(panel);
-    const accountSaveActions = syncAccountSettingsSaveActions(settingsRoot, panel, app);
-    if (settingsRoot.lastElementChild !== accountSaveActions || accountSaveActions.previousElementSibling !== panel) {
-      settingsRoot.appendChild(panel);
-      settingsRoot.appendChild(accountSaveActions);
-    }
-    hideOriginalAccountSaveButton(settingsRoot, panel);
     posterMetadataState.root = panel;
-    const input = panel.querySelector('[data-poster-metadata-tmdb-key="1"]');
-    if (input) {
-      mountSensitiveInputToggle(input);
-      if (posterMetadataState.removeRequested) input.value = '';
-      else if (!input.value && posterMetadataState.draftKey) input.value = posterMetadataState.draftKey;
-      const placeholder = posterMetadataState.tmdbStorage === 'kv_config'
-        ? '留空不会修改当前 KV 密钥'
-        : (posterMetadataState.tmdbStorage === 'worker_secret'
-            ? '输入 KV 密钥可覆盖 Worker Secret'
-            : '请输入 TMDB v3 API Key');
-      syncSensitiveInputPresentation(input, placeholder);
-      input.disabled = posterMetadataState.pending === true;
+    const states = {
+      tmdbToken: [posterMetadataState.tmdbTokenConfigured, posterMetadataState.tmdbTokenSource],
+      doubanOrigin: [posterMetadataState.doubanOriginConfigured, posterMetadataState.doubanOriginSource],
+      doubanToken: [posterMetadataState.doubanTokenConfigured, posterMetadataState.doubanTokenSource]
+    };
+    for (const [name, [configured, source]] of Object.entries(states)) {
+      const status = panel.querySelector('[data-poster-binding="' + name + '"]');
+      if (status) status.textContent = configured ? posterMetadataSourceLabel(source) : '未配置';
     }
-    const tmdbStatus = panel.querySelector('[data-poster-metadata-tmdb-status="1"]');
-    if (tmdbStatus) {
-      tmdbStatus.textContent = posterMetadataState.removeRequested
-        ? 'TMDB KV 密钥将在保存账号设置后移除'
-        : (posterMetadataState.draftKey
-            ? (posterMetadataState.tmdbStorage === 'kv_config' ? 'TMDB KV 密钥待替换' : 'TMDB KV 密钥待新增')
-            : (posterMetadataState.tmdbStorage === 'kv_config'
-                ? 'TMDB 密钥已配置（KV，优先）'
-                : (posterMetadataState.tmdbStorage === 'worker_secret'
-                    ? 'TMDB 已通过 Worker Secret 配置（兼容兜底）'
-                    : 'TMDB 密钥未配置')));
-    }
-    const removeButton = panel.querySelector('[data-poster-metadata-remove="1"]');
-    if (removeButton) {
-      removeButton.disabled = posterMetadataState.pending === true
-        || (!posterMetadataState.removeRequested && posterMetadataState.tmdbStorage !== 'kv_config');
-      removeButton.setAttribute('aria-busy', posterMetadataState.pending === true ? 'true' : 'false');
-      removeButton.textContent = posterMetadataState.removeRequested ? '撤销移除' : '移除 KV 密钥';
-    }
+    const tmdbInput = panel.querySelector('[data-poster-metadata-tmdb-token="1"]');
+    const doubanOriginInput = panel.querySelector('[data-poster-metadata-douban-origin="1"]');
+    const doubanTokenInput = panel.querySelector('[data-poster-metadata-douban-token="1"]');
+    const clearTmdb = panel.querySelector('[data-poster-metadata-clear-tmdb="1"]');
+    const clearDouban = panel.querySelector('[data-poster-metadata-clear-douban="1"]');
+    if (tmdbInput && tmdbInput.value !== posterMetadataState.tmdbToken) tmdbInput.value = posterMetadataState.tmdbToken;
+    if (doubanOriginInput && doubanOriginInput.value !== posterMetadataState.doubanOrigin) doubanOriginInput.value = posterMetadataState.doubanOrigin;
+    if (doubanTokenInput && doubanTokenInput.value !== posterMetadataState.doubanToken) doubanTokenInput.value = posterMetadataState.doubanToken;
+    if (clearTmdb) { clearTmdb.checked = posterMetadataState.clearTmdbToken; clearTmdb.disabled = posterMetadataState.tmdbTokenSource !== 'admin' || posterMetadataState.savePending; }
+    if (clearDouban) { clearDouban.checked = posterMetadataState.clearDoubanToken; clearDouban.disabled = posterMetadataState.doubanTokenSource !== 'admin' || posterMetadataState.savePending; }
+    panel.querySelectorAll('input,button').forEach((control) => {
+      if (!control.matches?.('[data-poster-metadata-clear-tmdb],[data-poster-metadata-clear-douban]')) control.disabled = posterMetadataState.savePending;
+    });
     if (!posterMetadataState.hydrated && !posterMetadataState.loading && !posterMetadataState.loadAttempted) {
       void hydratePosterMetadataState(app);
     }
@@ -2423,7 +2914,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     posterMetadataState.loadAttempted = true;
     try {
       const payload = await app.apiCall('getSettingsBootstrap');
-      if (hydrationSeq !== posterMetadataState.hydrationSeq) return;
+      if (hydrationSeq !== posterMetadataState.hydrationSeq || posterMetadataState.dirty) return;
       applyPosterMetadataStatePayload(payload);
     } catch (error) {
       if (hydrationSeq === posterMetadataState.hydrationSeq) console.error('hydratePosterMetadataState failed', error);
@@ -2433,119 +2924,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         syncPosterMetadataPanel(app);
       }
     }
-  }
-
-  function patchPosterMetadataAccountSaveChain(app) {
-    if (!app || patchedPosterMetadataAccountApp === app) return;
-    if (typeof app.getConfigPanelFieldKeys !== 'function'
-      || typeof app.collectConfigSectionFromForm !== 'function'
-      || typeof app.prepareConfigChangePreview !== 'function'
-      || typeof app.apiCall !== 'function'
-      || typeof app.saveSettings !== 'function') return;
-    patchedPosterMetadataAccountApp = app;
-
-    const getConfigPanelFieldKeys = app.getConfigPanelFieldKeys.bind(app);
-    app.getConfigPanelFieldKeys = function getConfigPanelFieldKeysWithPosterMetadata(section, panel = '') {
-      const fields = getConfigPanelFieldKeys(section, panel);
-      const normalizedFields = Array.isArray(fields) ? fields.slice() : [];
-      if (section === 'account' || panel === 'account') {
-        if (!normalizedFields.includes('tmdbApiKey')) normalizedFields.push('tmdbApiKey');
-      }
-      return normalizedFields;
-    };
-
-    const collectConfigSectionFromForm = app.collectConfigSectionFromForm.bind(app);
-    app.collectConfigSectionFromForm = function collectConfigSectionFromFormWithPosterMetadata(section, options = {}) {
-      const sectionConfig = collectConfigSectionFromForm(section, options);
-      if (section !== 'account') return sectionConfig;
-      const mutation = getPosterMetadataAccountMutation();
-      if (mutation) sectionConfig.tmdbApiKey = mutation.tmdbApiKey;
-      else delete sectionConfig.tmdbApiKey;
-      return sectionConfig;
-    };
-
-    if (typeof app.formatConfigPreviewValue === 'function') {
-      const formatConfigPreviewValue = app.formatConfigPreviewValue.bind(app);
-      app.formatConfigPreviewValue = function formatConfigPreviewValueWithRedactedPosterKey(field, value) {
-        if (field === 'tmdbApiKey') return value ? '已填写' : '未配置';
-        return formatConfigPreviewValue(field, value);
-      };
-    }
-
-    const prepareConfigChangePreview = app.prepareConfigChangePreview.bind(app);
-    app.prepareConfigChangePreview = async function prepareConfigChangePreviewWithPosterMetadata(section, currentConfig, nextConfig, panel = section) {
-      const result = await prepareConfigChangePreview(section, currentConfig, nextConfig, panel);
-      if (section !== 'account' && panel !== 'account') return result;
-      const mutation = getPosterMetadataAccountMutation();
-      if (!mutation) return result;
-      const sanitizedConfig = {
-        ...(result?.sanitizedConfig && typeof result.sanitizedConfig === 'object' ? result.sanitizedConfig : {}),
-        tmdbApiKey: mutation.tmdbApiKey
-      };
-      const actionLabel = mutation.type === 'remove' ? '移除' : (mutation.type === 'replace' ? '替换' : '新增');
-      const preview = result?.preview && typeof result.preview === 'object' ? result.preview : {};
-      const rawExistingMessage = String(preview.message || '');
-      const safeExistingMessage = mutation.tmdbApiKey
-        ? rawExistingMessage.split(mutation.tmdbApiKey).join('********')
-        : rawExistingMessage;
-      const messagePrefix = preview.hasChanges === true
-        ? safeExistingMessage
-        : '即将保存「账号设置」以下变更：';
-      return {
-        ...result,
-        sanitizedConfig,
-        preview: {
-          ...preview,
-          hasChanges: true,
-          message: messagePrefix + '\\n• TMDB KV 密钥：' + actionLabel
-        }
-      };
-    };
-
-    let activeAccountSave = null;
-    const apiCall = app.apiCall.bind(app);
-    app.apiCall = async function apiCallWithPosterMetadataAccountSave(action, payload, ...args) {
-      const result = await apiCall(action, payload, ...args);
-      if (activeAccountSave
-        && action === 'saveConfig'
-        && payload?.meta?.section === 'account') {
-        activeAccountSave.saved = true;
-        activeAccountSave.result = result;
-      }
-      return result;
-    };
-
-    const saveSettings = app.saveSettings.bind(app);
-    app.saveSettings = async function saveSettingsWithPosterMetadata(section, panel = section, ...args) {
-      if (section !== 'account' && panel !== 'account') return saveSettings(section, panel, ...args);
-      if (posterMetadataState.pending) return null;
-      const tmdbApiKey = syncPosterMetadataDraftFromInput();
-      if (tmdbApiKey && !TMDB_API_KEY_INPUT_REGEX.test(tmdbApiKey)) {
-        this.showMessage?.('请输入有效的 TMDB v3 API Key。', { tone: 'warning', modal: true });
-        getPosterMetadataKeyInput()?.focus?.();
-        return null;
-      }
-      const transaction = { saved: false, result: null };
-      activeAccountSave = transaction;
-      posterMetadataState.pending = true;
-      syncPosterMetadataPanel(this);
-      try {
-        const result = await saveSettings(section, panel, ...args);
-        if (transaction.saved) {
-          posterMetadataState.draftKey = '';
-          posterMetadataState.removeRequested = false;
-          const input = getPosterMetadataKeyInput();
-          if (input) input.value = '';
-          if (transaction.result?.posterMetadata) applyPosterMetadataStatePayload(transaction.result);
-          else await hydratePosterMetadataState(this, true);
-        }
-        return result;
-      } finally {
-        if (activeAccountSave === transaction) activeAccountSave = null;
-        posterMetadataState.pending = false;
-        syncPosterMetadataPanel(this);
-      }
-    };
   }
 
   function patchSafetyContractMethods(app) {
@@ -3391,7 +3769,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   function applySafetyContractEnhancements() {
     const app = window.App;
     if (!app) return;
-    patchPosterMetadataAccountSaveChain(app);
     patchSafetyContractMethods(app);
     patchMediaAggregationNodeCredentials(app);
     syncNodeMediaAggregationCredentialFields(app);
@@ -3418,6 +3795,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     scheduleIconRefresh(document.body);
     scheduleShellRefresh();
   }, { once: true });
+  window.addEventListener('pagehide', () => clearPosterBrowserSession(true));
 
   if (typeof MutationObserver === 'function') {
     const observer = new MutationObserver((records) => {
@@ -3438,6 +3816,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         }
         for (const node of record.removedNodes) {
           if (!node || node.nodeType !== Node.ELEMENT_NODE) continue;
+          releasePosterElements(node);
           if (
             node.matches?.('[data-admin-node-media-credentials="1"],[data-poster-metadata-panel="1"]')
             || node.querySelector?.('[data-admin-node-media-credentials="1"],[data-poster-metadata-panel="1"]')

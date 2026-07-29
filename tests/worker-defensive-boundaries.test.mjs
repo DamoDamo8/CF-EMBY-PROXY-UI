@@ -49,8 +49,6 @@ const {
   isMutableJsdelivrGithubAssetUrl,
   renderAdminReleaseVendorAsset,
   isAdminWarmRoute,
-  resolveAdminServerRecordPosterRouteMatch,
-  renderAdminServerRecordPoster,
   warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
   isAdminWarmResponseSuccessful,
@@ -64,9 +62,10 @@ const {
   matchMediaAggregationIdentities,
   buildMediaAggregationMatchFingerprintHash,
   verifyMediaAggregationSourceSignature,
-  normalizeTmdbApiKeyInput,
-  resolveTmdbPosterApiKey,
-  buildPosterMetadataSettingsState,
+  normalizePosterBrowserOrigin,
+  normalizeTmdbBrowserToken,
+  buildPosterBrowserConfig,
+  buildServerRecordPosterMetadata,
   resolveMediaAggregationCredentials,
   buildServerRecordExpiry,
   getDueScheduledClockSlots
@@ -267,29 +266,74 @@ test("media aggregation credentials prefer node usernames and allow empty passwo
   assert.equal(resolveMediaAggregationCredentials({}, {}).configured, false);
 });
 
-test("TMDB poster configuration accepts a KV key without exposing its value", () => {
-  const tmdbApiKey = "abcdefghijklmnopqrstuvwxyz123456";
-  assert.equal(normalizeTmdbApiKeyInput(tmdbApiKey), tmdbApiKey);
-  assert.equal(normalizeTmdbApiKeyInput("invalid key with spaces"), "");
-  assert.equal(resolveTmdbPosterApiKey({}, { tmdbApiKey }), tmdbApiKey);
-  assert.equal(resolveTmdbPosterApiKey({ TMDB_API_KEY: "environment-secret" }, { tmdbApiKey }), tmdbApiKey);
-  assert.equal(resolveTmdbPosterApiKey({ TMDB_API_KEY: "environment-secret" }, {}), "environment-secret");
-  assert.deepEqual(buildPosterMetadataSettingsState({}, { tmdbApiKey }), {
-    tmdb: { configured: true, storage: "kv_config" },
-    imdb: { configured: true, mode: "tmdb_find" },
-    sourceOrder: ["tmdb_direct", "imdb_tmdb_find", "emby", "placeholder"]
+test("poster browser bindings expose status separately from authenticated values", () => {
+  assert.equal(normalizePosterBrowserOrigin("https://douban.example"), "https://douban.example");
+  assert.equal(normalizePosterBrowserOrigin("https://douban.example/base"), "");
+  assert.equal(normalizeTmdbBrowserToken("Bearer tmdb-browser-token"), "tmdb-browser-token");
+  assert.equal(normalizeTmdbBrowserToken("0123456789abcdef0123456789abcdef"), "");
+  assert.deepEqual(buildPosterBrowserConfig({
+    TMDB_BROWSER_TOKEN: "tmdb-browser-token",
+    DOUBAN_BROWSER_ORIGIN: "https://douban.example",
+    DOUBAN_BROWSER_TOKEN: "douban-browser-token"
+  }), {
+    tmdbTokenConfigured: true,
+    tmdbTokenSource: "binding",
+    doubanOriginConfigured: true,
+    doubanOriginSource: "binding",
+    doubanTokenConfigured: true,
+    doubanTokenSource: "binding"
   });
-  assert.deepEqual(buildPosterMetadataSettingsState({ TMDB_API_KEY: "environment-secret" }, {}), {
-    tmdb: { configured: true, storage: "worker_secret" },
-    imdb: { configured: true, mode: "tmdb_find" },
-    sourceOrder: ["tmdb_direct", "imdb_tmdb_find", "emby", "placeholder"]
+  assert.deepEqual(buildPosterBrowserConfig({
+    TMDB_BROWSER_TOKEN: "tmdb-browser-token",
+    DOUBAN_BROWSER_ORIGIN: "https://douban.example",
+    DOUBAN_BROWSER_TOKEN: "douban-browser-token"
+  }, {
+    tmdbBrowserToken: "saved-tmdb-token",
+    doubanBrowserOrigin: "https://saved-douban.example",
+    doubanBrowserToken: "saved-douban-token"
+  }, true), {
+    tmdb: { configured: true, token: "saved-tmdb-token" },
+    douban: {
+      configured: true,
+      origin: "https://saved-douban.example",
+      token: "saved-douban-token"
+    }
   });
-  assert.deepEqual(buildPosterMetadataSettingsState({}, {}), {
-    tmdb: { configured: false, storage: "none" },
-    imdb: { configured: true, mode: "tmdb_find" },
-    sourceOrder: ["tmdb_direct", "imdb_tmdb_find", "emby", "placeholder"]
+});
+
+test("poster search metadata uses movie and series identities without provider ids", () => {
+  assert.deepEqual(buildServerRecordPosterMetadata({
+    Id: "movie-1",
+    Type: "Movie",
+    Name: "千与千寻",
+    OriginalTitle: "Spirited Away",
+    ProductionYear: 2001,
+    ProviderIds: { Tmdb: "129", Imdb: "tt0245429" }
+  }), {
+    mediaKind: "movie",
+    itemType: "movie",
+    title: "千与千寻",
+    originalTitle: "Spirited Away",
+    productionYear: 2001
   });
-  assert.doesNotMatch(JSON.stringify(buildPosterMetadataSettingsState({}, { tmdbApiKey })), /abcdefghijklmnopqrstuvwxyz123456/);
+  assert.deepEqual(buildServerRecordPosterMetadata({
+    Id: "episode-1",
+    Type: "Episode",
+    Name: "第一集",
+    SeriesName: "漫长的季节",
+    SeriesOriginalTitle: "The Long Season",
+    SeriesProductionYear: 2023,
+    OriginalTitle: "Episode One",
+    ProductionYear: 2026,
+    SeriesProviderIds: { Tmdb: "209064" }
+  }), {
+    mediaKind: "tv",
+    itemType: "episode",
+    title: "漫长的季节",
+    originalTitle: "The Long Season",
+    productionYear: 2023
+  });
+  assert.equal(JSON.stringify(buildServerRecordPosterMetadata({ Type: "Movie", Name: "No IDs" })).includes("provider"), false);
 });
 
 test("node summaries preserve credential state without exposing passwords", () => {
@@ -429,6 +473,32 @@ test("server record password reveal returns only the requested effective credent
   } finally {
     Database.getNodeForRead = originalGetNodeForRead;
   }
+});
+
+test("PlaybackInfo rewrite removes non-object media sources before client delivery", () => {
+  const result = Proxy.rewritePlaybackInfoPayload(
+    {
+      proxyPath: "/Items/primary/PlaybackInfo",
+      requestUrl: new URL("https://proxy.test/node/Items/primary/PlaybackInfo"),
+      rawRequestUrl: new URL("https://proxy.test/node/Items/primary/PlaybackInfo"),
+      nodeName: "node",
+      nodeKey: "secret",
+      entryMode: "kv_route"
+    },
+    {
+      MediaSources: [
+        JSON.stringify({ Id: "encoded-source" }),
+        { Id: "valid-source", Path: "/Videos/primary/stream" }
+      ]
+    },
+    new URL("https://upstream.test"),
+    new URL("https://upstream.test/Items/primary/PlaybackInfo")
+  );
+
+  assert.equal(result.rewriteState, "applied");
+  assert.equal(result.payload.MediaSources.length, 1);
+  assert.equal(result.payload.MediaSources[0].Id, "valid-source");
+  assert.ok(result.payload.MediaSources.every(source => source && typeof source === "object" && !Array.isArray(source)));
 });
 
 test("media aggregation appends matched backup sources without a database mapping", async () => {
@@ -1751,423 +1821,289 @@ test("admin warm route is exact and follows the configured admin path", () => {
   assert.equal(isAdminWarmRoute("/admin/__warm/asset", "/admin"), false);
 });
 
-test("server record poster route is exact and requires admin authentication", async () => {
-  assert.deepEqual(resolveAdminServerRecordPosterRouteMatch("/console/__server-record-poster/server-a", "/console"), {
-    nodeName: "server-a"
+test("retired server record poster URLs return ordinary 404 without upstream requests", async () => {
+  const env = { ADMIN_PATH: "/console", ADMIN_PASS: "poster-password", JWT_SECRET: "poster-jwt-secret" };
+  const login = await RuntimeEntry.handleFetch(new Request("https://worker.test/console/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: "poster-password" })
+  }), env, { waitUntil() {} });
+  const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
+  let externalRequests = 0;
+  await withWorkerGlobals({ fetch: async () => { externalRequests += 1; return new Response("unexpected"); } }, async () => {
+    const response = await RuntimeEntry.handleFetch(new Request(
+      "https://worker.test/console/__server-record-poster/server-a",
+      { headers: { Cookie: authCookie } }
+    ), env, { waitUntil() {} });
+    assert.equal(response.status, 404);
   });
-  assert.equal(resolveAdminServerRecordPosterRouteMatch("/console/__server-record-poster/server-a/extra", "/console"), null);
-  assert.equal(resolveAdminServerRecordPosterRouteMatch("/console/__server-record-poster/server%2Fa", "/console"), null);
+  assert.equal(externalRequests, 0);
+});
 
+test("poster browser config action is authenticated, no-store, and isolated from legacy bindings", async () => {
+  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {
+    tmdbBrowserToken: "admin-tmdb-token",
+    doubanBrowserOrigin: "https://admin-douban.example",
+    doubanBrowserToken: "admin-douban-token"
+  } });
   const env = {
+    ENI_KV: kv,
     ADMIN_PATH: "/console",
     ADMIN_PASS: "poster-password",
-    JWT_SECRET: "poster-jwt-secret"
+    JWT_SECRET: "poster-jwt-secret",
+    TMDB_BROWSER_TOKEN: "browser-tmdb-token",
+    DOUBAN_BROWSER_ORIGIN: "https://douban.example",
+    DOUBAN_BROWSER_TOKEN: "browser-douban-token",
+    TMDB_API_KEY: "legacy-tmdb-key",
+    DOUBAN_SCRAPER_ORIGIN: "https://legacy-douban.example",
+    DOUBAN_SCRAPER_TOKEN: "legacy-douban-token"
   };
-  const originalPosterResponse = Database.getServerRecordPosterResponse;
-  let posterReads = 0;
-  Database.getServerRecordPosterResponse = async (_env, nodeName, method) => {
-    posterReads += 1;
-    assert.equal(nodeName, "server-a");
-    assert.equal(method, "GET");
-    return new Response(new Uint8Array([1, 2, 3]), {
-      headers: { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=300" }
-    });
-  };
-  try {
-    const unauthorized = await RuntimeEntry.handleFetch(
-      new Request("https://worker.test/console/__server-record-poster/server-a"),
-      env,
-      { waitUntil() {} }
-    );
-    assert.equal(unauthorized.status, 401);
-    assert.equal(unauthorized.headers.get("Cache-Control"), "no-store, max-age=0");
-    assert.equal(posterReads, 0);
-
-    const login = await RuntimeEntry.handleFetch(
-      new Request("https://worker.test/console/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ password: "poster-password" })
-      }),
-      env,
-      { waitUntil() {} }
-    );
-    const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
-    assert.ok(authCookie);
-    const authorized = await RuntimeEntry.handleFetch(
-      new Request("https://worker.test/console/__server-record-poster/server-a", {
-        headers: { Cookie: authCookie }
-      }),
-      env,
-      { waitUntil() {} }
-    );
-    assert.equal(authorized.status, 200);
-    assert.equal(authorized.headers.get("Content-Type"), "image/jpeg");
-    assert.equal(posterReads, 1);
-  } finally {
-    Database.getServerRecordPosterResponse = originalPosterResponse;
-  }
-});
-
-test("server record posters proxy only images without exposing the Emby token", async () => {
-  const originalSnapshots = Database.getServerRecordSnapshots;
-  const originalLastWatch = Database.getServerLastWatch;
-  const originalGetNodeForRead = Database.getNodeForRead;
-  const requests = [];
-  Database.getServerRecordSnapshots = async () => new Map([["server-a", {
-    lastItem: { itemId: "movie/1 ?", watchedAt: "2026-07-25T01:02:03.000Z" }
-  }]]);
-  Database.getServerLastWatch = async () => new Map([["server-a", { lastWatchedAt: "2026-07-25T01:02:03.000Z" }]]);
-  Database.getNodeForRead = async () => ({
-    target: "https://origin.example/emby",
-    headers: { "X-Emby-Token": "private-node-token" },
-    serverRecord: { enabled: true }
+  const request = (cookie, action = "getPosterBrowserConfig", data = {}) => new Request("https://worker.test/console", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify({ action, ...data })
   });
-  try {
-    await withWorkerGlobals({
-      fetch: async (url, options = {}) => {
-        requests.push({ url: String(url), headers: new Headers(options.headers) });
-        return new Response(new Uint8Array([0xff, 0xd8, 0xff]), {
-          headers: { "Content-Type": "image/jpeg", ETag: '"poster-v1"' }
-        });
-      }
-    }, async () => {
-      const response = await Database.getServerRecordPosterResponse({ DB: {} }, "server-a", "GET");
-      assert.equal(response?.status, 200);
-      assert.equal(response?.headers.get("Cache-Control"), "private, max-age=300, stale-while-revalidate=60");
-      assert.equal(response?.headers.get("Vary"), "Cookie");
-      assert.equal(response?.headers.get("ETag"), '"poster-v1"');
-      assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [0xff, 0xd8, 0xff]);
-      assert.equal(requests.length, 1);
-      assert.match(new URL(requests[0].url).pathname, /\/emby\/Items\/movie%2F1%20%3F\/Images\/Primary$/);
-      assert.equal(requests[0].headers.get("X-Emby-Token"), "private-node-token");
-      assert.equal(requests.some(request => new URL(request.url).origin === "https://api.themoviedb.org"), false);
-      assert.doesNotMatch(JSON.stringify([...response.headers]), /private-node-token/);
-    });
-
-    await withWorkerGlobals({
-      fetch: async () => new Response("not an image", { headers: { "Content-Type": "text/html" } })
-    }, async () => {
-      assert.equal(await Database.getServerRecordPosterResponse({ DB: {} }, "server-a", "GET"), null);
-    });
-    await withWorkerGlobals({
-      fetch: async () => new Response("<svg></svg>", { headers: { "Content-Type": "image/svg+xml" } })
-    }, async () => {
-      assert.equal(await Database.getServerRecordPosterResponse({ DB: {} }, "server-a", "GET"), null);
-    });
-  } finally {
-    Database.getServerRecordSnapshots = originalSnapshots;
-    Database.getServerLastWatch = originalLastWatch;
-    Database.getNodeForRead = originalGetNodeForRead;
-  }
-});
-
-test("server record posters prefer TMDB movie posters, cache the fixed path, and avoid repeat metadata reads", async () => {
-  const originals = {
-    snapshots: Database.getServerRecordSnapshots,
-    lastWatch: Database.getServerLastWatch,
-    getNodeForRead: Database.getNodeForRead,
-    getPosterCache: Database.getServerRecordPosterCache,
-    persistPosterCache: Database.persistServerRecordPosterCache
-  };
-  const cachedWrites = [];
-  const makeSnapshot = (itemId, watchedAt) => new Map([["server-a", { lastItem: { itemId, watchedAt } }]]);
-  Database.getServerRecordSnapshots = async () => makeSnapshot("movie-1", "2026-07-25T01:02:03.000Z");
-  Database.getServerLastWatch = async () => new Map([["server-a", { lastWatchedAt: "2026-07-25T01:02:03.000Z" }]]);
-  Database.getNodeForRead = async () => ({
-    target: "https://origin.example/emby",
-    headers: { "X-Emby-Token": "private-node-token" },
-    serverRecord: { enabled: true }
+  assert.equal((await RuntimeEntry.handleFetch(request(""), env, { waitUntil() {} })).status, 401);
+  const login = await RuntimeEntry.handleFetch(new Request("https://worker.test/console/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ password: "poster-password" })
+  }), env, { waitUntil() {} });
+  const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
+  const response = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Cache-Control"), "no-store, max-age=0");
+  assert.deepEqual(await response.json(), {
+    tmdb: { configured: true, token: "admin-tmdb-token" },
+    douban: { configured: true, origin: "https://admin-douban.example", token: "admin-douban-token" }
   });
-  Database.getServerRecordPosterCache = async () => null;
-  Database.persistServerRecordPosterCache = async (_db, entry) => {
-    cachedWrites.push(entry);
-    return true;
-  };
-  try {
-    const requests = [];
-    await withWorkerGlobals({
-      fetch: async (url, options = {}) => {
-        const parsed = new URL(String(url));
-        requests.push({ url: parsed, headers: new Headers(options.headers) });
-        if (parsed.origin === "https://origin.example" && parsed.pathname.endsWith("/Items/movie-1")) {
-          return new Response(JSON.stringify({ Type: "Movie", ProviderIds: { Tmdb: "123", Imdb: "tt7654321" } }), {
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        if (parsed.origin === "https://api.themoviedb.org" && parsed.pathname === "/3/movie/123/images") {
-          return new Response(JSON.stringify({
-            posters: [
-              { file_path: "/english.jpg", iso_639_1: "en", width: 1000, height: 1500, aspect_ratio: 0.667 },
-              { file_path: "/chinese.jpg", iso_639_1: "zh", width: 1000, height: 1500, aspect_ratio: 0.667 }
-            ]
-          }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-        }
-        if (parsed.origin === "https://image.tmdb.org" && parsed.pathname === "/t/p/w500/chinese.jpg") {
-          return new Response(new Uint8Array([0xff, 0xd8, 0xff]), { headers: { "Content-Type": "image/jpeg" } });
-        }
-        throw new Error(`unexpected request ${parsed.origin}${parsed.pathname}`);
-      }
-    }, async () => {
-      const response = await Database.getServerRecordPosterResponse({ DB: {}, TMDB_API_KEY: "tmdb-secret" }, "server-a", "GET");
-      assert.equal(response?.status, 200);
-      assert.deepEqual([...new Uint8Array(await response.arrayBuffer())], [0xff, 0xd8, 0xff]);
-    });
-    assert.equal(requests.filter(request => request.url.origin === "https://origin.example").length, 1);
-    assert.equal(requests.filter(request => request.url.origin === "https://api.themoviedb.org").length, 1);
-    assert.equal(requests.filter(request => request.url.origin === "https://image.tmdb.org").length, 1);
-    assert.equal(requests[1].url.searchParams.get("api_key"), "tmdb-secret");
-    assert.equal(requests[1].headers.get("X-Emby-Token"), null);
-    assert.equal(cachedWrites.length, 1);
-    assert.deepEqual(cachedWrites[0], {
-      nodeName: "server-a",
-      watchedAt: "2026-07-25T01:02:03.000Z",
-      itemId: "movie-1",
-      tmdbId: "123",
-      imdbId: "tt7654321",
-      provider: "tmdb_direct",
-      imagePath: "/chinese.jpg",
-      expiresAt: cachedWrites[0].expiresAt
-    });
-    assert.ok(Date.parse(cachedWrites[0].expiresAt) > Date.now());
 
-    const cacheHitRequests = [];
-    Database.getServerRecordPosterCache = async () => ({
-      watchedAt: "2026-07-25T01:02:03.000Z",
-      itemId: "movie-1",
-      tmdbId: "123",
-      imdbId: "tt7654321",
-      provider: "tmdb_direct",
-      imagePath: "/chinese.jpg",
-      expiresAt: "2099-01-01T00:00:00.000Z",
-      failureCode: "",
-      retryAfter: ""
-    });
-    await withWorkerGlobals({
-      fetch: async url => {
-        const parsed = new URL(String(url));
-        cacheHitRequests.push(parsed);
-        assert.equal(parsed.origin, "https://image.tmdb.org");
-        assert.equal(parsed.pathname, "/t/p/w500/chinese.jpg");
-        return new Response(new Uint8Array([0xff, 0xd8, 0xff]), { headers: { "Content-Type": "image/jpeg" } });
-      }
-    }, async () => {
-      assert.equal((await Database.getServerRecordPosterResponse({ DB: {}, TMDB_API_KEY: "tmdb-secret" }, "server-a", "GET"))?.status, 200);
-    });
-    assert.equal(cacheHitRequests.length, 1);
-  } finally {
-    Database.getServerRecordSnapshots = originals.snapshots;
-    Database.getServerLastWatch = originals.lastWatch;
-    Database.getNodeForRead = originals.getNodeForRead;
-    Database.getServerRecordPosterCache = originals.getPosterCache;
-    Database.persistServerRecordPosterCache = originals.persistPosterCache;
-  }
-});
+  const cleared = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+    clearTmdbToken: true,
+    doubanOrigin: "",
+    clearDoubanToken: true
+  }), env, { waitUntil() {} });
+  assert.equal(cleared.status, 200);
+  const clearedPayload = await cleared.json();
+  assert.equal(clearedPayload.config.tmdbBrowserToken, undefined);
+  assert.equal(clearedPayload.config.doubanBrowserToken, undefined);
+  assert.equal(clearedPayload.posterBrowserBindings.tmdbTokenSource, "binding");
+  assert.equal(clearedPayload.posterBrowserBindings.doubanOriginSource, "binding");
+  assert.equal(clearedPayload.posterBrowserBindings.doubanTokenSource, "binding");
 
-test("server record episode posters resolve IMDb through TMDB Find and TMDB failures fall back to Emby without leaking secrets", async () => {
-  const originals = {
-    snapshots: Database.getServerRecordSnapshots,
-    lastWatch: Database.getServerLastWatch,
-    getNodeForRead: Database.getNodeForRead,
-    getPosterCache: Database.getServerRecordPosterCache,
-    persistPosterCache: Database.persistServerRecordPosterCache
-  };
-  const cachedWrites = [];
-  Database.getServerRecordSnapshots = async () => new Map([["server-a", {
-    lastItem: { itemId: "episode-1", watchedAt: "2026-07-25T03:02:03.000Z" }
-  }]]);
-  Database.getServerLastWatch = async () => new Map([["server-a", { lastWatchedAt: "2026-07-25T03:02:03.000Z" }]]);
-  Database.getNodeForRead = async () => ({
-    target: "https://origin.example/emby",
-    headers: { "X-Emby-Token": "private-node-token" },
-    serverRecord: { enabled: true }
+  const fallback = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  assert.deepEqual(await fallback.json(), {
+    tmdb: { configured: true, token: "browser-tmdb-token" },
+    douban: { configured: true, origin: "https://douban.example", token: "browser-douban-token" }
   });
-  Database.getServerRecordPosterCache = async () => null;
-  Database.persistServerRecordPosterCache = async (_db, entry) => {
-    cachedWrites.push(entry);
-    return true;
-  };
-  try {
-    const requests = [];
-    await withWorkerGlobals({
-      fetch: async url => {
-        const parsed = new URL(String(url));
-        requests.push(parsed);
-        if (parsed.origin === "https://origin.example" && parsed.pathname.endsWith("/Items/episode-1")) {
-          return new Response(JSON.stringify({ Type: "Episode", SeriesId: "series-1", ParentIndexNumber: 1, IndexNumber: 2 }), {
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        if (parsed.origin === "https://origin.example" && parsed.pathname.endsWith("/Items/series-1")) {
-          return new Response(JSON.stringify({ Type: "Series", ProviderIds: { Imdb: "tt7654321" } }), {
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        if (parsed.origin === "https://api.themoviedb.org" && parsed.pathname === "/3/find/tt7654321") {
-          return new Response(JSON.stringify({ tv_results: [{ id: 456 }] }), { headers: { "Content-Type": "application/json" } });
-        }
-        if (parsed.origin === "https://api.themoviedb.org" && parsed.pathname === "/3/tv/456/images") {
-          return new Response(JSON.stringify({
-            posters: [{ file_path: "/series.jpg", iso_639_1: null, width: 1000, height: 1500, aspect_ratio: 0.667 }]
-          }), { headers: { "Content-Type": "application/json" } });
-        }
-        if (parsed.origin === "https://image.tmdb.org") {
-          return new Response(new Uint8Array([0xff, 0xd8, 0xff]), { headers: { "Content-Type": "image/jpeg" } });
-        }
-        throw new Error(`unexpected request ${parsed.origin}${parsed.pathname}`);
-      }
-    }, async () => {
-      const response = await Database.getServerRecordPosterResponse({ DB: {}, TMDB_API_KEY: "tmdb-secret" }, "server-a", "GET");
-      assert.equal(response?.status, 200);
-      assert.doesNotMatch(JSON.stringify([...response.headers]), /tmdb-secret|origin\.example|private-node-token/);
-    });
-    assert.deepEqual(requests.map(request => `${request.origin}${request.pathname}`), [
-      "https://origin.example/emby/Items/episode-1",
-      "https://origin.example/emby/Items/series-1",
-      "https://api.themoviedb.org/3/find/tt7654321",
-      "https://api.themoviedb.org/3/tv/456/images",
-      "https://image.tmdb.org/t/p/w500/series.jpg"
-    ]);
-    assert.equal(cachedWrites[0]?.provider, "tmdb_imdb_find");
-    assert.equal(cachedWrites[0]?.tmdbId, "456");
 
-    cachedWrites.length = 0;
-    const fallbackRequests = [];
-    await withWorkerGlobals({
-      fetch: async url => {
-        const parsed = new URL(String(url));
-        fallbackRequests.push(parsed);
-        if (parsed.origin === "https://origin.example" && parsed.pathname.endsWith("/Items/episode-1")) {
-          return new Response(JSON.stringify({ Type: "Episode", SeriesProviderIds: { Tmdb: "456" } }), {
-            headers: { "Content-Type": "application/json" }
-          });
-        }
-        if (parsed.origin === "https://api.themoviedb.org") return new Response(null, { status: 429, headers: { "Content-Type": "application/json" } });
-        if (parsed.origin === "https://origin.example" && parsed.pathname.endsWith("/Images/Primary")) {
-          return new Response(new Uint8Array([0xff, 0xd8, 0xff]), { headers: { "Content-Type": "image/jpeg" } });
-        }
-        throw new Error(`unexpected fallback request ${parsed.origin}${parsed.pathname}`);
-      }
-    }, async () => {
-      const response = await Database.getServerRecordPosterResponse({ DB: {}, TMDB_API_KEY: "tmdb-secret" }, "server-a", "GET");
-      assert.equal(response?.status, 200);
-      assert.doesNotMatch(JSON.stringify([...response.headers]), /tmdb-secret|origin\.example|private-node-token/);
-    });
-    assert.equal(fallbackRequests.filter(request => request.origin === "https://api.themoviedb.org").length, 1);
-    assert.equal(fallbackRequests.filter(request => request.pathname.endsWith("/Images/Primary")).length, 1);
-    assert.equal(cachedWrites[0]?.failureCode, "tmdb_rate_limited");
-    assert.ok(Date.parse(cachedWrites[0]?.retryAfter) > Date.now());
-  } finally {
-    Database.getServerRecordSnapshots = originals.snapshots;
-    Database.getServerLastWatch = originals.lastWatch;
-    Database.getNodeForRead = originals.getNodeForRead;
-    Database.getServerRecordPosterCache = originals.getPosterCache;
-    Database.persistServerRecordPosterCache = originals.persistPosterCache;
-  }
+  const rejectedApiKey = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+    tmdbToken: "0123456789abcdef0123456789abcdef"
+  }), env, { waitUntil() {} });
+  assert.equal(rejectedApiKey.status, 400);
+  const rejectedApiKeyPayload = await rejectedApiKey.json();
+  assert.equal(rejectedApiKeyPayload.error.code, "POSTER_TMDB_TOKEN_INVALID");
+  assert.match(rejectedApiKeyPayload.error.message, /API 读取访问令牌/);
+
+  const saved = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+    tmdbToken: "Bearer new-admin-tmdb-token",
+    doubanOrigin: "https://new-admin-douban.example",
+    doubanToken: "new-admin-douban-token"
+  }), env, { waitUntil() {} });
+  assert.equal(saved.status, 200);
+  const savedPayload = await saved.json();
+  assert.equal(savedPayload.config.tmdbBrowserToken, undefined);
+  assert.equal(savedPayload.config.doubanBrowserToken, undefined);
+  assert.equal(savedPayload.config.doubanBrowserOrigin, "https://new-admin-douban.example");
+  const configured = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  assert.deepEqual(await configured.json(), {
+    tmdb: { configured: true, token: "new-admin-tmdb-token" },
+    douban: { configured: true, origin: "https://new-admin-douban.example", token: "new-admin-douban-token" }
+  });
 });
 
-test("server record poster metadata maps movie, series, and episodes to their intended TMDB families", async () => {
-  const originalFetchServerRecordEndpoint = Database.fetchServerRecordEndpoint;
-  const seenPaths = [];
-  Database.fetchServerRecordEndpoint = async (_targetRecord, path) => {
-    seenPaths.push(path);
-    if (path.endsWith("/movie-1")) return { ok: true, parseError: false, json: { Type: "Movie", ProviderIds: { Tmdb: "101" } } };
-    if (path.endsWith("/series-1")) return { ok: true, parseError: false, json: { Type: "Series", ProviderIds: { Tmdb: "202" } } };
-    if (path.endsWith("/episode-1")) return { ok: true, parseError: false, json: { Type: "Episode", SeriesId: "series-parent", ParentIndexNumber: 1, IndexNumber: 2 } };
-    if (path.endsWith("/series-parent")) return { ok: true, parseError: false, json: { Type: "Series", ProviderIds: { Imdb: "tt7654321" } } };
-    throw new Error(`unexpected metadata path ${path}`);
-  };
-  try {
-    const options = ["server-a", {}, [{}], new Headers(), { configured: false }];
-    assert.deepEqual(await Database.getServerRecordPosterMetadata(...options, "movie-1"), {
-      mediaKind: "movie",
-      providerIds: { tmdb: "101" },
-      tmdbId: "",
-      imdbId: ""
-    });
-    assert.deepEqual(await Database.getServerRecordPosterMetadata(...options, "series-1"), {
-      mediaKind: "tv",
-      providerIds: { tmdb: "202" },
-      tmdbId: "",
-      imdbId: ""
-    });
-    assert.deepEqual(await Database.getServerRecordPosterMetadata(...options, "episode-1"), {
-      mediaKind: "tv",
-      providerIds: { imdb: "tt7654321" },
-      tmdbId: "",
-      imdbId: ""
-    });
-    assert.deepEqual(seenPaths, ["/Items/movie-1", "/Items/series-1", "/Items/episode-1", "/Items/series-parent"]);
-  } finally {
-    Database.fetchServerRecordEndpoint = originalFetchServerRecordEndpoint;
-  }
-});
 
-test("TMDB poster requests reject timeout, empty results, and non-image payloads", async () => {
-  await withWorkerGlobals({
-    setTimeout: callback => {
-      callback();
-      return 1;
-    },
-    clearTimeout() {},
-    fetch: async (_url, options = {}) => {
-      assert.equal(options.signal.aborted, true);
-      const error = new Error("aborted");
-      error.name = "AbortError";
-      throw error;
+
+
+
+
+
+
+
+
+
+
+
+test("server watch media extracts passive original titles and years", () => {
+  const bodyText = JSON.stringify({
+    SessionId: "session-a",
+    ItemId: "episode-1",
+    Item: {
+      Name: "第 1 集",
+      Type: "Episode",
+      SeriesName: "机智的一休",
+      SeriesOriginalTitle: "Ikkyu-san",
+      SeriesProductionYear: 1975,
+      OriginalTitle: "Episode Original Title",
+      ProductionYear: 2026,
+      SeriesId: "series-1",
+      ImageTags: {},
+      SeriesPrimaryImageTag: "series-poster-tag"
     }
-  }, async () => {
-    assert.deepEqual(
-      await Database.fetchTmdbPosterJson({ TMDB_API_KEY: "tmdb-secret" }, "/3/movie/123/images"),
-      { ok: false, failureCode: "tmdb_timeout" }
-    );
   });
-
-  await withWorkerGlobals({
-    fetch: async () => new Response(JSON.stringify({ posters: [] }), { headers: { "Content-Type": "application/json" } })
-  }, async () => {
-    assert.deepEqual(
-      await Database.resolveTmdbPosterImagePath({ TMDB_API_KEY: "tmdb-secret" }, "movie", "123"),
-      { imagePath: "", failureCode: "tmdb_poster_not_found" }
-    );
+  const execution = {
+    nodeName: "server-a",
+    requestMethod: "POST",
+    requestUrl: new URL("https://worker.test/Sessions/Playing"),
+    request: new Request("https://worker.test/Sessions/Playing", { method: "POST" })
+  };
+  const transport = {
+    preparedBodyMode: "buffered",
+    preparedBodyText: bodyText,
+    newHeaders: new Headers({ "Content-Type": "application/json" })
+  };
+  assert.deepEqual(Proxy.resolveServerLastWatchMedia(execution, transport), {
+    itemId: "episode-1",
+    itemName: "第 1 集",
+    itemType: "Episode",
+    seriesName: "机智的一休",
+    originalTitle: "Ikkyu-san",
+    year: 1975
   });
+  assert.deepEqual(
+    Proxy.buildServerRecordPlaybackContextMedia({
+      Id: "episode-1",
+      Name: "第 1 集",
+      Type: "Episode",
+      SeriesName: "机智的一休",
+      SeriesOriginalTitle: "Ikkyu-san",
+      SeriesProductionYear: 1975,
+      OriginalTitle: "Episode Original Title",
+      ProductionYear: 2026,
+      SeriesPrimaryImageTag: "series-poster-tag"
+    }, "episode-1"),
+    {
+      itemId: "episode-1",
+      itemName: "第 1 集",
+      itemType: "Episode",
+      seriesName: "机智的一休",
+      originalTitle: "Ikkyu-san",
+      year: 1975
+    }
+  );
+  assert.deepEqual(
+    Proxy.buildServerRecordPlaybackContextMedia({
+      Id: "episode-2",
+      Name: "第 2 集",
+      Type: "Episode",
+      SeriesName: "机智的一休",
+      OriginalTitle: "Episode Original Title",
+      ProductionYear: 2026
+    }, "episode-2"),
+    {
+      itemId: "episode-2",
+      itemName: "第 2 集",
+      itemType: "Episode",
+      seriesName: "机智的一休",
+      originalTitle: "",
+      year: null
+    }
+  );
+  const oversized = "x".repeat(300);
+  const boundedContext = Proxy.buildServerRecordPlaybackContextMedia({
+    Id: oversized,
+    Name: oversized,
+    Type: "t".repeat(100),
+    SeriesName: oversized,
+    OriginalTitle: oversized,
+    PrimaryImageTag: oversized
+  }, oversized);
+  assert.deepEqual({
+    itemId: boundedContext.itemId.length,
+    itemName: boundedContext.itemName.length,
+    itemType: boundedContext.itemType.length,
+    seriesName: boundedContext.seriesName.length,
+    originalTitle: boundedContext.originalTitle.length
+  }, { itemId: 256, itemName: 256, itemType: 64, seriesName: 256, originalTitle: 0 });
 
-  await withWorkerGlobals({
-    fetch: async () => new Response("not an image", { headers: { "Content-Type": "text/html" } })
-  }, async () => {
-    assert.deepEqual(
-      await Database.fetchTmdbPosterImage("/poster.jpg", "GET"),
-      { response: null, failureCode: "tmdb_invalid_image" }
-    );
-  });
-});
-
-test("server record posters reject a stale media pointer before contacting an upstream", async () => {
-  const originalSnapshots = Database.getServerRecordSnapshots;
-  const originalLastWatch = Database.getServerLastWatch;
-  const originalGetNodeForRead = Database.getNodeForRead;
-  let upstreamRequests = 0;
-  Database.getServerRecordSnapshots = async () => new Map([["server-a", {
-    lastItem: { itemId: "stale-item", watchedAt: "2026-07-25T01:00:00.000Z" }
-  }]]);
-  Database.getServerLastWatch = async () => new Map([["server-a", { lastWatchedAt: "2026-07-25T02:00:00.000Z" }]]);
-  Database.getNodeForRead = async () => ({ target: "https://origin.example/emby", serverRecord: { enabled: true } });
-  try {
-    await withWorkerGlobals({
-      fetch: async () => {
-        upstreamRequests += 1;
-        return new Response(null, { status: 500 });
+  const boundedEvent = Proxy.resolveServerLastWatchMedia({
+    ...execution,
+    playbackSessionControlPayload: undefined
+  }, {
+    preparedBodyMode: "buffered",
+    preparedBodyText: JSON.stringify({
+      ItemId: oversized,
+      Item: {
+        Name: oversized,
+        Type: "t".repeat(100),
+        SeriesName: oversized,
+        OriginalTitle: oversized,
+        PrimaryImageTag: oversized
       }
-    }, async () => {
-      assert.equal(await Database.getServerRecordPosterResponse({ DB: {} }, "server-a", "GET"), null);
-      assert.equal(upstreamRequests, 0);
-    });
-  } finally {
-    Database.getServerRecordSnapshots = originalSnapshots;
-    Database.getServerLastWatch = originalLastWatch;
-    Database.getNodeForRead = originalGetNodeForRead;
-  }
+    }),
+    newHeaders: new Headers({ "Content-Type": "application/json" })
+  });
+  assert.deepEqual({
+    itemId: boundedEvent.itemId.length,
+    itemName: boundedEvent.itemName.length,
+    itemType: boundedEvent.itemType.length,
+    seriesName: boundedEvent.seriesName.length,
+    originalTitle: boundedEvent.originalTitle.length
+  }, { itemId: 256, itemName: 256, itemType: 64, seriesName: 256, originalTitle: 0 });
+
+  GLOBALS.ServerRecordPlaybackContexts.clear();
+  const oversizedPlaybackUrl = `https://worker.test/Items/${oversized}/PlaybackInfo?IsPlayback=true`;
+  assert.equal(Proxy.recordServerRecordPlaybackInfoIntent({
+    nodeName: "server-a",
+    node: { serverRecord: { enabled: true } },
+    requestMethod: "POST",
+    proxyPath: `/Items/${oversized}/PlaybackInfo`,
+    requestUrl: new URL(oversizedPlaybackUrl),
+    request: new Request(oversizedPlaybackUrl, {
+      method: "POST",
+      headers: { "X-Emby-Device-Id": "device-a" }
+    }),
+    requestTraits: { isPlaybackInfoRequest: true }
+  }), true);
+  assert.equal([...GLOBALS.ServerRecordPlaybackContexts.values()][0]?.intent?.itemId.length, 256);
+  GLOBALS.ServerRecordPlaybackContexts.clear();
+
+  assert.equal(
+    Proxy.observeServerRecordPlaybackItemDetails(
+      {
+        nodeName: "server-a",
+        node: { serverRecord: { enabled: true } },
+        requestMethod: "GET",
+        proxyPath: "/Items/episode-1",
+        requestUrl: new URL("https://worker.test/Items/episode-1?DeviceId=device-a"),
+        request: new Request("https://worker.test/Items/episode-1?DeviceId=device-a"),
+        ctx: { waitUntil() {} }
+      },
+      new Response(JSON.stringify({ Id: "episode-1", Name: "第 1 集" }), {
+        headers: { "Content-Type": "application/json" }
+      })
+    ),
+    true
+  );
+  assert.equal(
+    Proxy.observeServerRecordPlaybackItemDetails(
+      {
+        nodeName: "server-a",
+        node: { serverRecord: { enabled: true } },
+        requestMethod: "GET",
+        proxyPath: "/Items/episode-1/Images/Primary",
+        requestUrl: new URL("https://worker.test/Items/episode-1/Images/Primary"),
+        request: new Request("https://worker.test/Items/episode-1/Images/Primary"),
+        ctx: { waitUntil() {} }
+      },
+      new Response("image", { headers: { "Content-Type": "image/jpeg" } })
+    ),
+    false
+  );
 });
+
+
+
 
 test("manual setup renders GET and HEAD as no-store with the recovery reason", async () => {
   const statusPatches = [];
@@ -5220,6 +5156,111 @@ test("oversized PlaybackInfo rewrite bypasses without blocking its original stre
   assert.equal((await response.text()).length, oversizedBody.length);
 });
 
+test("PlaybackInfo passthrough removes non-object media sources from the delivered response", async () => {
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "passthrough",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  };
+  const upstreamState = {
+    response: new Response(JSON.stringify({
+      PlaySessionId: "session-1",
+      MediaSources: [
+        JSON.stringify({ Id: "encoded-source" }),
+        { Id: "valid-source", Path: "/Videos/1/stream" },
+        null,
+        ["array-source"]
+      ]
+    }), {
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": "999",
+        "ETag": "stale-etag",
+        "Digest": "sha-256=stale",
+        "X-Upstream": "preserved"
+      }
+    })
+  };
+
+  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  assert.notEqual(result, upstreamState);
+  assert.equal(execution.playbackInfoRewrite, "applied");
+  assert.deepEqual(await result.response.json(), {
+    PlaySessionId: "session-1",
+    MediaSources: [{ Id: "valid-source", Path: "/Videos/1/stream" }]
+  });
+  assert.equal(result.response.headers.get("Content-Length"), null);
+  assert.equal(result.response.headers.get("ETag"), null);
+  assert.equal(result.response.headers.get("Digest"), null);
+  assert.equal(result.response.headers.get("X-Upstream"), "preserved");
+});
+
+test("PlaybackInfo passthrough returns an empty media source array when every entry is invalid", async () => {
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "passthrough",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  };
+  const upstreamState = {
+    response: new Response(JSON.stringify({ MediaSources: ["encoded", null, []] }), {
+      headers: { "Content-Type": "application/json" }
+    })
+  };
+
+  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  assert.deepEqual((await result.response.json()).MediaSources, []);
+  assert.equal(execution.playbackInfoRewrite, "applied");
+});
+
+test("valid PlaybackInfo passthrough keeps the original response unchanged", async () => {
+  const bodyText = '{\n  "MediaSources": [{"Id":"valid-source"}],\n  "Marker": "original-bytes"\n}';
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "passthrough",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  };
+  const upstreamState = {
+    response: new Response(bodyText, {
+      headers: { "Content-Type": "application/json", "ETag": "preserved-etag" }
+    })
+  };
+
+  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  assert.equal(result, upstreamState);
+  assert.equal(result.response, upstreamState.response);
+  assert.equal(execution.playbackInfoRewrite, "passthrough");
+  assert.equal(result.response.headers.get("ETag"), "preserved-etag");
+  assert.equal(await result.response.text(), bodyText);
+});
+
+test("non-JSON and oversized PlaybackInfo passthrough responses remain untouched", async () => {
+  const makeExecution = () => ({
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "passthrough",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  });
+  const textState = {
+    response: new Response("upstream text", { headers: { "Content-Type": "text/plain" } })
+  };
+  const textExecution = makeExecution();
+  assert.equal(await Proxy.maybeRewritePlaybackInfoResponse(textExecution, textState), textState);
+  assert.equal(textExecution.playbackInfoRewrite, "passthrough");
+  assert.equal(await textState.response.text(), "upstream text");
+
+  const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
+  const oversizedState = {
+    response: new Response(oversizedBody, { headers: { "Content-Type": "application/json" } })
+  };
+  const oversizedExecution = makeExecution();
+  assert.equal(await Proxy.maybeRewritePlaybackInfoResponse(oversizedExecution, oversizedState), oversizedState);
+  assert.equal(oversizedExecution.playbackInfoRewrite, "passthrough");
+  assert.equal((await oversizedState.response.text()).length, oversizedBody.length);
+});
+
 test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching", async () => {
   GLOBALS.PlaybackInfoResponseCache.clear();
   const originalCloneDescriptor = Object.getOwnPropertyDescriptor(Response.prototype, "clone");
@@ -5398,7 +5439,8 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
     itemName: "Episode 1",
     itemType: "Episode",
     seriesName: "Series 1",
-    imageTag: ""
+    originalTitle: "",
+    year: null
   });
   assert.equal(transport.preparedBodyText, bodyText);
   assert.equal(transport.newHeaders.get("Content-Type"), "text/plain");
@@ -5733,6 +5775,8 @@ test("server record playback context requires matching PlaybackInfo and item det
     Name: "Context episode",
     Type: "Episode",
     SeriesName: "Context series",
+    SeriesOriginalTitle: "Original context series",
+    SeriesProductionYear: 2024,
     ImageTags: { Primary: "context-poster" }
   };
   const detailExecution = () => makeExecution(
@@ -5771,6 +5815,8 @@ test("server record playback context requires matching PlaybackInfo and item det
     await Promise.all(tasks.splice(0));
     assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
 
+    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution(), null, 503), false);
+    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
     assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
     const verified = Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport);
     assert.deepEqual(verified, {
@@ -5778,7 +5824,8 @@ test("server record playback context requires matching PlaybackInfo and item det
       itemName: "Context episode",
       itemType: "Episode",
       seriesName: "Context series",
-      imageTag: "context-poster"
+      originalTitle: "Original context series",
+      year: 2024
     });
     const lifecycle = lifecycleExecution();
     assert.equal(Proxy.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
@@ -6611,8 +6658,9 @@ test("server record snapshots persist counts and expose matching last-watch medi
           itemName: "Episode one",
           itemType: "Episode",
           seriesName: "Series one",
-          imageTag: "poster-1",
-          watchedAt: "2026-07-21T12:34:56.000Z"
+          originalTitle: "Original Series One",
+          year: 2025,
+          watchedAt: "2026-07-21T12:31:00.000Z"
         }
       }
     : {
@@ -6630,21 +6678,52 @@ test("server record snapshots persist counts and expose matching last-watch medi
     assert.deepEqual(probedNodeNames, ["server-a", "server-b"]);
     assert.equal(persistedProbeEntries.length, 2);
     assert.ok(available.records.every(record => record.counts.persisted === true));
-    const { posterUrl, ...firstWatch } = available.records[0].watch;
-    assert.deepEqual(firstWatch, {
+    assert.deepEqual(available.records[0].watch, {
       lastWatchedAt: "2026-07-21T12:34:56.000Z",
       state: "ok",
       itemId: "episode-1",
       itemName: "Episode one",
       itemType: "Episode",
       seriesName: "Series one",
-      imageTag: "poster-1"
+      posterSearch: {
+        itemId: "episode-1",
+        mediaType: "tv",
+        title: "Series one",
+        originalTitle: "Original Series One",
+        year: 2025,
+        watchedAt: "2026-07-21T12:31:00.000Z"
+      }
     });
-    assert.match(posterUrl, /^\/admin\/__server-record-poster\/server-a\?v=[a-z0-9]+$/);
     assert.equal(available.records[1].watch.itemId, "");
-    assert.equal(available.records[1].watch.posterUrl, "");
+    assert.equal("posterUrl" in available.records[1].watch, false);
     assert.deepEqual(available.availableNodes.map(record => record.expiryEnabled), [true, false]);
     assert.doesNotMatch(JSON.stringify(available), /totalSeconds|private-token|origin-[ab]\.example/);
+
+    const getCompleteSnapshots = Database.getServerRecordSnapshots;
+    Database.getServerRecordSnapshots = async (_db, names) => new Map(names.map(name => [name, {
+      counts: {},
+      lastItem: name === "server-a"
+        ? { itemId: "incomplete-item", watchedAt: "2026-07-21T12:34:56.000Z" }
+        : {}
+    }]));
+    const incompleteMedia = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
+    assert.deepEqual(incompleteMedia.records[0].watch, {
+      lastWatchedAt: "2026-07-21T12:34:56.000Z",
+      state: "ok",
+      itemId: "incomplete-item",
+      itemName: "",
+      itemType: "",
+      seriesName: "",
+      posterSearch: {
+        itemId: "incomplete-item",
+        mediaType: "",
+        title: "",
+        originalTitle: "",
+        year: null,
+        watchedAt: "2026-07-21T12:34:56.000Z"
+      }
+    });
+    Database.getServerRecordSnapshots = getCompleteSnapshots;
 
     probedNodeNames.length = 0;
     const metadataOnly = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
@@ -6726,4 +6805,21 @@ test("server record settings preserve node routes and credentials while normaliz
     expiresAt: null,
     expiryDays: 45
   });
+
+  const extensionState = {
+    responseCompatibility: { playbackInfoItemShape: "object" },
+    customProxyFlags: ["preserve", "server-record-save"]
+  };
+  const patched = Database.buildPreparedServerRecordSettingsMutation("server-a", {
+    ...existingNode,
+    ...extensionState
+  }, {
+    tags: ["观察中"],
+    serverRecord: { enabled: true, expiryEnabled: false }
+  });
+  assert.deepEqual(patched.nextNode.responseCompatibility, extensionState.responseCompatibility);
+  assert.deepEqual(patched.nextNode.customProxyFlags, extensionState.customProxyFlags);
+  assert.deepEqual(patched.nextNode.lines, normalized.lines);
+  assert.deepEqual(patched.nextNode.headers, normalized.headers);
+  assert.equal(patched.nextNode.serverRecord.enabled, true);
 });

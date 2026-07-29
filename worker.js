@@ -224,25 +224,9 @@ const DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnaps
 const SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
 const SERVER_RECORD_WATCH_TERMINAL_TTL_MS = 10 * 60 * 1000;
 const SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS = 12 * 60 * 60 * 1000;
+const SERVER_RECORD_MEDIA_TIME_TOLERANCE_MS = 5 * 60 * 1000;
 const SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS = 2 * 60 * 1000;
 const SERVER_RECORDS_PROBE_TIMEOUT_MS = 8000;
-const SERVER_RECORD_POSTER_CONTENT_TYPES = new Set([
-  "image/avif",
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/webp"
-]);
-const SERVER_RECORD_POSTER_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS = 30 * 60 * 1000;
-const TMDB_API_ORIGIN = "https://api.themoviedb.org";
-const TMDB_IMAGE_ORIGIN = "https://image.tmdb.org";
-const TMDB_POSTER_IMAGE_SIZE = "w500";
-const TMDB_POSTER_IMAGE_PATH_REGEX = /^\/[A-Za-z0-9_-]{1,128}\.(?:avif|gif|jpe?g|png|webp)$/i;
-const TMDB_NUMERIC_ID_REGEX = /^[1-9][0-9]{0,11}$/;
-const IMDB_ID_REGEX = /^tt[0-9]{5,12}$/i;
-const TMDB_API_KEY_INPUT_REGEX = /^[A-Za-z0-9_-]{16,256}$/;
-const TMDB_JSON_CONTENT_TYPES = new Set(["application/json"]);
 const SERVER_RECORDS_PROBE_CONCURRENCY = 4;
 const DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 const DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
@@ -260,6 +244,16 @@ const ADMIN_LOCAL_INDEX_KV_PREFIX = "sys:admin_index_upload:v1:";
 const Config = {
   Defaults: CONFIG_DEFAULTS
 };
+
+function areServerRecordWatchTimesCompatible(snapshotWatchedAt = "", lastWatchedAt = "") {
+  const snapshotTimeMs = Date.parse(String(snapshotWatchedAt || "").trim());
+  const lastWatchTimeMs = Date.parse(String(lastWatchedAt || "").trim());
+  const lagMs = lastWatchTimeMs - snapshotTimeMs;
+  return Number.isFinite(snapshotTimeMs)
+    && Number.isFinite(lastWatchTimeMs)
+    && lagMs >= 0
+    && lagMs <= SERVER_RECORD_MEDIA_TIME_TOLERANCE_MS;
+}
 
 const IMAGE_FILE_EXTENSION_REGEX = /\.(?:jpg|jpeg|gif|png|svg|ico|webp)$/i;
 const STATIC_ASSET_EXTENSION_REGEX = /\.(?:js|css|woff2?|ttf|otf|map|webmanifest)$/i;
@@ -367,7 +361,6 @@ const GLOBAL_DB_READY_STATE = {
   StatsHourlyDbReady: new WeakMap(),
   ServerLastWatchDbReady: new WeakMap(),
   ServerRecordSnapshotDbReady: new WeakMap(),
-  ServerRecordPosterCacheDbReady: new WeakMap(),
   DnsIpWorkspaceDbReady: new WeakMap(),
   OpsStatusDbReady: new WeakMap(),
   OpsStatusShadowCache: new WeakMap(),
@@ -1863,81 +1856,101 @@ async function verifyMediaAggregationSourceSignature(source, secret = "") {
   return source.signature === await Auth.sign(String(secret), String(source.signedPayload || ""));
 }
 
-function normalizeTmdbPosterId(value = "") {
-  const normalized = String(value || "").trim();
-  return TMDB_NUMERIC_ID_REGEX.test(normalized) ? normalized : "";
+function normalizePosterBrowserOrigin(value = "") {
+  try {
+    const url = new URL(String(value || "").trim());
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return "";
+    if (url.pathname !== "/") return "";
+    return url.origin;
+  } catch {
+    return "";
+  }
 }
 
-function normalizeImdbPosterId(value = "") {
-  const normalized = String(value || "").trim().toLowerCase();
-  return IMDB_ID_REGEX.test(normalized) ? normalized : "";
+function normalizePosterBrowserToken(value = "") {
+  const token = String(value || "").trim();
+  return token && token.length <= 4096 && !/[\r\n]/.test(token) ? token : "";
 }
 
-function normalizeTmdbApiKeyInput(value = "") {
-  const normalized = String(value || "").trim();
-  return TMDB_API_KEY_INPUT_REGEX.test(normalized) ? normalized : "";
+function normalizeTmdbBrowserToken(value = "") {
+  const token = normalizePosterBrowserToken(value).replace(/^Bearer\s+/i, "").trim();
+  // A v3 API Key is valid only as an api_key query parameter, never as a Bearer token.
+  return /^[a-f0-9]{32}$/i.test(token) ? "" : normalizePosterBrowserToken(token);
 }
 
-function resolveTmdbPosterApiKey(env, runtimeConfig = {}) {
-  return normalizeTmdbApiKeyInput(runtimeConfig?.tmdbApiKey)
-    || String(env?.TMDB_API_KEY || "").trim();
-}
-
-function buildPosterMetadataSettingsState(env, runtimeConfig = {}) {
-  const kvApiKey = normalizeTmdbApiKeyInput(runtimeConfig?.tmdbApiKey);
-  const workerSecret = String(env?.TMDB_API_KEY || "").trim();
-  const storage = kvApiKey ? "kv_config" : (workerSecret ? "worker_secret" : "none");
+function buildPosterBrowserConfig(env = {}, config = {}, includeValues = false) {
+  const savedTmdbToken = normalizeTmdbBrowserToken(config?.tmdbBrowserToken);
+  const savedDoubanOrigin = normalizePosterBrowserOrigin(config?.doubanBrowserOrigin);
+  const savedDoubanToken = normalizePosterBrowserToken(config?.doubanBrowserToken);
+  const tmdbToken = savedTmdbToken || normalizeTmdbBrowserToken(env?.TMDB_BROWSER_TOKEN);
+  const doubanOrigin = savedDoubanOrigin || normalizePosterBrowserOrigin(env?.DOUBAN_BROWSER_ORIGIN);
+  const doubanToken = savedDoubanToken || normalizePosterBrowserToken(env?.DOUBAN_BROWSER_TOKEN);
+  if (!includeValues) {
+    return {
+      tmdbTokenConfigured: Boolean(tmdbToken),
+      tmdbTokenSource: savedTmdbToken ? "admin" : (tmdbToken ? "binding" : "none"),
+      doubanOriginConfigured: Boolean(doubanOrigin),
+      doubanOriginSource: savedDoubanOrigin ? "admin" : (doubanOrigin ? "binding" : "none"),
+      doubanTokenConfigured: Boolean(doubanToken),
+      doubanTokenSource: savedDoubanToken ? "admin" : (doubanToken ? "binding" : "none")
+    };
+  }
   return {
-    tmdb: {
-      configured: storage !== "none",
-      storage
-    },
-    imdb: {
-      configured: true,
-      mode: "tmdb_find"
-    },
-    sourceOrder: ["tmdb_direct", "imdb_tmdb_find", "emby", "placeholder"]
+    tmdb: { configured: Boolean(tmdbToken), token: tmdbToken },
+    douban: {
+      configured: Boolean(doubanOrigin && doubanToken),
+      origin: doubanOrigin,
+      token: doubanToken
+    }
   };
 }
 
-function normalizeTmdbPosterImagePath(value = "") {
-  const normalized = String(value || "").trim();
-  return TMDB_POSTER_IMAGE_PATH_REGEX.test(normalized) ? normalized : "";
+function normalizeServerRecordPosterTitle(value = "") {
+  return String(value || "")
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 256);
 }
 
-function selectTmdbPosterImagePath(payload = {}) {
-  const posters = Array.isArray(payload?.posters) ? payload.posters : [];
-  const ranked = [];
-  for (const poster of posters) {
-    const imagePath = normalizeTmdbPosterImagePath(poster?.file_path || poster?.filePath);
-    const width = Number(poster?.width);
-    const height = Number(poster?.height);
-    const aspectRatio = Number(poster?.aspect_ratio ?? poster?.aspectRatio);
-    if (!imagePath || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= width) continue;
-    if (Number.isFinite(aspectRatio) && (aspectRatio <= 0 || aspectRatio > 0.8)) continue;
-    const language = String(poster?.iso_639_1 || poster?.iso6391 || "").trim().toLowerCase();
-    const languageRank = language.startsWith("zh") ? 0 : (language === "en" ? 1 : (language ? 3 : 2));
-    ranked.push({
-      imagePath,
-      languageRank,
-      voteCount: Math.max(0, Number(poster?.vote_count ?? poster?.voteCount) || 0),
-      width,
-      height
-    });
-  }
-  ranked.sort((left, right) => left.languageRank - right.languageRank
-    || right.voteCount - left.voteCount
-    || right.height - left.height
-    || right.width - left.width
-    || left.imagePath.localeCompare(right.imagePath));
-  return ranked[0]?.imagePath || "";
+function normalizeServerRecordPosterYear(value) {
+  return normalizeMediaAggregationYear(value);
 }
 
-function buildTmdbPosterImageUrl(imagePath = "") {
-  const normalizedPath = normalizeTmdbPosterImagePath(imagePath);
-  if (!normalizedPath) return null;
-  const url = new URL(`/t/p/${TMDB_POSTER_IMAGE_SIZE}${normalizedPath}`, TMDB_IMAGE_ORIGIN);
-  return url.origin === TMDB_IMAGE_ORIGIN ? url : null;
+function inferServerRecordPosterMediaKind(itemType = "", seriesName = "") {
+  const type = String(itemType || "").trim().toLowerCase();
+  if (type === "movie") return "movie";
+  if (["series", "episode"].includes(type) || normalizeServerRecordPosterTitle(seriesName)) return "tv";
+  return "";
+}
+
+function buildServerRecordPosterMetadata(item = {}, seriesItem = {}) {
+  if (!isPlainObject(item)) return null;
+  const normalizedItem = normalizeCaseInsensitiveObject(item);
+  const itemType = String(getCaseInsensitivePayloadValue(normalizedItem, ["Type"]) || "").trim().toLowerCase();
+  if (!["movie", "series", "episode"].includes(itemType)) return null;
+  const normalizedSeries = isPlainObject(seriesItem) ? normalizeCaseInsensitiveObject(seriesItem) : {};
+  const isEpisode = itemType === "episode";
+  const title = normalizeServerRecordPosterTitle(isEpisode
+    ? (getCaseInsensitivePayloadValue(normalizedSeries, ["Name"])
+      || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesName"]))
+    : getCaseInsensitivePayloadValue(normalizedItem, ["Name"]));
+  const originalTitle = normalizeServerRecordPosterTitle(isEpisode
+    ? (getCaseInsensitivePayloadValue(normalizedSeries, ["OriginalTitle"])
+      || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesOriginalTitle"]))
+    : getCaseInsensitivePayloadValue(normalizedItem, ["OriginalTitle"]));
+  const productionYear = normalizeServerRecordPosterYear(isEpisode
+    ? (getCaseInsensitivePayloadValue(normalizedSeries, ["ProductionYear"])
+      || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesProductionYear"]))
+    : getCaseInsensitivePayloadValue(normalizedItem, ["ProductionYear"]));
+  return {
+    mediaKind: itemType === "movie" ? "movie" : "tv",
+    itemType,
+    title,
+    originalTitle,
+    productionYear
+  };
 }
 
 function extractPlaybackInfoItemPathState(proxyPath = "") {
@@ -1957,11 +1970,13 @@ function extractPlaybackInfoItemPathState(proxyPath = "") {
 
 function extractUserItemDetailsPathState(proxyPath = "") {
   const normalizedPath = sanitizeProxyPath(proxyPath);
-  const match = /^(?:.*\/)?users\/[^/]+\/items\/([^/]+)\/?$/i.exec(normalizedPath);
+  // Prefer the official user-scoped details path, then bare /Items/{Id}.
+  // Sub-resources such as PlaybackInfo or Images must not count as details.
+  const match = /^(?:.*\/)?(?:users\/[^/]+\/)?items\/([^/]+)\/?$/i.exec(normalizedPath);
   if (!match) return { itemId: "" };
   let itemId = String(match[1] || "").trim();
   try { itemId = decodeURIComponent(itemId); } catch {}
-  return { itemId };
+  return { itemId: itemId.trim().slice(0, 256) };
 }
 
 function resolveMediaAggregationApiPrefix(proxyPath = "") {
@@ -7156,11 +7171,12 @@ function sanitizeRuntimeConfig(input = {}) {
   sanitized.defaultRealClientIpMode = normalizeDefaultRealClientIpMode(sanitized.defaultRealClientIpMode);
   sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
   sanitized.mediaAggregationMatchMode = normalizeMediaAggregationMatchMode(sanitized.mediaAggregationMatchMode);
+  sanitized.tmdbBrowserToken = normalizeTmdbBrowserToken(sanitized.tmdbBrowserToken);
+  sanitized.doubanBrowserOrigin = normalizePosterBrowserOrigin(sanitized.doubanBrowserOrigin);
+  sanitized.doubanBrowserToken = normalizePosterBrowserToken(sanitized.doubanBrowserToken);
   sanitized.scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(sanitized.scheduleUtcOffsetMinutes);
   sanitized.tgDailyReportClockTimes = normalizeScheduleClockTimeList(sanitized.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
-  const tmdbApiKey = normalizeTmdbApiKeyInput(sanitized.tmdbApiKey);
-  if (tmdbApiKey) sanitized.tmdbApiKey = tmdbApiKey;
-  else delete sanitized.tmdbApiKey;
+  delete sanitized.tmdbApiKey;
   const localIndexRevision = parseAdminLocalIndexSourceUrl(sanitized.indexUrl);
   sanitized.indexUrl = localIndexRevision ? buildAdminLocalIndexSourceUrl(localIndexRevision) : "";
   delete sanitized.releaseRepo;
@@ -7174,11 +7190,12 @@ function sanitizeRuntimeConfig(input = {}) {
 const CONFIG_SECRET_FIELDS = [
   "cfApiToken",
   "tgBotToken",
+  "tmdbBrowserToken",
+  "doubanBrowserToken",
   "mediaAggregationEmbyUsername",
-  "mediaAggregationEmbyPassword",
-  "tmdbApiKey"
+  "mediaAggregationEmbyPassword"
 ];
-const FULL_BACKUP_REDACTED_SECRET_FIELDS = ["cfApiToken", "tgBotToken", "tmdbApiKey"];
+const FULL_BACKUP_REDACTED_SECRET_FIELDS = ["cfApiToken", "tgBotToken", "tmdbBrowserToken", "doubanBrowserToken"];
 
 function redactRuntimeConfigSecrets(input = {}) {
   const config = sanitizeRuntimeConfig(input);
@@ -7192,11 +7209,11 @@ function redactFullBackupServiceSecrets(input = {}) {
   return config;
 }
 
-function redactAdminRuntimeConfigTmdbApiKey(input = {}) {
-  const config = sanitizeRuntimeConfig(input);
-  const tmdbApiKeyConfigured = Boolean(String(config.tmdbApiKey || "").trim());
-  delete config.tmdbApiKey;
-  return { ...config, tmdbApiKeyConfigured };
+function redactAdminRuntimeConfig(input = {}) {
+  const redacted = sanitizeRuntimeConfig(input);
+  delete redacted.tmdbBrowserToken;
+  delete redacted.doubanBrowserToken;
+  return redacted;
 }
 
 function redactNodeEmbyCredentials(node = {}) {
@@ -8302,11 +8319,13 @@ const CONFIG_ALLOWED_FIELDS = [
   "mediaAggregationNodes",
   "mediaAggregationEmbyUsername",
   "mediaAggregationEmbyPassword",
+  "tmdbBrowserToken",
+  "doubanBrowserOrigin",
+  "doubanBrowserToken",
   "mediaAggregationBidirectionalProgressEnabled",
   "mediaAggregationMatchMode",
   "mediaAggregationFirstResultTimeoutMs",
   "mediaAggregationGracePeriodMs",
-  "tmdbApiKey",
   "dnsDefaultFallbackCname",
   "defaultHostPrefixCnameTarget",
   "pingTimeout",
@@ -8413,7 +8432,7 @@ const CONFIG_DEFAULT_FALSE_FIELDS = [
 const CONFIG_SANITIZE_RULES = {
   allowedFields: CONFIG_ALLOWED_FIELDS,
   aliasFields: {},
-  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "mediaAggregationEmbyUsername", "mediaAggregationMatchMode", "tmdbApiKey", "tgDailyReportTime"],
+  trimFields: ["tgBotToken", "tgChatId", "cfAccountId", "cfZoneId", "cfApiToken", "cfKvNamespaceId", "cfD1DatabaseId", "indexUrl", "cfQuotaPlanOverride", "corsOrigins", "geoAllowlist", "geoBlocklist", "ipBlacklist", "dnsDefaultFallbackCname", "defaultHostPrefixCnameTarget", "prewarmDepth", "hedgeProbePath", "logSearchMode", "logWriteMode", "routingDecisionMode", "protocolStrategy", "defaultPlaybackInfoMode", "defaultRealClientIpMode", "defaultMediaAuthMode", "mediaAggregationEmbyUsername", "mediaAggregationMatchMode", "tmdbBrowserToken", "doubanBrowserOrigin", "doubanBrowserToken", "tgDailyReportTime"],
   arrayNormalizers: {
     sourceDirectNodes: "nodeNameList",
     mediaAggregationNodes: "nodeNameList",
@@ -10162,6 +10181,8 @@ const D1TidyPlanner = {
   },
 
   async readFacts(database, db, kv, context) {
+    const tableNames = await database.getD1TableNameSet(db);
+    const legacyPosterCachePresent = context.mode === "manual" && tableNames.has(database.SERVER_RECORD_POSTER_CACHE_TABLE);
     return {
       deletedExpiredLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp < ?`, [context.retentionCutoffMs]),
       preservedLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp >= ?`, [context.retentionCutoffMs]),
@@ -10171,7 +10192,10 @@ const D1TidyPlanner = {
       deletedExpiredAuthFailureCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.AUTH_FAILURES_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
       deletedExpiredDashboardCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_DASH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
       deletedExpiredRuntimeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_RUNTIME_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-      deletedExpiredServerRecordPosterCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SERVER_RECORD_POSTER_CACHE_TABLE} WHERE expires_at != '' AND expires_at <= ?`, [new Date(context.nowTimestamp).toISOString()]),
+      legacyPosterCachePresent,
+      legacyPosterCacheRowCount: legacyPosterCachePresent
+        ? await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SERVER_RECORD_POSTER_CACHE_TABLE}`)
+        : 0,
       statsHourlyRowCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.STATS_HOURLY_TABLE}`),
       dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
       dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
@@ -10210,7 +10234,7 @@ const D1TidyPlanner = {
       deleteExpiredAuthFailures: facts.deletedExpiredAuthFailureCount > 0,
       deleteExpiredDashboardCache: facts.deletedExpiredDashboardCacheCount > 0,
       deleteExpiredRuntimeCache: facts.deletedExpiredRuntimeCacheCount > 0,
-      deleteExpiredServerRecordPosterCache: facts.deletedExpiredServerRecordPosterCacheCount > 0,
+      dropLegacyServerRecordPosterCache: facts.legacyPosterCachePresent === true,
       rebuildStatsHourly: shouldRebuildStatsHourly,
       rebuildLogsFts: shouldRebuildLogsFts,
       rebuildLogsFtsDeferred: context.mode === "scheduled" && hasExpiredLogs && facts.ftsReady && shouldRebuildLogsFts !== true,
@@ -10232,8 +10256,7 @@ const D1TidyPlanner = {
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredProbeCacheCount > 0, "dns_ip_probe_cache", "过期 dns_ip_probe_cache 探测缓存", [], facts.deletedExpiredProbeCacheCount, "只会删除 expires_at 已过期的探测缓存。");
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredAuthFailureCount > 0, "auth_failures", "过期 auth_failures 登录失败计数", [], facts.deletedExpiredAuthFailureCount, "只会删除 expires_at 已过期的登录失败计数。");
     pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredDashboardCacheCount > 0, "cf_dashboard_cache", "过期 cf_dashboard_cache 仪表盘缓存", [], facts.deletedExpiredDashboardCacheCount, "只会删除 expires_at 已过期的仪表盘缓存。");
-    pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredRuntimeCacheCount > 0, "cf_runtime_cache", "过期 cf_runtime_cache Cloudflare 配额缓存", [], facts.deletedExpiredRuntimeCacheCount, "只会删除 expires_at 已过期的 Cloudflare runtime quota 缓存。");
-    pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredServerRecordPosterCacheCount > 0, "server_record_poster_cache", "过期 server_record_poster_cache 海报解析缓存", [], facts.deletedExpiredServerRecordPosterCacheCount, "只会删除已过期的 TMDB 海报解析结果或短期失败记录，不删除观看或统计数据。");
+    pushTidyPreviewGroup(deleteGroups, facts.legacyPosterCachePresent === true, "server_record_poster_cache", "退役 server_record_poster_cache 表", [], Math.max(1, facts.legacyPosterCacheRowCount), "会幂等删除整张退役海报缓存表，不迁移或备份其中数据。");
 
     const rewriteGroups = [
       createTidyPreviewGroup("proxy_stats_hourly", "proxy_stats_hourly 统计表", [], {
@@ -10309,7 +10332,7 @@ const D1TidyPlanner = {
       deletedExpiredAuthFailureCount: facts.deletedExpiredAuthFailureCount,
       deletedExpiredDashboardCacheCount: facts.deletedExpiredDashboardCacheCount,
       deletedExpiredRuntimeCacheCount: facts.deletedExpiredRuntimeCacheCount,
-      deletedExpiredServerRecordPosterCacheCount: facts.deletedExpiredServerRecordPosterCacheCount,
+      droppedLegacyServerRecordPosterCache: flags.dropLegacyServerRecordPosterCache === true,
       rebuiltStatsHourly: flags.rebuildStatsHourly === true,
       rebuiltLogsFts: flags.rebuildLogsFts === true,
       alignedStatsWindow: flags.alignStatsWindow === true,
@@ -10352,15 +10375,14 @@ const D1TidyExecutor = {
   },
 
   buildDeleteSteps(database, executionPlan = {}, summary = {}, flags = {}, db) {
-    return [
+    const steps = [
       [flags.deleteExpiredLogs, summary.deletedExpiredLogCount, "deleteExpiredLogs", database.LOGS_TABLE, "timestamp < ?", executionPlan.retentionCutoffMs],
       [flags.deleteExpiredLocks, summary.deletedExpiredLockCount, "deleteExpiredLocks", database.SCHEDULED_LOCKS_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredFetchCache, summary.deletedExpiredFetchCacheCount, "deleteExpiredFetchCache", database.DNS_IP_POOL_FETCH_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredProbeCache, summary.deletedExpiredProbeCacheCount, "deleteExpiredProbeCache", database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredAuthFailures, summary.deletedExpiredAuthFailureCount, "deleteExpiredAuthFailures", database.AUTH_FAILURES_TABLE, "expires_at <= ?", executionPlan.nowMs],
       [flags.deleteExpiredDashboardCache, summary.deletedExpiredDashboardCacheCount, "deleteExpiredDashboardCache", database.CF_DASH_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
-      [flags.deleteExpiredRuntimeCache, summary.deletedExpiredRuntimeCacheCount, "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs],
-      [flags.deleteExpiredServerRecordPosterCache, summary.deletedExpiredServerRecordPosterCacheCount, "deleteExpiredServerRecordPosterCache", database.SERVER_RECORD_POSTER_CACHE_TABLE, "expires_at != '' AND expires_at <= ?", new Date(executionPlan.nowMs).toISOString()]
+      [flags.deleteExpiredRuntimeCache, summary.deletedExpiredRuntimeCacheCount, "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", executionPlan.nowMs]
     ].map(([enabled, count, stepName, tableName, whereClause, bindParam]) => ({
       enabled,
       count,
@@ -10369,6 +10391,15 @@ const D1TidyExecutor = {
       sql: `DELETE FROM ${tableName} WHERE ${whereClause}`,
       bindParams: [bindParam]
     }));
+    steps.push({
+      enabled: flags.dropLegacyServerRecordPosterCache === true,
+      count: flags.dropLegacyServerRecordPosterCache === true ? 1 : 0,
+      stepName: "dropLegacyServerRecordPosterCache",
+      db,
+      sql: `DROP TABLE IF EXISTS ${quoteSqlIdentifier(database.SERVER_RECORD_POSTER_CACHE_TABLE)}`,
+      bindParams: []
+    });
+    return steps;
   },
 
   async runDeleteStep({ enabled = false, count = 0, beforeStep = async (_stepName) => {}, stepName = "", db, sql = "", bindParams = [] }) {
@@ -10781,7 +10812,7 @@ const Database = {
   DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
   DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
   DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
-  D1_SCHEMA_VERSION: 9,
+  D1_SCHEMA_VERSION: 11,
   D1_MIGRATIONS_TABLE: "d1_migrations",
   D1_REQUIRED_MIGRATIONS: [
     "0001_d1_fresh_baseline",
@@ -10790,7 +10821,9 @@ const Database = {
     "0004_server_watch_stats",
     "0005_server_record_snapshots",
     "0006_server_record_poster_cache",
-    "0007_server_watch_lifecycle"
+    "0007_server_watch_lifecycle",
+    "0008_server_record_poster_douban",
+    "0009_drop_server_record_poster_cache"
   ],
   OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
   TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
@@ -10827,11 +10860,6 @@ const Database = {
         table: this.CF_RUNTIME_CACHE_TABLE,
         columns: ["expires_at"],
         createSql: `CREATE INDEX idx_cf_runtime_cache_expires_at ON ${this.CF_RUNTIME_CACHE_TABLE} (expires_at)`
-      },
-      idx_server_record_poster_cache_expires_at: {
-        table: this.SERVER_RECORD_POSTER_CACHE_TABLE,
-        columns: ["expires_at"],
-        createSql: `CREATE INDEX idx_server_record_poster_cache_expires_at ON ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (expires_at)`
       },
       idx_dns_ip_pool_items_updated_ip: {
         table: this.DNS_IP_POOL_ITEMS_TABLE,
@@ -11006,20 +11034,9 @@ const Database = {
         last_item_type: "TEXT NOT NULL DEFAULT ''",
         last_item_series_name: "TEXT NOT NULL DEFAULT ''",
         last_item_image_tag: "TEXT NOT NULL DEFAULT ''",
+        last_item_original_title: "TEXT NOT NULL DEFAULT ''",
+        last_item_year: "INTEGER",
         last_item_watched_at: "TEXT NOT NULL DEFAULT ''",
-        updated_at: "TEXT NOT NULL DEFAULT ''"
-      },
-      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: {
-        watched_at: "TEXT NOT NULL DEFAULT ''",
-        item_id: "TEXT NOT NULL DEFAULT ''",
-        tmdb_id: "TEXT NOT NULL DEFAULT ''",
-        imdb_id: "TEXT NOT NULL DEFAULT ''",
-        provider: "TEXT NOT NULL DEFAULT ''",
-        image_path: "TEXT NOT NULL DEFAULT ''",
-        resolved_at: "TEXT NOT NULL DEFAULT ''",
-        expires_at: "TEXT NOT NULL DEFAULT ''",
-        failure_code: "TEXT NOT NULL DEFAULT ''",
-        retry_after: "TEXT NOT NULL DEFAULT ''",
         updated_at: "TEXT NOT NULL DEFAULT ''"
       }
     };
@@ -11038,8 +11055,7 @@ const Database = {
       [this.LOGS_TABLE]: ["id"],
       [this.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
       [this.SERVER_LAST_WATCH_TABLE]: ["node_name"],
-      [this.SERVER_RECORD_SNAPSHOT_TABLE]: ["node_name"],
-      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: ["node_name"]
+      [this.SERVER_RECORD_SNAPSHOT_TABLE]: ["node_name"]
     };
   },
   getD1RetiredIndexNames() {
@@ -11623,8 +11639,7 @@ const Database = {
       this.LOGS_TABLE,
       this.STATS_HOURLY_TABLE,
       this.SERVER_LAST_WATCH_TABLE,
-      this.SERVER_RECORD_SNAPSHOT_TABLE,
-      this.SERVER_RECORD_POSTER_CACHE_TABLE
+      this.SERVER_RECORD_SNAPSHOT_TABLE
     ];
     const requiredIndexes = this.getD1RuntimeIndexContract();
     const requiredColumns = {
@@ -11647,15 +11662,14 @@ const Database = {
         "node_name", "movie_count", "series_count", "episode_count", "counts_state",
         "counts_errors_json", "stats_checked_at", "last_item_id", "last_item_name",
         "last_item_type", "last_item_series_name", "last_item_image_tag",
+        "last_item_original_title", "last_item_year",
         "last_item_watched_at", "updated_at"
-      ],
-      [this.SERVER_RECORD_POSTER_CACHE_TABLE]: [
-        "node_name", "watched_at", "item_id", "tmdb_id", "imdb_id", "provider",
-        "image_path", "resolved_at", "expires_at", "failure_code", "retry_after", "updated_at"
       ]
     };
     const requiredPrimaryKeys = this.getD1RequiredPrimaryKeyContract();
     const issues = [];
+    const retiredPosterCacheAbsent = !tableNames.has(this.SERVER_RECORD_POSTER_CACHE_TABLE);
+    if (!retiredPosterCacheAbsent) issues.push(`retired_table_present:${this.SERVER_RECORD_POSTER_CACHE_TABLE}`);
     const tableStatus = Object.fromEntries(requiredTables.map(name => [name, tableNames.has(name)]));
     for (const [name, ready] of Object.entries(tableStatus)) if (!ready) issues.push(`missing_table:${name}`);
     const columnStatus = {};
@@ -11730,17 +11744,20 @@ const Database = {
     if (!migrationState.tablePresent) issues.push("migration_table_missing");
     else if (!migrationState.tableValid) issues.push("migration_table_invalid");
     for (const name of missingMigrations) issues.push(`missing_migration:${name}`);
-    const runtimeCompatibilityReady = Object.values(tableStatus).every(Boolean)
+    const runtimeCompatibilityReadyIgnoringRetiredPosterCache = Object.values(tableStatus).every(Boolean)
       && Object.values(indexStatus).every(Boolean)
       && Object.values(columnStatus).every(table => Object.values(table).every(Boolean))
       && Object.values(primaryKeyStatus).every(Boolean)
       && dnsIpUniqueReady;
+    const runtimeCompatibilityReady = runtimeCompatibilityReadyIgnoringRetiredPosterCache
+      && retiredPosterCacheAbsent;
     const migrationReady = runtimeCompatibilityReady
       && migrationState.tableValid
       && missingMigrations.length === 0;
     return {
       runtimeCompatibilityVersion: this.D1_SCHEMA_VERSION,
       runtimeCompatibilityReady,
+      runtimeCompatibilityReadyIgnoringRetiredPosterCache,
       appliedMigrations: migrationState.appliedMigrations,
       latestRequiredMigration: this.D1_REQUIRED_MIGRATIONS.at(-1) || "",
       missingMigrations,
@@ -11749,6 +11766,7 @@ const Database = {
       migrationReady,
       schemaVersion: migrationReady ? this.D1_SCHEMA_VERSION : null,
       tables: tableStatus,
+      retiredTables: { [this.SERVER_RECORD_POSTER_CACHE_TABLE]: retiredPosterCacheAbsent },
       columns: columnStatus,
       indexes: indexStatus,
       constraints: constraintStatus,
@@ -11760,7 +11778,8 @@ const Database = {
         repairNamedIndexes: true,
         rebuildDerivedFts: true,
         rebuildPrimaryOrUniqueConstraints: false,
-        deleteUnknownObjects: false
+        deleteUnknownObjects: false,
+        dropRetiredPosterCache: true
       },
       issues
     };
@@ -11961,6 +11980,11 @@ const Database = {
     const bookmarkState = requireBookmark ? await this.getD1TimeTravelBookmark(db) : null;
     try {
       const adjustedColumns = await this.ensureD1KnownColumns(db);
+      const droppedRetiredTables = [];
+      if (adoptMigrations && tablesBefore.has(this.SERVER_RECORD_POSTER_CACHE_TABLE)) {
+        await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(this.SERVER_RECORD_POSTER_CACHE_TABLE)}`).run();
+        droppedRetiredTables.push(this.SERVER_RECORD_POSTER_CACHE_TABLE);
+      }
       const bootstrap = await this.bootstrapD1Schema(db, profile);
       const adjustedAfterCreate = await this.ensureD1KnownColumns(db);
       const indexChanges = await this.repairD1RuntimeIndexes(db);
@@ -11983,6 +12007,7 @@ const Database = {
         migrationTableCreated: migrationAdoption.migrationTableCreated === true,
         adoptedMigrations: migrationAdoption.adoptedMigrations,
         createdTables,
+        droppedRetiredTables,
         adjustedColumns: [...new Set([...adjustedColumns, ...adjustedAfterCreate])],
         ...indexChanges,
         ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
@@ -12220,6 +12245,8 @@ const Database = {
         last_item_type TEXT NOT NULL DEFAULT '',
         last_item_series_name TEXT NOT NULL DEFAULT '',
         last_item_image_tag TEXT NOT NULL DEFAULT '',
+        last_item_original_title TEXT NOT NULL DEFAULT '',
+        last_item_year INTEGER,
         last_item_watched_at TEXT NOT NULL DEFAULT '',
         updated_at TEXT NOT NULL
       )`).run().then(() => {
@@ -12237,40 +12264,13 @@ const Database = {
       if (GLOBALS.ServerRecordSnapshotDbReady.get(db) === initTask) GLOBALS.ServerRecordSnapshotDbReady.delete(db);
     }
   },
-  async ensureServerRecordPosterCacheSchema(db) {
+  async hasServerRecordPosterSearchSchema(db) {
     if (!db) return false;
-    if (this.isD1SchemaReadyCached(db, "serverRecordPosterCacheSchema")) return true;
-    let initTask = GLOBALS.ServerRecordPosterCacheDbReady.get(db);
-    if (!initTask) {
-      initTask = (async () => {
-        await db.prepare(`CREATE TABLE IF NOT EXISTS ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
-          node_name TEXT PRIMARY KEY,
-          watched_at TEXT NOT NULL,
-          item_id TEXT NOT NULL,
-          tmdb_id TEXT NOT NULL DEFAULT '',
-          imdb_id TEXT NOT NULL DEFAULT '',
-          provider TEXT NOT NULL DEFAULT '',
-          image_path TEXT NOT NULL DEFAULT '',
-          resolved_at TEXT NOT NULL DEFAULT '',
-          expires_at TEXT NOT NULL DEFAULT '',
-          failure_code TEXT NOT NULL DEFAULT '',
-          retry_after TEXT NOT NULL DEFAULT '',
-          updated_at TEXT NOT NULL
-        )`).run();
-        await db.prepare(`CREATE INDEX IF NOT EXISTS idx_server_record_poster_cache_expires_at ON ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (expires_at)`).run();
-        this.markD1SchemaReady(db, "serverRecordPosterCacheSchema");
-        return true;
-      })().catch(error => {
-        GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
-        throw error;
-      });
-      GLOBALS.ServerRecordPosterCacheDbReady.set(db, initTask);
-    }
-    try {
-      return await initTask;
-    } finally {
-      if (GLOBALS.ServerRecordPosterCacheDbReady.get(db) === initTask) GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
-    }
+    if (this.isD1SchemaReadyCached(db, "serverRecordPosterSearchSchema")) return true;
+    const columns = await this.getTableColumns(db, this.SERVER_RECORD_SNAPSHOT_TABLE);
+    const ready = columns.has("last_item_original_title") && columns.has("last_item_year");
+    if (ready) this.markD1SchemaReady(db, "serverRecordPosterSearchSchema");
+    return ready;
   },
   async upsertServerLastWatch(db, nodeName = "", lastWatchedAt = "", media = {}) {
     const normalizedName = String(nodeName || "").trim().toLowerCase();
@@ -12286,7 +12286,16 @@ const Database = {
     const itemName = String(normalizedMedia.itemName || "").trim().slice(0, 256);
     const itemType = String(normalizedMedia.itemType || "").trim().slice(0, 64);
     const seriesName = String(normalizedMedia.seriesName || "").trim().slice(0, 256);
-    const imageTag = String(normalizedMedia.imageTag || "").trim().slice(0, 256);
+    const originalTitle = String(normalizedMedia.originalTitle || "").trim().slice(0, 256);
+    const year = normalizeServerRecordPosterYear(normalizedMedia.year ?? normalizedMedia.productionYear);
+    const posterSearchReady = await this.hasServerRecordPosterSearchSchema(db);
+    const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
+    const posterValues = posterSearchReady ? ", ?, ?" : "";
+    const posterUpdates = posterSearchReady
+      ? `,
+      last_item_original_title = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_original_title ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_original_title END,
+      last_item_year = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_year ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_year END`
+      : "";
     const lastWatchStatement = db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
       node_name, last_watched_at, updated_at
     ) VALUES (?, ?, ?)
@@ -12301,17 +12310,17 @@ const Database = {
       END`).bind(normalizedName, watchedAt, updatedAt);
     const snapshotStatement = db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
       node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-      last_item_image_tag, last_item_watched_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      last_item_watched_at, updated_at${posterColumns}
+    ) VALUES (?, ?, ?, ?, ?, ?, ?${posterValues})
     ON CONFLICT(node_name) DO UPDATE SET
       last_item_id = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_id ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_id END,
       last_item_name = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_name ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_name END,
       last_item_type = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_type ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_type END,
-      last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END,
-      last_item_image_tag = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_image_tag ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_image_tag END,
+      last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END${posterUpdates},
       last_item_watched_at = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_watched_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at END,
       updated_at = CASE WHEN excluded.last_item_watched_at > ${this.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.updated_at ELSE ${this.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`)
-      .bind(normalizedName, itemId, itemName, itemType, seriesName, imageTag, watchedAt, updatedAt);
+      .bind(normalizedName, itemId, itemName, itemType, seriesName, watchedAt, updatedAt,
+        ...(posterSearchReady ? [originalTitle, year] : []));
     await db.batch([lastWatchStatement, snapshotStatement]);
     return true;
   },
@@ -12357,7 +12366,14 @@ const Database = {
     const itemName = String(media.itemName || "").trim().slice(0, 256);
     const itemType = String(media.itemType || "").trim().slice(0, 64);
     const seriesName = String(media.seriesName || "").trim().slice(0, 256);
-    const imageTag = String(media.imageTag || "").trim().slice(0, 256);
+    const originalTitle = String(media.originalTitle || "").trim().slice(0, 256);
+    const year = normalizeServerRecordPosterYear(media.year ?? media.productionYear);
+    const posterSearchReady = await this.hasServerRecordPosterSearchSchema(db);
+    const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
+    const posterValues = posterSearchReady ? ", ?, ?" : "";
+    const posterUpdates = posterSearchReady
+      ? ",\n      last_item_original_title = excluded.last_item_original_title,\n      last_item_year = excluded.last_item_year"
+      : "";
     const terminalCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_TERMINAL_TTL_MS).toISOString();
     const abandonedCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS).toISOString();
     const lastWatchStatement = db.prepare(`INSERT INTO ${this.SERVER_LAST_WATCH_TABLE} (
@@ -12400,8 +12416,8 @@ const Database = {
     );
     const snapshotStatement = db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
       node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-      last_item_image_tag, last_item_watched_at, updated_at
-    ) SELECT ?, ?, ?, ?, ?, ?, ?, ?
+      last_item_watched_at, updated_at${posterColumns}
+    ) SELECT ?, ?, ?, ?, ?, ?, ?${posterValues}
     WHERE changes() > 0 AND EXISTS (
       SELECT 1 FROM ${this.SERVER_LAST_WATCH_TABLE}
       WHERE node_name = ? AND last_watched_at = ?
@@ -12411,8 +12427,7 @@ const Database = {
       last_item_id = excluded.last_item_id,
       last_item_name = excluded.last_item_name,
       last_item_type = excluded.last_item_type,
-      last_item_series_name = excluded.last_item_series_name,
-      last_item_image_tag = excluded.last_item_image_tag,
+      last_item_series_name = excluded.last_item_series_name${posterUpdates},
       last_item_watched_at = excluded.last_item_watched_at,
       updated_at = excluded.updated_at`).bind(
       nodeName,
@@ -12420,9 +12435,9 @@ const Database = {
       itemName,
       itemType,
       seriesName,
-      imageTag,
       eventAt,
       updatedAt,
+      ...(posterSearchReady ? [originalTitle, year] : []),
       nodeName,
       eventAt,
       sessionFingerprint,
@@ -12457,83 +12472,6 @@ const Database = {
       }
     }
     return result;
-  },
-  async getServerRecordPosterCache(db, nodeName = "", watchedAt = "", itemId = "") {
-    const normalizedName = String(nodeName || "").trim().toLowerCase();
-    const normalizedWatchedAt = String(watchedAt || "").trim();
-    const normalizedItemId = String(itemId || "").trim();
-    if (!db || !normalizedName || !normalizedWatchedAt || !normalizedItemId) return null;
-    await this.ensureServerRecordPosterCacheSchema(db);
-    const row = await db.prepare(`SELECT
-      node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
-      resolved_at, expires_at, failure_code, retry_after, updated_at
-      FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE}
-      WHERE node_name = ? AND watched_at = ? AND item_id = ?
-      LIMIT 1`).bind(normalizedName, normalizedWatchedAt, normalizedItemId).first();
-    if (!row) return null;
-    return {
-      nodeName: String(row?.node_name || "").trim().toLowerCase(),
-      watchedAt: String(row?.watched_at || "").trim(),
-      itemId: String(row?.item_id || "").trim(),
-      tmdbId: normalizeTmdbPosterId(row?.tmdb_id),
-      imdbId: normalizeImdbPosterId(row?.imdb_id),
-      provider: String(row?.provider || "").trim().toLowerCase(),
-      imagePath: normalizeTmdbPosterImagePath(row?.image_path),
-      resolvedAt: String(row?.resolved_at || "").trim(),
-      expiresAt: String(row?.expires_at || "").trim(),
-      failureCode: String(row?.failure_code || "").trim().toLowerCase(),
-      retryAfter: String(row?.retry_after || "").trim(),
-      updatedAt: String(row?.updated_at || "").trim()
-    };
-  },
-  async setServerRecordPosterCache(db, entry = {}) {
-    const nodeName = String(entry?.nodeName || entry?.node_name || "").trim().toLowerCase();
-    const watchedAt = String(entry?.watchedAt || entry?.watched_at || "").trim();
-    const itemId = String(entry?.itemId || entry?.item_id || "").trim().slice(0, 512);
-    const expiresAtMs = Date.parse(String(entry?.expiresAt || entry?.expires_at || "").trim());
-    if (!db || !nodeName || !watchedAt || !itemId || !Number.isFinite(expiresAtMs)) return false;
-    const now = new Date().toISOString();
-    const imagePath = normalizeTmdbPosterImagePath(entry?.imagePath || entry?.image_path);
-    const providerValue = String(entry?.provider || "").trim().toLowerCase();
-    const provider = imagePath && ["tmdb_direct", "tmdb_imdb_find"].includes(providerValue)
-      ? providerValue
-      : "";
-    const failureCode = imagePath ? "" : String(entry?.failureCode || entry?.failure_code || "tmdb_unavailable")
-      .trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "_").slice(0, 96);
-    const retryAfterMs = imagePath ? NaN : Date.parse(String(entry?.retryAfter || entry?.retry_after || "").trim());
-    const expiresAt = new Date(expiresAtMs).toISOString();
-    const retryAfter = Number.isFinite(retryAfterMs) ? new Date(retryAfterMs).toISOString() : "";
-    await this.ensureServerRecordPosterCacheSchema(db);
-    await db.prepare(`INSERT INTO ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
-      node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
-      resolved_at, expires_at, failure_code, retry_after, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(node_name) DO UPDATE SET
-      watched_at = excluded.watched_at,
-      item_id = excluded.item_id,
-      tmdb_id = excluded.tmdb_id,
-      imdb_id = excluded.imdb_id,
-      provider = excluded.provider,
-      image_path = excluded.image_path,
-      resolved_at = excluded.resolved_at,
-      expires_at = excluded.expires_at,
-      failure_code = excluded.failure_code,
-      retry_after = excluded.retry_after,
-      updated_at = excluded.updated_at`).bind(
-      nodeName,
-      watchedAt,
-      itemId,
-      normalizeTmdbPosterId(entry?.tmdbId || entry?.tmdb_id),
-      normalizeImdbPosterId(entry?.imdbId || entry?.imdb_id),
-      provider,
-      imagePath,
-      now,
-      expiresAt,
-      failureCode,
-      retryAfter,
-      now
-    ).run();
-    return true;
   },
   async persistServerRecordProbeSnapshots(db, entries = []) {
     if (!db) return 0;
@@ -12592,18 +12530,43 @@ const Database = {
     }
     return written;
   },
+  async persistServerRecordPosterSearchMetadata(db, candidate = {}, media = {}) {
+    const nodeName = String(candidate?.nodeName || "").trim().toLowerCase();
+    const itemId = String(candidate?.itemId || "").trim().slice(0, 256);
+    const watchedAt = String(candidate?.watchedAt || "").trim();
+    if (!db || !nodeName || !itemId || !watchedAt || !await this.hasServerRecordPosterSearchSchema(db)) return false;
+    const itemName = String(media?.itemName || "").trim().slice(0, 256);
+    const itemType = String(media?.itemType || "").trim().slice(0, 64);
+    const seriesName = String(media?.seriesName || "").trim().slice(0, 256);
+    const originalTitle = String(media?.originalTitle || "").trim().slice(0, 256);
+    const year = normalizeServerRecordPosterYear(media?.year ?? media?.productionYear);
+    const result = await db.prepare(`UPDATE ${this.SERVER_RECORD_SNAPSHOT_TABLE} SET
+      last_item_name = CASE WHEN ? != '' THEN ? ELSE last_item_name END,
+      last_item_type = CASE WHEN ? != '' THEN ? ELSE last_item_type END,
+      last_item_series_name = CASE WHEN ? != '' THEN ? ELSE last_item_series_name END,
+      last_item_original_title = CASE WHEN ? != '' THEN ? ELSE last_item_original_title END,
+      last_item_year = COALESCE(?, last_item_year),
+      updated_at = ?
+      WHERE node_name = ? AND last_item_id = ? AND last_item_watched_at = ?`)
+      .bind(itemName, itemName, itemType, itemType, seriesName, seriesName,
+        originalTitle, originalTitle, year, new Date().toISOString(), nodeName, itemId, watchedAt)
+      .run();
+    return (Number(result?.meta?.changes ?? result?.changes) || 0) > 0;
+  },
   async getServerRecordSnapshots(db, nodeNames = []) {
     const names = this.normalizeNodeIndex(nodeNames);
     const result = new Map();
     if (!db || names.length === 0) return result;
     await this.ensureServerRecordSnapshotSchema(db);
+    const posterSearchReady = await this.hasServerRecordPosterSearchSchema(db);
+    const posterSearchColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
     for (let offset = 0; offset < names.length; offset += 90) {
       const chunk = names.slice(offset, offset + 90);
       const placeholders = chunk.map(() => "?").join(", ");
       const rows = await db.prepare(`SELECT
         node_name, movie_count, series_count, episode_count, counts_state,
         counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-        last_item_type, last_item_series_name, last_item_image_tag,
+        last_item_type, last_item_series_name${posterSearchColumns},
         last_item_watched_at, updated_at
         FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE}
         WHERE node_name IN (${placeholders})`).bind(...chunk).all();
@@ -12633,7 +12596,8 @@ const Database = {
             itemName: String(row?.last_item_name || "").trim(),
             itemType: String(row?.last_item_type || "").trim(),
             seriesName: String(row?.last_item_series_name || "").trim(),
-            imageTag: String(row?.last_item_image_tag || "").trim(),
+            originalTitle: posterSearchReady ? String(row?.last_item_original_title || "").trim() : "",
+            year: posterSearchReady ? normalizeServerRecordPosterYear(row?.last_item_year) : null,
             watchedAt: String(row?.last_item_watched_at || "").trim()
           },
           updatedAt: String(row?.updated_at || "").trim()
@@ -12655,15 +12619,16 @@ const Database = {
   },
   async readServerRecordNodeLifecycleRows(db, nodeNames = []) {
     const names = this.normalizeNodeIndex(nodeNames);
-    const rows = { lastWatch: [], snapshots: [], posterCache: [], watchLifecycleSchemaReady: false };
+    const rows = { lastWatch: [], snapshots: [], watchLifecycleSchemaReady: false, posterSearchSchemaReady: false };
     if (!db || names.length === 0) return rows;
     await this.ensureServerLastWatchSchema(db);
     await this.ensureServerRecordSnapshotSchema(db);
-    await this.ensureServerRecordPosterCacheSchema(db);
     const watchLifecycleSchemaReady = await this.hasServerWatchLifecycleSchema(db);
+    const posterSearchSchemaReady = await this.hasServerRecordPosterSearchSchema(db);
     rows.watchLifecycleSchemaReady = watchLifecycleSchemaReady;
+    rows.posterSearchSchemaReady = posterSearchSchemaReady;
     const placeholders = names.map(() => "?").join(", ");
-    const [lastWatchRows, snapshotRows, posterCacheRows] = await Promise.all([
+    const [lastWatchRows, snapshotRows] = await Promise.all([
       db.prepare(`SELECT node_name, last_watched_at,
         ${watchLifecycleSchemaReady ? "playback_session_fingerprint" : "'' AS playback_session_fingerprint"},
         ${watchLifecycleSchemaReady ? "playback_session_strength" : "'' AS playback_session_strength"},
@@ -12673,19 +12638,14 @@ const Database = {
       db.prepare(`SELECT
         node_name, movie_count, series_count, episode_count, counts_state,
         counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-        last_item_type, last_item_series_name, last_item_image_tag,
+        last_item_type, last_item_series_name,
+        ${posterSearchSchemaReady ? "last_item_original_title, last_item_year," : "'' AS last_item_original_title, NULL AS last_item_year,"}
         last_item_watched_at, updated_at
         FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE}
-        WHERE node_name IN (${placeholders})`).bind(...names).all(),
-      db.prepare(`SELECT
-        node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
-        resolved_at, expires_at, failure_code, retry_after, updated_at
-        FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE}
         WHERE node_name IN (${placeholders})`).bind(...names).all()
     ]);
     rows.lastWatch = (lastWatchRows?.results || []).map(row => ({ ...row }));
     rows.snapshots = (snapshotRows?.results || []).map(row => ({ ...row }));
-    rows.posterCache = (posterCacheRows?.results || []).map(row => ({ ...row }));
     return rows;
   },
   getNewestServerRecordLifecycleRow(rows = [], timestampField = "") {
@@ -12743,7 +12703,8 @@ const Database = {
         last_item_name: String(newestMedia?.last_item_name || "").trim(),
         last_item_type: String(newestMedia?.last_item_type || "").trim(),
         last_item_series_name: String(newestMedia?.last_item_series_name || "").trim(),
-        last_item_image_tag: String(newestMedia?.last_item_image_tag || "").trim(),
+        last_item_original_title: String(newestMedia?.last_item_original_title || "").trim(),
+        last_item_year: normalizeServerRecordPosterYear(newestMedia?.last_item_year),
         last_item_watched_at: String(newestMedia?.last_item_watched_at || "").trim(),
         updated_at: String(snapshotUpdatedAt?.updated_at || new Date().toISOString()).trim()
       }
@@ -12755,8 +12716,7 @@ const Database = {
     const placeholders = names.map(() => "?").join(", ");
     const statements = [
       db.prepare(`DELETE FROM ${this.SERVER_LAST_WATCH_TABLE} WHERE node_name IN (${placeholders})`).bind(...names),
-      db.prepare(`DELETE FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE} WHERE node_name IN (${placeholders})`).bind(...names),
-      db.prepare(`DELETE FROM ${this.SERVER_RECORD_POSTER_CACHE_TABLE} WHERE node_name IN (${placeholders})`).bind(...names)
+      db.prepare(`DELETE FROM ${this.SERVER_RECORD_SNAPSHOT_TABLE} WHERE node_name IN (${placeholders})`).bind(...names)
     ];
     for (const row of Array.isArray(before?.lastWatch) ? before.lastWatch : []) {
       const values = [
@@ -12781,12 +12741,13 @@ const Database = {
         .bind(...values));
     }
     for (const row of Array.isArray(before?.snapshots) ? before.snapshots : []) {
+      const posterColumns = before?.posterSearchSchemaReady === true ? ", last_item_original_title, last_item_year" : "";
+      const posterValues = before?.posterSearchSchemaReady === true ? ", ?, ?" : "";
       statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
         node_name, movie_count, series_count, episode_count, counts_state,
         counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-        last_item_type, last_item_series_name, last_item_image_tag,
-        last_item_watched_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        last_item_type, last_item_series_name, last_item_watched_at, updated_at${posterColumns}
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`)
         .bind(
           String(row?.node_name || "").trim().toLowerCase(),
           row?.movie_count ?? null,
@@ -12799,29 +12760,11 @@ const Database = {
           String(row?.last_item_name || "").trim(),
           String(row?.last_item_type || "").trim(),
           String(row?.last_item_series_name || "").trim(),
-          String(row?.last_item_image_tag || "").trim(),
           String(row?.last_item_watched_at || "").trim(),
-          String(row?.updated_at || "").trim()
-        ));
-    }
-    for (const row of Array.isArray(before?.posterCache) ? before.posterCache : []) {
-      statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_POSTER_CACHE_TABLE} (
-        node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
-        resolved_at, expires_at, failure_code, retry_after, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-        .bind(
-          String(row?.node_name || "").trim().toLowerCase(),
-          String(row?.watched_at || "").trim(),
-          String(row?.item_id || "").trim(),
-          String(row?.tmdb_id || "").trim(),
-          String(row?.imdb_id || "").trim(),
-          String(row?.provider || "").trim(),
-          String(row?.image_path || "").trim(),
-          String(row?.resolved_at || "").trim(),
-          String(row?.expires_at || "").trim(),
-          String(row?.failure_code || "").trim(),
-          String(row?.retry_after || "").trim(),
-          String(row?.updated_at || "").trim()
+          String(row?.updated_at || "").trim(),
+          ...(before?.posterSearchSchemaReady === true
+            ? [String(row?.last_item_original_title || "").trim(), normalizeServerRecordPosterYear(row?.last_item_year)]
+            : [])
         ));
     }
     return statements;
@@ -12855,12 +12798,13 @@ const Database = {
         }
       }
       if (merged.snapshot) {
+        const posterColumns = before.posterSearchSchemaReady === true ? ", last_item_original_title, last_item_year" : "";
+        const posterValues = before.posterSearchSchemaReady === true ? ", ?, ?" : "";
         statements.push(db.prepare(`INSERT INTO ${this.SERVER_RECORD_SNAPSHOT_TABLE} (
           node_name, movie_count, series_count, episode_count, counts_state,
           counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-          last_item_type, last_item_series_name, last_item_image_tag,
-          last_item_watched_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+          last_item_type, last_item_series_name, last_item_watched_at, updated_at${posterColumns}
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`)
           .bind(
             merged.snapshot.node_name,
             merged.snapshot.movie_count,
@@ -12873,9 +12817,11 @@ const Database = {
             merged.snapshot.last_item_name,
             merged.snapshot.last_item_type,
             merged.snapshot.last_item_series_name,
-            merged.snapshot.last_item_image_tag,
             merged.snapshot.last_item_watched_at,
-            merged.snapshot.updated_at
+            merged.snapshot.updated_at,
+            ...(before.posterSearchSchemaReady === true
+              ? [merged.snapshot.last_item_original_title, merged.snapshot.last_item_year]
+              : [])
           ));
       }
     }
@@ -12888,18 +12834,9 @@ const Database = {
     if (!db || !applied?.lifecycle) return false;
     await this.ensureServerLastWatchSchema(db);
     await this.ensureServerRecordSnapshotSchema(db);
-    await this.ensureServerRecordPosterCacheSchema(db);
     await db.batch(this.buildServerRecordNodeLifecycleRestoreStatements(db, applied.lifecycle, applied.before));
     delete mutation.serverRecordNodeLifecycle;
     return true;
-  },
-  buildServerRecordPosterUrl(env, nodeName = "", snapshot = {}) {
-    const normalizedName = String(nodeName || "").trim().toLowerCase();
-    const itemId = String(snapshot?.itemId || "").trim();
-    if (!normalizedName || !itemId) return "";
-    const adminPath = getAdminPath(env).replace(/\/+$/, "") || "/admin";
-    const revision = hashStableText(`${String(snapshot?.watchedAt || "")}|${String(snapshot?.imageTag || "")}`);
-    return `${adminPath}/__server-record-poster/${encodeURIComponent(normalizedName)}?v=${encodeURIComponent(revision)}`;
   },
   normalizeD1SchemaProfile(profile = "") {
     const normalizedProfile = String(profile || "").trim().toLowerCase();
@@ -12932,7 +12869,6 @@ const Database = {
       GLOBALS.CfRuntimeCacheDbReady.delete(db);
       GLOBALS.ServerLastWatchDbReady.delete(db);
       GLOBALS.ServerRecordSnapshotDbReady.delete(db);
-      GLOBALS.ServerRecordPosterCacheDbReady.delete(db);
     }
   },
   async bootstrapD1Schema(db, profile = "logs-core") {
@@ -12956,8 +12892,7 @@ const Database = {
       { name: "ensureCfDashboardCacheTable", run: () => this.ensureCfDashboardCacheTable(db) },
       { name: "ensureCfRuntimeCacheTable", run: () => this.ensureCfRuntimeCacheTable(db) },
       { name: "ensureServerLastWatchSchema", run: () => this.ensureServerLastWatchSchema(db) },
-      { name: "ensureServerRecordSnapshotSchema", run: () => this.ensureServerRecordSnapshotSchema(db) },
-      { name: "ensureServerRecordPosterCacheSchema", run: () => this.ensureServerRecordPosterCacheSchema(db) }
+      { name: "ensureServerRecordSnapshotSchema", run: () => this.ensureServerRecordSnapshotSchema(db) }
     ];
     const logSteps = [
       { name: "ensureLogsBaseSchema", run: () => this.ensureLogsBaseSchema(db) },
@@ -17545,7 +17480,7 @@ const Database = {
         error.details = { quotaBudget: plan.quotaBudget };
         throw error;
       }
-      return await this.applyKvTidyPlan(plan, options);
+      return await this.applyKvTidyPlan(plan, { ...options, env });
     });
   },
   async readD1Count(db, sql, bindParams = []) {
@@ -17596,7 +17531,7 @@ const Database = {
       deletedExpiredProbeCacheCount: Math.max(0, Number(summary.deletedExpiredProbeCacheCount) || 0),
       deletedExpiredAuthFailureCount: Math.max(0, Number(summary.deletedExpiredAuthFailureCount) || 0),
       deletedExpiredDashboardCacheCount: Math.max(0, Number(summary.deletedExpiredDashboardCacheCount) || 0),
-      deletedExpiredServerRecordPosterCacheCount: Math.max(0, Number(summary.deletedExpiredServerRecordPosterCacheCount) || 0),
+      droppedLegacyServerRecordPosterCache: summary.droppedLegacyServerRecordPosterCache === true,
       preservedLogCount: Math.max(0, Number(summary.preservedLogCount) || 0),
       rebuiltStatsHourly: summary.rebuiltStatsHourly === true,
       rebuiltLogsFts: summary.rebuiltLogsFts === true,
@@ -17652,10 +17587,18 @@ const Database = {
     const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
     const flags = D1TidyPlanner.buildFlags(this, context, facts, sourcePolicy);
     const summary = D1TidyPlanner.buildSummary(context, facts, sourcePolicy, flags);
-    summary.runtimeCompatibilityReady = schemaStatus.runtimeCompatibilityReady === true;
-    summary.requiresSchemaInitialization = schemaStatus.runtimeCompatibilityReady !== true;
+    const posterDropOnly = context.mode === "manual"
+      && flags.dropLegacyServerRecordPosterCache === true
+      && schemaStatus.runtimeCompatibilityReadyIgnoringRetiredPosterCache === true
+      && schemaStatus.migrationReady !== true
+      && schemaStatus.migrationTableValid === true
+      && Array.isArray(schemaStatus.missingMigrations)
+      && schemaStatus.missingMigrations.length === 0;
+    const schemaReadyForTidy = schemaStatus.runtimeCompatibilityReady === true || posterDropOnly;
+    summary.runtimeCompatibilityReady = schemaReadyForTidy;
+    summary.requiresSchemaInitialization = !schemaReadyForTidy;
     const preview = D1TidyPlanner.buildPreview(context, facts, sourcePolicy, flags);
-    if (schemaStatus.runtimeCompatibilityReady !== true) {
+    if (!schemaReadyForTidy) {
       preview.warnings.unshift("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
     }
 
@@ -17693,7 +17636,14 @@ const Database = {
     const kv = options.kv || this.getKV(env) || null;
     if (!db) throw new Error("D1 not configured");
     const compatibilityStatus = await this.getD1SchemaStatus(db);
-    if (compatibilityStatus.runtimeCompatibilityReady !== true) {
+    const requestedMode = String(plan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
+    const posterDropOnly = requestedMode === "manual"
+      && plan?.flags?.dropLegacyServerRecordPosterCache === true
+      && compatibilityStatus.runtimeCompatibilityReadyIgnoringRetiredPosterCache === true
+      && compatibilityStatus.migrationTableValid === true
+      && Array.isArray(compatibilityStatus.missingMigrations)
+      && compatibilityStatus.missingMigrations.length === 0;
+    if (compatibilityStatus.runtimeCompatibilityReady !== true && !posterDropOnly) {
       const error = new Error("D1 schema must pass runtime compatibility checks before tidy execution");
       error.code = "D1_SCHEMA_INCOMPATIBLE";
       error.status = 409;
@@ -19146,359 +19096,6 @@ const Database = {
       clearTimeout(timeoutId);
     }
   },
-  async buildServerRecordPosterImageResponse(upstream, requestMethod = "GET") {
-    const contentType = String(upstream?.headers?.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
-    if (!upstream?.ok || !SERVER_RECORD_POSTER_CONTENT_TYPES.has(contentType)) {
-      try { await upstream?.body?.cancel?.(); } catch {}
-      return null;
-    }
-    const responseHeaders = new Headers({
-      "Content-Type": upstream.headers.get("Content-Type") || "image/jpeg",
-      "Cache-Control": "private, max-age=300, stale-while-revalidate=60",
-      "Content-Security-Policy": "default-src 'none'; sandbox",
-      "X-Content-Type-Options": "nosniff",
-      "Cross-Origin-Resource-Policy": "same-origin",
-      "Vary": "Cookie"
-    });
-    for (const headerName of ["Content-Length", "ETag", "Last-Modified"]) {
-      const value = upstream.headers.get(headerName);
-      if (value) responseHeaders.set(headerName, value);
-    }
-    return new Response(String(requestMethod || "GET").toUpperCase() === "HEAD" ? null : upstream.body, {
-      status: 200,
-      headers: responseHeaders
-    });
-  },
-  async fetchTmdbPosterJson(env, apiPath = "", query = {}, runtimeConfig = {}) {
-    const apiKey = resolveTmdbPosterApiKey(env, runtimeConfig);
-    if (!apiKey) return { ok: false, failureCode: "tmdb_secret_missing" };
-    let url;
-    try {
-      url = new URL(String(apiPath || ""), TMDB_API_ORIGIN);
-      if (url.origin !== TMDB_API_ORIGIN || !url.pathname.startsWith("/3/")) {
-        return { ok: false, failureCode: "tmdb_request_invalid" };
-      }
-    } catch {
-      return { ok: false, failureCode: "tmdb_request_invalid" };
-    }
-    url.searchParams.set("api_key", apiKey);
-    for (const [name, value] of Object.entries(isPlainObject(query) ? query : {})) {
-      if (value !== undefined && value !== null && String(value).trim()) url.searchParams.set(name, String(value));
-    }
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort("tmdb_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
-    try {
-      const response = await fetch(url.toString(), {
-        method: "GET",
-        headers: { Accept: "application/json" },
-        cache: "no-store",
-        redirect: "error",
-        signal: controller.signal
-      });
-      const contentType = String(response.headers.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
-      if (!response.ok) {
-        try { await response.body?.cancel?.(); } catch {}
-        return { ok: false, failureCode: response.status === 429 ? "tmdb_rate_limited" : (response.status === 404 ? "tmdb_not_found" : "tmdb_http_error") };
-      }
-      if (!TMDB_JSON_CONTENT_TYPES.has(contentType)) {
-        try { await response.body?.cancel?.(); } catch {}
-        return { ok: false, failureCode: "tmdb_invalid_mime" };
-      }
-      const body = await readResponseTextWithLimit(response, MEDIA_AGGREGATION_RESPONSE_MAX_BYTES);
-      if (body.exceeded || !body.text.trim()) return { ok: false, failureCode: "tmdb_invalid_json" };
-      try {
-        return { ok: true, json: JSON.parse(body.text) };
-      } catch {
-        return { ok: false, failureCode: "tmdb_invalid_json" };
-      }
-    } catch (error) {
-      const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
-      return { ok: false, failureCode: timedOut ? "tmdb_timeout" : "tmdb_network_error" };
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  },
-  async fetchTmdbPosterImage(imagePath = "", requestMethod = "GET") {
-    const url = buildTmdbPosterImageUrl(imagePath);
-    if (!url) return { response: null, failureCode: "tmdb_invalid_image_path" };
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort("tmdb_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
-    try {
-      const upstream = await fetch(url.toString(), {
-        method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
-        headers: { Accept: "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8" },
-        cache: "no-store",
-        redirect: "error",
-        signal: controller.signal
-      });
-      const response = await this.buildServerRecordPosterImageResponse(upstream, requestMethod);
-      return {
-        response,
-        failureCode: response ? "" : (upstream.status === 429 ? "tmdb_rate_limited" : "tmdb_invalid_image")
-      };
-    } catch (error) {
-      const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
-      return { response: null, failureCode: timedOut ? "tmdb_timeout" : "tmdb_network_error" };
-    } finally {
-      clearTimeout(timeoutId);
-    }
-  },
-  async resolveTmdbPosterImagePath(env, mediaKind = "", tmdbId = "", runtimeConfig = {}) {
-    const normalizedId = normalizeTmdbPosterId(tmdbId);
-    const type = String(mediaKind || "").trim().toLowerCase() === "movie" ? "movie" : "tv";
-    if (!normalizedId) return { imagePath: "", failureCode: "tmdb_id_invalid" };
-    const result = await this.fetchTmdbPosterJson(
-      env,
-      `/3/${type}/${encodeURIComponent(normalizedId)}/images`,
-      { include_image_language: "zh,en,null" },
-      runtimeConfig
-    );
-    if (!result.ok) return { imagePath: "", failureCode: result.failureCode };
-    const imagePath = selectTmdbPosterImagePath(result.json);
-    return imagePath ? { imagePath, failureCode: "" } : { imagePath: "", failureCode: "tmdb_poster_not_found" };
-  },
-  async resolveTmdbPosterFromImdb(env, mediaKind = "", imdbId = "", runtimeConfig = {}) {
-    const normalizedImdbId = normalizeImdbPosterId(imdbId);
-    const type = String(mediaKind || "").trim().toLowerCase() === "movie" ? "movie" : "tv";
-    if (!normalizedImdbId) return { tmdbId: "", imagePath: "", failureCode: "imdb_id_invalid" };
-    const findResult = await this.fetchTmdbPosterJson(
-      env,
-      `/3/find/${encodeURIComponent(normalizedImdbId)}`,
-      { external_source: "imdb_id" },
-      runtimeConfig
-    );
-    if (!findResult.ok) return { tmdbId: "", imagePath: "", failureCode: findResult.failureCode };
-    const candidates = type === "movie" ? findResult.json?.movie_results : findResult.json?.tv_results;
-    const tmdbId = normalizeTmdbPosterId(Array.isArray(candidates) ? candidates[0]?.id : "");
-    if (!tmdbId) return { tmdbId: "", imagePath: "", failureCode: "tmdb_find_not_found" };
-    const imageResult = await this.resolveTmdbPosterImagePath(env, type, tmdbId, runtimeConfig);
-    return { tmdbId, ...imageResult };
-  },
-  async getServerRecordPosterMetadata(nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "") {
-    const normalizedItemId = String(itemId || "").trim();
-    if (!normalizedItemId) return null;
-    for (const targetRecord of targetRecords) {
-      const headers = new Headers(baseHeaders);
-      if (credentials.configured) {
-        stripSensitiveProxyAuthHeaders(headers);
-        headers.delete("Cookie");
-        const auth = await this.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
-        if (!auth?.token) continue;
-        headers.set("X-Emby-Token", auth.token);
-      }
-      let metadataResult;
-      try {
-        metadataResult = await this.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(normalizedItemId)}`, headers, {
-          expectJson: true,
-          query: { Fields: "ProviderIds,SeriesProviderIds,SeriesId,SeriesName,ParentIndexNumber,IndexNumber" }
-        });
-      } catch {
-        continue;
-      }
-      if (!metadataResult?.ok || metadataResult.parseError || !isPlainObject(metadataResult.json)) continue;
-      const metadata = metadataResult.json;
-      const type = String(metadata?.Type || metadata?.type || "").trim().toLowerCase();
-      if (type === "movie" || type === "series") {
-        return {
-          mediaKind: type === "movie" ? "movie" : "tv",
-          providerIds: normalizeMediaAggregationProviderIds(metadata?.ProviderIds || metadata?.providerIds),
-          tmdbId: "",
-          imdbId: ""
-        };
-      }
-      if (type !== "episode") return { mediaKind: "", providerIds: {}, tmdbId: "", imdbId: "" };
-      const seriesProviderIds = normalizeMediaAggregationProviderIds(metadata?.SeriesProviderIds || metadata?.seriesProviderIds);
-      if (Object.keys(seriesProviderIds).length) {
-        return { mediaKind: "tv", providerIds: seriesProviderIds, tmdbId: "", imdbId: "" };
-      }
-      const seriesId = String(metadata?.SeriesId || metadata?.seriesId || "").trim();
-      if (!seriesId) return { mediaKind: "tv", providerIds: {}, tmdbId: "", imdbId: "" };
-      let seriesResult;
-      try {
-        seriesResult = await this.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(seriesId)}`, headers, {
-          expectJson: true,
-          query: { Fields: "ProviderIds,ParentIndexNumber,IndexNumber" }
-        });
-      } catch {
-        continue;
-      }
-      if (!seriesResult?.ok || seriesResult.parseError || !isPlainObject(seriesResult.json)) continue;
-      return {
-        mediaKind: "tv",
-        providerIds: normalizeMediaAggregationProviderIds(seriesResult.json?.ProviderIds || seriesResult.json?.providerIds),
-        tmdbId: "",
-        imdbId: ""
-      };
-    }
-    return null;
-  },
-  async persistServerRecordPosterCache(db, entry = {}) {
-    try {
-      return await this.setServerRecordPosterCache(db, entry);
-    } catch {
-      return false;
-    }
-  },
-  async resolveServerRecordTmdbPoster(env, db, nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "", watchedAt = "", requestMethod = "GET", runtimeConfig = {}) {
-    if (!resolveTmdbPosterApiKey(env, runtimeConfig)) return null;
-    const now = nowMs();
-    let cached = null;
-    try {
-      cached = await this.getServerRecordPosterCache(db, nodeName, watchedAt, itemId);
-    } catch {}
-    const cacheExpiresAt = Date.parse(String(cached?.expiresAt || ""));
-    if (cached && Number.isFinite(cacheExpiresAt) && cacheExpiresAt > now) {
-      if (cached.imagePath && ["tmdb_direct", "tmdb_imdb_find"].includes(cached.provider)) {
-        const imageResult = await this.fetchTmdbPosterImage(cached.imagePath, requestMethod);
-        if (imageResult.response) return imageResult.response;
-        await this.persistServerRecordPosterCache(db, {
-          nodeName,
-          watchedAt,
-          itemId,
-          tmdbId: cached.tmdbId,
-          imdbId: cached.imdbId,
-          expiresAt: new Date(now + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString(),
-          retryAfter: new Date(now + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString(),
-          failureCode: imageResult.failureCode
-        });
-        return null;
-      }
-      const retryAfter = Date.parse(String(cached.retryAfter || ""));
-      if (cached.failureCode && Number.isFinite(retryAfter) && retryAfter > now) return null;
-    }
-
-    const metadata = await this.getServerRecordPosterMetadata(nodeName, node, targetRecords, baseHeaders, credentials, itemId);
-    if (!metadata?.mediaKind) return null;
-    const providerIds = normalizeMediaAggregationProviderIds(metadata.providerIds);
-    const directTmdbId = normalizeTmdbPosterId(providerIds.tmdb);
-    const imdbId = normalizeImdbPosterId(providerIds.imdb);
-    const negativeCache = async (failureCode, tmdbId = directTmdbId) => {
-      const retryAt = new Date(nowMs() + SERVER_RECORD_POSTER_NEGATIVE_CACHE_TTL_MS).toISOString();
-      await this.persistServerRecordPosterCache(db, {
-        nodeName,
-        watchedAt,
-        itemId,
-        tmdbId,
-        imdbId,
-        expiresAt: retryAt,
-        retryAfter: retryAt,
-        failureCode
-      });
-    };
-    if (directTmdbId) {
-      const resolution = await this.resolveTmdbPosterImagePath(env, metadata.mediaKind, directTmdbId, runtimeConfig);
-      if (resolution.imagePath) {
-        const imageResult = await this.fetchTmdbPosterImage(resolution.imagePath, requestMethod);
-        if (imageResult.response) {
-          await this.persistServerRecordPosterCache(db, {
-            nodeName,
-            watchedAt,
-            itemId,
-            tmdbId: directTmdbId,
-            imdbId,
-            provider: "tmdb_direct",
-            imagePath: resolution.imagePath,
-            expiresAt: new Date(nowMs() + SERVER_RECORD_POSTER_CACHE_TTL_MS).toISOString()
-          });
-          return imageResult.response;
-        }
-        await negativeCache(imageResult.failureCode);
-        return null;
-      }
-      if (resolution.failureCode !== "tmdb_poster_not_found" && resolution.failureCode !== "tmdb_not_found") {
-        await negativeCache(resolution.failureCode);
-        return null;
-      }
-    }
-    if (imdbId) {
-      const resolution = await this.resolveTmdbPosterFromImdb(env, metadata.mediaKind, imdbId, runtimeConfig);
-      if (resolution.imagePath) {
-        const imageResult = await this.fetchTmdbPosterImage(resolution.imagePath, requestMethod);
-        if (imageResult.response) {
-          await this.persistServerRecordPosterCache(db, {
-            nodeName,
-            watchedAt,
-            itemId,
-            tmdbId: resolution.tmdbId,
-            imdbId,
-            provider: "tmdb_imdb_find",
-            imagePath: resolution.imagePath,
-            expiresAt: new Date(nowMs() + SERVER_RECORD_POSTER_CACHE_TTL_MS).toISOString()
-          });
-          return imageResult.response;
-        }
-        await negativeCache(imageResult.failureCode, resolution.tmdbId);
-        return null;
-      }
-      await negativeCache(resolution.failureCode, resolution.tmdbId);
-      return null;
-    }
-    await negativeCache(directTmdbId ? "tmdb_poster_not_found" : "tmdb_provider_ids_missing");
-    return null;
-  },
-  async getServerRecordEmbyPosterResponse(nodeName = "", node = {}, targetRecords = [], baseHeaders = new Headers(), credentials = {}, itemId = "", requestMethod = "GET") {
-    for (const targetRecord of targetRecords) {
-      const headers = new Headers(baseHeaders);
-      if (credentials.configured) {
-        stripSensitiveProxyAuthHeaders(headers);
-        headers.delete("Cookie");
-        const auth = await this.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
-        if (!auth?.token) continue;
-        headers.set("X-Emby-Token", auth.token);
-      }
-      headers.set("Accept", "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8");
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort("server_record_poster_timeout"), SERVER_RECORDS_PROBE_TIMEOUT_MS);
-      try {
-        const posterUrl = buildUpstreamProxyUrl(targetRecord, `/Items/${encodeURIComponent(String(itemId || "").trim())}/Images/Primary`);
-        const upstream = await fetch(posterUrl.toString(), {
-          method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
-          headers,
-          cache: "no-store",
-          redirect: "error",
-          signal: controller.signal
-        });
-        const response = await this.buildServerRecordPosterImageResponse(upstream, requestMethod);
-        if (response) return response;
-      } catch {} finally {
-        clearTimeout(timeoutId);
-      }
-    }
-    return null;
-  },
-  async getServerRecordPosterResponse(env, nodeName = "", requestMethod = "GET") {
-    const normalizedName = String(nodeName || "").trim().toLowerCase();
-    const db = this.getDB(env);
-    if (!db || !normalizedName) return null;
-    const [snapshots, lastWatchByNode] = await Promise.all([
-      this.getServerRecordSnapshots(db, [normalizedName]),
-      this.getServerLastWatch(db, [normalizedName])
-    ]);
-    const lastItem = snapshots.get(normalizedName)?.lastItem || {};
-    const itemId = String(lastItem.itemId || "").trim();
-    const watchedAt = String(lastItem.watchedAt || "").trim();
-    const lastWatchedAt = String(lastWatchByNode.get(normalizedName)?.lastWatchedAt || "").trim();
-    if (!itemId || !watchedAt || watchedAt !== lastWatchedAt) return null;
-    const node = await this.getNodeForRead(normalizedName, env);
-    if (!node || normalizeServerRecordSettings(node?.serverRecord).enabled !== true) return null;
-    const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
-    if (!targetRecords.length) return null;
-    const baseHeaders = this.buildServerRecordRequestHeaders(node);
-    const credentials = resolveServerRecordCredentials(node);
-    let runtimeConfig = {};
-    try {
-      runtimeConfig = await getRuntimeConfigStrict(env);
-    } catch {}
-    try {
-      const tmdbResponse = await this.resolveServerRecordTmdbPoster(
-        env, db, normalizedName, node, targetRecords, baseHeaders, credentials, itemId, watchedAt, requestMethod, runtimeConfig
-      );
-      if (tmdbResponse) return tmdbResponse;
-    } catch {}
-    return await this.getServerRecordEmbyPosterResponse(
-      normalizedName, node, targetRecords, baseHeaders, credentials, itemId, requestMethod
-    );
-  },
   normalizeServerRecordRuntimeError(error = null, status = 0) {
     if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
     if (status === 401 || status === 403) return "unauthorized";
@@ -19884,8 +19481,10 @@ const Database = {
               };
         const watch = lastWatchByNode.get(summary.nodeName) || {};
         const lastItem = isPlainObject(storedSnapshot?.lastItem) ? storedSnapshot.lastItem : {};
+        // Keep passive metadata attached only to the current watch pointer;
+        // bounded playback events may legitimately omit searchable names.
         const lastItemMatchesWatch = !!String(lastItem.itemId || "").trim()
-          && String(lastItem.watchedAt || "").trim() === String(watch.lastWatchedAt || "").trim();
+          && areServerRecordWatchTimesCompatible(lastItem.watchedAt, watch.lastWatchedAt);
         const probeRequested = probedNodeNames.has(summary.nodeName);
         return {
           ...summary,
@@ -19903,8 +19502,20 @@ const Database = {
             itemName: lastItemMatchesWatch ? String(lastItem.itemName || "") : "",
             itemType: lastItemMatchesWatch ? String(lastItem.itemType || "") : "",
             seriesName: lastItemMatchesWatch ? String(lastItem.seriesName || "") : "",
-            imageTag: lastItemMatchesWatch ? String(lastItem.imageTag || "") : "",
-            posterUrl: lastItemMatchesWatch ? this.buildServerRecordPosterUrl(env, summary.nodeName, lastItem) : ""
+            posterSearch: {
+              itemId: lastItemMatchesWatch ? String(lastItem.itemId || "") : "",
+              mediaType: lastItemMatchesWatch
+                ? inferServerRecordPosterMediaKind(lastItem.itemType, lastItem.seriesName)
+                : "",
+              title: lastItemMatchesWatch
+                ? String((String(lastItem.itemType || "").trim().toLowerCase() === "episode"
+                  ? lastItem.seriesName
+                  : lastItem.itemName) || "").trim()
+                : "",
+              originalTitle: lastItemMatchesWatch ? String(lastItem.originalTitle || "") : "",
+              year: lastItemMatchesWatch ? normalizeServerRecordPosterYear(lastItem.year) : null,
+              watchedAt: lastItemMatchesWatch ? String(lastItem.watchedAt || "") : ""
+            }
           },
           expiry: buildServerRecordExpiry(summary, watch.lastWatchedAt, config, options?.now || new Date())
         };
@@ -20244,6 +19855,26 @@ const Database = {
       nextNode,
       isRename,
       nodeChanged: isRename || !isSemanticNoop,
+      isSemanticNoop,
+      dnsPlan: null
+    };
+  },
+  buildPreparedServerRecordSettingsMutation(nodeName = "", existingNode = {}, settingsPatch = {}) {
+    const name = String(nodeName || "").trim().toLowerCase();
+    if (!name || !isPlainObject(existingNode) || !Object.keys(existingNode).length) return null;
+    const previousNode = this.normalizeNode(name, existingNode).data;
+    const nextNode = this.normalizeNode(name, {
+      ...existingNode,
+      ...(isPlainObject(settingsPatch) ? settingsPatch : {})
+    }).data;
+    const isSemanticNoop = this.areNodePayloadsEquivalent(previousNode, nextNode);
+    return {
+      previousName: name,
+      previousNode,
+      nextName: name,
+      nextNode,
+      isRename: false,
+      nodeChanged: !isSemanticNoop,
       isSemanticNoop,
       dnsPlan: null
     };
@@ -20639,7 +20270,7 @@ const Database = {
       try {
         const config = await getRuntimeConfigStrict(env);
         const revisions = await Database.getAdminRevisionsForRead({ env, kv, db }, { ctx, config });
-        return jsonResponse({ config: redactAdminRuntimeConfigTmdbApiKey(config), revisions });
+        return jsonResponse({ config: redactAdminRuntimeConfig(config), revisions });
       } catch (error) {
         throw remapAdminReadKvError(error, "CONFIG_READ_FAILED", "设置读取失败：KV 读取异常", "admin.read.config");
       }
@@ -20656,7 +20287,7 @@ const Database = {
         { env, kv, ctx }
       );
       return jsonResponse({
-        config: redactAdminRuntimeConfigTmdbApiKey(prepared.nextConfig),
+        config: redactAdminRuntimeConfig(prepared.nextConfig),
         migration: collectLegacyRuntimeConfigState(rawConfig),
         hostPrefixDnsSyncCount: prepared.dnsPlans.length
       });
@@ -20743,14 +20374,14 @@ const Database = {
           adminPath: getAdminPath(env),
           loginPath: getAdminLoginPath(env),
           initHealth,
-          config: redactAdminRuntimeConfigTmdbApiKey(config),
+          config: redactAdminRuntimeConfig(config),
           hostDomain: resolveConfiguredHost(env),
           legacyHost: resolveConfiguredLegacyHost(env),
           contract: buildAdminUiContract(),
           nodes,
           configSnapshots,
           shell: buildAdminShellState(env, initHealth, config),
-          posterMetadata: buildPosterMetadataSettingsState(env, config),
+          posterBrowserBindings: buildPosterBrowserConfig(env, config),
           runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object"
             ? runtimeStatusPayload.status
             : withAdminShellRuntimeStatus({}, env, config, initHealth),
@@ -20815,13 +20446,13 @@ const Database = {
       }
 
       return jsonResponse({
-        config: redactAdminRuntimeConfigTmdbApiKey(config),
+        config: redactAdminRuntimeConfig(config),
         hostDomain: resolveConfiguredHost(env),
         legacyHost: resolveConfiguredLegacyHost(env),
         contract: buildAdminUiContract(),
         nodes,
         configSnapshots,
-        posterMetadata: buildPosterMetadataSettingsState(env, config),
+        posterBrowserBindings: buildPosterBrowserConfig(env, config),
         runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
         revisions,
         generatedAt: new Date().toISOString()
@@ -20992,59 +20623,53 @@ const Database = {
       }
     },
 
-    async savePosterMetadataSettings(data, { env, ctx, kv }) {
+    async getPosterBrowserConfig(data, { env }) {
+      const config = await getRuntimeConfigStrict(env);
+      return jsonResponse(buildPosterBrowserConfig(env, config, true), 200, {
+        "Cache-Control": "no-store, max-age=0"
+      });
+    },
+
+    async savePosterBrowserSettings(data, { env, ctx, kv }) {
       if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-      const operation = String(data?.operation || "set").trim().toLowerCase() === "remove" ? "remove" : "set";
-      const tmdbApiKey = operation === "set" ? normalizeTmdbApiKeyInput(data?.tmdbApiKey) : "";
-      if (operation === "set" && !tmdbApiKey) {
+      const currentConfig = await getRuntimeConfigStrict(env);
+      const nextConfig = { ...currentConfig };
+      const tmdbToken = normalizeTmdbBrowserToken(data?.tmdbToken);
+      const doubanOrigin = normalizePosterBrowserOrigin(data?.doubanOrigin);
+      const doubanToken = normalizePosterBrowserToken(data?.doubanToken);
+      if (String(data?.tmdbToken || "").trim() && !tmdbToken) {
         return jsonError(
-          "TMDB_API_KEY_INVALID",
-          "请输入有效的 TMDB v3 API Key",
+          "POSTER_TMDB_TOKEN_INVALID",
+          "请填写 TMDB 设置页上方的 API 读取访问令牌，不要填写下方的 32 位 API 密钥",
           400
         );
       }
-
-      let currentConfig;
-      try {
-        currentConfig = await getRuntimeConfigStrict(env);
-      } catch (error) {
-        throw remapAdminReadKvError(
-          error,
-          "TMDB_POSTER_CONFIG_READ_FAILED",
-          "TMDB 密钥配置读取失败：KV 读取异常",
-          "admin.write.tmdb_poster"
-        );
+      if (String(data?.doubanOrigin || "").trim() && !doubanOrigin) {
+        return jsonError("POSTER_DOUBAN_ORIGIN_INVALID", "豆瓣服务地址必须是 HTTPS 根 Origin", 400);
       }
-
-      try {
-        const nextConfig = { ...currentConfig };
-        if (operation === "remove") delete nextConfig.tmdbApiKey;
-        else nextConfig.tmdbApiKey = tmdbApiKey;
-        const savedConfig = await Database.persistRuntimeConfig(nextConfig, {
-          env,
-          kv,
-          ctx,
-          snapshotMeta: {
-            reason: operation === "remove" ? "remove_tmdb_poster_key" : "save_tmdb_poster_key",
-            section: "account",
-            source: "poster_metadata",
-            actor: "admin"
-          }
-        });
-        return jsonResponse({
-          success: true,
-          posterMetadata: buildPosterMetadataSettingsState(env, savedConfig),
-          config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
-          revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
-        });
-      } catch (error) {
-        return jsonError(
-          operation === "remove" ? "TMDB_POSTER_KEY_REMOVE_FAILED" : "TMDB_POSTER_KEY_SAVE_FAILED",
-          "TMDB 密钥保存失败，请稍后重试",
-          normalizeErrorStatus(error?.status, 500),
-          isPlainObject(error?.details) ? error.details : null
-        );
+      if (String(data?.doubanToken || "").trim() && !doubanToken) {
+        return jsonError("POSTER_DOUBAN_TOKEN_INVALID", "豆瓣 Browser Token 格式无效", 400);
       }
+      if (data?.clearTmdbToken === true) delete nextConfig.tmdbBrowserToken;
+      else if (tmdbToken) nextConfig.tmdbBrowserToken = tmdbToken;
+      if (Object.prototype.hasOwnProperty.call(data || {}, "doubanOrigin")) {
+        if (doubanOrigin) nextConfig.doubanBrowserOrigin = doubanOrigin;
+        else delete nextConfig.doubanBrowserOrigin;
+      }
+      if (data?.clearDoubanToken === true) delete nextConfig.doubanBrowserToken;
+      else if (doubanToken) nextConfig.doubanBrowserToken = doubanToken;
+      const savedConfig = await Database.persistRuntimeConfig(nextConfig, {
+        env,
+        kv,
+        ctx,
+        snapshotMeta: { reason: "save_config", section: "poster_browser", source: "ui", actor: "admin" }
+      });
+      return jsonResponse({
+        success: true,
+        config: redactAdminRuntimeConfig(savedConfig),
+        posterBrowserBindings: buildPosterBrowserConfig(env, savedConfig),
+        revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
+      });
     },
 
     async updateWorkerAndAdminIndex(data, { env, request, kv, ctx }) {
@@ -21185,7 +20810,7 @@ const Database = {
           revision: persistedIndex.record.revision,
           uploadedAt: persistedIndex.record.uploadedAt
         },
-        config: redactAdminRuntimeConfigTmdbApiKey(persistedIndex.config),
+        config: redactAdminRuntimeConfig(persistedIndex.config),
         revisions: await Database.getAdminRevisions(env, { ctx, config: persistedIndex.config })
       });
     },
@@ -21208,8 +20833,8 @@ const Database = {
         : currentConfig;
       return jsonResponse({
         success: true,
-        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
-        posterMetadata: buildPosterMetadataSettingsState(env, savedConfig),
+        config: redactAdminRuntimeConfig(savedConfig),
+        posterBrowserBindings: buildPosterBrowserConfig(env, savedConfig),
         revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
       });
     },
@@ -21237,7 +20862,7 @@ const Database = {
           fileName: persisted.record.fileName,
           bytes: persisted.record.bytes,
           uploadedAt: persisted.record.uploadedAt,
-          config: redactAdminRuntimeConfigTmdbApiKey(persisted.config),
+          config: redactAdminRuntimeConfig(persisted.config),
           revisions: await Database.getAdminRevisions(env, { ctx, config: persisted.config })
         });
       } catch (error) {
@@ -21346,7 +20971,7 @@ const Database = {
       ]);
       return jsonResponse({
         success: true,
-        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+        config: redactAdminRuntimeConfig(savedConfig),
         configSnapshots,
         revisions,
         generatedAt: new Date().toISOString()
@@ -21414,7 +21039,7 @@ const Database = {
         const restoredConfig = await Database.restoreTidyKvMigrationSnapshot(snapshot, { env, kv, ctx });
         return jsonResponse({
           success: true,
-          config: redactAdminRuntimeConfigTmdbApiKey(restoredConfig),
+          config: redactAdminRuntimeConfig(restoredConfig),
           restoredSnapshotId: snapshotId,
           restoredMigrationPayload: true,
           revisions: await Database.getAdminRevisions(env, { ctx, config: restoredConfig })
@@ -21436,7 +21061,7 @@ const Database = {
       });
       return jsonResponse({
         success: true,
-        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+        config: redactAdminRuntimeConfig(savedConfig),
         restoredSnapshotId: snapshotId,
         revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig })
       });
@@ -21571,9 +21196,7 @@ const Database = {
         if (credentialValidationError) {
           return jsonError(credentialValidationError.code, credentialValidationError.message, 400);
         }
-        const mutation = Database.buildPreparedNodeMutation({
-          name: nodeName,
-          originalName: nodeName,
+        const mutation = Database.buildPreparedServerRecordSettingsMutation(nodeName, existingNode, {
           tags,
           tag: tags[0] || "",
           serverRecordEmbyUsername,
@@ -21585,7 +21208,7 @@ const Database = {
             expiresAt: expiryMode === "fixed" ? expiresAt : null,
             expiryDays: storedExpiryDays
           }
-        }, existingNode, { previousName: nodeName, nextName: nodeName });
+        });
         if (!mutation) return jsonError("INVALID_TARGET", "节点目标无效", 400);
         let mutationCommitted = false;
         try {
@@ -21926,7 +21549,7 @@ const Database = {
         success: true,
         selectedNodeNames,
         updatedNodeCount,
-        config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+        config: redactAdminRuntimeConfig(savedConfig),
         nodes: summaryNodes,
         revisions: await Database.getAdminRevisions(env, {
           ctx,
@@ -22078,7 +21701,7 @@ const Database = {
           success: true,
           selectedNodeNames,
           updatedNodeCount: preparedMutations.length,
-          config: redactAdminRuntimeConfigTmdbApiKey(savedConfig),
+          config: redactAdminRuntimeConfig(savedConfig),
           nodes: summaryNodes,
           revisions: await Database.getAdminRevisions(env, { ctx, config: savedConfig, nodes: summaryNodes })
         });
@@ -25120,17 +24743,39 @@ const Proxy = {
     ].forEach(header => sanitizedHeaders.delete(header));
     return sanitizedHeaders;
   },
-  rewritePlaybackInfoPayload(execution, payload, activeTargetBase, responseBaseUrl) {
-    // Structured schema-level rewrite keeps passthrough untouched and only normalizes playback-facing media source fields.
-    if (!isPlainObject(payload) || !Array.isArray(payload.MediaSources) || !payload.MediaSources.length) {
+  sanitizePlaybackInfoMediaSourcesPayload(payload) {
+    if (!isPlainObject(payload) || !Array.isArray(payload.MediaSources)) {
       return {
         payload,
         rewriteState: "not_needed"
       };
     }
-    let changed = false;
-    const nextMediaSources = payload.MediaSources.map((mediaSource) => {
-      if (!isPlainObject(mediaSource)) return mediaSource;
+    const validMediaSources = payload.MediaSources.filter(isPlainObject);
+    if (validMediaSources.length === payload.MediaSources.length) {
+      return {
+        payload,
+        rewriteState: "not_needed"
+      };
+    }
+    return {
+      payload: {
+        ...payload,
+        MediaSources: validMediaSources
+      },
+      rewriteState: "applied"
+    };
+  },
+  rewritePlaybackInfoPayload(execution, payload, activeTargetBase, responseBaseUrl) {
+    const sanitizedResult = this.sanitizePlaybackInfoMediaSourcesPayload(payload);
+    const sanitizedPayload = sanitizedResult.payload;
+    if (!isPlainObject(sanitizedPayload) || !Array.isArray(sanitizedPayload.MediaSources)) {
+      return {
+        payload,
+        rewriteState: "not_needed"
+      };
+    }
+    let changed = sanitizedResult.rewriteState === "applied";
+    const nextMediaSources = sanitizedPayload.MediaSources.map((mediaSource) => {
       let nextMediaSource = mediaSource;
       const applyField = (fieldKey, nextValue, options = {}) => {
         const hasOwnField = Object.prototype.hasOwnProperty.call(nextMediaSource, fieldKey);
@@ -25171,7 +24816,7 @@ const Proxy = {
     }
     return {
       payload: {
-        ...payload,
+        ...sanitizedPayload,
         MediaSources: nextMediaSources
       },
       rewriteState: "applied"
@@ -25835,29 +25480,27 @@ const Proxy = {
   },
   async maybeRewritePlaybackInfoResponse(execution, upstreamState) {
     if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
-    if (normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) !== "rewrite") {
-      execution.playbackInfoRewrite = "passthrough";
-      return upstreamState;
-    }
+    const rewriteEnabled = normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) === "rewrite";
+    const bypassState = rewriteEnabled ? "not_needed" : "passthrough";
     const response = upstreamState?.response;
     if (!response || !(response.status >= 200 && response.status < 300)) {
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
     if (execution.requestMethod === "HEAD") {
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
     const contentType = String(response.headers.get("Content-Type") || "").toLowerCase();
     if (!contentType.includes("json")) {
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
     const declaredBodyBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
     if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES) {
       execution.playbackInfoCacheBodyResolved = true;
       execution.playbackInfoCacheBody = null;
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
     const bodyResult = await readResponseTextWithLimit(
@@ -25867,12 +25510,36 @@ const Proxy = {
     execution.playbackInfoCacheBodyResolved = true;
     execution.playbackInfoCacheBody = null;
     if (bodyResult.exceeded) {
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
     const bodyText = bodyResult.text;
     try {
       const parsedPayload = JSON.parse(bodyText);
+      if (!rewriteEnabled) {
+        const sanitizedResult = this.sanitizePlaybackInfoMediaSourcesPayload(parsedPayload);
+        if (sanitizedResult.rewriteState !== "applied") {
+          execution.playbackInfoRewrite = "passthrough";
+          execution.playbackInfoCacheBody = { text: bodyText, bytes: bodyResult.bytes };
+          return upstreamState;
+        }
+        const serializedBodyText = JSON.stringify(sanitizedResult.payload);
+        const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
+        execution.playbackInfoRewrite = "applied";
+        execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
+          ? { text: serializedBodyText, bytes: serializedBodyBytes }
+          : null;
+        const responseHeaders = this.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
+        try { Promise.resolve(response.body?.cancel?.()).catch(() => {}); } catch {}
+        return {
+          ...upstreamState,
+          response: new Response(serializedBodyText, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: responseHeaders
+          })
+        };
+      }
       const responseBaseUrl = upstreamState?.finalUrl
         || (() => {
           const fallbackUrl = upstreamState?.activeTargetBase instanceof URL
@@ -25931,7 +25598,7 @@ const Proxy = {
         })
       };
     } catch {
-      execution.playbackInfoRewrite = "not_needed";
+      execution.playbackInfoRewrite = bypassState;
       return upstreamState;
     }
   },
@@ -27482,7 +27149,7 @@ const Proxy = {
     execution.mediaAggregationDiagnostic = cacheEntry?.mediaAggregationDiagnostic && typeof cacheEntry.mediaAggregationDiagnostic === "object"
       ? cacheEntry.mediaAggregationDiagnostic
       : execution.mediaAggregationDiagnostic;
-    this.recordServerRecordPlaybackInfoIntent(execution, transport);
+    this.recordServerRecordPlaybackInfoIntent(execution, transport, Number(cacheEntry.status) || 200);
     const cachedResponse = new Response(
       execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""),
       {
@@ -27648,18 +27315,21 @@ const Proxy = {
     const parsedPayload = this.parsePlaybackSessionControlPayload(execution, transport);
     const rawItem = getCaseInsensitivePayloadValue(parsedPayload.body, ["Item"]);
     const item = normalizeCaseInsensitiveObject(isPlainObject(rawItem) ? rawItem : {});
-    const imageTags = normalizeCaseInsensitiveObject(isPlainObject(item.imagetags) ? item.imagetags : {});
     const pickTopLevel = names => {
       const fromQuery = getCaseInsensitivePayloadValue(parsedPayload.query, names);
       if (String(fromQuery || "").trim()) return fromQuery;
       return getCaseInsensitivePayloadValue(parsedPayload.body, names);
     };
+    const itemId = String(pickTopLevel(["ItemId"]) || getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
+    const itemType = String(getCaseInsensitivePayloadValue(item, ["Type"]) || pickTopLevel(["ItemType"]) || "").trim().slice(0, 64);
+    const posterSearch = buildServerRecordPosterMetadata({ ...item, Type: itemType });
     return {
-      itemId: String(pickTopLevel(["ItemId"]) || getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim(),
-      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || pickTopLevel(["ItemName", "Name"]) || "").trim(),
-      itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || pickTopLevel(["ItemType"]) || "").trim(),
-      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || pickTopLevel(["SeriesName"]) || "").trim(),
-      imageTag: String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(item, ["PrimaryImageTag"]) || "").trim()
+      itemId,
+      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || pickTopLevel(["ItemName", "Name"]) || "").trim().slice(0, 256),
+      itemType,
+      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || pickTopLevel(["SeriesName"]) || "").trim().slice(0, 256),
+      originalTitle: String(posterSearch?.originalTitle || ""),
+      year: posterSearch?.productionYear ?? null
     };
   },
   resolveServerRecordPlaybackContextKeys(execution, transport = null) {
@@ -27720,13 +27390,15 @@ const Proxy = {
     }
     return true;
   },
-  recordServerRecordPlaybackInfoIntent(execution, transport = null) {
+  recordServerRecordPlaybackInfoIntent(execution, transport = null, responseStatus = 200) {
+    const status = Number(responseStatus) || 0;
     if (execution?.requestTraits?.isPlaybackInfoRequest !== true
       || String(execution?.requestMethod || "").toUpperCase() !== "POST"
+      || status < 200 || status >= 300
       || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
     const isPlayback = [...(execution?.requestUrl?.searchParams?.entries?.() || [])]
       .some(([key, value]) => String(key || "").trim().toLowerCase() === "isplayback" && String(value || "").trim().toLowerCase() === "true");
-    const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim();
+    const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim().slice(0, 256);
     if (!isPlayback || !itemId) return false;
     return this.updateServerRecordPlaybackContexts(execution, transport, (existing, now) => {
       const details = existing?.details && String(existing.details.itemId || "") === itemId
@@ -27741,19 +27413,21 @@ const Proxy = {
   },
   buildServerRecordPlaybackContextMedia(payload, expectedItemId = "") {
     const item = normalizeCaseInsensitiveObject(isPlainObject(payload) ? payload : {});
-    const itemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim();
-    if (!itemId || itemId !== String(expectedItemId || "").trim()) return null;
-    const imageTags = normalizeCaseInsensitiveObject(isPlainObject(item.imagetags) ? item.imagetags : {});
+    const itemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
+    const expected = String(expectedItemId || "").trim().slice(0, 256);
+    if (!itemId || itemId !== expected) return null;
+    const posterSearch = buildServerRecordPosterMetadata(item);
     return {
       itemId,
-      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim(),
-      itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim(),
-      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim(),
-      imageTag: String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(item, ["PrimaryImageTag"]) || "").trim()
+      itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim().slice(0, 256),
+      itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim().slice(0, 64),
+      seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim().slice(0, 256),
+      originalTitle: String(posterSearch?.originalTitle || ""),
+      year: posterSearch?.productionYear ?? null
     };
   },
   recordServerRecordPlaybackItemDetails(execution, media = {}) {
-    const itemId = String(media?.itemId || "").trim();
+    const itemId = String(media?.itemId || "").trim().slice(0, 256);
     if (!itemId || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
     return this.updateServerRecordPlaybackContexts(execution, null, (existing, now) => {
       const details = { itemId, media: { ...media }, observedAt: now };
@@ -27767,6 +27441,45 @@ const Proxy = {
       };
     });
   },
+  getServerRecordPlaybackContextVerification(execution, expectedItemId = "") {
+    const contexts = GLOBALS.ServerRecordPlaybackContexts;
+    if (!(contexts instanceof Map)) return null;
+    const now = nowMs();
+    this.cleanupServerRecordPlaybackContexts(now);
+    const expected = String(expectedItemId || "").trim();
+    for (const contextKey of this.resolveServerRecordPlaybackContextKeys(execution, null)) {
+      const context = contexts.get(contextKey);
+      const media = context?.verifiedMedia;
+      const intentItemId = String(context?.intent?.itemId || "").trim();
+      const intentObservedAt = Number(context?.intent?.observedAt) || 0;
+      if (!media || !intentObservedAt || intentItemId !== String(media.itemId || "").trim()
+        || (expected && String(media.itemId || "") !== expected)) continue;
+      touchMapEntry(contexts, contextKey);
+      return { media: { ...media }, intentObservedAt };
+    }
+    return null;
+  },
+  async persistObservedServerRecordPosterMetadata(execution, media = {}) {
+    const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
+    const itemId = String(media?.itemId || "").trim().slice(0, 256);
+    const db = Database.getDB(execution?.env);
+    if (!db || !nodeName || !itemId) return false;
+    const verification = this.getServerRecordPlaybackContextVerification(execution, itemId);
+    if (!verification) return false;
+    const [snapshots, lastWatchByNode] = await Promise.all([
+      Database.getServerRecordSnapshots(db, [nodeName]),
+      Database.getServerLastWatch(db, [nodeName])
+    ]);
+    const lastItem = snapshots.get(nodeName)?.lastItem || {};
+    const watchedAt = String(lastItem.watchedAt || "").trim();
+    const lastWatchedAt = String(lastWatchByNode.get(nodeName)?.lastWatchedAt || "").trim();
+    const watchedAtMs = Date.parse(watchedAt);
+    if (String(lastItem.itemId || "").trim() !== itemId
+      || !Number.isFinite(watchedAtMs)
+      || watchedAtMs < verification.intentObservedAt
+      || !areServerRecordWatchTimesCompatible(watchedAt, lastWatchedAt)) return false;
+    return await Database.persistServerRecordPosterSearchMetadata(db, { nodeName, itemId, watchedAt }, media);
+  },
   observeServerRecordPlaybackItemDetails(execution, response) {
     if (String(execution?.requestMethod || "").toUpperCase() !== "GET"
       || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true
@@ -27778,18 +27491,25 @@ const Proxy = {
     let responseCopy;
     try { responseCopy = response.clone(); } catch { return false; }
     const task = readResponseTextWithLimit(responseCopy, DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES)
-      .then(body => {
+      .then(async body => {
         if (body.exceeded || !body.text.trim()) return false;
         let payload;
         try { payload = JSON.parse(body.text); } catch { return false; }
         const media = this.buildServerRecordPlaybackContextMedia(payload, itemId);
-        return media ? this.recordServerRecordPlaybackItemDetails(execution, media) : false;
+        if (!media || !this.recordServerRecordPlaybackItemDetails(execution, media)) return false;
+        const verifiedMedia = this.getServerRecordPlaybackContextMedia(execution, null, itemId);
+        return verifiedMedia
+          ? await this.persistObservedServerRecordPosterMetadata(execution, verifiedMedia)
+          : false;
       })
       .catch(() => false);
     execution.ctx.waitUntil(task);
     return true;
   },
   getServerRecordPlaybackContextMedia(execution, transport = null, expectedItemId = "") {
+    if (!transport) {
+      return this.getServerRecordPlaybackContextVerification(execution, expectedItemId)?.media || null;
+    }
     const contexts = GLOBALS.ServerRecordPlaybackContexts;
     if (!(contexts instanceof Map)) return null;
     const now = nowMs();
@@ -27816,7 +27536,8 @@ const Proxy = {
       itemName: pick("itemName"),
       itemType: pick("itemType"),
       seriesName: pick("seriesName"),
-      imageTag: pick("imageTag")
+      originalTitle: pick("originalTitle"),
+      year: normalizeServerRecordPosterYear(current.year ?? previous.year)
     };
   },
   cleanupServerRecordWatchSessions(now = nowMs()) {
@@ -27882,7 +27603,8 @@ const Proxy = {
     const identityKey = String(sessionInfo.sessionIdentityFingerprint || "");
     let entry = identityKey ? sessions.get(identityKey) : null;
     if (phase === "stopped" && entry) media = this.mergeServerWatchMedia(media, entry.media);
-    const itemId = String(media.itemId || "").trim();
+    const itemId = String(media.itemId || "").trim().slice(0, 256);
+    if (itemId !== String(media.itemId || "")) media = { ...media, itemId };
     if (phase !== "stopped" && !itemId) {
       diagnostic.decision = parsedPayload.parseErrorReason === "unbuffered_body" ? "skipped_unbuffered" : "skipped_no_item";
       diagnostic.finalized = true;
@@ -29019,7 +28741,7 @@ const Proxy = {
       }));
     }
     if (execution.requestTraits.isPlaybackInfoRequest === true) {
-      this.recordServerRecordPlaybackInfoIntent(execution, transport);
+      this.recordServerRecordPlaybackInfoIntent(execution, transport, finalStatus);
       await this.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
     }
     this.observeServerRecordPlaybackItemDetails(execution, finalUpstreamState.response);
@@ -29886,7 +29608,6 @@ const ADMIN_REMOTE_SHELL_SOURCE_HASH_HEADER = "X-Admin-Shell-Source-Hash";
 const ADMIN_RELEASE_PROXY_PATH_SEGMENT = "__release";
 const ADMIN_RELEASE_VENDOR_PATH_SEGMENT = "vendor";
 const ADMIN_WARM_PATH_SEGMENT = "__warm";
-const ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT = "__server-record-poster";
 const ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN = "https://admin-release-vendor-cache.invalid";
 const ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN = "https://admin-release-vendor-manifest.invalid";
 const ADMIN_RELEASE_VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -31403,42 +31124,6 @@ function isAdminWarmRoute(pathname = "", adminPath = "/admin") {
   return normalizedPathname.toLowerCase() === `${normalizedAdminPath}/${ADMIN_WARM_PATH_SEGMENT}`.toLowerCase();
 }
 
-function resolveAdminServerRecordPosterRouteMatch(pathname = "", adminPath = "/admin") {
-  const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
-  const normalizedPathname = sanitizeProxyPath(pathname || "/");
-  const prefix = `${normalizedAdminPath}/${ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT}/`;
-  if (!normalizedPathname.toLowerCase().startsWith(prefix.toLowerCase())) return null;
-  const rawNodeName = normalizedPathname.slice(prefix.length);
-  if (!rawNodeName || rawNodeName.includes("/")) return null;
-  try {
-    const nodeName = decodeURIComponent(rawNodeName).trim().toLowerCase();
-    return nodeName && nodeName.length <= 128 && !nodeName.includes("/") ? { nodeName } : null;
-  } catch {
-    return null;
-  }
-}
-
-function buildAdminServerRecordPosterErrorResponse(status = 404) {
-  return new Response(null, {
-    status,
-    headers: {
-      "Cache-Control": "no-store, max-age=0",
-      "X-Content-Type-Options": "nosniff"
-    }
-  });
-}
-
-async function renderAdminServerRecordPoster(request, env, routeMatch = null) {
-  if (!routeMatch?.nodeName) return buildAdminServerRecordPosterErrorResponse(404);
-  try {
-    return await Database.getServerRecordPosterResponse(env, routeMatch.nodeName, request.method)
-      || buildAdminServerRecordPosterErrorResponse(404);
-  } catch (error) {
-    console.error("server record poster route failed", error);
-    return buildAdminServerRecordPosterErrorResponse(502);
-  }
-}
-
 function getAdminRemoteShellCachedAt(response) {
   const cachedAt = Number.parseInt(String(response?.headers?.get?.(ADMIN_REMOTE_SHELL_CACHED_AT_HEADER) || ""), 10);
   return Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : 0;
@@ -32901,14 +32586,6 @@ const RuntimeEntry = {
       return renderLandingPage(env, routeContext.initHealth);
     }
 
-    const adminServerRecordPosterRoute = isGetOrHead
-      ? resolveAdminServerRecordPosterRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
-      : null;
-    if (adminServerRecordPosterRoute) {
-      if (!(await Auth.verifyRequest(request, env))) return buildAdminServerRecordPosterErrorResponse(401);
-      return renderAdminServerRecordPoster(request, env, adminServerRecordPosterRoute);
-    }
-
     const adminReleaseVendorRoute = isGetOrHead
       ? resolveAdminReleaseVendorRouteMatch(routeContext.normalizedPathname, routeContext.adminPath)
       : null;
@@ -33346,9 +33023,10 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     matchMediaAggregationIdentities,
     buildMediaAggregationMatchFingerprintHash,
     verifyMediaAggregationSourceSignature,
-    normalizeTmdbApiKeyInput,
-    resolveTmdbPosterApiKey,
-    buildPosterMetadataSettingsState,
+    normalizePosterBrowserOrigin,
+    normalizeTmdbBrowserToken,
+    buildPosterBrowserConfig,
+    buildServerRecordPosterMetadata,
     readMediaAggregationCredentialPair,
     resolveMediaAggregationCredentials,
     hasConfiguredMediaAggregationNodeCredentials,
@@ -33390,8 +33068,6 @@ if (IS_NODE_LIKE_TEST_RUNTIME) {
     isMutableJsdelivrGithubAssetUrl,
     renderAdminReleaseVendorAsset,
     isAdminWarmRoute,
-    resolveAdminServerRecordPosterRouteMatch,
-    renderAdminServerRecordPoster,
     renderAdminWarmResponse,
     warmAdminReleaseVendorEntries,
     buildAdminWarmSubrequest,

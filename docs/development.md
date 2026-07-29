@@ -7,6 +7,7 @@
 - `Frontend App`
 - `Worker Shell`
 - `Worker API / Proxy`
+- `Poster / Server Records`
 - `Build & Publish`
 - `Cache / Delivery`
 - `Debug / Regression`
@@ -14,6 +15,8 @@
 鉴权、代理、KV/D1、scheduled、缓存一致性、资源路由和响应头属于高风险区域。展示层、Vite 配置、发布校验脚本和测试脚本通常风险较低，但仍需按正式入口验证。
 
 任务对应的阅读路径见根 [AGENTS.md](../AGENTS.md)。
+
+海报和服务器记录任务还必须读取已实现的 [服务器记录海报重构契约](poster-contract.md)。
 
 ## 开始前
 
@@ -95,7 +98,7 @@ npm run dev
 ## D1 schema 迁移
 
 - 正式 migration 位于根 `migrations/`，由 `wrangler.toml` 声明目录和记录表；这些文件是版本与结构契约，不代表生产必须优先从 Wrangler 执行。不要只修改 `worker.js` 的运行时兜底 DDL；schema 或索引契约变化必须同时新增 migration。
-- 当前 v9 migration 顺序固定为 `0001_d1_fresh_baseline.sql`（新库基础表）、`0002_d1_historical_compatibility.sql`（历史库兼容表）、`0003_d1_schema_v5_indexes.sql`（索引收口）、`0004_server_watch_stats.sql`（节点最后观看）、`0005_server_record_snapshots.sql`（资源统计与最近媒体指针）、`0006_server_record_poster_cache.sql`（外部海报解析缓存）和 `0007_server_watch_lifecycle.sql`（播放会话指纹与事件阶段）。先发布能够同时读取 v8/v9 schema 的 expand 代码，再优先在管理台执行“初始化 DB”：该动作自动取得初始化前 Time Travel bookmark，完成兼容修复、结构复检和缺失 migration 基线采纳。Cloudflare Dashboard 是第二操作入口；Wrangler 仅在管理台不可用、Sessions API 不受支持、本地验证或灾难恢复时回退使用。基础 migration 不包含可重建的 `proxy_logs_fts`。
+- 当前 v11 migration 顺序固定为 `0001_d1_fresh_baseline.sql`、`0002_d1_historical_compatibility.sql`、`0003_d1_schema_v5_indexes.sql`、`0004_server_watch_stats.sql`、`0005_server_record_snapshots.sql`、历史海报缓存 `0006_server_record_poster_cache.sql`、播放生命周期 `0007_server_watch_lifecycle.sql`、历史豆瓣字段 `0008_server_record_poster_douban.sql` 和补齐原始标题/年份并删除退役缓存表的 `0009_drop_server_record_poster_cache.sql`。先发布能够读取旧 schema 并识别 v11 缺列/残留表的 expand 代码，再优先在管理台执行“初始化 DB”：该动作自动取得初始化前 Time Travel bookmark，完成兼容修复、结构复检和缺失 migration 基线采纳。Cloudflare Dashboard 是第二操作入口；Wrangler 仅在管理台不可用、Sessions API 不受支持、本地验证或灾难恢复时回退使用。基础 migration 不包含可重建的 `proxy_logs_fts`。
 - 历史库的未知列组合不得由静态 migration 猜测。“初始化 DB”必须严格读取 `sqlite_master`、`PRAGMA table_info`、`index_list` 与 `index_xinfo`，先对所有已存在同名表完成主键/唯一键只读预检，再逐项补齐登记的非键列、创建缺表、修复命名普通索引、删除登记的退役索引并重建异常 FTS。PRAGMA 失败、主键/唯一约束漂移、键列缺失或未知结构均在任何 DDL 前 fail-closed，不自动 `DROP TABLE` 重建业务表。FTS 检查必须覆盖 FTS5、`content=proxy_logs`、`content_rowid=id` 和插入触发器字段映射。
 - 本地 migration SQL 验证可在已配置 Wrangler 的环境中执行；这些命令不得被自动扩展为远端生产写入：
 
@@ -110,8 +113,10 @@ npx wrangler@latest d1 execute <DATABASE_NAME> --local --command="SELECT name, t
 ## 服务器最后观看记录
 
 - 服务器记录不使用 Durable Object。通过前置检查的 `POST /Sessions/Playing*` 使用 Worker 请求进入时间驱动生命周期：Playing 立即异步 UPSERT，缺少 Playing 时首次 Progress 兜底，Stopped 更新最终时间；观看表与最近媒体指针在同一 D1 batch 中按接纳结果联动。媒体字段只复用代理流程已在 256 KiB 内缓冲并解析的 JSON object 或 query，Hills `text/plain` JSON 必须可用；缺少 ItemId 时可在同一 isolate 的 2 分钟窗口内，用成功 `IsPlayback=true` PlaybackInfo 与同节点同身份、同 ItemId 的用户详情 JSON 补齐最小媒体字段，图片请求和单独详情浏览不得作为证据。不得为记录功能额外物化未知长度或超限请求体，也不得改变上游正文和请求头。
-- 本地/预发必须验证不同 `nodeName` 独立写入、GET/HEAD 控制请求不写、Playing 后不退出也能显示时间/媒体/海报、首次强 Progress 兜底且后续高频 Progress 零重复写、弱 Playing 重播、STOP 后 10 分钟同指纹门禁、未 STOP 的 12 小时门禁、同会话 ItemId 变化生成新的 16 位十六进制指纹并绕过旧媒体 tombstone，以及重复/乱序/并发 STOP 和迟到 Progress 不回拨或覆盖。还要验证同设备的 PlaybackInfo 与 Item Details 两种到达顺序均能补齐缺少 ItemId 的 Hills 事件，跨节点/设备/ItemId、非播放 PlaybackInfo、普通详情和图片请求均不关联；STOP 复用同 isolate 同会话媒体，无法确认时清空旧海报指针；最终 `watchDecision` 在 D1 任务完成后准确入队且不阻塞 Emby 响应；`text/plain`、query fallback、无效 object/数组/文本、未知长度和超限正文保持安全转发；禁用记录、D1 缺失或失败不改变 Emby 响应。v8 表必须让 Playing/STOP 走旧写入并关闭 Progress 持久化，v9 初始化后自动启用完整去重。节点改名、删除、导入替换与 revision 失效必须清理内存会话和播放上下文，并迁移或补偿 D1 生命周期字段；其余资源统计与海报安全回归保持不变。
-- 外部海报回归必须覆盖 `TMDB 直接 ID -> IMDb ID 经 TMDB Find -> Emby` 顺序、电影/剧集/单集的 Movie/TV 映射、缓存命中不重复读取 Emby 元数据、观看指针变化不命中旧缓存、节点改名/删除/补偿回滚的缓存隔离、有效密钥缺失、429、超时、无结果、无效路径与非图片 MIME 的 Emby 兜底。TMDB 图片只能使用固定官方主机和相对路径；IMDb 没有独立密钥且不得抓取网页。还必须验证“影视海报来源”位于账号设置底部，KV 密钥通过账号 `previewConfig / saveConfig` 保存、替换或移除，空草稿不携带字段，显式移除携带空字符串，取消或失败保留草稿，成功后刷新来源状态，且正式前端不调用兼容 `savePosterMetadataSettings`。同时覆盖 `tmdbApiKey > TMDB_API_KEY` 优先级、移除 KV 后 Worker Secret 继续兜底，以及普通保存/缺字段导入保留当前密钥。预览文案、普通 bootstrap/load/save 响应、配置快照和默认 settings/完整备份导出不得出现明文；显式确认的 `includeSecrets` 导出才可包含 KV 密钥，测试夹具使用假值且不得把真实密钥写入仓库或日志。
+- 本地/预发必须验证不同 `nodeName` 独立写入、GET/HEAD 控制请求不写、Playing 后不退出也能显示时间/媒体、首次强 Progress 兜底且后续高频 Progress 零重复写、弱 Playing 重播、STOP 后 10 分钟同指纹门禁、未 STOP 的 12 小时门禁，以及重复、乱序和并发事件不回拨。播放写入侧只复用已缓冲的请求/响应元数据，覆盖电影与剧集标题、原始标题、年份、类型和缺失元数据；单集必须使用系列身份。快照不得返回 `posterUrl`、图片 Tag 或供应商 ID，不得在播放写入任务中读取 Emby、预热图片或搜索标题。
+- 浏览器海报回归必须覆盖中文标题到原始标题、TMDB 到豆瓣、前三项候选与唯一精确匹配、16 路并发、8 秒超时、取消、重定向拒绝、CORS/认证/限流错误，以及 5 MiB、MIME、文件签名和 Blob URL 释放。卡片首次可见才请求一次 `getPosterBrowserConfig`；卡片移除、离开页面或退出登录必须取消请求，退出登录还要清空内存凭据。旧海报路由必须返回普通 `404` 且零外部请求。
+- 浏览器缓存回归必须覆盖 SHA-256 搜索身份、7 天成功/30 分钟失败 TTL、256 项 LRU、损坏存储恢复、旧前缀键清理、手动刷新只绕过失败缓存且不预取不可见卡片，以及缓存图片失败后的单次供应商回退。
+- 海报安全回归必须确认 TMDB 只使用固定官方 HTTPS origin，豆瓣只使用配置 origin 下固定的 resolve/poster 路径，所有外部请求拒绝重定向，错误只输出供应商和固定错误码。`getPosterBrowserConfig` 必须鉴权并返回 `no-store`；管理台保存值逐项优先于 `TMDB_BROWSER_TOKEN`、`DOUBAN_BROWSER_ORIGIN`、`DOUBAN_BROWSER_TOKEN` binding，清除后回退 binding。设置 bootstrap 只返回 Token 配置状态和来源，Token 不进入快照或导出；KV 保存、整理、导入、快照与任何导出必须永久移除 `tmdbApiKey`。
 - 探测回归必须覆盖 Ping 成功但 System Info 失败仍为在线、活动线路 Ping 返回 HTTP 错误后继续回退、全部线路 Ping 无权限、401/403 与网络或 HTTP 失败混合时不误报无权限、真实 `server_record_timeout` 与 `server_record_network_error` 进入强制刷新退避、普通页面读取零 Emby 请求、单卡片刷新只探测目标节点、全部刷新探测所有启用节点，以及重新启用节点保留标签/完整到期策略和待关联旧记录可选择已启用节点。服务器记录专用或继承账号必须先登录并复用同 isolate 的短期令牌；登录与详情请求不得携带继承的节点代理 Token/Cookie，认证失败时必须跳过三项 `/Items` 统计且不能回退到节点代理认证头。服务器记录密码默认只显示 `********`；仅点击显示按钮时才请求当前节点的有效密码，单纯显示后保存不得把继承凭据复制为服务器记录专用凭据。
 - 节点/故障转移探针 URL 回归必须覆盖：根目标 + origin-root 探针、目标 `/emby` 与探针 `/emby/...` 去重、大小写不一致（`/Emby` + `/emby/...`、`/emby` + `/EMBY/...`）、嵌套 base（`/proxy/emby` + 默认 `/emby/system/ping`）去重、整段 base 匹配（`/proxy/emby` + `/proxy/emby/...`）、相对探针 `/System/Ping` 以及业务 `buildUpstreamProxyUrl` 不受探针去重影响。前端普通回读在保留 previous `runtime` 时不得盖住 D1 persisted `counts`。
 - 首次上线部署兼容 Worker 后，在管理台执行“初始化 DB”即可创建并登记服务器观看与快照表；`wrangler.toml` 不需要服务器观看相关的 Durable Object binding 或 class migration。
@@ -166,13 +171,13 @@ AGG2 回归必须覆盖 HMAC 篡改、内容身份漂移、目标节点移出池
 
 域名前缀 CNAME 自动化覆盖三层目标优先级、主机名清洗、非法值拒绝、计划前向/回滚、全局 active plan 补偿、真实 CNAME 分步失败与 history 写失败的完整 host snapshot 恢复、手动单记录创建/更新的 history 失败补偿、DNS 失败后节点 KV 仍回滚，以及 rename 的部分 KV 写补偿。节点新建、清空覆盖、删除、批量导入和管理台回显仍需预发 smoke；DNS 断言必须确认记录名仍为 `<节点名>.<HOST>`，记录为 `ttl: 1`、`proxied: false`。
 
-D1 schema 自动化覆盖 fresh/旧日志 migration、完整必需列、主键/唯一键、同名错误索引、partial/expression 索引、FTS5 content binding 与触发器字段映射、自动补列、命名索引修复、退役索引删除、未知同名表零 DDL、跨 profile 初始化串行、业务行保留、v5 索引、v6 节点最后观看、v7 资源/最近媒体快照、v8 海报解析缓存与正式查询、v9 播放生命周期字段和强弱指纹门禁、过期缓存 tidy、bookmark 早于首个写入、bookmark 失败零写入、畸形 migration 表 fail-closed、0001–0007 幂等采纳、DNS 来源 batch、100 参数上限和稳定 IP `id`。D1 实例配额和真实 Time Travel 恢复仍为人工发布检查。
+D1 schema 自动化覆盖 fresh/v10/重复初始化、完整必需列、主键/唯一键、索引与 FTS、跨 profile 初始化串行、业务行保留、v5 索引、v6 节点最后观看、v7 资源/最近媒体快照、v9 播放生命周期、v11 原始标题/年份补列和退役海报缓存表删除、失败时不登记 `0009`、bookmark 早于首个写入、bookmark 失败零写入、畸形 migration 表 fail-closed、0001–0009 幂等采纳、DNS 来源 batch、100 参数上限和稳定 IP `id`。手动 D1 tidy 覆盖幂等删除意外残留表且不修改 migration 账本，scheduled 与节点生命周期不得读取或修改旧表。D1 实例配额和真实 Time Travel 恢复仍为人工发布检查。
 
-全局设置与备份自动化覆盖无 KV fail-closed、条件补偿与并发冲突、完整导入失败回滚、后发设置与节点保存串行、Worker 部署失败时保留后发设置并只补偿 HTML revision、快照与默认 settings/节点/完整备份导出对 TMDB 密钥及全局/节点 Emby 凭据的脱敏、确认式密钥导出保留 `tmdbApiKey`、确认式完整备份保留全量 Emby 凭据、未确认敏感导出被拒绝、缺字段保存/导入保留当前密钥与凭据、不可回导完整备份的导出门禁，以及显式字段覆盖/清空。含密钥或 Emby 凭据导出的浏览器确认交互和真实文件导入下载仍需管理台 smoke。
+全局设置与备份自动化覆盖无 KV fail-closed、条件补偿与并发冲突、完整导入失败回滚、后发设置与节点保存串行、Worker 部署失败时保留后发设置并只补偿 HTML revision、全局/节点 Emby 凭据的脱敏、确认式完整备份保留全量 Emby 凭据、未确认敏感导出被拒绝、缺字段保存/导入保留当前凭据、不可回导完整备份的导出门禁，以及显式字段覆盖/清空。所有保存、KV tidy、导入和导出路径都必须永久删除 `tmdbApiKey`。含其他密钥或 Emby 凭据导出的浏览器确认交互和真实文件导入下载仍需管理台 smoke。
 
 KV tidy 自动化覆盖缺失/重复游标、签名篡改、过期与计划变化、配置/快照 revision 绑定、条件补偿冲突、最坏补偿配额、D1 未就绪时保留 D1-owned 遗留键、D1 复制失败时零 KV 删除、异常 OpsStatus/Telegram JSON 与缺目标/缺 ID/重复 ID 的 DNS 来源在首个写入前 fail-closed，以及本地 HTML 内容随配置/快照引用淘汰和整理遗留孤立键。1000 页上限、所有 truth-source 读取失败点、每个 mutation 位置、跨存储写入后 KV 失败的重复执行、与设置保存并发及结果分组 UI 对照仍需补充自动化；涉及这些边界的发布必须人工验证零写入失败语义。
 
-D1 migration fixture 当前使用 `node:sqlite` 实际执行七个 migration，覆盖新库、缺少兼容日志列的旧库、节点最后观看、资源统计/最近媒体快照、v8 海报解析缓存、v9 生命周期列、Playing/Progress/STOP 接纳、强弱指纹门禁、并发快照联动、v8 降级、旧刷新防回拨、缺列自动补齐、错误索引修复、退役索引清理、错误主键/唯一键 fail-closed、未知同名表零修改、FTS 定义/触发器校验与重建、同 binding 跨 profile 串行、migration 表缺失/落后采纳、bookmark 失败零写入、已有 `0005` 业务行保留，以及 KV 遗留状态合并，不需要新增 npm 依赖。D1 tidy 还覆盖手动签名计划成功执行、数据变化 stale、初始化前预览不授权删除，以及 scheduled 结构漂移零删除。PRAGMA 失败、逐 step 失败重试及 FTS 创建失败仍需补充自动化；修改这些路径时以预发检查兜底。
+D1 migration fixture 当前使用 `node:sqlite` 实际执行九个 migration，覆盖新库、v10 库、缺少兼容日志列的旧库、节点最后观看、资源统计/最近媒体快照、播放生命周期、v11 原始标题/年份、退役海报缓存表删除、Playing/Progress/STOP 接纳、强弱指纹门禁、并发快照联动、旧 schema 降级、旧刷新防回拨、缺列自动补齐、错误索引修复、退役索引清理、错误主键/唯一键 fail-closed、未知同名表零修改、FTS 定义/触发器校验与重建、同 binding 跨 profile 串行、migration 表缺失/落后采纳、`0009` 失败零登记、bookmark 失败零写入、已有 `0005` 业务行保留，以及 KV 遗留状态合并，不需要新增 npm 依赖。D1 tidy 还覆盖手动幂等删除残留表、数据变化 stale、初始化前预览不授权删除，以及 scheduled 不触碰旧表。PRAGMA 失败、逐 step 失败重试及 FTS 创建失败仍需补充自动化；修改这些路径时以预发检查兜底。
 
 D1 管理动作统一以 `initLogsDb` 作为管理台“初始化 DB”入口；它返回最终 status、本次自动调整、`adoptedMigrations` 和写入前 `recoveryBookmark`。只有该显式登录动作可在结构复检通过后采纳 migration；`getD1TimeTravelBookmark` 始终只读，`getD1SchemaStatus`、`initD1Schema` 与 `initLogsFts` 仅保留 API 兼容并不得登记 migration。FTS 失败不得返回 ready，显式状态检查必须复检实际结构。
 

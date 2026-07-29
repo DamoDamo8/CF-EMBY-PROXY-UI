@@ -89,6 +89,8 @@ function createD1Adapter(database, options = {}) {
         },
         async run() {
           options.events?.push({ type: "run", sql: sqlText });
+          const runError = options.runError?.(sqlText);
+          if (runError) throw runError instanceof Error ? runError : new Error(String(runError));
           return statement.run(...bindings);
         },
         async all() {
@@ -132,7 +134,7 @@ function createDeferred() {
   return { promise, resolve };
 }
 
-test("D1 migrations build the fresh v9 baseline in order", async () => {
+test("D1 migrations build the fresh v11 baseline in order", async () => {
   const migrations = await loadMigrations();
   assert.deepEqual(migrations.map(migration => migration.filename), [
     "0001_d1_fresh_baseline.sql",
@@ -141,7 +143,9 @@ test("D1 migrations build the fresh v9 baseline in order", async () => {
     "0004_server_watch_stats.sql",
     "0005_server_record_snapshots.sql",
     "0006_server_record_poster_cache.sql",
-    "0007_server_watch_lifecycle.sql"
+    "0007_server_watch_lifecycle.sql",
+    "0008_server_record_poster_douban.sql",
+    "0009_drop_server_record_poster_cache.sql"
   ]);
   assert.ok(migrations.every(migration => !/ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS/i.test(executableSql(migration.sql))));
 
@@ -163,8 +167,7 @@ test("D1 migrations build the fresh v9 baseline in order", async () => {
       "proxy_logs",
       "proxy_stats_hourly",
       "server_last_watch",
-      "server_record_snapshots",
-      "server_record_poster_cache"
+      "server_record_snapshots"
     ]) {
       assert.ok(tables.has(tableName), `missing table ${tableName}`);
     }
@@ -187,39 +190,68 @@ test("D1 migrations build the fresh v9 baseline in order", async () => {
       "last_item_id",
       "last_item_image_tag",
       "last_item_name",
+      "last_item_original_title",
       "last_item_series_name",
       "last_item_type",
       "last_item_watched_at",
+      "last_item_year",
       "movie_count",
       "node_name",
       "series_count",
       "stats_checked_at",
       "updated_at"
     ]);
-    assert.deepEqual([...getColumns(database, "server_record_poster_cache")].sort(), [
-      "expires_at",
-      "failure_code",
-      "image_path",
-      "imdb_id",
-      "item_id",
-      "node_name",
-      "provider",
-      "resolved_at",
-      "retry_after",
-      "tmdb_id",
-      "updated_at",
-      "watched_at"
-    ]);
+    assert.equal(tables.has("server_record_poster_cache"), false);
     assert.ok(getIndexes(database, "proxy_logs").has("idx_proxy_logs_client_time"));
     assert.ok(getIndexes(database, "dns_ip_probe_cache").has("idx_dns_ip_probe_cache_colo_ip_expires"));
-    assert.ok(getIndexes(database, "server_record_poster_cache").has("idx_server_record_poster_cache_expires_at"));
-    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 7);
+    assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 9);
 
     const d1 = createD1Adapter(database);
     const status = await Database.getD1SchemaStatus(d1);
     assert.equal(status.runtimeCompatibilityReady, true);
     assert.equal(status.migrationReady, true);
-    assert.equal(status.schemaVersion, 9);
+    assert.equal(status.schemaVersion, 11);
+  } finally {
+    database.close();
+  }
+});
+
+test("v10 to v11 migration adds passive metadata columns and drops the poster cache", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const migrations = await loadMigrations();
+    applyMigrations(database, migrations.slice(0, 7));
+    database.prepare(`INSERT INTO server_record_poster_cache (
+      node_name, watched_at, item_id, tmdb_id, imdb_id, provider, image_path,
+      resolved_at, expires_at, failure_code, retry_after, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?)`)
+      .run(
+        "poster-node",
+        "2026-07-27T09:00:00.000Z",
+        "movie-1",
+        "123",
+        "tt1234567",
+        "tmdb_direct",
+        "/poster.jpg",
+        "2026-07-27T09:00:00.000Z",
+        "2026-08-03T09:00:00.000Z",
+        "2026-07-27T09:00:00.000Z"
+      );
+
+    database.exec(migrations[7].sql);
+    const row = database.prepare(`SELECT tmdb_id, imdb_id, douban_id, provider, image_path
+      FROM server_record_poster_cache WHERE node_name = ?`).get("poster-node");
+    assert.deepEqual({ ...row }, {
+      tmdb_id: "123",
+      imdb_id: "tt1234567",
+      douban_id: "",
+      provider: "tmdb_direct",
+      image_path: "/poster.jpg"
+    });
+    database.exec(migrations[8].sql);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'server_record_poster_cache'").get().total, 0);
+    assert.ok(getColumns(database, "server_record_snapshots").has("last_item_original_title"));
+    assert.ok(getColumns(database, "server_record_snapshots").has("last_item_year"));
   } finally {
     database.close();
   }
@@ -401,7 +433,7 @@ test("initialize DB repairs known columns and named indexes without losing legac
   }
 });
 
-test("managed initialization captures a bookmark before writes, adopts v9 migrations, and preserves 0005 rows", async () => {
+test("managed initialization captures a bookmark before writes, adopts v11 migrations, and preserves 0005 rows", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     database.exec(await readFile(new URL("0005_server_record_snapshots.sql", MIGRATIONS_URL), "utf8"));
@@ -434,9 +466,9 @@ test("managed initialization captures a bookmark before writes, adopts v9 migrat
     assert.deepEqual(initialized.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
     assert.equal(initialized.runtimeCompatibilityReady, true);
     assert.equal(initialized.migrationReady, true);
-    assert.equal(initialized.schemaVersion, 9);
+    assert.equal(initialized.schemaVersion, 11);
     assert.equal(initialized.status.missingMigrations.length, 0);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
     const preservedSnapshot = database.prepare("SELECT node_name, movie_count, last_item_id FROM server_record_snapshots").get();
     assert.equal(preservedSnapshot.node_name, "persisted-node");
     assert.equal(preservedSnapshot.movie_count, 12);
@@ -452,7 +484,7 @@ test("managed initialization captures a bookmark before writes, adopts v9 migrat
     assert.deepEqual(repeated.adoptedMigrations, []);
     assert.equal(repeated.migrationTableCreated, false);
     assert.equal(repeated.migrationReady, true);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM server_record_snapshots").get().total, 1);
   } finally {
     database.close();
@@ -478,6 +510,33 @@ test("managed initialization fails closed with zero mutations when bookmark capt
     );
     assert.equal(events.some(event => event.type === "run" && /^(?:CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE)\b/i.test(event.sql.trim())), false);
     assert.deepEqual(database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("managed initialization does not register 0009 when the retired table cannot be dropped", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const migrations = await loadMigrations();
+    applyMigrations(database, migrations.slice(0, 8));
+    const d1 = createD1Adapter(database, {
+      runError: sql => /DROP TABLE IF EXISTS [`"]?server_record_poster_cache/i.test(sql)
+        ? new Error("forced poster cache drop failure")
+        : null
+    });
+
+    await assert.rejects(
+      Database.initializeD1Database(d1, {
+        includeFts: true,
+        adoptMigrations: true,
+        requireBookmark: true,
+        failOnIncompatible: true
+      }),
+      /forced poster cache drop failure/
+    );
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'server_record_poster_cache'").get().total, 1);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations WHERE name = '0009_drop_server_record_poster_cache'").get().total, 0);
   } finally {
     database.close();
   }
@@ -525,7 +584,7 @@ test("Time Travel bookmark admin action is read-only", async () => {
   }
 });
 
-test("initLogsDb admin action returns a managed v9 baseline and recovery bookmark", async () => {
+test("initLogsDb admin action returns a managed v11 baseline and recovery bookmark", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     const d1 = createD1Adapter(database, { bookmark: "bookmark-from-init-api" });
@@ -535,12 +594,12 @@ test("initLogsDb admin action returns a managed v9 baseline and recovery bookmar
     assert.equal(payload.success, true);
     assert.equal(payload.runtimeCompatibilityReady, true);
     assert.equal(payload.migrationReady, true);
-    assert.equal(payload.schemaVersion, 9);
+    assert.equal(payload.schemaVersion, 11);
     assert.equal(payload.recoveryBookmark, "bookmark-from-init-api");
     assert.deepEqual(payload.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
     assert.equal(payload.initialization.migrationTableCreated, true);
     assert.equal(payload.status.missingMigrations.length, 0);
-    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 7);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
   } finally {
     database.close();
   }
@@ -807,6 +866,34 @@ test("D1 tidy executes an unchanged signed preview", async () => {
   }
 });
 
+test("manual D1 tidy idempotently removes a stray retired poster table without changing migrations", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    const migrations = await loadMigrations();
+    applyMigrations(database, migrations);
+    database.exec(migrations[5].sql);
+    const d1 = createD1Adapter(database);
+    const env = { DB: d1 };
+    const options = {
+      db: d1,
+      config: { logRetentionDays: 7 },
+      mode: "manual",
+      maintenanceMode: "smart",
+      nowMs: Date.parse("2026-07-25T00:00:00.000Z")
+    };
+    const plan = await Database.buildD1TidyPlan(env, options);
+    assert.equal(plan.flags.dropLegacyServerRecordPosterCache, true);
+    await Database.applyD1TidyPlan(plan, { ...options, env });
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'server_record_poster_cache'").get().total, 0);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
+
+    const repeatedPlan = await Database.buildD1TidyPlan(env, options);
+    assert.equal(repeatedPlan.flags.dropLegacyServerRecordPosterCache, false);
+  } finally {
+    database.close();
+  }
+});
+
 test("D1 tidy preview cannot authorize deletes until initialization is followed by a new preview", async () => {
   const database = new DatabaseSync(":memory:");
   try {
@@ -871,7 +958,7 @@ test("server watch lifecycle enforces strong and weak D1 admission gates", async
   try {
     applyMigrations(database, await loadMigrations());
     const d1 = createD1Adapter(database);
-    const media = (itemId, itemName) => ({ itemId, itemName, itemType: "Movie", imageTag: `${itemId}-poster` });
+    const media = (itemId, itemName) => ({ itemId, itemName, itemType: "Movie", originalTitle: itemName, year: 2026 });
     const write = (nodeName, eventAt, phase, sessionFingerprint, sessionStrength, itemId, itemName = itemId) => (
       Database.upsertServerWatchLifecycle(d1, {
         nodeName,
@@ -988,7 +1075,8 @@ test("server watch lifecycle falls back safely against a v8 table", async () => 
   }
 });
 
-test("runtime D1 SQL executes against the fresh v9 schema", async () => {
+
+test("runtime D1 SQL executes against the fresh v11 schema", async () => {
   const database = new DatabaseSync(":memory:");
   try {
     applyMigrations(database, await loadMigrations());
@@ -1004,7 +1092,8 @@ test("runtime D1 SQL executes against the fresh v9 schema", async () => {
         itemId: "movie-3000",
         itemName: "Latest movie",
         itemType: "Movie",
-        imageTag: "poster-3000"
+        originalTitle: "Latest Original",
+        year: 2026
       })
     ]);
     const lastWatch = await Database.getServerLastWatch(d1, ["server-a", "server-b"]);
@@ -1036,7 +1125,8 @@ test("runtime D1 SQL executes against the fresh v9 schema", async () => {
       itemName: "Latest movie",
       itemType: "Movie",
       seriesName: "",
-      imageTag: "poster-3000",
+      originalTitle: "Latest Original",
+      year: 2026,
       watchedAt: new Date(now + 3000).toISOString()
     });
     await Database.persistServerRecordProbeSnapshots(d1, [{
@@ -1242,9 +1332,6 @@ test("runtime D1 SQL executes against the fresh v9 schema", async () => {
       INSERT INTO cf_runtime_cache (
         cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
       ) VALUES ('expired-smoke', 'test', 'test', '{}', 1, 1, 1);
-      INSERT INTO server_record_poster_cache (
-        node_name, watched_at, item_id, expires_at, updated_at
-      ) VALUES ('expired-smoke', '1970-01-01T00:00:00.001Z', 'item-smoke', '1970-01-01T00:00:00.001Z', '1970-01-01T00:00:00.001Z');
     `);
     const tidyPlan = await Database.buildD1TidyPlan({ DB: d1 }, {
       db: d1,
@@ -1266,8 +1353,7 @@ test("runtime D1 SQL executes against the fresh v9 schema", async () => {
       ["dns_ip_probe_cache", "ip", "198.51.100.2"],
       ["auth_failures", "ip", "198.51.100.10"],
       ["cf_dashboard_cache", "cache_key", "expired-smoke"],
-      ["cf_runtime_cache", "cache_key", "expired-smoke"],
-      ["server_record_poster_cache", "node_name", "expired-smoke"]
+      ["cf_runtime_cache", "cache_key", "expired-smoke"]
     ]) {
       const expiredCount = database.prepare(`SELECT COUNT(*) AS total FROM ${tableName} WHERE ${columnName} = ?`)
         .get(value)
@@ -1312,26 +1398,6 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       counts: { movies: 4, series: 5, episodes: 6, errors: {} },
       checkedAt: "2026-07-25T02:30:00.000Z"
     }]);
-    await Database.setServerRecordPosterCache(d1, {
-      nodeName: "alpha",
-      watchedAt: "2026-07-25T01:00:00.000Z",
-      itemId: "alpha-item",
-      tmdbId: "100",
-      provider: "tmdb_direct",
-      imagePath: "/alpha-poster.jpg",
-      expiresAt: "2026-08-01T01:00:00.000Z"
-    });
-    await Database.setServerRecordPosterCache(d1, {
-      nodeName: "beta",
-      watchedAt: "2026-07-25T02:00:00.000Z",
-      itemId: "beta-item",
-      tmdbId: "200",
-      provider: "tmdb_direct",
-      imagePath: "/beta-poster.jpg",
-      expiresAt: "2026-08-01T02:00:00.000Z"
-    });
-    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:01.000Z", "alpha-item"), null);
-
     const rename = {
       previousName: "alpha",
       previousNode: { target: "https://alpha.example" },
@@ -1361,11 +1427,10 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       itemName: "Beta item",
       itemType: "Episode",
       seriesName: "Beta series",
-      imageTag: "",
+      originalTitle: "",
+      year: null,
       watchedAt: "2026-07-25T02:00:00.000Z"
     });
-    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"), null);
-    assert.equal(await Database.getServerRecordPosterCache(d1, "beta", "2026-07-25T02:00:00.000Z", "beta-item"), null);
 
     await Database.rollbackPreparedNodeMutation(rename, { kv, db: d1 });
     assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), true);
@@ -1373,8 +1438,6 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
     const restoredWatch = await Database.getServerLastWatch(d1, ["alpha", "beta"]);
     assert.equal(restoredWatch.get("alpha")?.lastWatchedAt, "2026-07-25T01:00:00.000Z");
     assert.equal(restoredWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
-    assert.equal((await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"))?.imagePath, "/alpha-poster.jpg");
-    assert.equal((await Database.getServerRecordPosterCache(d1, "beta", "2026-07-25T02:00:00.000Z", "beta-item"))?.imagePath, "/beta-poster.jpg");
 
     await Database.applyPreparedNodeMutation({
       previousName: "alpha",
@@ -1388,7 +1451,6 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
     assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), false);
     assert.equal(deletedWatch.has("alpha"), false);
     assert.equal(deletedSnapshots.has("alpha"), false);
-    assert.equal(await Database.getServerRecordPosterCache(d1, "alpha", "2026-07-25T01:00:00.000Z", "alpha-item"), null);
   } finally {
     database.close();
   }

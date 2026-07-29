@@ -222,12 +222,16 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     rateLimitRpm: 10,
     cfApiToken: "previous-cf-secret",
     tgBotToken: "previous-tg-secret",
+    tmdbBrowserToken: "previous-tmdb-browser-token",
+    doubanBrowserToken: "previous-douban-browser-token",
     mediaAggregationEmbyPassword: "previous-emby-secret"
   };
   const currentConfig = {
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
     tgBotToken: "current-tg-secret",
+    tmdbBrowserToken: "current-tmdb-browser-token",
+    doubanBrowserToken: "current-douban-browser-token",
     mediaAggregationEmbyPassword: "current-emby-secret"
   };
   const { kv } = createKv({
@@ -244,6 +248,8 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   const [snapshot] = JSON.parse(snapshotsMutation.value);
   assert.equal(snapshot.config.cfApiToken, undefined);
   assert.equal(snapshot.config.tgBotToken, undefined);
+  assert.equal(snapshot.config.tmdbBrowserToken, undefined);
+  assert.equal(snapshot.config.doubanBrowserToken, undefined);
   assert.equal(snapshot.config.mediaAggregationEmbyPassword, undefined);
 
   const env = {
@@ -260,6 +266,8 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     assert.equal(restoredConfig.rateLimitRpm, 5);
     assert.equal(restoredConfig.cfApiToken, "current-cf-secret");
     assert.equal(restoredConfig.tgBotToken, "current-tg-secret");
+    assert.equal(restoredConfig.tmdbBrowserToken, "current-tmdb-browser-token");
+    assert.equal(restoredConfig.doubanBrowserToken, "current-douban-browser-token");
     assert.equal(restoredConfig.mediaAggregationEmbyPassword, "current-emby-secret");
 
     const restoredFromRollback = await Database.restoreTidyKvMigrationSnapshot({
@@ -301,6 +309,8 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
     tgBotToken: "current-tg-secret",
+    tmdbBrowserToken: "current-tmdb-browser-token",
+    doubanBrowserToken: "current-douban-browser-token",
     mediaAggregationEmbyUsername: "current-emby-user",
     mediaAggregationEmbyPassword: "current-emby-password"
   };
@@ -319,6 +329,8 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     assert.equal(backup.secretsRedacted, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.config.tmdbBrowserToken, undefined);
+    assert.equal(backup.config.doubanBrowserToken, undefined);
     assert.equal(backup.config.mediaAggregationEmbyUsername, undefined);
     assert.equal(backup.config.mediaAggregationEmbyPassword, undefined);
 
@@ -326,6 +338,8 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
+    assert.equal(restored.doubanBrowserToken, "current-douban-browser-token");
     assert.equal(restored.mediaAggregationEmbyUsername, "current-emby-user");
     assert.equal(restored.mediaAggregationEmbyPassword, "current-emby-password");
   } finally {
@@ -333,108 +347,48 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
   }
 });
 
-test("TMDB poster key is stored in KV but redacted from management reads, snapshots, and default exports", async () => {
-  const tmdbApiKey = "abcdefghijklmnopqrstuvwxyz123456";
-  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 20 } });
+test("legacy tmdbApiKey is permanently removed by save, export, import, and KV tidy", async () => {
+  const legacySecret = "legacy-tmdb-secret";
+  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 20, tmdbApiKey: legacySecret } });
   const env = {
     ENI_KV: kv,
-    TMDB_API_KEY: "environment-fallback-secret",
-    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-tmdb-poster-key"
+    JWT_SECRET: "legacy-tmdb-tidy-secret",
+    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-retired-tmdb-key"
   };
   invalidateRuntimeConfigCache();
   try {
     const saveResponse = await Database.ApiHandlers.saveConfig({
-      config: { rateLimitRpm: 20, tmdbApiKey }
+      config: { rateLimitRpm: 25, tmdbApiKey: "ignored-replacement" }
     }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
     assert.equal(saveResponse.status, 200);
-    const savedPayload = await saveResponse.json();
-    assert.equal(savedPayload.posterMetadata.tmdb.configured, true);
-    assert.equal(savedPayload.posterMetadata.tmdb.storage, "kv_config");
-    assert.equal(savedPayload.config.tmdbApiKey, undefined);
-    assert.equal(savedPayload.config.tmdbApiKeyConfigured, true);
-    assert.doesNotMatch(JSON.stringify(savedPayload), new RegExp(tmdbApiKey));
+    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
 
-    const storedConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
-    assert.equal(storedConfig.tmdbApiKey, tmdbApiKey);
-    const snapshots = await kv.get(Database.CONFIG_SNAPSHOTS_KEY, { type: "json" });
-    assert.ok(snapshots.every(snapshot => snapshot?.config?.tmdbApiKey === undefined));
-
-    const readResponse = await Database.ApiHandlers.loadConfig({}, { env, kv, db: null, ctx: null });
-    const readPayload = await readResponse.json();
-    assert.equal(readPayload.config.tmdbApiKey, undefined);
-    assert.equal(readPayload.config.tmdbApiKeyConfigured, true);
-
-    const settingsBootstrapResponse = await Database.ApiHandlers.getSettingsBootstrap({}, { env, kv, db: null, ctx: null });
-    const settingsBootstrapPayload = await settingsBootstrapResponse.json();
-    assert.equal(settingsBootstrapPayload.posterMetadata.tmdb.storage, "kv_config");
-    assert.equal(settingsBootstrapPayload.config.tmdbApiKey, undefined);
-    assert.doesNotMatch(JSON.stringify(settingsBootstrapPayload), /environment-fallback-secret/);
-
-    const adminBootstrapResponse = await Database.ApiHandlers.getAdminBootstrap({}, { env, kv, db: null, ctx: null });
-    const adminBootstrapPayload = await adminBootstrapResponse.json();
-    assert.equal(adminBootstrapPayload.posterMetadata.tmdb.storage, "kv_config");
-    assert.equal(adminBootstrapPayload.config.tmdbApiKey, undefined);
-    assert.doesNotMatch(JSON.stringify(adminBootstrapPayload), new RegExp(`${tmdbApiKey}|environment-fallback-secret`));
-
-    const previewResponse = await Database.ApiHandlers.previewConfig({ config: { rateLimitRpm: 25 } }, { env, kv, ctx: null });
-    const previewPayload = await previewResponse.json();
-    assert.equal(previewPayload.config.tmdbApiKey, undefined);
-    assert.equal(previewPayload.config.tmdbApiKeyConfigured, true);
-
+    await kv.put(Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 30, tmdbApiKey: legacySecret }));
+    invalidateRuntimeConfigCache();
     const defaultExport = await Database.ApiHandlers.exportSettings({}, {
       env,
       request: new Request("https://worker.test/admin")
     });
+    const secretExport = await Database.ApiHandlers.exportSettings({ includeSecrets: true }, {
+      env,
+      request: new Request("https://worker.test/admin", { headers: { "X-Admin-Confirm": "exportSettings" } })
+    });
     assert.equal((await defaultExport.json()).config.tmdbApiKey, undefined);
-    const confirmedExport = await Database.ApiHandlers.exportSettings({ includeSecrets: true }, {
-      env,
-      request: new Request("https://worker.test/admin", {
-        headers: { "X-Admin-Confirm": "exportSettings" }
-      })
-    });
-    assert.equal((await confirmedExport.json()).config.tmdbApiKey, tmdbApiKey);
+    assert.equal((await secretExport.json()).config.tmdbApiKey, undefined);
 
-    const defaultFullExport = await Database.ApiHandlers.exportConfig({}, {
-      env,
-      ctx: null,
-      request: new Request("https://worker.test/admin")
-    });
-    assert.equal((await defaultFullExport.json()).config.tmdbApiKey, undefined);
-    const confirmedFullExport = await Database.ApiHandlers.exportConfig({ includeSecrets: true }, {
-      env,
-      ctx: null,
-      request: new Request("https://worker.test/admin", {
-        headers: { "X-Admin-Confirm": "exportConfig" }
-      })
-    });
-    assert.equal((await confirmedFullExport.json()).config.tmdbApiKey, tmdbApiKey);
-
-    const ordinarySave = await Database.ApiHandlers.saveConfig({ config: { rateLimitRpm: 30 } }, { env, ctx: null, kv, meta: { section: "account" } });
-    const ordinarySavePayload = await ordinarySave.json();
-    assert.equal(ordinarySavePayload.config.tmdbApiKey, undefined);
-    assert.equal(ordinarySavePayload.posterMetadata.tmdb.storage, "kv_config");
-    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, tmdbApiKey);
-
-    const ordinaryImport = await Database.ApiHandlers.importSettings({ config: { rateLimitRpm: 40 } }, { env, ctx: null, kv, meta: {} });
-    assert.equal((await ordinaryImport.json()).config.tmdbApiKey, undefined);
-    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, tmdbApiKey);
-
-    const removeResponse = await Database.ApiHandlers.saveConfig({
-      config: { rateLimitRpm: 30, tmdbApiKey: "" }
-    }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
-    assert.equal(removeResponse.status, 200);
-    const removePayload = await removeResponse.json();
-    assert.equal(removePayload.posterMetadata.tmdb.configured, true);
-    assert.equal(removePayload.posterMetadata.tmdb.storage, "worker_secret");
-    assert.doesNotMatch(JSON.stringify(removePayload), /environment-fallback-secret/);
+    const imported = await Database.ApiHandlers.importSettings({
+      config: { rateLimitRpm: 35, tmdbApiKey: "imported-legacy-secret" }
+    }, { env, ctx: null, kv, meta: {} });
+    assert.equal(imported.status, 200);
     assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
 
-    const legacyCompatibilityResponse = await Database.ApiHandlers.savePosterMetadataSettings({
-      operation: "set",
-      tmdbApiKey
-    }, { env, ctx: null, kv });
-    assert.equal(legacyCompatibilityResponse.status, 200);
-    assert.equal((await legacyCompatibilityResponse.json()).posterMetadata.tmdb.storage, "kv_config");
+    await kv.put(Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 40, tmdbApiKey: legacySecret }));
+    invalidateRuntimeConfigCache();
+    const plan = await Database.buildKvTidyPlan(env, { kv });
+    assert.ok(plan.mutationPlan.some(mutation => mutation.type === "put" && mutation.key === Database.CONFIG_KEY));
+    const planToken = await Database.createKvTidyPlanToken(env, plan);
+    await Database.tidyKvData(env, { kv, planToken });
+    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -449,6 +403,8 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     rateLimitRpm: 30,
     cfApiToken: "current-cf-secret",
     tgBotToken: "current-tg-secret",
+    tmdbBrowserToken: "current-tmdb-browser-token",
+    doubanBrowserToken: "current-douban-browser-token",
     mediaAggregationEmbyUsername: "global-user",
     mediaAggregationEmbyPassword: "global-password",
     indexUrl: adminIndexRecord.sourceUrl
@@ -511,6 +467,8 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     assert.equal(backup.containsSecrets, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
+    assert.equal(backup.config.tmdbBrowserToken, undefined);
+    assert.equal(backup.config.doubanBrowserToken, undefined);
     assert.equal(backup.config.mediaAggregationEmbyUsername, "global-user");
     assert.equal(backup.config.mediaAggregationEmbyPassword, "global-password");
     assert.equal(backup.nodes.length, 1);
@@ -526,6 +484,8 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
+    assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
+    assert.equal(restored.doubanBrowserToken, "current-douban-browser-token");
     assert.equal(restored.mediaAggregationEmbyUsername, "global-user");
     assert.equal(restored.mediaAggregationEmbyPassword, "global-password");
     const restoredNode = await kv.get(`${Database.PREFIX}backup`, { type: "json" });

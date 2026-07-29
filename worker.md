@@ -23,6 +23,7 @@
 | --- | --- |
 | [运行时架构](docs/architecture.md) | Worker 壳、路由职责、运行时绑定、缓存和资源代理 |
 | [管理台契约](docs/admin-console.md) | 管理台入口、主视图、动作目录、设置页和前端同步链 |
+| [海报重构契约](docs/poster-contract.md) | 已实现的服务器记录海报浏览器直连契约与迁移门禁 |
 | [开发与验证](docs/development.md) | 任务分类、开发顺序、本地调试、验证和交付要求 |
 | [构建与发布](docs/release.md) | 固定 GitHub Release 源、资产 URL、构建产物和发布门禁 |
 
@@ -37,8 +38,8 @@
 - `POST ADMIN_PATH/login` 与 `POST ADMIN_PATH` 保持既有登录和管理 API 契约，细节见 [管理台契约](docs/admin-console.md)。
 - 浏览器使用 Worker 同源 vendor 路径加载依赖；Worker 负责源站重写和 Cache API 缓冲。
 - Emby 节点代理只承载 API、WebSocket 与媒体请求，不反代 `/web` 子树；该边界不影响管理台 `/admin` 的资源交付。
-- 服务器记录的 TMDB 海报密钥由管理台“账号设置”统一预览和保存到 KV，运行时按“KV 配置优先、Worker Secret 兼容兜底”解析；完整安全与回退语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
-- 服务器记录使用 D1 v9 播放生命周期：`Playing` 即时更新上次观看，首次 `Progress` 在缺少 Playing 时兜底，`Stopped` 推进最终时间；完整去重与 v8 兼容语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
+- 服务器记录海报由已登录浏览器在卡片可见后直连 TMDB 和独立豆瓣服务解析；Worker 只被动保存并返回 `posterSearch`，不请求供应商、图片或 Emby 元数据。完整安全、缓存与回退语义见 [海报重构契约](docs/poster-contract.md)。
+- 服务器记录使用 D1 v11 schema；播放生命周期字段继续承载 `Playing` 即时更新、首次 `Progress` 兜底和 `Stopped` 最终时间，快照保存被动取得的原始标题与年份，退役的 Worker 海报缓存表不存在。完整去重与旧 schema 兼容语义见 [运行时架构](docs/architecture.md#服务器最后观看记录)。
 - 前端开发和构建先把 `frontend/admin-runtime.template.html` 与显式 runtime enhancements 确定性组合为 `frontend/index.html`。
 
 ## 核心约束
