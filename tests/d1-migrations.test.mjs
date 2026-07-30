@@ -3,8 +3,17 @@ import { readFile, readdir } from "node:fs/promises";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 
-await import("../worker.js");
-const { Database, GLOBALS, Logger } = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
+import { createTestApplication } from "../worker/testing/hooks.js";
+import {
+  defineSchemaInspectionMethods,
+  isolateState
+} from "../worker/runtime/application-facades.js";
+
+const testHooks = createTestApplication();
+
+const { testPlatform } = testHooks;
+const { adminActions, logger } = testPlatform.fetch;
+const kernel = testPlatform.d1;
 
 const MIGRATIONS_URL = new URL("../migrations/", import.meta.url);
 const REQUIRED_LOG_COLUMNS = new Map([
@@ -207,7 +216,7 @@ test("D1 migrations build the fresh v11 baseline in order", async () => {
     assert.equal(database.prepare("SELECT COUNT(*) AS count FROM d1_migrations").get().count, 9);
 
     const d1 = createD1Adapter(database);
-    const status = await Database.getD1SchemaStatus(d1);
+    const status = await kernel.getD1SchemaStatus(d1);
     assert.equal(status.runtimeCompatibilityReady, true);
     assert.equal(status.migrationReady, true);
     assert.equal(status.schemaVersion, 11);
@@ -289,9 +298,9 @@ test("D1 migrations preserve an old proxy_logs table until runtime compatibility
     assert.equal(database.prepare("SELECT node_name FROM proxy_logs WHERE id = 1").get().node_name, "legacy-node");
 
     const d1 = createD1Adapter(database);
-    Database.invalidateD1SchemaReadiness(d1, "logs");
-    await Database.ensureLogsBaseSchema(d1);
-    await Database.ensureStatsHourlySchema(d1);
+    kernel.invalidateD1SchemaReadiness(d1, "logs");
+    await kernel.ensureLogsBaseSchema(d1);
+    await kernel.ensureStatsHourlySchema(d1);
     applyMigrations(database, migrations.slice(2));
 
     for (const columnName of REQUIRED_LOG_COLUMNS.keys()) {
@@ -300,7 +309,7 @@ test("D1 migrations preserve an old proxy_logs table until runtime compatibility
     assert.ok(getIndexes(database, "proxy_logs").has("idx_proxy_logs_category_time"));
     assert.equal(database.prepare("SELECT category FROM proxy_logs WHERE id = 1").get().category, "api");
     assert.equal(database.prepare("SELECT node_name FROM proxy_logs WHERE id = 1").get().node_name, "legacy-node");
-    assert.equal((await Database.getD1SchemaStatus(d1)).migrationReady, true);
+    assert.equal((await kernel.getD1SchemaStatus(d1)).migrationReady, true);
   } finally {
     database.close();
   }
@@ -312,14 +321,14 @@ test("D1 schema status rejects a malformed FTS table and runtime initialization 
     applyMigrations(database, await loadMigrations());
     database.exec("CREATE TABLE proxy_logs_fts (node_name TEXT, request_path TEXT)");
     const d1 = createD1Adapter(database);
-    const malformedStatus = await Database.getD1SchemaStatus(d1);
+    const malformedStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(malformedStatus.ftsReady, false);
     assert.ok(malformedStatus.issues.includes("fts_virtual_table_invalid"));
     assert.ok(malformedStatus.issues.includes("fts_columns_incomplete"));
 
-    const initialized = await Database.ensureLogsFtsSchema(d1);
+    const initialized = await kernel.ensureLogsFtsSchema(d1);
     assert.equal(initialized.rebuilt, true);
-    const readyStatus = await Database.getD1SchemaStatus(d1);
+    const readyStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(readyStatus.ftsReady, true);
     assert.equal(readyStatus.fts.virtualTableReady, true);
     assert.equal(readyStatus.fts.triggerReady, true);
@@ -328,12 +337,12 @@ test("D1 schema status rejects a malformed FTS table and runtime initialization 
       DROP TRIGGER proxy_logs_fts_ai;
       CREATE TRIGGER proxy_logs_fts_ai AFTER INSERT ON proxy_logs BEGIN SELECT 1; END;
     `);
-    const malformedTriggerStatus = await Database.getD1SchemaStatus(d1);
+    const malformedTriggerStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(malformedTriggerStatus.ftsReady, false);
     assert.equal(malformedTriggerStatus.fts.triggerReady, false);
     assert.ok(malformedTriggerStatus.issues.includes("missing_trigger:proxy_logs_fts_ai"));
 
-    const repaired = await Database.initializeD1Database(d1, { includeFts: true });
+    const repaired = await kernel.initializeD1Database(d1, { includeFts: true });
     assert.equal(repaired.status.ftsReady, true);
     assert.equal(repaired.ftsRebuilt, true);
 
@@ -344,10 +353,10 @@ test("D1 schema status rejects a malformed FTS table and runtime initialization 
         VALUES (new.id, new.request_path, new.node_name, new.user_agent, new.error_detail, new.detail_json);
       END;
     `);
-    const wrongTriggerMappingStatus = await Database.getD1SchemaStatus(d1);
+    const wrongTriggerMappingStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(wrongTriggerMappingStatus.ftsReady, false);
     assert.equal(wrongTriggerMappingStatus.fts.triggerReady, false);
-    const triggerMappingRepair = await Database.initializeD1Database(d1, { includeFts: true });
+    const triggerMappingRepair = await kernel.initializeD1Database(d1, { includeFts: true });
     assert.equal(triggerMappingRepair.status.ftsReady, true);
     assert.equal(triggerMappingRepair.ftsRebuilt, true);
 
@@ -356,10 +365,10 @@ test("D1 schema status rejects a malformed FTS table and runtime initialization 
       DROP TABLE proxy_logs_fts;
       CREATE VIRTUAL TABLE proxy_logs_fts USING fts5(node_name, request_path, user_agent, error_detail, detail_json);
     `);
-    const wrongContentBindingStatus = await Database.getD1SchemaStatus(d1);
+    const wrongContentBindingStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(wrongContentBindingStatus.ftsReady, false);
     assert.equal(wrongContentBindingStatus.fts.virtualTableReady, false);
-    const contentBindingRepair = await Database.initializeD1Database(d1, { includeFts: true });
+    const contentBindingRepair = await kernel.initializeD1Database(d1, { includeFts: true });
     assert.equal(contentBindingRepair.ftsRecreated, true);
     assert.equal(contentBindingRepair.status.ftsReady, true);
   } finally {
@@ -380,7 +389,7 @@ test("D1 schema status rejects missing runtime columns and same-name indexes on 
       CREATE INDEX idx_proxy_logs_client_time ON proxy_logs (node_name);
     `);
 
-    const status = await Database.getD1SchemaStatus(createD1Adapter(database));
+    const status = await kernel.getD1SchemaStatus(createD1Adapter(database));
     assert.equal(status.columns.auth_failures.ip, true);
     assert.equal(status.columns.auth_failures.fail_count, false);
     assert.equal(status.indexes.idx_auth_failures_expires_at, false);
@@ -413,7 +422,7 @@ test("initialize DB repairs known columns and named indexes without losing legac
     `);
 
     const d1 = createD1Adapter(database);
-    const result = await Database.initializeD1Database(d1, { includeFts: true });
+    const result = await kernel.initializeD1Database(d1, { includeFts: true });
     assert.equal(result.runtimeCompatibilityReady, true);
     assert.equal(result.migrationReady, true);
     assert.ok(result.adjustedColumns.includes("auth_failures.fail_count"));
@@ -450,7 +459,7 @@ test("managed initialization captures a bookmark before writes, adopts v11 migra
     const events = [];
     const d1 = createD1Adapter(database, { events, bookmark: "bookmark-before-managed-init" });
 
-    const initialized = await Database.initializeD1Database(d1, {
+    const initialized = await kernel.initializeD1Database(d1, {
       includeFts: true,
       adoptMigrations: true,
       requireBookmark: true,
@@ -463,7 +472,7 @@ test("managed initialization captures a bookmark before writes, adopts v11 migra
     assert.ok(firstMutationIndex > bookmarkProbeIndex);
     assert.equal(initialized.recoveryBookmark, "bookmark-before-managed-init");
     assert.equal(initialized.migrationTableCreated, true);
-    assert.deepEqual(initialized.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
+    assert.deepEqual(initialized.adoptedMigrations, kernel.D1_REQUIRED_MIGRATIONS);
     assert.equal(initialized.runtimeCompatibilityReady, true);
     assert.equal(initialized.migrationReady, true);
     assert.equal(initialized.schemaVersion, 11);
@@ -475,7 +484,7 @@ test("managed initialization captures a bookmark before writes, adopts v11 migra
     assert.equal(preservedSnapshot.last_item_id, "item-5");
 
     events.length = 0;
-    const repeated = await Database.initializeD1Database(d1, {
+    const repeated = await kernel.initializeD1Database(d1, {
       includeFts: true,
       adoptMigrations: true,
       requireBookmark: true,
@@ -500,7 +509,7 @@ test("managed initialization fails closed with zero mutations when bookmark capt
       bookmarkError: new Error("bookmark service unavailable")
     });
     await assert.rejects(
-      Database.initializeD1Database(d1, {
+      kernel.initializeD1Database(d1, {
         includeFts: true,
         adoptMigrations: true,
         requireBookmark: true,
@@ -527,7 +536,7 @@ test("managed initialization does not register 0009 when the retired table canno
     });
 
     await assert.rejects(
-      Database.initializeD1Database(d1, {
+      kernel.initializeD1Database(d1, {
         includeFts: true,
         adoptMigrations: true,
         requireBookmark: true,
@@ -549,7 +558,7 @@ test("managed initialization rejects a malformed migration table before bookmark
     const events = [];
     const d1 = createD1Adapter(database, { events });
     await assert.rejects(
-      Database.initializeD1Database(d1, {
+      kernel.initializeD1Database(d1, {
         includeFts: true,
         adoptMigrations: true,
         requireBookmark: true,
@@ -571,7 +580,7 @@ test("Time Travel bookmark admin action is read-only", async () => {
   try {
     const events = [];
     const d1 = createD1Adapter(database, { events, bookmark: "bookmark-from-admin" });
-    const response = await Database.ApiHandlers.getD1TimeTravelBookmark({}, { db: d1 });
+    const response = await adminActions.getD1TimeTravelBookmark({}, { db: d1 });
     const payload = await response.json();
 
     assert.equal(payload.success, true);
@@ -588,7 +597,7 @@ test("initLogsDb admin action returns a managed v11 baseline and recovery bookma
   const database = new DatabaseSync(":memory:");
   try {
     const d1 = createD1Adapter(database, { bookmark: "bookmark-from-init-api" });
-    const response = await Database.ApiHandlers.initLogsDb({}, { db: d1 });
+    const response = await adminActions.initLogsDb({}, { db: d1 });
     const payload = await response.json();
 
     assert.equal(payload.success, true);
@@ -596,7 +605,7 @@ test("initLogsDb admin action returns a managed v11 baseline and recovery bookma
     assert.equal(payload.migrationReady, true);
     assert.equal(payload.schemaVersion, 11);
     assert.equal(payload.recoveryBookmark, "bookmark-from-init-api");
-    assert.deepEqual(payload.adoptedMigrations, Database.D1_REQUIRED_MIGRATIONS);
+    assert.deepEqual(payload.adoptedMigrations, kernel.D1_REQUIRED_MIGRATIONS);
     assert.equal(payload.initialization.migrationTableCreated, true);
     assert.equal(payload.status.missingMigrations.length, 0);
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
@@ -610,10 +619,10 @@ test("KV legacy state is merged into D1 before its old keys can be removed", asy
   try {
     applyMigrations(database, await loadMigrations());
     const d1 = createD1Adapter(database);
-    await Database.putOpsStatusPayloadToDb(d1, Database.getOpsStatusDbScope(), {
+    await kernel.putOpsStatusPayloadToDb(d1, kernel.getOpsStatusDbScope(), {
       scheduled: { status: "current", currentOnly: true }
     }, Date.now());
-    await Database.persistDnsIpPoolSources({ db: d1 }, [{
+    await kernel.persistDnsIpPoolSources({ db: d1 }, [{
       id: "current-source",
       name: "Current source",
       url: "https://current.example/ips.txt",
@@ -621,12 +630,12 @@ test("KV legacy state is merged into D1 before its old keys can be removed", asy
       sourceKind: "custom"
     }]);
 
-    const result = await Database.applyKvD1LegacyMigrations(d1, [{
-      key: Database.LEGACY_OPS_STATUS_KEY,
+    const result = await kernel.applyKvD1LegacyMigrations(d1, [{
+      key: kernel.LEGACY_OPS_STATUS_KEY,
       kind: "ops_status_root",
       payload: { scheduled: { status: "legacy", legacyOnly: true } }
     }, {
-      key: Database.LEGACY_DNS_IP_POOL_SOURCES_KEY,
+      key: kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY,
       kind: "dns_ip_pool_sources",
       payload: [{
         id: "legacy-source",
@@ -639,12 +648,12 @@ test("KV legacy state is merged into D1 before its old keys can be removed", asy
 
     assert.equal(result.migratedKeyCount, 2);
     assert.equal(result.migratedDnsIpPoolSourceCount, 1);
-    const root = await Database.getOpsStatusPayloadFromDb(d1, Database.getOpsStatusDbScope());
+    const root = await kernel.getOpsStatusPayloadFromDb(d1, kernel.getOpsStatusDbScope());
     assert.equal(root.scheduled.status, "current");
     assert.equal(root.scheduled.currentOnly, true);
     assert.equal(root.scheduled.legacyOnly, true);
     assert.deepEqual(
-      new Set((await Database.getDnsIpPoolSourcesFromDb(d1)).map(source => source.id)),
+      new Set((await kernel.getDnsIpPoolSourcesFromDb(d1)).map(source => source.id)),
       new Set(["legacy-source", "current-source"])
     );
   } finally {
@@ -665,7 +674,7 @@ test("D1 schema status rejects expression and partial required indexes", async (
         WHERE expires_at > 0;
     `);
 
-    const status = await Database.getD1SchemaStatus(createD1Adapter(database));
+    const status = await kernel.getD1SchemaStatus(createD1Adapter(database));
     assert.equal(status.indexes.idx_auth_failures_expires_at, false);
     assert.equal(status.indexes.idx_cf_dashboard_cache_expires_at, false);
     assert.ok(status.issues.includes("invalid_index:idx_auth_failures_expires_at"));
@@ -712,14 +721,14 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
     `);
 
     const d1 = createD1Adapter(database);
-    const partialStatus = await Database.getD1SchemaStatus(d1);
+    const partialStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(partialStatus.constraints.primaryKeys.auth_failures, false);
     assert.equal(partialStatus.constraints.uniqueKeys["dns_ip_pool_items.ip"], false);
     assert.ok(partialStatus.issues.includes("invalid_primary_key:auth_failures"));
     assert.ok(partialStatus.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
     assert.equal(partialStatus.migrationReady, false);
 
-    const initialized = await Database.initializeD1Database(d1, { includeFts: false });
+    const initialized = await kernel.initializeD1Database(d1, { includeFts: false });
     assert.equal(initialized.runtimeCompatibilityReady, false);
     assert.ok(initialized.status.issues.includes("invalid_primary_key:auth_failures"));
     assert.ok(initialized.status.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
@@ -730,7 +739,7 @@ test("D1 schema status validates primary and unique keys used by runtime upserts
       CREATE UNIQUE INDEX idx_dns_ip_pool_items_ip_expression
         ON dns_ip_pool_items (lower(ip));
     `);
-    const expressionStatus = await Database.getD1SchemaStatus(d1);
+    const expressionStatus = await kernel.getD1SchemaStatus(d1);
     assert.equal(expressionStatus.constraints.uniqueKeys["dns_ip_pool_items.ip"], false);
     assert.ok(expressionStatus.issues.includes("missing_unique_key:dns_ip_pool_items.ip"));
     assert.equal(expressionStatus.migrationReady, false);
@@ -744,7 +753,7 @@ test("initialize DB leaves unknown same-name tables untouched when key contracts
   try {
     database.exec("CREATE TABLE auth_failures (foreign_column TEXT)");
     const d1 = createD1Adapter(database);
-    const initialized = await Database.initializeD1Database(d1, { includeFts: false });
+    const initialized = await kernel.initializeD1Database(d1, { includeFts: false });
 
     assert.equal(initialized.runtimeCompatibilityReady, false);
     assert.ok(initialized.status.issues.includes("invalid_primary_key:auth_failures"));
@@ -753,7 +762,7 @@ test("initialize DB leaves unknown same-name tables untouched when key contracts
       ["foreign_column"]
     );
     await assert.rejects(
-      Database.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true }),
+      kernel.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true }),
       error => error?.code === "D1_SCHEMA_INCOMPATIBLE"
         && error?.details?.phase === "preflight"
     );
@@ -763,14 +772,15 @@ test("initialize DB leaves unknown same-name tables untouched when key contracts
 });
 
 test("D1 initialization serializes core and FTS profiles on one binding", async () => {
-  const database = Object.create(Database);
+  const schemaOperations = { ...kernel };
+  Object.assign(schemaOperations, defineSchemaInspectionMethods({}, schemaOperations));
   const binding = {};
   const coreStarted = createDeferred();
   const releaseCore = createDeferred();
   const events = [];
   let active = 0;
   let maxActive = 0;
-  database.runD1DatabaseInitialization = async (db, options = {}) => {
+  schemaOperations.runD1DatabaseInitialization = async (db, options = {}) => {
     const profile = options.includeFts === true ? "logs-fts" : "logs-core";
     active += 1;
     maxActive = Math.max(maxActive, active);
@@ -784,9 +794,9 @@ test("D1 initialization serializes core and FTS profiles on one binding", async 
     return { profile };
   };
 
-  const coreTask = database.initializeD1Database(binding, { includeFts: false });
+  const coreTask = schemaOperations.initializeD1Database(binding, { includeFts: false });
   await coreStarted.promise;
-  const ftsTask = database.initializeD1Database(binding, { includeFts: true });
+  const ftsTask = schemaOperations.initializeD1Database(binding, { includeFts: true });
   await Promise.resolve();
   assert.equal(maxActive, 1);
   assert.deepEqual(events, ["logs-core:start"]);
@@ -805,21 +815,21 @@ test("D1 tidy requires a new signed preview when rows change", async () => {
     const now = Date.parse("2026-07-25T00:00:00.000Z");
     const env = { DB: d1, JWT_SECRET: "d1-tidy-test-secret" };
     const config = { logRetentionDays: 7 };
-    const previewPlan = await Database.buildD1TidyPlan(env, {
+    const previewPlan = await kernel.buildD1TidyPlan(env, {
       db: d1,
       config,
       mode: "manual",
       maintenanceMode: "smart",
       nowMs: now
     });
-    const planToken = await Database.createD1TidyPlanToken(env, previewPlan);
+    const planToken = await kernel.createD1TidyPlanToken(env, previewPlan);
     database.exec(`INSERT INTO proxy_logs (
       timestamp, node_name, request_path, request_method, status_code,
       response_time, client_ip, category, created_at
     ) VALUES (1, 'late-expired', '/expired', 'GET', 200, 1, '198.51.100.20', 'api', '1970-01-01T00:00:00.001Z')`);
 
     await assert.rejects(
-      Database.tidyD1Data(env, {
+      kernel.tidyD1Data(env, {
         db: d1,
         config,
         mode: "manual",
@@ -843,15 +853,15 @@ test("D1 tidy executes an unchanged signed preview", async () => {
     const now = Date.parse("2026-07-25T00:00:00.000Z");
     const env = { DB: d1, JWT_SECRET: "d1-tidy-success-secret" };
     const config = { logRetentionDays: 7 };
-    const plan = await Database.buildD1TidyPlan(env, {
+    const plan = await kernel.buildD1TidyPlan(env, {
       db: d1,
       config,
       mode: "manual",
       maintenanceMode: "smart",
       nowMs: now
     });
-    const planToken = await Database.createD1TidyPlanToken(env, plan);
-    const result = await Database.tidyD1Data(env, {
+    const planToken = await kernel.createD1TidyPlanToken(env, plan);
+    const result = await kernel.tidyD1Data(env, {
       db: d1,
       config,
       mode: "manual",
@@ -881,13 +891,13 @@ test("manual D1 tidy idempotently removes a stray retired poster table without c
       maintenanceMode: "smart",
       nowMs: Date.parse("2026-07-25T00:00:00.000Z")
     };
-    const plan = await Database.buildD1TidyPlan(env, options);
+    const plan = await kernel.buildD1TidyPlan(env, options);
     assert.equal(plan.flags.dropLegacyServerRecordPosterCache, true);
-    await Database.applyD1TidyPlan(plan, { ...options, env });
+    await kernel.applyD1TidyPlan(plan, { ...options, env });
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM sqlite_master WHERE type = 'table' AND name = 'server_record_poster_cache'").get().total, 0);
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM d1_migrations").get().total, 9);
 
-    const repeatedPlan = await Database.buildD1TidyPlan(env, options);
+    const repeatedPlan = await kernel.buildD1TidyPlan(env, options);
     assert.equal(repeatedPlan.flags.dropLegacyServerRecordPosterCache, false);
   } finally {
     database.close();
@@ -903,15 +913,15 @@ test("D1 tidy preview cannot authorize deletes until initialization is followed 
     `);
     const d1 = createD1Adapter(database);
     const env = { DB: d1, JWT_SECRET: "d1-tidy-preview-secret" };
-    const firstResponse = await Database.ApiHandlers.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
+    const firstResponse = await adminActions.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
     const firstPreview = await firstResponse.json();
     assert.equal(firstPreview.requiresSchemaInitialization, true);
     assert.equal(firstPreview.planToken, "");
     assert.equal(firstPreview.summary.deletedExpiredLogCount, 0);
 
-    const initialized = await Database.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true });
+    const initialized = await kernel.initializeD1Database(d1, { includeFts: false, failOnIncompatible: true });
     assert.equal(initialized.runtimeCompatibilityReady, true);
-    const secondResponse = await Database.ApiHandlers.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
+    const secondResponse = await adminActions.previewTidyData({ scope: "d1" }, { env, db: d1, kv: null });
     const secondPreview = await secondResponse.json();
     assert.equal(secondPreview.requiresSchemaInitialization, false);
     assert.ok(secondPreview.planToken);
@@ -938,7 +948,7 @@ test("scheduled D1 tidy fails before deletion when key contracts drift", async (
     `);
     const d1 = createD1Adapter(database);
     await assert.rejects(
-      Database.tidyD1Data({ DB: d1 }, {
+      kernel.tidyD1Data({ DB: d1 }, {
         db: d1,
         config: { logRetentionDays: 7 },
         mode: "scheduled",
@@ -960,7 +970,7 @@ test("server watch lifecycle enforces strong and weak D1 admission gates", async
     const d1 = createD1Adapter(database);
     const media = (itemId, itemName) => ({ itemId, itemName, itemType: "Movie", originalTitle: itemName, year: 2026 });
     const write = (nodeName, eventAt, phase, sessionFingerprint, sessionStrength, itemId, itemName = itemId) => (
-      Database.upsertServerWatchLifecycle(d1, {
+      kernel.upsertServerWatchLifecycle(d1, {
         nodeName,
         eventAt,
         phase,
@@ -1026,8 +1036,8 @@ test("server watch lifecycle keeps snapshots coupled to admitted writes across d
       media: { itemId: "parallel-item", itemName, itemType: "Movie" }
     });
     const [first, second] = await Promise.all([
-      Database.upsertServerWatchLifecycle(d1, event("Accepted media")),
-      Database.upsertServerWatchLifecycle(d1, event("Rejected overwrite"))
+      kernel.upsertServerWatchLifecycle(d1, event("Accepted media")),
+      kernel.upsertServerWatchLifecycle(d1, event("Rejected overwrite"))
     ]);
     assert.deepEqual([first.admitted, second.admitted], [true, false]);
     assert.deepEqual(
@@ -1055,21 +1065,21 @@ test("server watch lifecycle falls back safely against a v8 table", async () => 
       media: { itemId: "legacy-item", itemName: "Legacy movie", itemType: "Movie" }
     };
 
-    const started = await Database.upsertServerWatchLifecycle(d1, { ...common, eventAt: startedAt, phase: "started" });
-    const progress = await Database.upsertServerWatchLifecycle(d1, {
+    const started = await kernel.upsertServerWatchLifecycle(d1, { ...common, eventAt: startedAt, phase: "started" });
+    const progress = await kernel.upsertServerWatchLifecycle(d1, {
       ...common,
       eventAt: "2026-07-26T14:10:00.000Z",
       phase: "progress"
     });
-    const stopped = await Database.upsertServerWatchLifecycle(d1, { ...common, eventAt: stoppedAt, phase: "stopped" });
+    const stopped = await kernel.upsertServerWatchLifecycle(d1, { ...common, eventAt: stoppedAt, phase: "stopped" });
     assert.deepEqual(started, { admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" });
     assert.deepEqual(progress, { admitted: false, schemaVersion: 8, reason: "schema_v8_progress_disabled" });
     assert.deepEqual(stopped, { admitted: true, schemaVersion: 8, reason: "schema_v8_fallback" });
     assert.equal(getColumns(database, "server_last_watch").has("playback_event_phase"), false);
     assert.equal(database.prepare("SELECT last_watched_at FROM server_last_watch WHERE node_name = ?").get("v8-node").last_watched_at, stoppedAt);
-    GLOBALS.ServerRecordWatchSessions.set("v8-pending", { nodeName: "v8-node" });
-    Database.invalidateD1SchemaReadiness(d1);
-    assert.equal(GLOBALS.ServerRecordWatchSessions.size, 0);
+    isolateState.ServerRecordWatchSessions.set("v8-pending", { nodeName: "v8-node" });
+    kernel.invalidateD1SchemaReadiness(d1);
+    assert.equal(isolateState.ServerRecordWatchSessions.size, 0);
   } finally {
     database.close();
   }
@@ -1084,11 +1094,11 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
 
-    await Database.upsertServerLastWatch(d1, "server-a", new Date(now + 2000).toISOString());
-    await Database.upsertServerLastWatch(d1, "server-a", new Date(now + 1000).toISOString());
+    await kernel.upsertServerLastWatch(d1, "server-a", new Date(now + 2000).toISOString());
+    await kernel.upsertServerLastWatch(d1, "server-a", new Date(now + 1000).toISOString());
     await Promise.all([
-      Database.upsertServerLastWatch(d1, "server-a", nowIso),
-      Database.upsertServerLastWatch(d1, "server-a", new Date(now + 3000).toISOString(), {
+      kernel.upsertServerLastWatch(d1, "server-a", nowIso),
+      kernel.upsertServerLastWatch(d1, "server-a", new Date(now + 3000).toISOString(), {
         itemId: "movie-3000",
         itemName: "Latest movie",
         itemType: "Movie",
@@ -1096,21 +1106,21 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
         year: 2026
       })
     ]);
-    const lastWatch = await Database.getServerLastWatch(d1, ["server-a", "server-b"]);
+    const lastWatch = await kernel.getServerLastWatch(d1, ["server-a", "server-b"]);
     assert.equal(lastWatch.get("server-a")?.lastWatchedAt, new Date(now + 3000).toISOString());
     assert.equal(lastWatch.has("server-b"), false);
 
-    await Database.persistServerRecordProbeSnapshots(d1, [{
+    await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "server-a",
       counts: { movies: 4, series: 5, episodes: 6, errors: {} },
       checkedAt: new Date(now + 5000).toISOString()
     }]);
-    await Database.persistServerRecordProbeSnapshots(d1, [{
+    await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "server-a",
       counts: { movies: 1, series: 2, episodes: 3, errors: {} },
       checkedAt: new Date(now + 4000).toISOString()
     }]);
-    const snapshots = await Database.getServerRecordSnapshots(d1, ["server-a"]);
+    const snapshots = await kernel.getServerRecordSnapshots(d1, ["server-a"]);
     assert.deepEqual(snapshots.get("server-a")?.counts, {
       movies: 4,
       series: 5,
@@ -1129,12 +1139,12 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       year: 2026,
       watchedAt: new Date(now + 3000).toISOString()
     });
-    await Database.persistServerRecordProbeSnapshots(d1, [{
+    await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "server-a",
       counts: { movies: null, series: 7, episodes: 8, errors: { movies: "http_503" } },
       checkedAt: new Date(now + 6000).toISOString()
     }]);
-    assert.deepEqual((await Database.getServerRecordSnapshots(d1, ["server-a"])).get("server-a")?.counts, {
+    assert.deepEqual((await kernel.getServerRecordSnapshots(d1, ["server-a"])).get("server-a")?.counts, {
       movies: null,
       series: 7,
       episodes: 8,
@@ -1143,27 +1153,27 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       checkedAt: new Date(now + 6000).toISOString(),
       source: "persisted"
     });
-    assert.equal(await Database.persistServerRecordProbeSnapshots(d1, [{
+    assert.equal(await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "server-a",
       counts: { movies: null, series: null, episodes: null, errors: { movies: "offline" } },
       checkedAt: new Date(now + 6000).toISOString()
     }]), 0);
 
-    const bootstrap = await Database.bootstrapD1Schema(d1, "logs-core");
+    const bootstrap = await kernel.bootstrapD1Schema(d1, "logs-core");
     assert.equal(bootstrap.runtimeTablesReady, true);
     assert.equal(bootstrap.schemaReady, true);
     assert.equal(bootstrap.statsReady, true);
-    assert.equal((await Database.ensureLogsFtsSchema(d1)).rebuilt, true);
+    assert.equal((await kernel.ensureLogsFtsSchema(d1)).rebuilt, true);
 
-    await Database.upsertAuthFailureEntry(d1, "203.0.113.10", {
+    await kernel.upsertAuthFailureEntry(d1, "203.0.113.10", {
       failCount: 2,
       expiresAt: now + 60_000,
       updatedAt: now
     });
-    assert.equal((await Database.getAuthFailureEntry(d1, "203.0.113.10")).failCount, 2);
-    assert.equal(await Database.deleteAuthFailureEntry(d1, "203.0.113.10"), true);
+    assert.equal((await kernel.getAuthFailureEntry(d1, "203.0.113.10")).failCount, 2);
+    assert.equal(await kernel.deleteAuthFailureEntry(d1, "203.0.113.10"), true);
 
-    await Database.putCfDashboardCacheEntry(d1, {
+    await kernel.putCfDashboardCacheEntry(d1, {
       cacheKey: "dashboard:smoke",
       zoneId: "zone-smoke",
       bucketDate: "2026-07-19",
@@ -1173,10 +1183,10 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       expiresAt: now + 60_000,
       updatedAt: now
     });
-    assert.equal((await Database.getCfDashboardCacheEntry(d1, "dashboard:smoke"))?.zoneId, "zone-smoke");
-    assert.equal(await Database.deleteCfDashboardCacheEntry(d1, "dashboard:smoke"), true);
+    assert.equal((await kernel.getCfDashboardCacheEntry(d1, "dashboard:smoke"))?.zoneId, "zone-smoke");
+    assert.equal(await kernel.deleteCfDashboardCacheEntry(d1, "dashboard:smoke"), true);
 
-    await Database.putCfRuntimeCacheEntry(d1, {
+    await kernel.putCfRuntimeCacheEntry(d1, {
       cacheKey: "runtime:smoke",
       cacheGroup: "smoke",
       resourceId: "resource-smoke",
@@ -1185,15 +1195,15 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       expiresAt: now + 60_000,
       updatedAt: now
     });
-    assert.equal((await Database.getCfRuntimeCacheEntry(d1, "runtime:smoke"))?.payload?.ok, true);
+    assert.equal((await kernel.getCfRuntimeCacheEntry(d1, "runtime:smoke"))?.payload?.ok, true);
 
-    await Database.patchOpsStatus({ db: d1 }, {
+    await kernel.patchOpsStatus({ db: d1 }, {
       log: { schemaReady: true, statsReady: true, ftsReady: true },
       scheduled: { status: "smoke" }
     });
-    assert.equal((await Database.getOpsStatusSection({ db: d1 }, "scheduled")).status, "smoke");
+    assert.equal((await kernel.getOpsStatusSection({ db: d1 }, "scheduled")).status, "smoke");
 
-    const dnsItems = await Database.upsertDnsIpPoolItems(d1, [{
+    const dnsItems = await kernel.upsertDnsIpPoolItems(d1, [{
       id: "ip-smoke",
       ip: "1.1.1.1",
       ipType: "ipv4",
@@ -1205,9 +1215,9 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       updatedAt: nowIso
     }]);
     assert.equal(dnsItems.length, 1);
-    assert.equal((await Database.getDnsIpPoolItems(d1)).length, 1);
+    assert.equal((await kernel.getDnsIpPoolItems(d1)).length, 1);
 
-    await Database.persistDnsIpPoolSources({ db: d1 }, [{
+    await kernel.persistDnsIpPoolSources({ db: d1 }, [{
       id: "source-smoke",
       name: "Smoke source",
       url: "https://example.test/ips.txt",
@@ -1219,14 +1229,14 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       createdAt: nowIso,
       updatedAt: nowIso
     }]);
-    assert.equal((await Database.getDnsIpPoolSourcesFromDb(d1)).length, 1);
-    assert.equal(await Database.updateDnsIpPoolSourceFetchState(d1, "source-smoke", {
+    assert.equal((await kernel.getDnsIpPoolSourcesFromDb(d1)).length, 1);
+    assert.equal(await kernel.updateDnsIpPoolSourceFetchState(d1, "source-smoke", {
       lastFetchAt: nowIso,
       lastFetchStatus: "success",
       lastFetchCount: 1
     }), true);
 
-    await Database.upsertDnsIpPoolFetchCacheEntry(d1, {
+    await kernel.upsertDnsIpPoolFetchCacheEntry(d1, {
       signature: "fetch-smoke",
       items: dnsItems,
       sourceResults: [],
@@ -1235,9 +1245,9 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       cachedAtMs: now,
       expiresAtMs: now + 60_000
     });
-    assert.equal((await Database.getDnsIpPoolFetchCacheEntry(d1, "fetch-smoke"))?.importedCount, 1);
+    assert.equal((await kernel.getDnsIpPoolFetchCacheEntry(d1, "fetch-smoke"))?.importedCount, 1);
 
-    await Database.upsertDnsIpProbeCacheEntry(d1, {
+    await kernel.upsertDnsIpProbeCacheEntry(d1, {
       ip: "1.1.1.1",
       entryColo: "HKG",
       probeStatus: "success",
@@ -1245,29 +1255,29 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       probedAt: nowIso,
       expiresAt: now + 60_000
     });
-    assert.equal((await Database.getDnsIpProbeCacheEntry(d1, "1.1.1.1", "HKG"))?.latencyMs, 12);
-    assert.equal((await Database.getDnsIpProbeCacheEntries(d1, ["1.1.1.1"], "HKG")).length, 1);
+    assert.equal((await kernel.getDnsIpProbeCacheEntry(d1, "1.1.1.1", "HKG"))?.latencyMs, 12);
+    assert.equal((await kernel.getDnsIpProbeCacheEntries(d1, ["1.1.1.1"], "HKG")).length, 1);
 
-    await Database.upsertStatsHourlyBuckets(d1, [{
+    await kernel.upsertStatsHourlyBuckets(d1, [{
       bucketDate: "2026-07-19",
       bucketHour: 12,
       requestCount: 3,
       playCount: 1,
       playbackInfoCount: 1
     }]);
-    assert.equal((await Database.getDailyStatsHourly(d1, "2026-07-19"))[0]?.request_count, 3);
+    assert.equal((await kernel.getDailyStatsHourly(d1, "2026-07-19"))[0]?.request_count, 3);
 
-    const lease = await Database.tryAcquireScheduledLeaseWithDb(d1, {
+    const lease = await kernel.tryAcquireScheduledLeaseWithDb(d1, {
       token: "lease-smoke",
       owner: "test",
       leaseMs: 60_000
     });
     assert.equal(lease.acquired, true);
-    assert.equal((await Database.renewScheduledLeaseWithDb(d1, "lease-smoke", 60_000, { owner: "test" }))?.token, "lease-smoke");
-    assert.equal(await Database.releaseScheduledLeaseWithDb(d1, "lease-smoke"), true);
+    assert.equal((await kernel.renewScheduledLeaseWithDb(d1, "lease-smoke", 60_000, { owner: "test" }))?.token, "lease-smoke");
+    assert.equal(await kernel.releaseScheduledLeaseWithDb(d1, "lease-smoke"), true);
 
-    GLOBALS.LogQueue.length = 0;
-    GLOBALS.LogQueue.push({
+    isolateState.LogQueue.length = 0;
+    isolateState.LogQueue.push({
       timestamp: now,
       nodeName: "runtime-node",
       requestPath: "/Items/runtime",
@@ -1284,10 +1294,10 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       detailJson: JSON.stringify({ deliveryMode: "direct", protocolFailureReason: "timeout" }),
       createdAt: nowIso
     });
-    await Logger.flush({ DB: d1 });
+    await logger.flush({ DB: d1 });
     assert.equal(database.prepare("SELECT COUNT(*) AS total FROM proxy_logs WHERE node_name = ?").get("runtime-node").total, 1);
 
-    const likeResponse = await Database.ApiHandlers.getLogs({
+    const likeResponse = await adminActions.getLogs({
       page: 1,
       pageSize: 10,
       paginationMode: "offset",
@@ -1303,7 +1313,7 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
     assert.equal(likeResponse.status, 200);
     assert.equal((await likeResponse.json()).logs.length, 1);
 
-    const ftsResponse = await Database.ApiHandlers.getLogs({
+    const ftsResponse = await adminActions.getLogs({
       page: 1,
       pageSize: 10,
       filters: { keyword: "runtime", searchMode: "fts" }
@@ -1333,14 +1343,14 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
         cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
       ) VALUES ('expired-smoke', 'test', 'test', '{}', 1, 1, 1);
     `);
-    const tidyPlan = await Database.buildD1TidyPlan({ DB: d1 }, {
+    const tidyPlan = await kernel.buildD1TidyPlan({ DB: d1 }, {
       db: d1,
       config: { logRetentionDays: 7 },
       mode: "manual",
       maintenanceMode: "smart",
       nowMs: now
     });
-    const tidyResult = await Database.applyD1TidyPlan(tidyPlan, {
+    const tidyResult = await kernel.applyD1TidyPlan(tidyPlan, {
       env: { DB: d1 },
       db: d1,
       mode: "manual"
@@ -1361,7 +1371,7 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       assert.equal(expiredCount, 0, `expired row remained in ${tableName}`);
     }
 
-    assert.equal(await Database.deleteDnsIpPoolItems(d1, ["1.1.1.1"]), 1);
+    assert.equal(await kernel.deleteDnsIpPoolItems(d1, ["1.1.1.1"]), 1);
   } finally {
     database.close();
   }
@@ -1377,23 +1387,23 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       async put(key, value) { nodeValues.set(key, String(value)); },
       async delete(key) { nodeValues.delete(key); }
     };
-    await Database.upsertServerLastWatch(d1, "alpha", "2026-07-25T01:00:00.000Z", {
+    await kernel.upsertServerLastWatch(d1, "alpha", "2026-07-25T01:00:00.000Z", {
       itemId: "alpha-item",
       itemName: "Alpha item",
       itemType: "Movie"
     });
-    await Database.persistServerRecordProbeSnapshots(d1, [{
+    await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "alpha",
       counts: { movies: 1, series: 2, episodes: 3, errors: {} },
       checkedAt: "2026-07-25T01:30:00.000Z"
     }]);
-    await Database.upsertServerLastWatch(d1, "beta", "2026-07-25T02:00:00.000Z", {
+    await kernel.upsertServerLastWatch(d1, "beta", "2026-07-25T02:00:00.000Z", {
       itemId: "beta-item",
       itemName: "Beta item",
       itemType: "Episode",
       seriesName: "Beta series"
     });
-    await Database.persistServerRecordProbeSnapshots(d1, [{
+    await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "beta",
       counts: { movies: 4, series: 5, episodes: 6, errors: {} },
       checkedAt: "2026-07-25T02:30:00.000Z"
@@ -1405,11 +1415,11 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       nextNode: { target: "https://beta.example" },
       nodeChanged: true
     };
-    await Database.applyPreparedNodeMutation(rename, { kv, db: d1 });
-    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), false);
-    assert.equal(nodeValues.has(`${Database.PREFIX}beta`), true);
-    const renamedWatch = await Database.getServerLastWatch(d1, ["alpha", "beta"]);
-    const renamedSnapshots = await Database.getServerRecordSnapshots(d1, ["alpha", "beta"]);
+    await kernel.applyPreparedNodeMutation(rename, { kv, db: d1 });
+    assert.equal(nodeValues.has(`${kernel.PREFIX}alpha`), false);
+    assert.equal(nodeValues.has(`${kernel.PREFIX}beta`), true);
+    const renamedWatch = await kernel.getServerLastWatch(d1, ["alpha", "beta"]);
+    const renamedSnapshots = await kernel.getServerRecordSnapshots(d1, ["alpha", "beta"]);
     assert.equal(renamedWatch.has("alpha"), false);
     assert.equal(renamedWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
     assert.equal(renamedSnapshots.has("alpha"), false);
@@ -1432,23 +1442,23 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       watchedAt: "2026-07-25T02:00:00.000Z"
     });
 
-    await Database.rollbackPreparedNodeMutation(rename, { kv, db: d1 });
-    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), true);
-    assert.equal(nodeValues.has(`${Database.PREFIX}beta`), false);
-    const restoredWatch = await Database.getServerLastWatch(d1, ["alpha", "beta"]);
+    await kernel.rollbackPreparedNodeMutation(rename, { kv, db: d1 });
+    assert.equal(nodeValues.has(`${kernel.PREFIX}alpha`), true);
+    assert.equal(nodeValues.has(`${kernel.PREFIX}beta`), false);
+    const restoredWatch = await kernel.getServerLastWatch(d1, ["alpha", "beta"]);
     assert.equal(restoredWatch.get("alpha")?.lastWatchedAt, "2026-07-25T01:00:00.000Z");
     assert.equal(restoredWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
 
-    await Database.applyPreparedNodeMutation({
+    await kernel.applyPreparedNodeMutation({
       previousName: "alpha",
       previousNode: { target: "https://alpha.example" },
       nextName: "alpha",
       nextNode: null,
       nodeChanged: true
     }, { kv, db: d1 });
-    const deletedWatch = await Database.getServerLastWatch(d1, ["alpha"]);
-    const deletedSnapshots = await Database.getServerRecordSnapshots(d1, ["alpha"]);
-    assert.equal(nodeValues.has(`${Database.PREFIX}alpha`), false);
+    const deletedWatch = await kernel.getServerLastWatch(d1, ["alpha"]);
+    const deletedSnapshots = await kernel.getServerRecordSnapshots(d1, ["alpha"]);
+    assert.equal(nodeValues.has(`${kernel.PREFIX}alpha`), false);
     assert.equal(deletedWatch.has("alpha"), false);
     assert.equal(deletedSnapshots.has("alpha"), false);
   } finally {

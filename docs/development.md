@@ -21,7 +21,7 @@
 ## 开始前
 
 - 先读根 `worker.md` 和任务对应的专题文档。
-- 优先检查根 `worker.js` 与根 `frontend/`，不要从历史目录推断当前行为。
+- Worker 修改优先检查根 `worker/` ESM 源码；发布与部署核对根 `worker.js` 生成产物。前端检查根 `frontend/`，不要从历史目录推断当前行为。
 - 涉及管理台边界时，先核对页面入口、启动动作、六个主视图、八个设置视觉分区和五个保存分组。
 - 涉及 Cache API、`ctx.waitUntil()`、Request/Response、`compatibility_flags` 或平台限制时，先查 `developers.cloudflare.com`，重点核对 Workers Cache API、缓存工作方式、Runtime Context 和平台限制。
 
@@ -29,10 +29,10 @@
 
 正式开发环境使用 Windows PowerShell，不依赖 WSL：
 
-- Node.js 版本由 `frontend/.nvmrc` 与 `frontend/package.json#engines` 约束。
+- Node.js 版本由根 `package.json#engines`、`frontend/.nvmrc` 与 `frontend/package.json#engines` 共同约束，当前最低版本为 24.15.0。
 - Python 版本由根 `.python-version` 约束；当前基线为 Python 3.14.6。`scripts/extract-ui-from-js.py` 的最低语法要求为 Python 3.10。
 - Git 使用 Windows 版 Git。
-- Wrangler 不要求全局安装，通过 `npx wrangler@latest` 调用。
+- Wrangler 不要求全局安装，由根 workspace 锁定并通过 `npx wrangler` 调用。
 
 首次进入仓库后验证工具链并安装锁定依赖：
 
@@ -42,8 +42,8 @@ npm --version
 python --version
 py --version
 git --version
-npx wrangler@latest --version
-npm --prefix frontend ci
+npm ci
+npx wrangler --version
 ```
 
 Python UI 提取工具可通过以下命令验证：
@@ -78,7 +78,7 @@ ADMIN_PASS=<password>
 
 ```powershell
 Copy-Item .dev.vars.example .dev.vars
-npx wrangler@latest dev --local --ip 127.0.0.1 --port 8787 --env-file .dev.vars
+npx wrangler dev --local --ip 127.0.0.1 --port 8787 --env-file .dev.vars
 ```
 
 在第二个 Windows PowerShell 终端启动前端：
@@ -129,20 +129,27 @@ npx wrangler@latest d1 execute <DATABASE_NAME> --local --command="SELECT name, t
 `tests/` 保存自动化断言，`scripts/` 保存可执行工程工具。两者保持独立目录，通过以下只读入口统一执行常用提交前检查：
 
 ```bash
-node scripts/check-project.mjs
+npm run check
 ```
 
-该命令依次运行 Worker 语法检查、Worker 防御边界回归、配置/KV 安全回归、D1 migration SQLite fixture、前端增强 VM 回归、管理台组合一致性、CDN 路径检查和 `git diff --check`。正式前端构建仍按下文单独执行，因为构建会改写 `frontend/dist/`。
+该命令依次运行全部 Worker ESM 源码语法检查、Facade/循环/导入架构门禁、根 `worker.js` freshness 重建比对、Worker 产物 smoke、Worker 防御边界回归、配置/KV 安全回归、D1 migration SQLite fixture、前端增强 VM 回归、管理台组合一致性、CDN 路径检查和 `git diff --check`。正式前端构建仍按下文单独执行，因为构建会改写 `frontend/dist/`。
 
 前端管理台交互回归至少覆盖：同一资源的后发请求不会被先前响应或错误覆盖，显式全量刷新能够取代普通读取，确认到提交期间的重复动作只产生一次管理 API 写入，失败后控件恢复可用；同时检查异步状态播报、busy 属性和弹窗焦点恢复。优先使用 `tests/frontend-runtime-enhancements.test.mjs` 的 VM/mock 行为测试，字符串断言只用于生成入口、静态可访问性属性和同步链完整性。
 
 ### Worker
 
-修改 `worker.js` 后至少运行：
+修改 `worker/` 后先生成根产物并执行源码、架构与 freshness 门禁：
 
 ```bash
-node --check worker.js
+npm run build:worker
+npm run check:worker-syntax
+npm run check:worker-architecture
+npm run check:worker-bundle
 ```
+
+根 `worker.js` 顶部带生成标记且不得手工编辑。行为测试通过 `worker/testing/hooks.js` 调用唯一的 `createWorkerApplication()`，取得同一套三个具名 Facade、冻结的生产 Worker handler，以及按 `kv`、`d1`、`cache`、`fetch`、`clock` 分区的测试平台；默认生产组合不公开测试内核。测试不得重建 proxy/runtime 或修改旧操作袋；仅白盒边界断言可从 `worker/runtime/application-facades.js` 具名导入，不得恢复已删除模块或 `globalThis` test hooks。Vite 使用 ES2022、单 ES chunk、不压缩和 hidden source map；`.worker-dist/` 只供本地/CI 使用，不进入 Release。
+
+Facade 连接回归必须确认：直接调用 `AdminConsoleFacade.handle()` 与生产 handler 对未认证管理读写都返回 `401`；普通节点路径不经过管理 Facade，`NodeProxyFacade.handle()` 缺少显式 `routeContext` 时拒绝执行；`ScheduledMaintenanceFacade.handle()` 对每次事件只登记一个 `waitUntil` 任务，空 binding、租约忙、续租失败和部分存储失败均通过同一观测链收口。
 
 涉及管理台防御边界、全局设置、KV 整理、D1 schema、HTML 壳缓存、isolate 内存缓存或 OpsStatus 读取收口时，还要运行聚焦回归：
 
@@ -190,9 +197,8 @@ D1 管理动作统一以 `initLogsDb` 作为管理台“初始化 DB”入口；
 正式前端构建应在 Windows PowerShell 中运行。在 Windows PowerShell 已定位到仓库根目录时执行：
 
 ```powershell
-Set-Location frontend
-npm run build
-npm run build:cdn
+npm run build:frontend
+npm run build:release
 ```
 
 重点检查：

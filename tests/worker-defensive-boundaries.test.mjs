@@ -2,76 +2,360 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-await import("../worker.js");
+import { createTestApplication } from "../worker/testing/hooks.js";
+import {
+  AdminConsoleFacade,
+  Config,
+  NodeProxyFacade,
+  ScheduledMaintenanceFacade,
+  buildCanonicalWorkerMetadataCacheKey,
+  buildDailyTelegramSummaryMessage,
+  buildDnsIpWorkspaceSummary,
+  buildMediaAggregationIdentity,
+  buildMediaAggregationMatchFingerprintHash,
+  buildMediaAggregationSourceId,
+  buildMediaAggregationSourceIdV2,
+  buildPosterBrowserConfig,
+  buildProbeUpstreamUrl,
+  buildProxyAccessRuleProfile,
+  buildResolvedAdminIndexState,
+  buildServerRecordExpiry,
+  buildServerRecordPosterMetadata,
+  buildUpstreamProxyUrl,
+  buildWorkerMetadataCacheIdentityPartition,
+  buildWorkerMetadataCacheLookupRequest,
+  buildWorkerMetadataCachePolicyRevision,
+  buildWorkerMetadataPrewarmIdentityPartition,
+  createTargetRecord,
+  createWorkerApplication,
+  defineAnalyticsCacheMethods,
+  defineDatabaseStatusMethods,
+  defineNodeRepositoryMethods,
+  getDueScheduledClockSlots,
+  getRuntimeConfig,
+  hasWorkerMetadataPrivateIdentity,
+  invalidateNodesRevisionCache,
+  invalidateRuntimeConfigCache,
+  isEmbyWebProxyPath,
+  isolateState,
+  matchMediaAggregationIdentities,
+  mediaAggregationProviderIdsMatch,
+  normalizeMediaAggregationTitle,
+  normalizePosterBrowserOrigin,
+  normalizeTmdbBrowserToken,
+  parseMediaAggregationSourceId,
+  resolveEffectiveRoutingDecisionMode,
+  resolveMediaAggregationCredentials,
+  resolvePlaybackInfoRewriteUrlMode,
+  resolveRoutingDecisionMode,
+  runSingleFlight,
+  runWithConcurrency,
+  sanitizeRuntimeConfig,
+  serializeBoundedLogDetailJson,
+  verifyMediaAggregationSourceSignature
+} from "../worker/runtime/application-facades.js";
 
-const hooks = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
+const hooks = createTestApplication();
 assert.ok(hooks, "worker.js must expose Node test hooks");
 
 const {
-  Config,
-  GLOBALS,
-  Database,
-  CacheManager,
-  Logger,
-  Proxy,
-  RuntimeEntry,
-  isEmbyWebProxyPath,
-  buildWorkerMetadataCacheIdentityPartition,
-  buildWorkerMetadataPrewarmIdentityPartition,
-  buildWorkerMetadataCachePolicyRevision,
-  buildCanonicalWorkerMetadataCacheKey,
-  buildWorkerMetadataCacheLookupRequest,
-  hasWorkerMetadataPrivateIdentity,
-  buildProxyAccessRuleProfile,
-  serializeBoundedLogDetailJson,
-  runSingleFlight,
-  getRuntimeConfig,
-  invalidateRuntimeConfigCache,
-  invalidateNodesRevisionCache,
-  buildResolvedAdminIndexState,
+  adminConsole,
+  nodeProxy,
+  scheduledMaintenance,
+  testPlatform,
+  workerHandler
+} = hooks;
+const {
+  adminActions,
+  adminShell,
+  logger,
+  proxyService,
+  routeTesting
+} = testPlatform.fetch;
+const {
   buildAdminLocalIndexUploadRecord,
   buildAdminRemoteShellErrorContent,
-  renderAdminRemoteShellErrorPage,
-  isAdminIndexSetupForced,
-  ensureAdminRemoteTailwindConfigGlobal,
   buildAdminRemoteShellCacheKeyRequest,
   buildAdminRemoteShellLegacyCacheKeyRequest,
-  fetchAdminRemoteShellStoredResponse,
   buildAdminRemoteShellStoredResponse,
-  patchAdminShellRuntimeStatus,
-  renderRemoteAdminPage,
-  renderAdminLoginPage,
-  createTargetRecord,
-  buildUpstreamProxyUrl,
-  buildProbeUpstreamUrl,
-  renderAdminPage,
-  isAcceptedAdminHtmlDocumentContentType,
-  isMutableJsdelivrGithubAssetUrl,
-  renderAdminReleaseVendorAsset,
-  isAdminWarmRoute,
-  warmAdminReleaseVendorEntries,
   buildAdminWarmSubrequest,
+  ensureAdminRemoteTailwindConfigGlobal,
+  fetchAdminRemoteShellStoredResponse,
+  isAcceptedAdminHtmlDocumentContentType,
   isAdminWarmResponseSuccessful,
-  buildDailyTelegramSummaryMessage,
-  buildMediaAggregationSourceId,
-  buildMediaAggregationSourceIdV2,
-  parseMediaAggregationSourceId,
-  mediaAggregationProviderIdsMatch,
-  normalizeMediaAggregationTitle,
-  buildMediaAggregationIdentity,
-  matchMediaAggregationIdentities,
-  buildMediaAggregationMatchFingerprintHash,
-  verifyMediaAggregationSourceSignature,
-  normalizePosterBrowserOrigin,
-  normalizeTmdbBrowserToken,
-  buildPosterBrowserConfig,
-  buildServerRecordPosterMetadata,
-  resolveMediaAggregationCredentials,
-  buildServerRecordExpiry,
-  getDueScheduledClockSlots
-} = hooks;
+  isAdminIndexSetupForced,
+  isAdminWarmRoute,
+  isMutableJsdelivrGithubAssetUrl,
+  patchAdminShellRuntimeStatus,
+  renderAdminLoginPage,
+  renderAdminPage,
+  renderAdminReleaseVendorAsset,
+  renderAdminRemoteShellErrorPage,
+  renderRemoteAdminPage,
+  warmAdminReleaseVendorEntries
+} = adminShell;
+const kernel = testPlatform.kv;
+const cachePort = testPlatform.cache;
 
-assert.ok(RuntimeEntry && typeof RuntimeEntry === "object", "missing Node test hook: RuntimeEntry");
+assert.ok(routeTesting && typeof routeTesting === "object", "missing route test adapter");
+
+test("workflow facades replace capability ports and compatibility composition", () => {
+  const facades = createWorkerApplication();
+  assert.equal(Object.isFrozen(facades), true);
+  assert.ok(facades.adminConsole instanceof AdminConsoleFacade);
+  assert.ok(facades.nodeProxy instanceof NodeProxyFacade);
+  assert.ok(facades.scheduledMaintenance instanceof ScheduledMaintenanceFacade);
+  assert.equal("capabilityPorts" in facades, false);
+  assert.equal("compatibilityOperations" in facades, false);
+  assert.equal("testingSupport" in facades, false);
+  assert.equal(typeof facades.adminConsole.handle, "function");
+  assert.equal(typeof facades.nodeProxy.handle, "function");
+  assert.equal(typeof facades.scheduledMaintenance.handle, "function");
+  for (const facade of [facades.adminConsole, facades.nodeProxy, facades.scheduledMaintenance]) {
+    assert.deepEqual(
+      Object.getOwnPropertyNames(Object.getPrototypeOf(facade)).filter(name => name !== "constructor"),
+      ["handle"]
+    );
+  }
+});
+
+test("test composition exposes the production facades and handler", () => {
+  assert.deepEqual(Object.keys(hooks).sort(), [
+    "adminConsole",
+    "nodeProxy",
+    "scheduledMaintenance",
+    "testPlatform",
+    "workerHandler"
+  ]);
+  assert.deepEqual(Object.keys(testPlatform).sort(), ["cache", "clock", "d1", "fetch", "kv"]);
+  assert.ok(adminConsole instanceof AdminConsoleFacade);
+  assert.ok(nodeProxy instanceof NodeProxyFacade);
+  assert.ok(scheduledMaintenance instanceof ScheduledMaintenanceFacade);
+  assert.notStrictEqual(testPlatform.kv, testPlatform.d1);
+  assert.equal(typeof testPlatform.fetch.fetchRequest, "function");
+  assert.equal(typeof testPlatform.clock.now, "function");
+  assert.equal(typeof workerHandler.fetch, "function");
+  assert.equal(typeof workerHandler.scheduled, "function");
+  assert.equal(Object.isFrozen(workerHandler), true);
+});
+
+test("node proxy facade consumes a precomputed route context", async () => {
+  const request = new Request("https://worker.test/");
+  const env = {};
+  const ctx = { waitUntil() {} };
+  const routeContext = routeTesting.buildFetchRouteContext(request, env);
+
+  const response = await nodeProxy.handle(request, env, ctx, routeContext);
+
+  assert.equal(response.status, 404);
+  assert.equal(routeContext.hostPrefixMatch, null);
+  await assert.rejects(nodeProxy.handle(request, env, ctx, null), {
+    name: "TypeError",
+    message: "NodeProxyFacade.handle requires routeContext"
+  });
+});
+
+test("production handler dispatches ordinary node routes without entering the admin facade", async () => {
+  const application = createWorkerApplication();
+  application.adminConsole.handle = async () => {
+    throw new Error("ordinary node route entered AdminConsoleFacade");
+  };
+
+  const response = await application.workerHandler.fetch(
+    new Request("https://worker.test/missing-node/System/Info"),
+    {},
+    { waitUntil() {} }
+  );
+
+  assert.equal(response.status, 404);
+});
+
+test("direct Admin facade and production handler reject unauthenticated read and write actions", async () => {
+  const env = {
+    ADMIN_PATH: "/admin",
+    ADMIN_PASS: "admin-password",
+    JWT_SECRET: "admin-secret"
+  };
+  const ctx = { waitUntil() {} };
+  const buildRequest = action => new Request("https://worker.test/admin", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action, data: action === "saveConfig" ? { rateLimitRpm: 30 } : {} })
+  });
+
+  for (const action of ["getConfig", "saveConfig"]) {
+    const direct = await adminConsole.handle(buildRequest(action), env, ctx);
+    const production = await workerHandler.fetch(buildRequest(action), env, ctx);
+    assert.equal(direct.status, 401, `${action} direct facade status`);
+    assert.equal(production.status, 401, `${action} production status`);
+    assert.deepEqual(await direct.json(), await production.json());
+  }
+});
+
+test("production scheduled handler owns waitUntil for empty and busy bindings", async () => {
+  const emptyTasks = [];
+  workerHandler.scheduled(
+    { scheduledTime: Date.UTC(2026, 6, 30, 0, 0, 0) },
+    {},
+    { waitUntil(task) { emptyTasks.push(task); } }
+  );
+  assert.equal(emptyTasks.length, 1);
+  await emptyTasks[0];
+
+  const originals = {
+    getDB: kernel.getDB,
+    getKV: kernel.getKV,
+    patchOpsStatus: kernel.patchOpsStatus,
+    tryAcquireScheduledLeaseWithDb: kernel.tryAcquireScheduledLeaseWithDb
+  };
+  const statusPatches = [];
+  try {
+    kernel.getDB = () => ({});
+    kernel.getKV = () => null;
+    kernel.tryAcquireScheduledLeaseWithDb = async () => ({
+      acquired: false,
+      backend: "d1",
+      reason: "lease_busy",
+      lock: { expiresAt: "2026-07-30T00:05:00.000Z" }
+    });
+    kernel.patchOpsStatus = async (_env, patch) => {
+      statusPatches.push(patch);
+      return patch;
+    };
+    const busyTasks = [];
+    workerHandler.scheduled(
+      { scheduledTime: Date.UTC(2026, 6, 30, 0, 1, 0) },
+      {},
+      { waitUntil(task) { busyTasks.push(task); } }
+    );
+    assert.equal(busyTasks.length, 1);
+    await busyTasks[0];
+    assert.equal(statusPatches.length, 1);
+    assert.equal(statusPatches[0].scheduled.lock.status, "busy");
+    assert.equal(statusPatches[0].scheduled.lock.backend, "d1");
+  } finally {
+    for (const [name, value] of Object.entries(originals)) kernel[name] = value;
+  }
+});
+
+test("formal Worker source tree omits legacy composition and public service forwarders", async () => {
+  const facadeSource = await readFile(new URL("../worker/runtime/application-facades.js", import.meta.url), "utf8");
+  assert.match(facadeSource, /class \{[\s\S]*AdminConsoleFacade|AdminConsoleFacade = class/);
+  for (const relativePath of [
+    "../worker/runtime/capabilities.js",
+    "../worker/runtime/compat-facades.js",
+    "../worker/features/admin/public/actions/service.js"
+  ]) {
+    await assert.rejects(readFile(new URL(relativePath, import.meta.url), "utf8"), { code: "ENOENT" });
+  }
+});
+
+function createStatusTestService(db) {
+  return defineDatabaseStatusMethods({
+    bindingPort: {
+      getDB: () => db,
+      getKV: () => null
+    },
+    schemaReadinessPort: {
+      isD1SchemaReadyCached: () => true,
+      markD1SchemaReady() {}
+    },
+    statusPersistence: {
+      buildOpsStatusRootPatch: patch => patch,
+      cacheOpsStatusPayload() {},
+      ensureSysStatusTable: async () => true,
+      flushOpsStatusShadow: async () => ({}),
+      getOpsStatusDbScope: sectionName => sectionName
+        ? kernel.OPS_STATUS_SECTION_SCOPES[sectionName]
+        : kernel.OPS_STATUS_DB_SCOPE_ROOT,
+      getOpsStatusPayloadCache: () => null,
+      getOpsStatusShadowPatch: activeDb => isolateState.OpsStatusShadowCache.get(activeDb)?.pendingPatch || {},
+      getOpsStatusShadowState: () => null,
+      resolveOpsStatusStores: value => ({ db: value, kv: null })
+    }
+  });
+}
+
+test("DNS IP workspace summary includes current-host and combined rows", () => {
+  const summary = buildDnsIpWorkspaceSummary(
+    [{ ipType: "IPv4", countryCode: "US", coloCode: "SJC" }],
+    [{ ipType: "IPv6", countryCode: "DE", coloCode: "FRA" }]
+  );
+
+  assert.deepEqual(summary.currentHost, {
+    ipCount: 1,
+    ipv4Count: 1,
+    ipv6Count: 0,
+    countryCount: 1,
+    coloCount: 1
+  });
+  assert.equal(summary.sharedPool.ipv6Count, 1);
+  assert.deepEqual(summary.combined, {
+    ipCount: 2,
+    ipv4Count: 1,
+    ipv6Count: 1,
+    countryCount: 2,
+    coloCount: 2
+  });
+});
+
+test("PlaybackInfo URL mode is emitted only for rewrite mode", () => {
+  assert.equal(resolvePlaybackInfoRewriteUrlMode("rewrite"), "relative");
+  assert.equal(resolvePlaybackInfoRewriteUrlMode("passthrough"), "");
+  assert.equal(resolvePlaybackInfoRewriteUrlMode("unknown"), "");
+});
+
+test("routing decision mode honors global config and node inheritance", () => {
+  assert.equal(resolveRoutingDecisionMode({ routingDecisionMode: "legacy" }), "legacy");
+  assert.equal(resolveRoutingDecisionMode({ routingDecisionMode: "simplified" }), "simplified");
+  assert.equal(resolveEffectiveRoutingDecisionMode({ routingDecisionMode: "inherit" }, { routingDecisionMode: "legacy" }), "legacy");
+  assert.equal(resolveEffectiveRoutingDecisionMode({ routingDecisionMode: "simplified" }, { routingDecisionMode: "legacy" }), "simplified");
+
+  const requestTraits = {
+    legacyEntryOffloadEnabled: true,
+    legacyEntryOffloadReason: "legacy_direct",
+    nodeDirectMedia: false,
+    directStaticAssets: false,
+    directHlsDash: false
+  };
+  assert.equal(proxyService.getEntryRoutingDecision({ routingDecisionMode: "legacy", requestTraits }).action, "DIRECT");
+  assert.equal(proxyService.getEntryRoutingDecision({ routingDecisionMode: "simplified", requestTraits }).action, "PROXY");
+});
+
+test("runtime config sanitization migrates aliases once and drops retired fields", () => {
+  const sanitized = sanitizeRuntimeConfig({
+    directSourceNodes: ["Alpha"],
+    enableH2: true,
+    tmdbApiKey: "retired",
+    releaseRepo: "retired/repo",
+    tgDailyReportTime: "08:30"
+  });
+
+  assert.deepEqual(sanitized.sourceDirectNodes, ["Alpha"]);
+  assert.equal(sanitized.protocolStrategy, "balanced");
+  assert.deepEqual(sanitized.tgDailyReportClockTimes, ["08:30"]);
+  for (const key of ["directSourceNodes", "enableH2", "tmdbApiKey", "releaseRepo", "tgDailyReportTime"]) {
+    assert.equal(Object.prototype.hasOwnProperty.call(sanitized, key), false);
+  }
+});
+
+test("runWithConcurrency preserves order and enforces normalized limits", async () => {
+  const measure = async (limit) => {
+    let active = 0;
+    let peak = 0;
+    const values = await runWithConcurrency([1, 2, 3, 4, 5], limit, async value => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      active -= 1;
+      return value * 2;
+    });
+    return { peak, values };
+  };
+
+  assert.deepEqual(await measure(2), { peak: 2, values: [2, 4, 6, 8, 10] });
+  assert.deepEqual(await measure(Number.NaN), { peak: 1, values: [2, 4, 6, 8, 10] });
+});
 
 test("node probes preserve target base paths and require a successful response", async () => {
   const rootTarget = createTargetRecord("https://origin.example");
@@ -137,15 +421,15 @@ test("node probes preserve target base paths and require a successful response",
       return new Response(null, { status: responses.shift() });
     }
   }, async () => {
-    assert.equal(await Database.pingTarget("https://origin.example/emby", 1000), 9999);
-    const successLatency = await Database.pingTarget("https://origin.example", 1000, {
+    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
+    const successLatency = await kernel.pingTarget("https://origin.example", 1000, {
       probePath: "/emby/System/Info/Public"
     });
     assert.ok(successLatency >= 0 && successLatency < 9999);
-    const fallbackLatency = await Database.pingTarget("https://origin.example/emby", 1000);
+    const fallbackLatency = await kernel.pingTarget("https://origin.example/emby", 1000);
     assert.ok(fallbackLatency >= 0 && fallbackLatency < 9999);
-    assert.equal(await Database.pingTarget("https://origin.example/emby", 1000), 9999);
-    assert.equal(await Database.pingTarget("https://origin.example/emby", 1000), 9999);
+    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
+    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
   });
   assert.deepEqual(requests, [
     { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
@@ -159,14 +443,14 @@ test("node probes preserve target base paths and require a successful response",
 });
 
 test("failover probes reuse the base-aware probe URL and accept all 2xx responses", async () => {
-  const originalProbeRequest = Proxy.performFailoverProbeRequest;
+  const originalProbeRequest = proxyService.performFailoverProbeRequest;
   const requests = [];
-  Proxy.performFailoverProbeRequest = async (_execution, probeUrl, method) => {
+  proxyService.performFailoverProbeRequest = async (_execution, probeUrl, method) => {
     requests.push({ url: probeUrl.toString(), method });
     return new Response(null, { status: method === "HEAD" ? 405 : 204 });
   };
   try {
-    const result = await Proxy.runFailoverProbeCandidate({
+    const result = await proxyService.runFailoverProbeCandidate({
       failoverContext: { probePath: "/emby/system/ping", probeTimeoutMs: 1000 }
     }, createTargetRecord("https://origin.example/emby"));
     assert.equal(result.ok, true);
@@ -177,7 +461,7 @@ test("failover probes reuse the base-aware probe URL and accept all 2xx response
       { url: "https://origin.example/emby/system/ping", method: "GET" }
     ]);
   } finally {
-    Proxy.performFailoverProbeRequest = originalProbeRequest;
+    proxyService.performFailoverProbeRequest = originalProbeRequest;
   }
 });
 
@@ -337,7 +621,7 @@ test("poster search metadata uses movie and series identities without provider i
 });
 
 test("node summaries preserve credential state without exposing passwords", () => {
-  const summary = Database.buildNodeSummary("backup", {
+  const summary = kernel.buildNodeSummary("backup", {
     displayName: "Backup",
     target: "https://backup.test",
     lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
@@ -354,14 +638,14 @@ test("node summaries preserve credential state without exposing passwords", () =
   assert.equal(summary.serverRecordEmbyCredentialsConfigured, true);
   assert.equal(summary.serverRecordEmbyCredentialSource, "record");
   assert.equal(summary.serverRecordEmbyPassword, undefined);
-  const normalizedSummary = Database.normalizeNodeSummaryIndex([summary]).nodes[0];
+  const normalizedSummary = kernel.normalizeNodeSummaryIndex([summary]).nodes[0];
   assert.equal(normalizedSummary.mediaAggregationEmbyCredentialsConfigured, true);
   assert.equal(normalizedSummary.serverRecordEmbyCredentialsConfigured, true);
   assert.equal(normalizedSummary.serverRecordEmbyUsername, "stats-user");
   assert.equal(normalizedSummary.serverRecordEmbyCredentialSource, "record");
   assert.equal(normalizedSummary.serverRecordEmbyPassword, undefined);
 
-  const inheritedSummary = Database.buildNodeSummary("node-credentials", {
+  const inheritedSummary = kernel.buildNodeSummary("node-credentials", {
     target: "https://node-credentials.test",
     lines: [{ id: "main", target: "https://node-credentials.test" }],
     activeLineId: "main",
@@ -375,9 +659,9 @@ test("node summaries preserve credential state without exposing passwords", () =
 });
 
 test("admin node reads expose credential usernames and password states without passwords", async () => {
-  const originalGetNodeForRead = Database.getNodeForRead;
-  const originalGetAdminRevisionsForRead = Database.getAdminRevisionsForRead;
-  Database.getNodeForRead = async () => ({
+  const originalGetNodeForRead = kernel.getNodeForRead;
+  const originalGetAdminRevisionsForRead = kernel.getAdminRevisionsForRead;
+  kernel.getNodeForRead = async () => ({
     target: "https://backup.test",
     lines: [{ id: "main", target: "https://backup.test" }],
     activeLineId: "main",
@@ -386,9 +670,9 @@ test("admin node reads expose credential usernames and password states without p
     mediaAggregationEmbyUsername: "node-user",
     mediaAggregationEmbyPassword: "node-password"
   });
-  Database.getAdminRevisionsForRead = async () => ({});
+  kernel.getAdminRevisionsForRead = async () => ({});
   try {
-    const response = await Database.ApiHandlers.getNode({ name: "backup" }, {
+    const response = await adminActions.getNode({ name: "backup" }, {
       env: {},
       ctx: null,
       kv: null,
@@ -402,14 +686,14 @@ test("admin node reads expose credential usernames and password states without p
     assert.equal(payload.node.serverRecordEmbyPassword, undefined);
     assert.equal(payload.node.serverRecordEmbyCredentialsConfigured, true);
   } finally {
-    Database.getNodeForRead = originalGetNodeForRead;
-    Database.getAdminRevisionsForRead = originalGetAdminRevisionsForRead;
+    kernel.getNodeForRead = originalGetNodeForRead;
+    kernel.getAdminRevisionsForRead = originalGetAdminRevisionsForRead;
   }
 });
 
 test("server record password reveal returns only the requested effective credential", async () => {
-  const originalGetNodeForRead = Database.getNodeForRead;
-  Database.getNodeForRead = async nodeName => String(nodeName).toLowerCase() === "record-node"
+  const originalGetNodeForRead = kernel.getNodeForRead;
+  kernel.getNodeForRead = async nodeName => String(nodeName).toLowerCase() === "record-node"
     ? {
         serverRecordEmbyUsername: "record-user",
         serverRecordEmbyPassword: "record-password",
@@ -424,18 +708,18 @@ test("server record password reveal returns only the requested effective credent
     : null;
   try {
     const context = { env: { ADMIN_PASS: "admin-password" }, ctx: null, request: null };
-    const requiredResponse = await Database.ApiHandlers.getServerRecordCredential({ nodeName: "record-node" }, context);
+    const requiredResponse = await adminActions.getServerRecordCredential({ nodeName: "record-node" }, context);
     assert.equal(requiredResponse.status, 428);
     assert.equal((await requiredResponse.json()).error.code, "RECENT_AUTH_REQUIRED");
 
-    const rejectedResponse = await Database.ApiHandlers.getServerRecordCredential({
+    const rejectedResponse = await adminActions.getServerRecordCredential({
       nodeName: "record-node",
       adminPassword: "incorrect"
     }, context);
     assert.equal(rejectedResponse.status, 401);
     assert.equal((await rejectedResponse.json()).error.code, "RECENT_AUTH_FAILED");
 
-    const response = await Database.ApiHandlers.getServerRecordCredential({
+    const response = await adminActions.getServerRecordCredential({
       nodeName: "record-node",
       adminPassword: "admin-password"
     }, context);
@@ -450,7 +734,7 @@ test("server record password reveal returns only the requested effective credent
       }
     });
 
-    const inheritedResponse = await Database.ApiHandlers.getServerRecordCredential({
+    const inheritedResponse = await adminActions.getServerRecordCredential({
       nodeName: "inherited-node",
       adminPassword: "admin-password"
     }, context);
@@ -464,19 +748,19 @@ test("server record password reveal returns only the requested effective credent
       }
     });
 
-    const missingResponse = await Database.ApiHandlers.getServerRecordCredential({
+    const missingResponse = await adminActions.getServerRecordCredential({
       nodeName: "missing-node",
       adminPassword: "admin-password"
     }, context);
     assert.equal(missingResponse.status, 404);
     assert.equal((await missingResponse.json()).error.code, "NODE_NOT_FOUND");
   } finally {
-    Database.getNodeForRead = originalGetNodeForRead;
+    kernel.getNodeForRead = originalGetNodeForRead;
   }
 });
 
-test("PlaybackInfo rewrite removes non-object media sources before client delivery", () => {
-  const result = Proxy.rewritePlaybackInfoPayload(
+test("PlaybackInfo rewrite decodes object sources and removes invalid entries before client delivery", () => {
+  const result = proxyService.rewritePlaybackInfoPayload(
     {
       proxyPath: "/Items/primary/PlaybackInfo",
       requestUrl: new URL("https://proxy.test/node/Items/primary/PlaybackInfo"),
@@ -488,7 +772,8 @@ test("PlaybackInfo rewrite removes non-object media sources before client delive
     {
       MediaSources: [
         JSON.stringify({ Id: "encoded-source" }),
-        { Id: "valid-source", Path: "/Videos/primary/stream" }
+        { Id: "valid-source", Path: "/Videos/primary/stream" },
+        "invalid-source"
       ]
     },
     new URL("https://upstream.test"),
@@ -496,16 +781,15 @@ test("PlaybackInfo rewrite removes non-object media sources before client delive
   );
 
   assert.equal(result.rewriteState, "applied");
-  assert.equal(result.payload.MediaSources.length, 1);
-  assert.equal(result.payload.MediaSources[0].Id, "valid-source");
+  assert.deepEqual(result.payload.MediaSources.map(source => source.Id), ["encoded-source", "valid-source"]);
   assert.ok(result.payload.MediaSources.every(source => source && typeof source === "object" && !Array.isArray(source)));
 });
 
 test("media aggregation appends matched backup sources without a database mapping", async () => {
-  const originalGetNode = Database.getNode;
-  const originalAuth = Proxy.getMediaAggregationAuth;
-  const originalFetchJson = Proxy.fetchMediaAggregationJson;
-  const originalRewrite = Proxy.rewritePlaybackInfoPayload;
+  const originalGetNode = kernel.getNode;
+  const originalAuth = proxyService.getMediaAggregationAuth;
+  const originalFetchJson = proxyService.fetchMediaAggregationJson;
+  const originalRewrite = proxyService.rewritePlaybackInfoPayload;
   const backupNode = {
     name: "backup",
     secret: "backup-secret",
@@ -514,9 +798,9 @@ test("media aggregation appends matched backup sources without a database mappin
     lines: [{ id: "main", target: "https://backup.test" }],
     activeLineId: "main"
   };
-  Database.getNode = async () => backupNode;
-  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
-  Proxy.fetchMediaAggregationJson = async (_execution, _node, proxyPath) => {
+  kernel.getNode = async () => backupNode;
+  proxyService.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  proxyService.fetchMediaAggregationJson = async (_execution, _node, proxyPath) => {
     if (String(proxyPath).endsWith("/Items")) {
       return {
         payload: {
@@ -535,7 +819,7 @@ test("media aggregation appends matched backup sources without a database mappin
     }
     return null;
   };
-  Proxy.rewritePlaybackInfoPayload = (execution, payload) => ({
+  proxyService.rewritePlaybackInfoPayload = (execution, payload) => ({
     payload: {
       ...payload,
       MediaSources: payload.MediaSources.map(source => ({
@@ -560,7 +844,7 @@ test("media aggregation appends matched backup sources without a database mappin
       requestUrl: new URL("https://worker.test/primary/Items/1/PlaybackInfo"),
       rawRequestUrl: new URL("https://worker.test/primary/Items/1/PlaybackInfo")
     };
-    const result = await Proxy.aggregateMediaSources(
+    const result = await proxyService.aggregateMediaSources(
       execution,
       { Type: "Movie", Name: "Example Movie", ProductionYear: 2024, ProviderIds: { Tmdb: "123" }, MediaSources: [{ Id: "main" }] },
       { activeTargetBase: new URL("https://primary.test") }
@@ -574,15 +858,15 @@ test("media aggregation appends matched backup sources without a database mappin
     assert.equal(parsedSource.mediaSourceId, "abc");
     assert.equal(await verifyMediaAggregationSourceSignature(parsedSource, "aggregation-signing-secret"), true);
   } finally {
-    Database.getNode = originalGetNode;
-    Proxy.getMediaAggregationAuth = originalAuth;
-    Proxy.fetchMediaAggregationJson = originalFetchJson;
-    Proxy.rewritePlaybackInfoPayload = originalRewrite;
+    kernel.getNode = originalGetNode;
+    proxyService.getMediaAggregationAuth = originalAuth;
+    proxyService.fetchMediaAggregationJson = originalFetchJson;
+    proxyService.rewritePlaybackInfoPayload = originalRewrite;
   }
 });
 
 test("media aggregation logs into a backup with an account-only global credential", async () => {
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
   const requests = [];
   const node = {
     name: "backup",
@@ -610,7 +894,7 @@ test("media aggregation logs into a backup with an account-only global credentia
       });
     }
   }, async () => {
-    const auth = await Proxy.getMediaAggregationAuth(execution, "backup", node, "");
+    const auth = await proxyService.getMediaAggregationAuth(execution, "backup", node, "");
     assert.equal(auth.token, "backup-token");
     assert.equal(auth.userId, "backup-user");
   });
@@ -621,11 +905,11 @@ test("media aggregation logs into a backup with an account-only global credentia
     Pw: ""
   });
   assert.equal(new Headers(requests[0].init.headers).get("X-Emby-Token"), null);
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
 });
 
 test("media aggregation login prefers fixed credentials stored on the backup node", async () => {
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
   const requests = [];
   const node = {
     name: "backup",
@@ -654,22 +938,22 @@ test("media aggregation login prefers fixed credentials stored on the backup nod
       });
     }
   }, async () => {
-    assert.ok(await Proxy.getMediaAggregationAuth(execution, "backup", node, ""));
+    assert.ok(await proxyService.getMediaAggregationAuth(execution, "backup", node, ""));
   });
   assert.deepEqual(JSON.parse(String(requests[0].init.body)), {
     Username: "node-user",
     Pw: " node-password "
   });
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
 });
 
 test("media aggregation routes a magic PlaybackInfo source to the backup item", async () => {
-  const originalGetNode = Database.getNode;
-  const originalAuth = Proxy.getMediaAggregationAuth;
-  const originalValidateSource = Proxy.validateMediaAggregationPlaybackSource;
-  const originalPrepareExecutionContext = Proxy.prepareExecutionContext;
-  const originalParseTargetRecords = Proxy.parseTargetRecords;
-  const originalBuildProxyRequestState = Proxy.buildProxyRequestState;
+  const originalGetNode = kernel.getNode;
+  const originalAuth = proxyService.getMediaAggregationAuth;
+  const originalValidateSource = proxyService.validateMediaAggregationPlaybackSource;
+  const originalPrepareExecutionContext = proxyService.prepareExecutionContext;
+  const originalParseTargetRecords = proxyService.parseTargetRecords;
+  const originalBuildProxyRequestState = proxyService.buildProxyRequestState;
   const backupNode = {
     name: "backup",
     secret: "backup-secret",
@@ -692,9 +976,9 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
   let preparedRequest = null;
   let preparedPath = "";
   let routedBodyText = "";
-  Database.getNode = async () => backupNode;
-  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
-  Proxy.validateMediaAggregationPlaybackSource = async (_execution, parsedSource) => ({
+  kernel.getNode = async () => backupNode;
+  proxyService.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  proxyService.validateMediaAggregationPlaybackSource = async (_execution, parsedSource) => ({
     ok: true,
     auth: { token: "backup-token", userId: "backup-user" },
     targetRecord: {
@@ -704,7 +988,7 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
     source: { ...parsedSource, version: "AGG1", identityHash: "legacy_revalidated_identity" },
     status: "legacy_revalidated"
   });
-  Proxy.prepareExecutionContext = async (nextRequest, node, proxyPath, nodeName, nodeKey, env, ctx, options) => {
+  proxyService.prepareExecutionContext = async (nextRequest, node, proxyPath, nodeName, nodeKey, env, ctx, options) => {
     preparedRequest = nextRequest;
     preparedPath = proxyPath;
     return {
@@ -726,7 +1010,7 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
       effectiveMediaAuthMode: "auto"
     };
   };
-  Proxy.parseTargetRecords = () => ({
+  proxyService.parseTargetRecords = () => ({
     targetRecords: [{
       targetUrl: new URL("https://backup.test"),
       originText: "https://backup.test",
@@ -735,7 +1019,7 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
     }],
     invalidResponse: null
   });
-  Proxy.buildProxyRequestState = async (nextRequest) => {
+  proxyService.buildProxyRequestState = async (nextRequest) => {
     routedBodyText = await nextRequest.clone().text();
     return {
       newHeaders: new Headers(nextRequest.headers),
@@ -743,7 +1027,7 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
     };
   };
   try {
-    const route = await Proxy.resolveMediaAggregationPlaybackRoute({
+    const route = await proxyService.resolveMediaAggregationPlaybackRoute({
       request,
       requestUrl,
       rawRequestUrl: requestUrl,
@@ -769,20 +1053,20 @@ test("media aggregation routes a magic PlaybackInfo source to the backup item", 
     assert.equal(route.execution.mediaAggregationRouted, true);
     assert.equal(route.transport.newHeaders.get("X-Emby-Token"), "backup-token");
   } finally {
-    Database.getNode = originalGetNode;
-    Proxy.getMediaAggregationAuth = originalAuth;
-    Proxy.validateMediaAggregationPlaybackSource = originalValidateSource;
-    Proxy.prepareExecutionContext = originalPrepareExecutionContext;
-    Proxy.parseTargetRecords = originalParseTargetRecords;
-    Proxy.buildProxyRequestState = originalBuildProxyRequestState;
+    kernel.getNode = originalGetNode;
+    proxyService.getMediaAggregationAuth = originalAuth;
+    proxyService.validateMediaAggregationPlaybackSource = originalValidateSource;
+    proxyService.prepareExecutionContext = originalPrepareExecutionContext;
+    proxyService.parseTargetRecords = originalParseTargetRecords;
+    proxyService.buildProxyRequestState = originalBuildProxyRequestState;
   }
 });
 
 test("media aggregation mirrors progress to the backup with real source IDs", async () => {
-  const originalGetNode = Database.getNode;
-  const originalAuth = Proxy.getMediaAggregationAuth;
-  const originalParseTargetRecords = Proxy.parseTargetRecords;
-  const originalFetch = Proxy.performFetchWithTimeout;
+  const originalGetNode = kernel.getNode;
+  const originalAuth = proxyService.getMediaAggregationAuth;
+  const originalParseTargetRecords = proxyService.parseTargetRecords;
+  const originalFetch = proxyService.performFetchWithTimeout;
   const backupNode = {
     name: "backup",
     headers: {},
@@ -794,9 +1078,9 @@ test("media aggregation mirrors progress to the backup with real source IDs", as
   const bodyText = JSON.stringify({ ItemId: "123", MediaSourceId: magicId, PositionTicks: 42 });
   const pending = [];
   let mirroredRequest = null;
-  Database.getNode = async () => backupNode;
-  Proxy.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
-  Proxy.parseTargetRecords = () => ({
+  kernel.getNode = async () => backupNode;
+  proxyService.getMediaAggregationAuth = async () => ({ token: "backup-token", userId: "backup-user" });
+  proxyService.parseTargetRecords = () => ({
     targetRecords: [{
       targetUrl: new URL("https://backup.test"),
       originText: "https://backup.test",
@@ -804,7 +1088,7 @@ test("media aggregation mirrors progress to the backup with real source IDs", as
       absoluteBasePrefix: "https://backup.test"
     }]
   });
-  Proxy.performFetchWithTimeout = async (targetUrl, buildOptions) => {
+  proxyService.performFetchWithTimeout = async (targetUrl, buildOptions) => {
     mirroredRequest = { url: targetUrl.toString(), options: await buildOptions() };
     return {
       response: new Response(null, { status: 204 }),
@@ -819,7 +1103,7 @@ test("media aggregation mirrors progress to the backup with real source IDs", as
       headers: { "Content-Type": "application/json", "X-Emby-Token": "client-token" },
       body: bodyText
     });
-    await Proxy.maybeScheduleMediaAggregationProgressMirror({
+    await proxyService.maybeScheduleMediaAggregationProgressMirror({
       request,
       requestUrl,
       requestMethod: "POST",
@@ -853,17 +1137,17 @@ test("media aggregation mirrors progress to the backup with real source IDs", as
       PositionTicks: 42
     });
   } finally {
-    Database.getNode = originalGetNode;
-    Proxy.getMediaAggregationAuth = originalAuth;
-    Proxy.parseTargetRecords = originalParseTargetRecords;
-    Proxy.performFetchWithTimeout = originalFetch;
+    kernel.getNode = originalGetNode;
+    proxyService.getMediaAggregationAuth = originalAuth;
+    proxyService.parseTargetRecords = originalParseTargetRecords;
+    proxyService.performFetchWithTimeout = originalFetch;
   }
 });
 
 test("media aggregation foreground collection uses first result plus grace and returns all failures early", async () => {
   const pending = [];
   const startedAt = Date.now();
-  const collected = await Proxy.collectMediaAggregationResults([
+  const collected = await proxyService.collectMediaAggregationResults([
     async () => {
       await new Promise(resolve => setTimeout(resolve, 10));
       return { nodeName: "fast", status: "matched_provider", sources: [{ Id: "fast" }] };
@@ -886,7 +1170,7 @@ test("media aggregation foreground collection uses first result plus grace and r
   await Promise.all(pending);
 
   const failedAt = Date.now();
-  const allFailed = await Proxy.collectMediaAggregationResults([
+  const allFailed = await proxyService.collectMediaAggregationResults([
     async () => ({ nodeName: "a", status: "auth_failed", sources: [] }),
     async () => ({ nodeName: "b", status: "no_match", sources: [] })
   ], { firstResultTimeoutMs: 1000, gracePeriodMs: 50, hardDeadlineAt: Date.now() + 1000 });
@@ -895,12 +1179,12 @@ test("media aggregation foreground collection uses first result plus grace and r
 });
 
 test("media aggregation retries a node's next line after the active line fails", async () => {
-  const originalGetNode = Database.getNode;
-  const originalAuth = Proxy.getMediaAggregationAuth;
-  const originalFind = Proxy.findMediaAggregationCandidate;
-  const originalBuild = Proxy.buildMediaAggregationInjectedSources;
+  const originalGetNode = kernel.getNode;
+  const originalAuth = proxyService.getMediaAggregationAuth;
+  const originalFind = proxyService.findMediaAggregationCandidate;
+  const originalBuild = proxyService.buildMediaAggregationInjectedSources;
   const attemptedTargets = [];
-  Database.getNode = async () => ({
+  kernel.getNode = async () => ({
     name: "backup",
     lines: [
       { id: "active", target: "https://offline.test" },
@@ -908,7 +1192,7 @@ test("media aggregation retries a node's next line after the active line fails",
     ],
     activeLineId: "active"
   });
-  Proxy.getMediaAggregationAuth = async (execution, _name, _node, _prefix, targetRecord) => {
+  proxyService.getMediaAggregationAuth = async (execution, _name, _node, _prefix, targetRecord) => {
     attemptedTargets.push(targetRecord.targetUrl.hostname);
     if (targetRecord.targetUrl.hostname === "offline.test") {
       execution.mediaAggregationLastAuthStatus = "network_error";
@@ -916,20 +1200,20 @@ test("media aggregation retries a node's next line after the active line fails",
     }
     return { token: "token", userId: "user", targetRecord };
   };
-  Proxy.findMediaAggregationCandidate = async () => ({
+  proxyService.findMediaAggregationCandidate = async () => ({
     ok: true,
     item: { Id: "item-2", Type: "Movie" },
     identity: buildMediaAggregationIdentity({ Type: "Movie", ProviderIds: { Tmdb: "2" } }),
     match: { status: "matched_provider", fingerprint: { type: "movie", provider: { key: "tmdb", value: "2" } } }
   });
-  Proxy.buildMediaAggregationInjectedSources = async () => ({
+  proxyService.buildMediaAggregationInjectedSources = async () => ({
     ok: true,
     status: "matched_provider",
     identityHash: "identity_hash_for_fallback",
     sources: [{ Id: "signed-source" }]
   });
   try {
-    const result = await Proxy.aggregateMediaAggregationNode({
+    const result = await proxyService.aggregateMediaAggregationNode({
       env: {},
       ctx: null,
       finalOrigin: "*",
@@ -940,16 +1224,16 @@ test("media aggregation retries a node's next line after the active line fails",
     assert.equal(result.status, "matched_provider");
     assert.equal(result.sources.length, 1);
   } finally {
-    Database.getNode = originalGetNode;
-    Proxy.getMediaAggregationAuth = originalAuth;
-    Proxy.findMediaAggregationCandidate = originalFind;
-    Proxy.buildMediaAggregationInjectedSources = originalBuild;
+    kernel.getNode = originalGetNode;
+    proxyService.getMediaAggregationAuth = originalAuth;
+    proxyService.findMediaAggregationCandidate = originalFind;
+    proxyService.buildMediaAggregationInjectedSources = originalBuild;
   }
 });
 
 test("partial aggregation responses skip PlaybackInfo caching and instance mappings stay compact", async () => {
-  GLOBALS.PlaybackInfoResponseCache.clear();
-  GLOBALS.MediaAggregationInstanceMap.clear();
+  isolateState.PlaybackInfoResponseCache.clear();
+  isolateState.MediaAggregationInstanceMap.clear();
   const execution = {
     requestTraits: { isPlaybackInfoRequest: true },
     requestMethod: "GET",
@@ -958,20 +1242,20 @@ test("partial aggregation responses skip PlaybackInfo caching and instance mappi
     playbackInfoCacheKey: "partial-cache-key",
     mediaAggregationCacheable: false
   };
-  assert.equal(await Proxy.storePlaybackInfoResponseCache(execution, new Response("{}", { headers: { "Content-Type": "application/json" } })), false);
-  assert.equal(GLOBALS.PlaybackInfoResponseCache.size, 0);
+  assert.equal(await proxyService.storePlaybackInfoResponseCache(execution, new Response("{}", { headers: { "Content-Type": "application/json" } })), false);
+  assert.equal(isolateState.PlaybackInfoResponseCache.size, 0);
   assert.equal(execution.playbackInfoCacheState, "skip_partial_aggregation");
 
   for (let index = 0; index < 70; index += 1) {
-    Proxy.cacheMediaAggregationInstance(`primary-${index}`, `node-${index}`, `revision-${index}`, `item-${index}`, `hash-${index}`, "matched_provider");
+    proxyService.cacheMediaAggregationInstance(`primary-${index}`, `node-${index}`, `revision-${index}`, `item-${index}`, `hash-${index}`, "matched_provider");
   }
-  assert.equal(GLOBALS.MediaAggregationInstanceMap.size, Config.Defaults.MediaAggregationInstanceMapMax);
-  assert.doesNotMatch(JSON.stringify([...GLOBALS.MediaAggregationInstanceMap.values()]), /token|password|https?:\/\//i);
-  GLOBALS.MediaAggregationInstanceMap.clear();
+  assert.equal(isolateState.MediaAggregationInstanceMap.size, Config.Defaults.MediaAggregationInstanceMapMax);
+  assert.doesNotMatch(JSON.stringify([...isolateState.MediaAggregationInstanceMap.values()]), /token|password|https?:\/\//i);
+  isolateState.MediaAggregationInstanceMap.clear();
 });
 
 test("tampered AGG2 PlaybackInfo selections are cleared before primary fallback", async () => {
-  const originalGetNode = Database.getNode;
+  const originalGetNode = kernel.getNode;
   const identityHash = await buildMediaAggregationMatchFingerprintHash({ fingerprint: { type: "movie", provider: { key: "tmdb", value: "123" } } });
   const validId = await buildMediaAggregationSourceIdV2("valid-secret", "backup", "98765", "abc", identityHash);
   const tamperedId = `${validId.slice(0, -1)}${validId.endsWith("A") ? "B" : "A"}`;
@@ -985,9 +1269,9 @@ test("tampered AGG2 PlaybackInfo selections are cleared before primary fallback"
     newHeaders: new Headers({ "Content-Type": "application/json" }),
     transportTemplate: { baseHeaderEntries: [] }
   };
-  Database.getNode = async () => ({ name: "backup", lines: [{ id: "main", target: "https://backup.test" }], activeLineId: "main" });
+  kernel.getNode = async () => ({ name: "backup", lines: [{ id: "main", target: "https://backup.test" }], activeLineId: "main" });
   try {
-    const route = await Proxy.resolveMediaAggregationPlaybackRoute({
+    const route = await proxyService.resolveMediaAggregationPlaybackRoute({
       request: new Request(requestUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: bodyText }),
       requestUrl,
       rawRequestUrl: requestUrl,
@@ -1006,19 +1290,19 @@ test("tampered AGG2 PlaybackInfo selections are cleared before primary fallback"
     assert.equal(requestUrl.searchParams.has("MediaSourceId"), false);
     assert.deepEqual(JSON.parse(transport.preparedBodyText), { ItemId: "123" });
   } finally {
-    Database.getNode = originalGetNode;
+    kernel.getNode = originalGetNode;
   }
 });
 
 test("media aggregation JSON requests classify unsupported, retryable, oversized, and invalid responses", async () => {
-  const originalFetch = Proxy.performFetchWithTimeout;
+  const originalFetch = proxyService.performFetchWithTimeout;
   const responses = [
     new Response("{}", { status: 400, headers: { "Content-Type": "application/json" } }),
     new Response("{}", { status: 503, headers: { "Content-Type": "application/json" } }),
     new Response("not-json", { status: 200, headers: { "Content-Type": "application/json" } }),
     new Response("x".repeat(Config.Defaults.MediaAggregationResponseMaxBytes + 1), { status: 200, headers: { "Content-Type": "application/json" } })
   ];
-  Proxy.performFetchWithTimeout = async (targetUrl) => ({
+  proxyService.performFetchWithTimeout = async (targetUrl) => ({
     response: responses.shift(),
     finalUrl: targetUrl,
     releaseFetchController() {}
@@ -1031,24 +1315,24 @@ test("media aggregation JSON requests classify unsupported, retryable, oversized
   };
   const node = { headers: {}, lines: [{ id: "main", target: "https://backup.test" }], activeLineId: "main" };
   try {
-    const unsupported = await Proxy.fetchMediaAggregationJson(execution, node, "/Items", "");
-    const retryable = await Proxy.fetchMediaAggregationJson(execution, node, "/Items", "");
-    const invalid = await Proxy.fetchMediaAggregationJson(execution, node, "/Items", "");
-    const oversized = await Proxy.fetchMediaAggregationJson(execution, node, "/Items", "");
+    const unsupported = await proxyService.fetchMediaAggregationJson(execution, node, "/Items", "");
+    const retryable = await proxyService.fetchMediaAggregationJson(execution, node, "/Items", "");
+    const invalid = await proxyService.fetchMediaAggregationJson(execution, node, "/Items", "");
+    const oversized = await proxyService.fetchMediaAggregationJson(execution, node, "/Items", "");
     assert.equal(unsupported.status, "query_unsupported");
     assert.equal(retryable.status, "network_error");
     assert.equal(retryable.retryable, true);
     assert.equal(invalid.status, "invalid_json");
     assert.equal(oversized.status, "response_too_large");
   } finally {
-    Proxy.performFetchWithTimeout = originalFetch;
+    proxyService.performFetchWithTimeout = originalFetch;
   }
 });
 
 test("AGG2 identity drift is rejected while a legacy source requires live revalidation", async () => {
-  const originalPrimary = Proxy.resolveMediaAggregationPrimaryRouteIdentity;
-  const originalAuth = Proxy.getMediaAggregationAuth;
-  const originalItemIdentity = Proxy.fetchMediaAggregationItemIdentity;
+  const originalPrimary = proxyService.resolveMediaAggregationPrimaryRouteIdentity;
+  const originalAuth = proxyService.getMediaAggregationAuth;
+  const originalItemIdentity = proxyService.fetchMediaAggregationItemIdentity;
   const primaryIdentity = buildMediaAggregationIdentity({ Type: "Movie", Name: "Primary", ProductionYear: 2024, ProviderIds: { Tmdb: "123" } });
   const validCandidate = buildMediaAggregationIdentity({ Type: "Movie", Name: "Backup", ProductionYear: 2024, ProviderIds: { Tmdb: "123" } });
   const driftedCandidate = buildMediaAggregationIdentity({ Type: "Movie", Name: "Backup", ProductionYear: 2024, ProviderIds: { Tmdb: "999" } });
@@ -1056,9 +1340,9 @@ test("AGG2 identity drift is rejected while a legacy source requires live revali
   const identityHash = await buildMediaAggregationMatchFingerprintHash(match);
   const signedId = await buildMediaAggregationSourceIdV2("identity-secret", "backup", "98765", "abc", identityHash);
   const targetRecord = createTargetRecord("https://backup.test");
-  Proxy.resolveMediaAggregationPrimaryRouteIdentity = async () => primaryIdentity;
-  Proxy.getMediaAggregationAuth = async () => ({ token: "token", userId: "user", targetRecord });
-  Proxy.fetchMediaAggregationItemIdentity = async () => ({
+  proxyService.resolveMediaAggregationPrimaryRouteIdentity = async () => primaryIdentity;
+  proxyService.getMediaAggregationAuth = async () => ({ token: "token", userId: "user", targetRecord });
+  proxyService.fetchMediaAggregationItemIdentity = async () => ({
     ok: true,
     item: { Id: "98765", MediaSources: [{ Id: "abc" }] },
     identity: driftedCandidate
@@ -1072,14 +1356,14 @@ test("AGG2 identity drift is rejected while a legacy source requires live revali
   };
   const targetNode = { lines: [{ id: "main", target: "https://backup.test" }], activeLineId: "main" };
   try {
-    const drifted = await Proxy.validateMediaAggregationPlaybackSource(execution, parseMediaAggregationSourceId(signedId), "123", targetNode);
+    const drifted = await proxyService.validateMediaAggregationPlaybackSource(execution, parseMediaAggregationSourceId(signedId), "123", targetNode);
     assert.equal(drifted.ok, false);
-    Proxy.fetchMediaAggregationItemIdentity = async () => ({
+    proxyService.fetchMediaAggregationItemIdentity = async () => ({
       ok: true,
       item: { Id: "98765", MediaSources: [{ Id: "abc" }] },
       identity: validCandidate
     });
-    const legacy = await Proxy.validateMediaAggregationPlaybackSource(
+    const legacy = await proxyService.validateMediaAggregationPlaybackSource(
       execution,
       parseMediaAggregationSourceId(buildMediaAggregationSourceId("backup", "98765", "abc")),
       "123",
@@ -1088,16 +1372,16 @@ test("AGG2 identity drift is rejected while a legacy source requires live revali
     assert.equal(legacy.ok, true);
     assert.equal(legacy.status, "legacy_revalidated");
   } finally {
-    Proxy.resolveMediaAggregationPrimaryRouteIdentity = originalPrimary;
-    Proxy.getMediaAggregationAuth = originalAuth;
-    Proxy.fetchMediaAggregationItemIdentity = originalItemIdentity;
+    proxyService.resolveMediaAggregationPrimaryRouteIdentity = originalPrimary;
+    proxyService.getMediaAggregationAuth = originalAuth;
+    proxyService.fetchMediaAggregationItemIdentity = originalItemIdentity;
   }
 });
 
 test("PlaybackInfo aggregation cache identity changes with every pool member revision", async () => {
-  const originalGetNodesList = CacheManager.getNodesList;
+  const originalGetNodesList = cachePort.getNodesList;
   let backupRevision = "backup-r1";
-  CacheManager.getNodesList = async () => [
+  cachePort.getNodesList = async () => [
     { name: "primary", cacheRevision: "primary-r1" },
     { name: "backup", cacheRevision: backupRevision }
   ];
@@ -1119,15 +1403,15 @@ test("PlaybackInfo aggregation cache identity changes with every pool member rev
   });
   try {
     const first = buildExecution();
-    await Proxy.prepareMediaAggregationPlaybackInfoCacheRevision(first);
-    const firstKey = Proxy.buildPlaybackInfoCacheKey(first);
+    await proxyService.prepareMediaAggregationPlaybackInfoCacheRevision(first);
+    const firstKey = proxyService.buildPlaybackInfoCacheKey(first);
     backupRevision = "backup-r2";
     const second = buildExecution();
-    await Proxy.prepareMediaAggregationPlaybackInfoCacheRevision(second);
-    const secondKey = Proxy.buildPlaybackInfoCacheKey(second);
+    await proxyService.prepareMediaAggregationPlaybackInfoCacheRevision(second);
+    const secondKey = proxyService.buildPlaybackInfoCacheKey(second);
     assert.notEqual(firstKey, secondKey);
   } finally {
-    CacheManager.getNodesList = originalGetNodesList;
+    cachePort.getNodesList = originalGetNodesList;
   }
 });
 
@@ -1283,17 +1567,17 @@ test("daily server expiry slot is due once per configured local day", () => {
 
 test("server expiry Telegram milestones are deduplicated and playback changes renew signatures", async () => {
   const originalMethods = {
-    getServerRecordsSnapshotPayload: Database.getServerRecordsSnapshotPayload,
-    getOpsStatusPayloadFromDb: Database.getOpsStatusPayloadFromDb,
-    putOpsStatusPayloadToDb: Database.putOpsStatusPayloadToDb,
-    sendTelegramMessage: Database.sendTelegramMessage
+    getServerRecordsSnapshotPayload: kernel.getServerRecordsSnapshotPayload,
+    getOpsStatusPayloadFromDb: kernel.getOpsStatusPayloadFromDb,
+    putOpsStatusPayloadToDb: kernel.putOpsStatusPayloadToDb,
+    sendTelegramMessage: kernel.sendTelegramMessage
   };
   let storedState = null;
   let sendCount = 0;
   let rollingWatchedRevision = "2026-06-28T00:00:00.000Z";
   let fixedWatchedRevision = "2026-06-27T00:00:00.000Z";
   try {
-    Database.getServerRecordsSnapshotPayload = async () => ({
+    kernel.getServerRecordsSnapshotPayload = async () => ({
       records: [7, 3, 1, 0].map((days, index) => ({
         nodeName: `node-${days}`,
         displayName: `Node ${days}`,
@@ -1310,12 +1594,12 @@ test("server expiry Telegram milestones are deduplicated and playback changes re
         }
       }))
     });
-    Database.getOpsStatusPayloadFromDb = async () => storedState;
-    Database.putOpsStatusPayloadToDb = async (_db, _scope, payload) => {
+    kernel.getOpsStatusPayloadFromDb = async () => storedState;
+    kernel.putOpsStatusPayloadToDb = async (_db, _scope, payload) => {
       storedState = payload;
       return true;
     };
-    Database.sendTelegramMessage = async () => {
+    kernel.sendTelegramMessage = async () => {
       sendCount += 1;
       return { ok: true };
     };
@@ -1327,34 +1611,34 @@ test("server expiry Telegram milestones are deduplicated and playback changes re
       tgBotToken: "token",
       tgChatId: "chat"
     };
-    const first = await Database.maybeSendServerExpiryWarnings(env, { config });
+    const first = await kernel.maybeSendServerExpiryWarnings(env, { config });
     assert.equal(first.sent, true);
     assert.equal(first.issueCount, 4);
     assert.equal(sendCount, 1);
 
-    const repeated = await Database.maybeSendServerExpiryWarnings(env, { config });
+    const repeated = await kernel.maybeSendServerExpiryWarnings(env, { config });
     assert.equal(repeated.sent, false);
     assert.equal(repeated.reason, "already_sent");
     assert.equal(sendCount, 1);
 
     fixedWatchedRevision = "2026-06-29T00:00:00.000Z";
     rollingWatchedRevision = "2026-06-29T00:00:00.000Z";
-    const renewed = await Database.maybeSendServerExpiryWarnings(env, { config });
+    const renewed = await kernel.maybeSendServerExpiryWarnings(env, { config });
     assert.equal(renewed.sent, true);
     assert.equal(renewed.issueCount, 1);
     assert.equal(sendCount, 2);
 
-    Database.sendTelegramMessage = async () => {
+    kernel.sendTelegramMessage = async () => {
       throw new Error("telegram unavailable");
     };
     rollingWatchedRevision = "2026-06-30T00:00:00.000Z";
     await assert.rejects(
-      Database.maybeSendServerExpiryWarnings(env, { config }),
+      kernel.maybeSendServerExpiryWarnings(env, { config }),
       /telegram unavailable/
     );
     assert.equal(storedState.signatures.some((signature) => signature.includes(rollingWatchedRevision)), false);
   } finally {
-    Object.assign(Database, originalMethods);
+    Object.assign(kernel, originalMethods);
   }
 });
 
@@ -1457,23 +1741,23 @@ function getComparableDnsRecords(records) {
 }
 
 test("daily Telegram summary places monthly traffic below today's traffic", async () => {
-  const originalBuildDashboardStatsPayload = Database.buildDashboardStatsPayload;
-  const originalGetDashboardMonthlyTrafficPayload = Database.getDashboardMonthlyTrafficPayload;
+  const originalBuildDashboardStatsPayload = kernel.buildDashboardStatsPayload;
+  const originalGetDashboardMonthlyTrafficPayload = kernel.getDashboardMonthlyTrafficPayload;
   const ctx = { waitUntil() {} };
   try {
-    Database.buildDashboardStatsPayload = async () => ({
+    kernel.buildDashboardStatsPayload = async () => ({
       requestCountDisplay: "1,234",
       todayTraffic: "12.5 GB",
       playCount: 56,
       infoCount: 78,
       todayRequests: 1234
     });
-    Database.getDashboardMonthlyTrafficPayload = async (_env, options = {}) => {
+    kernel.getDashboardMonthlyTrafficPayload = async (_env, options = {}) => {
       assert.equal(options.ctx, ctx);
       return { traffic: "345.6 GB" };
     };
 
-    const payload = await Database.buildDailyTelegramSummaryPayload({}, {
+    const payload = await kernel.buildDailyTelegramSummaryPayload({}, {
       config: { scheduleUtcOffsetMinutes: 480 },
       ctx,
       now: new Date("2026-07-19T04:00:00.000Z")
@@ -1491,8 +1775,8 @@ test("daily Telegram summary places monthly traffic below today's traffic", asyn
       "#Cloudflare #Emby #日报"
     ].join("\n"));
   } finally {
-    Database.buildDashboardStatsPayload = originalBuildDashboardStatsPayload;
-    Database.getDashboardMonthlyTrafficPayload = originalGetDashboardMonthlyTrafficPayload;
+    kernel.buildDashboardStatsPayload = originalBuildDashboardStatsPayload;
+    kernel.getDashboardMonthlyTrafficPayload = originalGetDashboardMonthlyTrafficPayload;
   }
 });
 
@@ -1505,7 +1789,7 @@ test("oversized log detail fallback remains valid JSON", () => {
 test("monthly traffic stats are on-demand cached without touching D1", async () => {
   const zoneId = `monthly-zone-${Date.now()}`;
   const { kv } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: {
+    [kernel.CONFIG_KEY]: {
       cfZoneId: zoneId,
       cfApiToken: "monthly-token",
       scheduleUtcOffsetMinutes: 480
@@ -1553,9 +1837,9 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
   const ctx = { waitUntil(task) { backgroundTasks.push(Promise.resolve(task)); } };
 
   invalidateRuntimeConfigCache();
-  GLOBALS.DashboardMonthlyTrafficCache.clear();
+  isolateState.DashboardMonthlyTrafficCache.clear();
   await withWorkerGlobals({ fetch, caches: { default: edgeCache } }, async () => {
-    const firstResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+    const firstResponse = await adminActions.getMonthlyTrafficStats({}, {
       env,
       ctx,
       kv,
@@ -1569,7 +1853,7 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
     const liveRequestCount = graphqlRequestCount;
     await Promise.all(backgroundTasks.splice(0));
 
-    const memoryResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+    const memoryResponse = await adminActions.getMonthlyTrafficStats({}, {
       env,
       ctx,
       kv,
@@ -1578,8 +1862,8 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
     assert.equal((await memoryResponse.json()).cacheStatus, "cache");
     assert.equal(graphqlRequestCount, liveRequestCount);
 
-    GLOBALS.DashboardMonthlyTrafficCache.clear();
-    const edgeResponse = await Database.ApiHandlers.getMonthlyTrafficStats({}, {
+    isolateState.DashboardMonthlyTrafficCache.clear();
+    const edgeResponse = await adminActions.getMonthlyTrafficStats({}, {
       env,
       ctx,
       kv,
@@ -1620,7 +1904,7 @@ test("monthly traffic splits GraphQL windows to one day while preserving edge re
   };
 
   await withWorkerGlobals({ fetch }, async () => {
-    const payload = await Database.buildDashboardMonthlyTrafficPayload({}, {
+    const payload = await kernel.buildDashboardMonthlyTrafficPayload({}, {
       config: {
         cfZoneId: "monthly-zone",
         cfApiToken: "monthly-token",
@@ -1700,9 +1984,9 @@ test("remote shell error responses are no-store and never expose saved secrets",
 test("stable admin shell cache-hit status writes are throttled per D1 binding", async () => {
   const db = { prepare() { throw new Error("unexpected D1 query"); } };
   const env = { DB: db, ADMIN_PATH: "/admin" };
-  const originalPatchOpsStatus = Database.patchOpsStatus;
+  const originalPatchOpsStatus = kernel.patchOpsStatus;
   const writes = [];
-  Database.patchOpsStatus = async (_envOrStore, patch) => {
+  kernel.patchOpsStatus = async (_envOrStore, patch) => {
     writes.push(patch);
     return patch;
   };
@@ -1729,7 +2013,7 @@ test("stable admin shell cache-hit status writes are throttled per D1 binding", 
     await patchAdminShellRuntimeStatus(env, baseStatus);
     assert.equal(writes.length, 1);
     assert.deepEqual(
-      Object.keys(GLOBALS.AdminShellStatusWriteState.get(db) || {}).sort(),
+      Object.keys(isolateState.AdminShellStatusWriteState.get(db) || {}).sort(),
       ["fingerprint", "writePromise", "writtenAt"]
     );
 
@@ -1747,7 +2031,7 @@ test("stable admin shell cache-hit status writes are throttled per D1 binding", 
     });
     assert.equal(writes.length, 3);
   } finally {
-    Database.patchOpsStatus = originalPatchOpsStatus;
+    kernel.patchOpsStatus = originalPatchOpsStatus;
   }
 });
 
@@ -1795,7 +2079,7 @@ test("admin login page emits valid submit interception script", async () => {
 });
 
 test("admin login preserves leading and trailing password whitespace", async () => {
-  const response = await RuntimeEntry.handleFetch(
+  const response = await workerHandler.fetch(
     new Request("https://worker.test/console/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1823,7 +2107,7 @@ test("admin warm route is exact and follows the configured admin path", () => {
 
 test("retired server record poster URLs return ordinary 404 without upstream requests", async () => {
   const env = { ADMIN_PATH: "/console", ADMIN_PASS: "poster-password", JWT_SECRET: "poster-jwt-secret" };
-  const login = await RuntimeEntry.handleFetch(new Request("https://worker.test/console/login", {
+  const login = await workerHandler.fetch(new Request("https://worker.test/console/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password: "poster-password" })
@@ -1831,7 +2115,7 @@ test("retired server record poster URLs return ordinary 404 without upstream req
   const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
   let externalRequests = 0;
   await withWorkerGlobals({ fetch: async () => { externalRequests += 1; return new Response("unexpected"); } }, async () => {
-    const response = await RuntimeEntry.handleFetch(new Request(
+    const response = await workerHandler.fetch(new Request(
       "https://worker.test/console/__server-record-poster/server-a",
       { headers: { Cookie: authCookie } }
     ), env, { waitUntil() {} });
@@ -1841,7 +2125,7 @@ test("retired server record poster URLs return ordinary 404 without upstream req
 });
 
 test("poster browser config action is authenticated, no-store, and isolated from legacy bindings", async () => {
-  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {
+  const { kv } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: {
     tmdbBrowserToken: "admin-tmdb-token",
     doubanBrowserOrigin: "https://admin-douban.example",
     doubanBrowserToken: "admin-douban-token"
@@ -1863,14 +2147,14 @@ test("poster browser config action is authenticated, no-store, and isolated from
     headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
     body: JSON.stringify({ action, ...data })
   });
-  assert.equal((await RuntimeEntry.handleFetch(request(""), env, { waitUntil() {} })).status, 401);
-  const login = await RuntimeEntry.handleFetch(new Request("https://worker.test/console/login", {
+  assert.equal((await workerHandler.fetch(request(""), env, { waitUntil() {} })).status, 401);
+  const login = await workerHandler.fetch(new Request("https://worker.test/console/login", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ password: "poster-password" })
   }), env, { waitUntil() {} });
   const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
-  const response = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  const response = await workerHandler.fetch(request(authCookie), env, { waitUntil() {} });
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("Cache-Control"), "no-store, max-age=0");
   assert.deepEqual(await response.json(), {
@@ -1878,7 +2162,7 @@ test("poster browser config action is authenticated, no-store, and isolated from
     douban: { configured: true, origin: "https://admin-douban.example", token: "admin-douban-token" }
   });
 
-  const cleared = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+  const cleared = await workerHandler.fetch(request(authCookie, "savePosterBrowserSettings", {
     clearTmdbToken: true,
     doubanOrigin: "",
     clearDoubanToken: true
@@ -1891,13 +2175,13 @@ test("poster browser config action is authenticated, no-store, and isolated from
   assert.equal(clearedPayload.posterBrowserBindings.doubanOriginSource, "binding");
   assert.equal(clearedPayload.posterBrowserBindings.doubanTokenSource, "binding");
 
-  const fallback = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  const fallback = await workerHandler.fetch(request(authCookie), env, { waitUntil() {} });
   assert.deepEqual(await fallback.json(), {
     tmdb: { configured: true, token: "browser-tmdb-token" },
     douban: { configured: true, origin: "https://douban.example", token: "browser-douban-token" }
   });
 
-  const rejectedApiKey = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+  const rejectedApiKey = await workerHandler.fetch(request(authCookie, "savePosterBrowserSettings", {
     tmdbToken: "0123456789abcdef0123456789abcdef"
   }), env, { waitUntil() {} });
   assert.equal(rejectedApiKey.status, 400);
@@ -1905,7 +2189,7 @@ test("poster browser config action is authenticated, no-store, and isolated from
   assert.equal(rejectedApiKeyPayload.error.code, "POSTER_TMDB_TOKEN_INVALID");
   assert.match(rejectedApiKeyPayload.error.message, /API 读取访问令牌/);
 
-  const saved = await RuntimeEntry.handleFetch(request(authCookie, "savePosterBrowserSettings", {
+  const saved = await workerHandler.fetch(request(authCookie, "savePosterBrowserSettings", {
     tmdbToken: "Bearer new-admin-tmdb-token",
     doubanOrigin: "https://new-admin-douban.example",
     doubanToken: "new-admin-douban-token"
@@ -1915,7 +2199,7 @@ test("poster browser config action is authenticated, no-store, and isolated from
   assert.equal(savedPayload.config.tmdbBrowserToken, undefined);
   assert.equal(savedPayload.config.doubanBrowserToken, undefined);
   assert.equal(savedPayload.config.doubanBrowserOrigin, "https://new-admin-douban.example");
-  const configured = await RuntimeEntry.handleFetch(request(authCookie), env, { waitUntil() {} });
+  const configured = await workerHandler.fetch(request(authCookie), env, { waitUntil() {} });
   assert.deepEqual(await configured.json(), {
     tmdb: { configured: true, token: "new-admin-tmdb-token" },
     douban: { configured: true, origin: "https://new-admin-douban.example", token: "new-admin-douban-token" }
@@ -1962,7 +2246,7 @@ test("server watch media extracts passive original titles and years", () => {
     preparedBodyText: bodyText,
     newHeaders: new Headers({ "Content-Type": "application/json" })
   };
-  assert.deepEqual(Proxy.resolveServerLastWatchMedia(execution, transport), {
+  assert.deepEqual(proxyService.resolveServerLastWatchMedia(execution, transport), {
     itemId: "episode-1",
     itemName: "第 1 集",
     itemType: "Episode",
@@ -1971,7 +2255,7 @@ test("server watch media extracts passive original titles and years", () => {
     year: 1975
   });
   assert.deepEqual(
-    Proxy.buildServerRecordPlaybackContextMedia({
+    proxyService.buildServerRecordPlaybackContextMedia({
       Id: "episode-1",
       Name: "第 1 集",
       Type: "Episode",
@@ -1992,7 +2276,7 @@ test("server watch media extracts passive original titles and years", () => {
     }
   );
   assert.deepEqual(
-    Proxy.buildServerRecordPlaybackContextMedia({
+    proxyService.buildServerRecordPlaybackContextMedia({
       Id: "episode-2",
       Name: "第 2 集",
       Type: "Episode",
@@ -2010,7 +2294,7 @@ test("server watch media extracts passive original titles and years", () => {
     }
   );
   const oversized = "x".repeat(300);
-  const boundedContext = Proxy.buildServerRecordPlaybackContextMedia({
+  const boundedContext = proxyService.buildServerRecordPlaybackContextMedia({
     Id: oversized,
     Name: oversized,
     Type: "t".repeat(100),
@@ -2026,7 +2310,7 @@ test("server watch media extracts passive original titles and years", () => {
     originalTitle: boundedContext.originalTitle.length
   }, { itemId: 256, itemName: 256, itemType: 64, seriesName: 256, originalTitle: 0 });
 
-  const boundedEvent = Proxy.resolveServerLastWatchMedia({
+  const boundedEvent = proxyService.resolveServerLastWatchMedia({
     ...execution,
     playbackSessionControlPayload: undefined
   }, {
@@ -2051,9 +2335,9 @@ test("server watch media extracts passive original titles and years", () => {
     originalTitle: boundedEvent.originalTitle.length
   }, { itemId: 256, itemName: 256, itemType: 64, seriesName: 256, originalTitle: 0 });
 
-  GLOBALS.ServerRecordPlaybackContexts.clear();
+  isolateState.ServerRecordPlaybackContexts.clear();
   const oversizedPlaybackUrl = `https://worker.test/Items/${oversized}/PlaybackInfo?IsPlayback=true`;
-  assert.equal(Proxy.recordServerRecordPlaybackInfoIntent({
+  assert.equal(proxyService.recordServerRecordPlaybackInfoIntent({
     nodeName: "server-a",
     node: { serverRecord: { enabled: true } },
     requestMethod: "POST",
@@ -2065,11 +2349,11 @@ test("server watch media extracts passive original titles and years", () => {
     }),
     requestTraits: { isPlaybackInfoRequest: true }
   }), true);
-  assert.equal([...GLOBALS.ServerRecordPlaybackContexts.values()][0]?.intent?.itemId.length, 256);
-  GLOBALS.ServerRecordPlaybackContexts.clear();
+  assert.equal([...isolateState.ServerRecordPlaybackContexts.values()][0]?.intent?.itemId.length, 256);
+  isolateState.ServerRecordPlaybackContexts.clear();
 
   assert.equal(
-    Proxy.observeServerRecordPlaybackItemDetails(
+    proxyService.observeServerRecordPlaybackItemDetails(
       {
         nodeName: "server-a",
         node: { serverRecord: { enabled: true } },
@@ -2086,7 +2370,7 @@ test("server watch media extracts passive original titles and years", () => {
     true
   );
   assert.equal(
-    Proxy.observeServerRecordPlaybackItemDetails(
+    proxyService.observeServerRecordPlaybackItemDetails(
       {
         nodeName: "server-a",
         node: { serverRecord: { enabled: true } },
@@ -2107,8 +2391,8 @@ test("server watch media extracts passive original titles and years", () => {
 
 test("manual setup renders GET and HEAD as no-store with the recovery reason", async () => {
   const statusPatches = [];
-  const originalPatchOpsStatus = Database.patchOpsStatus;
-  Database.patchOpsStatus = async (_env, patch) => {
+  const originalPatchOpsStatus = kernel.patchOpsStatus;
+  kernel.patchOpsStatus = async (_env, patch) => {
     statusPatches.push(patch);
     return patch;
   };
@@ -2143,7 +2427,7 @@ test("manual setup renders GET and HEAD as no-store with the recovery reason", a
     assert.equal(headResponse.headers.get("Cache-Control"), "no-store, max-age=0");
     assert.equal(await headResponse.text(), "");
   } finally {
-    Database.patchOpsStatus = originalPatchOpsStatus;
+    kernel.patchOpsStatus = originalPatchOpsStatus;
   }
 
   assert.deepEqual(
@@ -2210,8 +2494,8 @@ test("remote shell cache identity separates legacy, transform, and full bootstra
 });
 
 test("legacy stale cache migrates to the current key before one failing SWR task", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.AdminRemoteShellCacheMutationChains.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.AdminRemoteShellCacheMutationChains.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const legacyHtml = '<!doctype html><html><head><script id="admin-bootstrap" type="application/json">{"old":true}</script><script>tailwind.config={}</script></head><body><div id="app"></div></body></html>';
   const legacyResponse = buildAdminRemoteShellStoredResponse(legacyHtml, {
@@ -2289,13 +2573,13 @@ test("legacy stale cache migrates to the current key before one failing SWR task
   assert.match(storedWrites[0].html, /id="admin-tailwind-prelude"/);
   assert.equal(storedResponses.has(storedWrites[0].url.href), true);
   assert.equal(reportedWarnings.length, 1);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
-  assert.equal(GLOBALS.AdminRemoteShellCacheMutationChains.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.AdminRemoteShellCacheMutationChains.size, 0);
 });
 
 test("concurrent legacy migration cannot overwrite a fresh revalidation in one isolate", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.AdminRemoteShellCacheMutationChains.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.AdminRemoteShellCacheMutationChains.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const legacyHtml = '<!doctype html><html><head><script>tailwind.config={}</script></head><body><div id="app">legacy-marker</div></body></html>';
   const legacyResponse = buildAdminRemoteShellStoredResponse(legacyHtml, {
@@ -2379,13 +2663,13 @@ test("concurrent legacy migration cannot overwrite a fresh revalidation in one i
   assert.equal(freshWriteCount, 1);
   assert.equal(revalidationFetchCount, 1);
   assert.match(await currentStoredResponse.text(), /fresh-marker/);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
-  assert.equal(GLOBALS.AdminRemoteShellCacheMutationChains.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.AdminRemoteShellCacheMutationChains.size, 0);
 });
 
 test("legacy migration waits for an in-flight fresh write after current-cache eviction", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.AdminRemoteShellCacheMutationChains.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.AdminRemoteShellCacheMutationChains.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const staleResponse = buildAdminRemoteShellStoredResponse(
     '<!doctype html><html><body><div id="app">stale-marker</div></body></html>',
@@ -2483,8 +2767,8 @@ test("legacy migration waits for an in-flight fresh write after current-cache ev
   assert.equal(staleWriteCount, 0);
   assert.equal(freshWriteCount, 1);
   assert.match(await currentStoredResponse.text(), /fresh-marker/);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
-  assert.equal(GLOBALS.AdminRemoteShellCacheMutationChains.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.AdminRemoteShellCacheMutationChains.size, 0);
 });
 
 test("304 refresh preserves representation and upstream validators", async () => {
@@ -2533,7 +2817,7 @@ test("304 refresh preserves representation and upstream validators", async () =>
 });
 
 test("cached remote shell route returns a stable conditional 304", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const cachedResponse = buildAdminRemoteShellStoredResponse(
     '<!doctype html><html><body><div id="app">cached</div></body></html>',
@@ -2582,11 +2866,11 @@ test("cached remote shell route returns a stable conditional 304", async () => {
 
   assert.equal(cacheReadCount, 1);
   assert.equal(fetchCount, 0);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
 });
 
 test("remote shell does not reuse source Last-Modified for transformed representations", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const cachedResponse = buildAdminRemoteShellStoredResponse(
     '<!doctype html><html><body><div id="app">new-bootstrap</div></body></html>',
@@ -2626,13 +2910,13 @@ test("remote shell does not reuse source Last-Modified for transformed represent
 });
 
 test("concurrent remote shell cold loads share one upstream fetch", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   const remoteShellIndexUrl = "https://example.test/releases/v1/index.html";
   const fetchGate = createDeferred();
   let upstreamFetchCount = 0;
   let cacheWriteCount = 0;
-  const originalPatchOpsStatus = Database.patchOpsStatus;
-  Database.patchOpsStatus = async () => null;
+  const originalPatchOpsStatus = kernel.patchOpsStatus;
+  kernel.patchOpsStatus = async () => null;
 
   try {
     await withWorkerGlobals({
@@ -2668,12 +2952,12 @@ test("concurrent remote shell cold loads share one upstream fetch", async () => 
       assert.deepEqual(responses.map(response => response.status), [200, 200, 200, 200, 200, 200]);
     });
   } finally {
-    Database.patchOpsStatus = originalPatchOpsStatus;
+    kernel.patchOpsStatus = originalPatchOpsStatus;
   }
 
   assert.equal(upstreamFetchCount, 1);
   assert.equal(cacheWriteCount, 1);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
 });
 
 test("vendor warmup preserves order and limits concurrency", async () => {
@@ -2850,7 +3134,7 @@ test("private metadata responses stay browser-private and upstream fetch bypasse
     isSmartStrmMedia: false,
     isSegment: false
   };
-  const privateHeaders = Proxy.buildProxyResponseHeaders(
+  const privateHeaders = proxyService.buildProxyResponseHeaders(
     new Response("image"),
     privateRequest,
     {},
@@ -2858,7 +3142,7 @@ test("private metadata responses stay browser-private and upstream fetch bypasse
     requestTraits,
     { imageCacheMaxAge: 3600 }
   );
-  const publicHeaders = Proxy.buildProxyResponseHeaders(
+  const publicHeaders = proxyService.buildProxyResponseHeaders(
     new Response("image"),
     publicRequest,
     {},
@@ -2869,7 +3153,7 @@ test("private metadata responses stay browser-private and upstream fetch bypasse
   assert.equal(privateHeaders.get("Cache-Control"), "private, max-age=3600");
   assert.equal(publicHeaders.get("Cache-Control"), "public, max-age=3600");
 
-  const buildFetchOptions = Proxy.createBuildFetchOptions({
+  const buildFetchOptions = proxyService.createBuildFetchOptions({
     request: privateRequest,
     requestMethod: "GET",
     requestTraits,
@@ -2886,7 +3170,7 @@ test("private metadata responses stay browser-private and upstream fetch bypasse
 });
 
 test("single-flight deduplicates equal keys while distinct keys run independently", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   const sharedGate = createDeferred();
   let sharedLoadCount = 0;
   const first = runSingleFlight("test:shared", async () => {
@@ -2920,7 +3204,7 @@ test("single-flight deduplicates equal keys while distinct keys run independentl
 });
 
 test("single-flight rejection clears the key for a later retry", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   let loadCount = 0;
   await assert.rejects(
     runSingleFlight("test:retry", async () => {
@@ -2929,7 +3213,7 @@ test("single-flight rejection clears the key for a later retry", async () => {
     }),
     /first attempt failed/
   );
-  assert.equal(GLOBALS.SingleFlightTasks.has("test:retry"), false);
+  assert.equal(isolateState.SingleFlightTasks.has("test:retry"), false);
 
   const retriedValue = await runSingleFlight("test:retry", async () => {
     loadCount += 1;
@@ -2937,7 +3221,7 @@ test("single-flight rejection clears the key for a later retry", async () => {
   });
   assert.equal(retriedValue, "recovered");
   assert.equal(loadCount, 2);
-  assert.equal(GLOBALS.SingleFlightTasks.has("test:retry"), false);
+  assert.equal(isolateState.SingleFlightTasks.has("test:retry"), false);
 });
 
 test("runtime route context normalizes hostnames once and defers CORS headers", async () => {
@@ -2955,7 +3239,7 @@ test("runtime route context normalizes hostnames once and defers CORS headers", 
       }
     }
   }, async () => {
-    const routeContext = RuntimeEntry.buildFetchRouteContext(request, {
+    const routeContext = routeTesting.buildFetchRouteContext(request, {
       HOST: "Media.Example.COM.",
       LEGACY_HOST: "Legacy.Example.COM.",
       ADMIN_PASS: "test-password",
@@ -2969,7 +3253,7 @@ test("runtime route context normalizes hostnames once and defers CORS headers", 
     assert.equal(Object.hasOwn(routeContext, "dynamicCors"), false);
     assert.equal(headersConstructionCount, 0);
 
-    const response = RuntimeEntry.buildRouteCorsResponse(request, {}, "Not Found", 404);
+    const response = routeTesting.buildRouteCorsResponse(request, {}, "Not Found", 404);
     assert.equal(response.status, 404);
     assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://client.test");
     assert.equal(response.headers.get("Vary"), "Origin");
@@ -2990,19 +3274,19 @@ test("proxy access rules reuse one parsed profile per runtime config object", ()
   assert.equal(secondProfile, firstProfile);
   assert.deepEqual(firstProfile.corsOrigins, ["https://client-a.test", "https://client-b.test"]);
   assert.equal(
-    Proxy.resolveCorsOrigin(runtimeConfig, new Request("https://worker.test", {
+    proxyService.resolveCorsOrigin(runtimeConfig, new Request("https://worker.test", {
       headers: { Origin: "https://client-b.test" }
     })),
     "https://client-b.test"
   );
-  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "198.51.100.1", "US", "*")?.status, 403);
-  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*"), null);
-  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "FR", "*")?.status, 403);
+  assert.equal(proxyService.evaluateFirewall(runtimeConfig, "198.51.100.1", "US", "*")?.status, 403);
+  assert.equal(proxyService.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*"), null);
+  assert.equal(proxyService.evaluateFirewall(runtimeConfig, "203.0.113.1", "FR", "*")?.status, 403);
 
   runtimeConfig.geoBlocklist = "US";
   const updatedProfile = buildProxyAccessRuleProfile(runtimeConfig);
   assert.notEqual(updatedProfile, firstProfile);
-  assert.equal(Proxy.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*")?.status, 403);
+  assert.equal(proxyService.evaluateFirewall(runtimeConfig, "203.0.113.1", "US", "*")?.status, 403);
 });
 
 test("playback-critical route detection preserves encoded and link-variant paths", () => {
@@ -3020,10 +3304,10 @@ test("playback-critical route detection preserves encoded and link-variant paths
   ];
 
   for (const segments of playbackRoutes) {
-    assert.equal(RuntimeEntry.isPlaybackCriticalRouteContext({ segments }), true, segments.join("/"));
+    assert.equal(routeTesting.isPlaybackCriticalRouteContext({ segments }), true, segments.join("/"));
   }
   for (const segments of nonPlaybackRoutes) {
-    assert.equal(RuntimeEntry.isPlaybackCriticalRouteContext({ segments }), false, segments.join("/"));
+    assert.equal(routeTesting.isPlaybackCriticalRouteContext({ segments }), false, segments.join("/"));
   }
 });
 
@@ -3072,7 +3356,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
           Origin: "https://client.test"
         }
       });
-      const response = await Proxy.handle(
+      const response = await proxyService.handle(
         request,
         null,
         proxyPath,
@@ -3095,7 +3379,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
         method,
         headers: { Cookie: "emby_web_bypass=1" }
       });
-      const response = await Proxy.handle(request, null, "/web", "node", "secret", {}, null, {
+      const response = await proxyService.handle(request, null, "/web", "node", "secret", {}, null, {
         runtimeConfig: { rateLimitRpm: 0 }
       });
       assert.equal(response.status, 404, method);
@@ -3117,7 +3401,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
       const request = new Request(
         `https://worker.test/node/secret${proxyPath}?__pb_target=${encodeURIComponent(encodedWebRelayTarget)}`
       );
-      const response = await Proxy.handle(
+      const response = await proxyService.handle(
         request,
         { target: "https://origin.test" },
         proxyPath,
@@ -3143,7 +3427,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
     }
   }, async () => {
     const request = new Request("https://worker.test/node/secret/");
-    const response = await Proxy.handle(
+    const response = await proxyService.handle(
       request,
       { target: "https://origin.test/emby" },
       "/",
@@ -3168,7 +3452,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
     }
   }, async () => {
     const request = new Request("https://worker.test/node/secret/Videos/1/stream?__pb_abs=1");
-    const response = await Proxy.handle(
+    const response = await proxyService.handle(
       request,
       { target: "https://origin.test" },
       "/Videos/1/stream",
@@ -3200,7 +3484,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
     const request = new Request("https://worker.test/node/secret/Videos/1/stream", {
       headers: { Range: "bytes=0-1023" }
     });
-    const response = await Proxy.handle(
+    const response = await proxyService.handle(
       request,
       { target: "https://origin.test", mainVideoStreamMode: "direct" },
       "/Videos/1/stream",
@@ -3231,7 +3515,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
     }
   }, async () => {
     const request = new Request("https://worker.test/node/secret/");
-    const response = await Proxy.handle(
+    const response = await proxyService.handle(
       request,
       { target: "https://origin.test" },
       "/",
@@ -3248,7 +3532,7 @@ test("Emby Web proxy boundary rejects only the exact web subtree", async () => {
 });
 
 test("runtime config refresh is single-flight and cached by namespace", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   invalidateRuntimeConfigCache();
   const loadGate = createDeferred();
   const loadStarted = createDeferred();
@@ -3256,7 +3540,7 @@ test("runtime config refresh is single-flight and cached by namespace", async ()
   let configWriteCount = 0;
   const kv = {
     async get(key) {
-      assert.equal(key, Database.CONFIG_KEY);
+      assert.equal(key, kernel.CONFIG_KEY);
       configReadCount += 1;
       loadStarted.resolve();
       await loadGate.promise;
@@ -3278,12 +3562,12 @@ test("runtime config refresh is single-flight and cached by namespace", async ()
   assert.equal(await getRuntimeConfig(env), firstConfig);
   assert.equal(configReadCount, 1);
   assert.equal(configWriteCount, 0);
-  assert.equal(GLOBALS.SingleFlightTasks.size, 0);
+  assert.equal(isolateState.SingleFlightTasks.size, 0);
   invalidateRuntimeConfigCache();
 });
 
 test("runtime config invalidation prevents an older load from restoring stale cache", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   invalidateRuntimeConfigCache();
   const oldLoadGate = createDeferred();
   const oldLoadStarted = createDeferred();
@@ -3312,15 +3596,15 @@ test("runtime config invalidation prevents an older load from restoring stale ca
   oldLoadGate.resolve();
   const oldConfig = await oldLoad;
   assert.equal(oldConfig.rateLimitRpm, 100);
-  assert.equal(GLOBALS.ConfigCache.data.rateLimitRpm, 200);
+  assert.equal(isolateState.ConfigCache.data.rateLimitRpm, 200);
   assert.equal(configReadCount, 2);
   invalidateRuntimeConfigCache();
 });
 
 test("runtime config writes roll back when metadata persistence fails", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   invalidateRuntimeConfigCache();
-  const storedValues = new Map([[Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 10 })]]);
+  const storedValues = new Map([[kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 10 })]]);
   let metadataFailurePending = true;
   const kv = {
     async get(key, options = {}) {
@@ -3329,7 +3613,7 @@ test("runtime config writes roll back when metadata persistence fails", async ()
       return options.type === "json" ? JSON.parse(value) : value;
     },
     async put(key, value) {
-      if (key === Database.CONFIG_META_KEY && metadataFailurePending) {
+      if (key === kernel.CONFIG_META_KEY && metadataFailurePending) {
         metadataFailurePending = false;
         throw new Error("metadata maintenance failed");
       }
@@ -3343,34 +3627,34 @@ test("runtime config writes roll back when metadata persistence fails", async ()
   await getRuntimeConfig(env);
 
   await assert.rejects(
-    Database.persistRuntimeConfig({ rateLimitRpm: 20 }, { env, kv }),
+    kernel.persistRuntimeConfig({ rateLimitRpm: 20 }, { env, kv }),
     /metadata maintenance failed/
   );
 
-  assert.equal(JSON.parse(storedValues.get(Database.CONFIG_KEY)).rateLimitRpm, 10);
-  assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_KEY), false);
-  assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_META_KEY), false);
+  assert.equal(JSON.parse(storedValues.get(kernel.CONFIG_KEY)).rateLimitRpm, 10);
+  assert.equal(storedValues.has(kernel.CONFIG_SNAPSHOTS_KEY), false);
+  assert.equal(storedValues.has(kernel.CONFIG_SNAPSHOTS_META_KEY), false);
   invalidateRuntimeConfigCache();
   assert.equal((await getRuntimeConfig(env)).rateLimitRpm, 10);
   invalidateRuntimeConfigCache();
 });
 
 test("host-prefix CNAME targets normalize at config and node boundaries", async () => {
-  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const { kv } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: {} });
   const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "host-prefix-normalize" };
-  const config = await Database.persistRuntimeConfig({
+  const config = await kernel.persistRuntimeConfig({
     defaultHostPrefixCnameTarget: "  Global.Target.Example.  "
   }, { env, kv });
   assert.equal(config.defaultHostPrefixCnameTarget, "global.target.example");
 
-  const hostPrefixNode = Database.normalizeNode("alpha", {
+  const hostPrefixNode = kernel.normalizeNode("alpha", {
     target: "https://origin.test",
     entryMode: "host_prefix",
     hostPrefixCnameTarget: "  Node.Target.Example.  "
   }).data;
   assert.equal(hostPrefixNode.hostPrefixCnameTarget, "node.target.example");
 
-  const kvRouteNode = Database.normalizeNode("alpha", {
+  const kvRouteNode = kernel.normalizeNode("alpha", {
     target: "https://origin.test",
     entryMode: "kv_route",
     hostPrefixCnameTarget: "node.target.example"
@@ -3379,7 +3663,7 @@ test("host-prefix CNAME targets normalize at config and node boundaries", async 
 });
 
 test("invalid global host-prefix CNAME targets are rejected before persistence", async () => {
-  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const { kv } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: {} });
   const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "host-prefix-invalid" };
   const invalidTargets = [
     "https://target.example",
@@ -3392,7 +3676,7 @@ test("invalid global host-prefix CNAME targets are rejected before persistence",
 
   for (const defaultHostPrefixCnameTarget of invalidTargets) {
     await assert.rejects(
-      Database.persistRuntimeConfig({ defaultHostPrefixCnameTarget }, { env, kv }),
+      kernel.persistRuntimeConfig({ defaultHostPrefixCnameTarget }, { env, kv }),
       error => error?.code === "HOST_PREFIX_CNAME_TARGET_INVALID"
         && error?.details?.field === "defaultHostPrefixCnameTarget"
     );
@@ -3407,7 +3691,7 @@ test("host-prefix CNAME target priority is node then global then HOST", () => {
     hostPrefixCnameTarget: "node.target.example"
   };
 
-  const nodeOverridePlan = Database.buildHostPrefixDnsSyncPlan(
+  const nodeOverridePlan = kernel.buildHostPrefixDnsSyncPlan(
     "",
     null,
     "alpha",
@@ -3417,7 +3701,7 @@ test("host-prefix CNAME target priority is node then global then HOST", () => {
   );
   assert.equal(nodeOverridePlan.nextCnameTarget, "node.target.example");
 
-  const globalDefaultPlan = Database.buildHostPrefixDnsSyncPlan(
+  const globalDefaultPlan = kernel.buildHostPrefixDnsSyncPlan(
     "",
     null,
     "alpha",
@@ -3427,7 +3711,7 @@ test("host-prefix CNAME target priority is node then global then HOST", () => {
   );
   assert.equal(globalDefaultPlan.nextCnameTarget, "global.target.example");
 
-  const hostFallbackPlan = Database.buildHostPrefixDnsSyncPlan(
+  const hostFallbackPlan = kernel.buildHostPrefixDnsSyncPlan(
     "",
     null,
     "alpha",
@@ -3439,7 +3723,7 @@ test("host-prefix CNAME target priority is node then global then HOST", () => {
 
 test("host-prefix DNS plans carry forward and rollback CNAME targets", () => {
   const node = { target: "https://origin.test", entryMode: "host_prefix" };
-  const plan = Database.buildHostPrefixDnsSyncPlan(
+  const plan = kernel.buildHostPrefixDnsSyncPlan(
     "alpha",
     node,
     "alpha",
@@ -3472,11 +3756,11 @@ test("node summaries retain host-prefix CNAME overrides without changing proxy c
     target: "https://origin.test",
     entryMode: "host_prefix"
   };
-  const firstSummary = Database.buildNodeSummary("alpha", {
+  const firstSummary = kernel.buildNodeSummary("alpha", {
     ...baseNode,
     hostPrefixCnameTarget: "First.Target.Example."
   }).summary;
-  const secondSummary = Database.buildNodeSummary("alpha", {
+  const secondSummary = kernel.buildNodeSummary("alpha", {
     ...baseNode,
     hostPrefixCnameTarget: "second.target.example"
   }).summary;
@@ -3493,17 +3777,17 @@ test("global host-prefix CNAME changes sync only nodes that inherit the default"
     cfApiToken: "api-token"
   };
   const { kv, storedValues } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: previousConfig,
-    [`${Database.PREFIX}inherited`]: {
+    [kernel.CONFIG_KEY]: previousConfig,
+    [`${kernel.PREFIX}inherited`]: {
       target: "https://inherited-origin.test",
       entryMode: "host_prefix"
     },
-    [`${Database.PREFIX}overridden`]: {
+    [`${kernel.PREFIX}overridden`]: {
       target: "https://overridden-origin.test",
       entryMode: "host_prefix",
       hostPrefixCnameTarget: "node.target.example"
     },
-    [`${Database.PREFIX}path-node`]: {
+    [`${kernel.PREFIX}path-node`]: {
       target: "https://path-origin.test",
       entryMode: "kv_route"
     }
@@ -3514,15 +3798,15 @@ test("global host-prefix CNAME changes sync only nodes that inherit the default"
     __CONFIG_CACHE_NAMESPACE: "cname-global-sync-success"
   };
   const dnsPlans = [];
-  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
-  Database.persistHostPrefixDnsSyncPlan = async (plan) => {
+  const originalPersistHostPrefixDnsSyncPlan = kernel.persistHostPrefixDnsSyncPlan;
+  kernel.persistHostPrefixDnsSyncPlan = async (plan) => {
     dnsPlans.push(structuredClone(plan));
     return { changed: true };
   };
   invalidateRuntimeConfigCache();
 
   try {
-    const savedConfig = await Database.persistRuntimeConfig({
+    const savedConfig = await kernel.persistRuntimeConfig({
       ...previousConfig,
       defaultHostPrefixCnameTarget: "new.target.example"
     }, { env, kv });
@@ -3534,11 +3818,11 @@ test("global host-prefix CNAME changes sync only nodes that inherit the default"
       cnameTarget: "new.target.example"
     }]]);
     assert.equal(
-      JSON.parse(storedValues.get(Database.CONFIG_KEY)).defaultHostPrefixCnameTarget,
+      JSON.parse(storedValues.get(kernel.CONFIG_KEY)).defaultHostPrefixCnameTarget,
       "new.target.example"
     );
   } finally {
-    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+    kernel.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
     invalidateRuntimeConfigCache();
   }
 });
@@ -3550,12 +3834,12 @@ test("global host-prefix CNAME sync rolls back earlier DNS updates before config
     cfApiToken: "api-token"
   };
   const { kv, storedValues, putKeys } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: previousConfig,
-    [`${Database.PREFIX}alpha`]: {
+    [kernel.CONFIG_KEY]: previousConfig,
+    [`${kernel.PREFIX}alpha`]: {
       target: "https://alpha-origin.test",
       entryMode: "host_prefix"
     },
-    [`${Database.PREFIX}beta`]: {
+    [`${kernel.PREFIX}beta`]: {
       target: "https://beta-origin.test",
       entryMode: "host_prefix"
     }
@@ -3567,8 +3851,8 @@ test("global host-prefix CNAME sync rolls back earlier DNS updates before config
   };
   const dnsSteps = [];
   let forwardPlanCount = 0;
-  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
-  Database.persistHostPrefixDnsSyncPlan = async (plan) => {
+  const originalPersistHostPrefixDnsSyncPlan = kernel.persistHostPrefixDnsSyncPlan;
+  kernel.persistHostPrefixDnsSyncPlan = async (plan) => {
     const steps = structuredClone(plan.steps || []);
     dnsSteps.push(steps);
     if (steps[0]?.cnameTarget === "new.target.example") {
@@ -3581,7 +3865,7 @@ test("global host-prefix CNAME sync rolls back earlier DNS updates before config
 
   try {
     await assert.rejects(
-      Database.persistRuntimeConfig({
+      kernel.persistRuntimeConfig({
         ...previousConfig,
         defaultHostPrefixCnameTarget: "new.target.example"
       }, { env, kv }),
@@ -3615,14 +3899,14 @@ test("global host-prefix CNAME sync rolls back earlier DNS updates before config
       }]
     ]);
     assert.equal(
-      JSON.parse(storedValues.get(Database.CONFIG_KEY)).defaultHostPrefixCnameTarget,
+      JSON.parse(storedValues.get(kernel.CONFIG_KEY)).defaultHostPrefixCnameTarget,
       "old.target.example"
     );
-    assert.equal(storedValues.has(Database.CONFIG_SNAPSHOTS_KEY), false);
-    assert.equal(putKeys.includes(Database.CONFIG_KEY), false);
-    assert.equal(putKeys.includes(Database.CONFIG_SNAPSHOTS_KEY), false);
+    assert.equal(storedValues.has(kernel.CONFIG_SNAPSHOTS_KEY), false);
+    assert.equal(putKeys.includes(kernel.CONFIG_KEY), false);
+    assert.equal(putKeys.includes(kernel.CONFIG_SNAPSHOTS_KEY), false);
   } finally {
-    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+    kernel.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
     invalidateRuntimeConfigCache();
   }
 });
@@ -3640,7 +3924,7 @@ test("CNAME sync restores the complete host snapshot after a partial delete fail
 
   await withWorkerGlobals({ fetch: dns.fetch }, async () => {
     await assert.rejects(
-      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+      kernel.upsertHostPrefixDnsRecord("alpha.proxy.example", {
         env: { HOST: "proxy.example" },
         kv,
         config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
@@ -3660,7 +3944,7 @@ test("CNAME sync restores DNS when strict history persistence fails", async () =
     { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
   ];
   const dns = createCloudflareDnsFetch(initialRecords);
-  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const historyKey = kernel.getDnsRecordHistoryKey("zone-id", kernel.getDnsHostHistoryRecordId("alpha.proxy.example"));
   const { kv } = createInMemoryKvStore({
     [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
   });
@@ -3672,7 +3956,7 @@ test("CNAME sync restores DNS when strict history persistence fails", async () =
 
   await withWorkerGlobals({ fetch: dns.fetch }, async () => {
     await assert.rejects(
-      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+      kernel.upsertHostPrefixDnsRecord("alpha.proxy.example", {
         env: { HOST: "proxy.example" },
         kv,
         config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
@@ -3692,7 +3976,7 @@ test("CNAME history mutation fails closed when the existing history cannot be re
     { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
   ];
   const dns = createCloudflareDnsFetch(initialRecords);
-  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const historyKey = kernel.getDnsRecordHistoryKey("zone-id", kernel.getDnsHostHistoryRecordId("alpha.proxy.example"));
   const { kv, putKeys } = createInMemoryKvStore();
   const originalGet = kv.get;
   kv.get = async (key, options) => {
@@ -3702,7 +3986,7 @@ test("CNAME history mutation fails closed when the existing history cannot be re
 
   await withWorkerGlobals({ fetch: dns.fetch }, async () => {
     await assert.rejects(
-      Database.upsertHostPrefixDnsRecord("alpha.proxy.example", {
+      kernel.upsertHostPrefixDnsRecord("alpha.proxy.example", {
         env: { HOST: "proxy.example" },
         kv,
         config: { cfZoneId: "zone-id", cfApiToken: "api-token" },
@@ -3722,9 +4006,9 @@ test("single-record DNS update restores the previous record when history persist
     { id: "cname-1", name: "alpha.proxy.example", type: "CNAME", content: "old.target.example", ttl: 60, proxied: false }
   ];
   const dns = createCloudflareDnsFetch(initialRecords);
-  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const historyKey = kernel.getDnsRecordHistoryKey("zone-id", kernel.getDnsHostHistoryRecordId("alpha.proxy.example"));
   const { kv } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
     [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
   });
   const originalPut = kv.put;
@@ -3736,7 +4020,7 @@ test("single-record DNS update restores the previous record when history persist
   invalidateRuntimeConfigCache();
 
   try {
-    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.updateDnsRecord({
       recordId: "cname-1",
       host: "alpha.proxy.example",
       type: "CNAME",
@@ -3770,9 +4054,9 @@ test("single-record DNS update reports a failed history compensation", async () 
     failMutationAt: 2,
     failureMessage: "dns_rollback_failed"
   });
-  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const historyKey = kernel.getDnsRecordHistoryKey("zone-id", kernel.getDnsHostHistoryRecordId("alpha.proxy.example"));
   const { kv } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
     [historyKey]: [{ type: "CNAME", content: "old.target.example" }]
   });
   const originalPut = kv.put;
@@ -3784,7 +4068,7 @@ test("single-record DNS update reports a failed history compensation", async () 
   invalidateRuntimeConfigCache();
 
   try {
-    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.updateDnsRecord({
       recordId: "cname-1",
       host: "alpha.proxy.example",
       type: "CNAME",
@@ -3811,9 +4095,9 @@ test("single-record DNS update reports a failed history compensation", async () 
 
 test("single-record DNS create deletes the new record when history persistence fails", async () => {
   const dns = createCloudflareDnsFetch([]);
-  const historyKey = Database.getDnsRecordHistoryKey("zone-id", Database.getDnsHostHistoryRecordId("alpha.proxy.example"));
+  const historyKey = kernel.getDnsRecordHistoryKey("zone-id", kernel.getDnsHostHistoryRecordId("alpha.proxy.example"));
   const { kv } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
   });
   const originalPut = kv.put;
   kv.put = async (key, value) => {
@@ -3824,7 +4108,7 @@ test("single-record DNS create deletes the new record when history persistence f
   invalidateRuntimeConfigCache();
 
   try {
-    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => Database.ApiHandlers.updateDnsRecord({
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.updateDnsRecord({
       host: "alpha.proxy.example",
       type: "CNAME",
       content: "new.target.example"
@@ -3848,7 +4132,7 @@ test("single-record DNS create deletes the new record when history persistence f
 
 test("node rollback restores KV even when DNS compensation fails", async () => {
   const { kv, storedValues } = createInMemoryKvStore({
-    [`${Database.PREFIX}alpha`]: { target: "https://new-origin.test", entryMode: "host_prefix" }
+    [`${kernel.PREFIX}alpha`]: { target: "https://new-origin.test", entryMode: "host_prefix" }
   });
   const mutation = {
     previousName: "alpha",
@@ -3858,35 +4142,35 @@ test("node rollback restores KV even when DNS compensation fails", async () => {
     nodeChanged: true,
     dnsPlan: { changed: true, rollbackSteps: [{ type: "upsert", host: "alpha.proxy.example", cnameTarget: "old.target.example" }] }
   };
-  const originalPersistHostPrefixDnsSyncPlan = Database.persistHostPrefixDnsSyncPlan;
-  Database.persistHostPrefixDnsSyncPlan = async () => {
+  const originalPersistHostPrefixDnsSyncPlan = kernel.persistHostPrefixDnsSyncPlan;
+  kernel.persistHostPrefixDnsSyncPlan = async () => {
     throw new Error("dns_rollback_failed");
   };
   try {
     await assert.rejects(
-      Database.rollbackPreparedNodeMutations([mutation], {
+      kernel.rollbackPreparedNodeMutations([mutation], {
         kv,
         config: { cfZoneId: "zone-id", cfApiToken: "api-token" }
       }),
       /dns:dns_rollback_failed/
     );
   } finally {
-    Database.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
+    kernel.persistHostPrefixDnsSyncPlan = originalPersistHostPrefixDnsSyncPlan;
   }
 
-  assert.equal(JSON.parse(storedValues.get(`${Database.PREFIX}alpha`)).target, "https://old-origin.test");
+  assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).target, "https://old-origin.test");
 });
 
 test("active rename mutation rolls back a partial KV write", async () => {
   const previousNode = { target: "https://old-origin.test", entryMode: "kv_route" };
   const nextNode = { target: "https://new-origin.test", entryMode: "kv_route" };
   const { kv, storedValues } = createInMemoryKvStore({
-    [`${Database.PREFIX}alpha`]: previousNode
+    [`${kernel.PREFIX}alpha`]: previousNode
   });
   const originalDelete = kv.delete;
   let deleteFailurePending = true;
   kv.delete = async key => {
-    if (key === `${Database.PREFIX}alpha` && deleteFailurePending) {
+    if (key === `${kernel.PREFIX}alpha` && deleteFailurePending) {
       deleteFailurePending = false;
       throw new Error("rename_delete_failed");
     }
@@ -3894,7 +4178,7 @@ test("active rename mutation rolls back a partial KV write", async () => {
   };
 
   await assert.rejects(
-    Database.applyPreparedNodeMutations([{
+    kernel.applyPreparedNodeMutations([{
       previousName: "alpha",
       previousNode,
       nextName: "beta",
@@ -3907,8 +4191,8 @@ test("active rename mutation rolls back a partial KV write", async () => {
       && error?.details?.rollbackSucceeded === true
   );
 
-  assert.deepEqual(JSON.parse(storedValues.get(`${Database.PREFIX}alpha`)), previousNode);
-  assert.equal(storedValues.has(`${Database.PREFIX}beta`), false);
+  assert.deepEqual(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)), previousNode);
+  assert.equal(storedValues.has(`${kernel.PREFIX}beta`), false);
 });
 
 test("full import restores inherited host-prefix DNS after a node index rebuild failure", async () => {
@@ -3922,8 +4206,8 @@ test("full import restores inherited host-prefix DNS after a node index rebuild 
     entryMode: "host_prefix"
   };
   const { kv, storedValues } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: previousConfig,
-    [`${Database.PREFIX}alpha`]: previousNode
+    [kernel.CONFIG_KEY]: previousConfig,
+    [`${kernel.PREFIX}alpha`]: previousNode
   });
   const dns = createCloudflareDnsFetch([{
     id: "cname-1",
@@ -3938,19 +4222,19 @@ test("full import restores inherited host-prefix DNS after a node index rebuild 
     HOST: "proxy.example",
     __CONFIG_CACHE_NAMESPACE: "full-import-node-rebuild-rollback"
   };
-  const originalRebuildNodeIndexesFromKv = Database.rebuildNodeIndexesFromKv;
+  const originalRebuildNodeIndexesFromKv = kernel.rebuildNodeIndexesFromKv;
   let rebuildCount = 0;
-  Database.rebuildNodeIndexesFromKv = async (...args) => {
+  kernel.rebuildNodeIndexesFromKv = async (...args) => {
     rebuildCount += 1;
     if (rebuildCount === 1) throw new Error("node_index_rebuild_failed");
-    return await originalRebuildNodeIndexesFromKv.apply(Database, args);
+    return await originalRebuildNodeIndexesFromKv.apply(kernel, args);
   };
   invalidateRuntimeConfigCache();
 
   try {
     await withWorkerGlobals({ fetch: dns.fetch }, async () => {
       await assert.rejects(
-        Database.ApiHandlers.importFull({
+        adminActions.importFull({
           config: {
             ...previousConfig,
             defaultHostPrefixCnameTarget: "new.target.example"
@@ -3967,8 +4251,8 @@ test("full import restores inherited host-prefix DNS after a node index rebuild 
       );
     });
 
-    const restoredConfig = JSON.parse(storedValues.get(Database.CONFIG_KEY));
-    const restoredNode = JSON.parse(storedValues.get(`${Database.PREFIX}alpha`));
+    const restoredConfig = JSON.parse(storedValues.get(kernel.CONFIG_KEY));
+    const restoredNode = JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`));
     assert.equal(restoredConfig.defaultHostPrefixCnameTarget, "old.target.example");
     assert.equal(restoredNode.entryMode, "host_prefix");
     assert.equal(restoredNode.target, "https://old-origin.test:443");
@@ -3980,21 +4264,21 @@ test("full import restores inherited host-prefix DNS after a node index rebuild 
       proxied: false
     }]);
   } finally {
-    Database.rebuildNodeIndexesFromKv = originalRebuildNodeIndexesFromKv;
+    kernel.rebuildNodeIndexesFromKv = originalRebuildNodeIndexesFromKv;
     invalidateRuntimeConfigCache();
   }
 });
 
 test("node revision refresh coalesces and hot node reads stay in memory", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
   invalidateNodesRevisionCache();
   const revisionGate = createDeferred();
   const revisionReadStarted = createDeferred();
   let revisionReadCount = 0;
   const kv = {
     async get(key) {
-      assert.equal(key, Database.NODES_INDEX_META_KEY);
+      assert.equal(key, kernel.NODES_INDEX_META_KEY);
       revisionReadCount += 1;
       revisionReadStarted.resolve();
       await revisionGate.promise;
@@ -4002,41 +4286,41 @@ test("node revision refresh coalesces and hot node reads stay in memory", async 
     }
   };
 
-  const firstRevision = Database.getNodesRevision(kv);
-  const secondRevision = Database.getNodesRevision(kv);
+  const firstRevision = kernel.getNodesRevision(kv);
+  const secondRevision = kernel.getNodesRevision(kv);
   await revisionReadStarted.promise;
   assert.equal(revisionReadCount, 1);
   revisionGate.resolve();
   assert.deepEqual(await Promise.all([firstRevision, secondRevision]), ["nodes-r1", "nodes-r1"]);
 
-  GLOBALS.NodeCache.set("alpha", {
+  isolateState.NodeCache.set("alpha", {
     data: { target: "https://origin.test" },
     exp: Date.now() + 60000,
     nodesRevision: "nodes-r1"
   });
-  const cachedNode = await Database.getNode("alpha", { ENI_KV: kv }, null);
+  const cachedNode = await kernel.getNode("alpha", { ENI_KV: kv }, null);
   assert.equal(cachedNode.target, "https://origin.test");
   assert.equal(revisionReadCount, 1);
-  GLOBALS.NodeCache.clear();
+  isolateState.NodeCache.clear();
   invalidateNodesRevisionCache();
 });
 
 test("node revision read failures are retried instead of negative-cached", async () => {
-  GLOBALS.SingleFlightTasks.clear();
+  isolateState.SingleFlightTasks.clear();
   invalidateNodesRevisionCache();
   let revisionReadCount = 0;
   const kv = {
     async get(key) {
-      assert.equal(key, Database.NODES_INDEX_META_KEY);
+      assert.equal(key, kernel.NODES_INDEX_META_KEY);
       revisionReadCount += 1;
       if (revisionReadCount === 1) throw new Error("transient revision failure");
       return { revision: "nodes-r2" };
     }
   };
 
-  assert.equal(await Database.getNodesRevision(kv), "");
-  assert.equal(GLOBALS.NodesRevisionCache, null);
-  assert.equal(await Database.getNodesRevision(kv), "nodes-r2");
+  assert.equal(await kernel.getNodesRevision(kv), "");
+  assert.equal(isolateState.NodesRevisionCache, null);
+  assert.equal(await kernel.getNodesRevision(kv), "nodes-r2");
   assert.equal(revisionReadCount, 2);
   invalidateNodesRevisionCache();
 });
@@ -4046,13 +4330,13 @@ test("node writes prevent older positive and negative reads from refilling memor
     ["stale-positive", { target: "https://old-origin.test" }],
     ["stale-negative", null]
   ]) {
-    GLOBALS.NodeCache.clear();
+    isolateState.NodeCache.clear();
     invalidateNodesRevisionCache();
     const entityReadStarted = createDeferred();
     const entityReadGate = createDeferred();
     const kv = {
       async get(key) {
-        if (key === `${Database.PREFIX}${nodeName}`) {
+        if (key === `${kernel.PREFIX}${nodeName}`) {
           entityReadStarted.resolve();
           await entityReadGate.promise;
           return storedNode;
@@ -4061,35 +4345,35 @@ test("node writes prevent older positive and negative reads from refilling memor
       }
     };
 
-    const staleRead = Database.getNode(nodeName, { ENI_KV: kv }, null);
+    const staleRead = kernel.getNode(nodeName, { ENI_KV: kv }, null);
     await entityReadStarted.promise;
-    Database.invalidateNodeCaches(nodeName, { invalidateList: true });
+    kernel.invalidateNodeCaches(nodeName, { invalidateList: true });
     entityReadGate.resolve();
 
     assert.equal(await staleRead, null);
-    assert.equal(GLOBALS.NodeCache.has(nodeName), false);
+    assert.equal(isolateState.NodeCache.has(nodeName), false);
   }
   invalidateNodesRevisionCache();
 });
 
 test("evicted node generations cannot revive an older cold read", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
   const entityReadStarted = createDeferred();
   const entityReadGate = createDeferred();
   const kv = {
     async get(key) {
-      if (key === `${Database.PREFIX}alpha`) {
+      if (key === `${kernel.PREFIX}alpha`) {
         entityReadStarted.resolve();
         await entityReadGate.promise;
         return { target: "https://stale-origin.test" };
       }
-      if (key === Database.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
+      if (key === kernel.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
       throw new Error(`unexpected KV read: ${key}`);
     }
   };
-  const database = Object.create(Database);
+  const database = { ...kernel };
   database.upsertNodeSummaryEntry = async () => null;
 
   const staleRead = database.getNode("alpha", { ENI_KV: kv }, null);
@@ -4098,88 +4382,89 @@ test("evicted node generations cannot revive an older cold read", async () => {
     "alpha",
     ...Array.from({ length: 5000 }, (_, index) => `generation-churn-${index}`)
   ]);
-  assert.equal(GLOBALS.NodeCacheGenerations.has("alpha"), false);
+  assert.equal(isolateState.NodeCacheGenerations.has("alpha"), false);
   entityReadGate.resolve();
 
   assert.equal(await staleRead, null);
-  assert.equal(GLOBALS.NodeCache.has("alpha"), false);
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
+  assert.equal(isolateState.NodeCache.has("alpha"), false);
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
 });
 
 test("unrelated node invalidation does not cancel another node's cold read", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const entityReadStarted = createDeferred();
   const entityReadGate = createDeferred();
   const kv = {
     async get(key) {
-      if (key === `${Database.PREFIX}alpha`) {
+      if (key === `${kernel.PREFIX}alpha`) {
         entityReadStarted.resolve();
         await entityReadGate.promise;
         return { target: "https://origin.test" };
       }
-      if (key === Database.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
+      if (key === kernel.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
       throw new Error(`unexpected KV read: ${key}`);
     },
     async put() {}
   };
-  const database = Object.create(Database);
-  database.upsertNodeSummaryEntry = async () => null;
+  const nodeOperations = { ...kernel };
+  Object.assign(nodeOperations, defineNodeRepositoryMethods({}, nodeOperations));
+  nodeOperations.upsertNodeSummaryEntry = async () => null;
 
-  const alphaRead = database.getNode("alpha", { ENI_KV: kv }, null);
+  const alphaRead = nodeOperations.getNode("alpha", { ENI_KV: kv }, null);
   await entityReadStarted.promise;
-  database.invalidateNodeCaches("beta", { invalidateList: true });
+  nodeOperations.invalidateNodeCaches("beta", { invalidateList: true });
   entityReadGate.resolve();
 
   const alphaNode = await alphaRead;
   assert.equal(new URL(alphaNode.target).hostname, "origin.test");
-  assert.equal(GLOBALS.NodeCache.get("alpha")?.data, alphaNode);
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  assert.equal(isolateState.NodeCache.get("alpha")?.data, alphaNode);
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("stale node-summary reads cannot refill invalidated list caches", async () => {
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const summaryReadStarted = createDeferred();
   const summaryReadGate = createDeferred();
-  const alphaSummary = Database.buildNodeSummary("alpha", { target: "https://origin.test" }).summary;
+  const alphaSummary = kernel.buildNodeSummary("alpha", { target: "https://origin.test" }).summary;
   assert.ok(alphaSummary);
   const kv = {
     async get(key) {
-      assert.equal(key, Database.NODES_SUMMARY_INDEX_KEY);
+      assert.equal(key, kernel.NODES_SUMMARY_INDEX_KEY);
       summaryReadStarted.resolve();
       await summaryReadGate.promise;
       return [alphaSummary];
     }
   };
 
-  const staleRead = Database.getNodesSummaryIndex(kv, { useCache: false });
+  const staleRead = kernel.getNodesSummaryIndex(kv, { useCache: false });
   await summaryReadStarted.promise;
   invalidateNodesRevisionCache();
   summaryReadGate.resolve();
 
   const summaries = await staleRead;
   assert.deepEqual(summaries.map(node => node.name), ["alpha"]);
-  assert.equal(GLOBALS.NodesListCache, null);
-  assert.equal(GLOBALS.NodesIndexCache, null);
+  assert.equal(isolateState.NodesListCache, null);
+  assert.equal(isolateState.NodesIndexCache, null);
   invalidateNodesRevisionCache();
 });
 
 test("node-index mutations serialize so final KV and memory revisions match", async () => {
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const oldWriteStarted = createDeferred();
   const oldWriteGate = createDeferred();
@@ -4197,7 +4482,7 @@ test("node-index mutations serialize so final KV and memory revisions match", as
       storedValues.set(key, value);
     }
   };
-  const database = Object.create(Database);
+  const database = { ...kernel };
   database.readRevisionMeta = async () => ({
     revision: "nodes-base",
     updatedAt: "2026-07-01T00:00:00.000Z",
@@ -4216,29 +4501,29 @@ test("node-index mutations serialize so final KV and memory revisions match", as
   await Promise.all([oldMutation, freshMutation]);
 
   assert.deepEqual(putKeys, [
-    Database.NODES_INDEX_KEY,
-    Database.NODES_INDEX_META_KEY,
-    Database.NODES_INDEX_KEY,
-    Database.NODES_INDEX_META_KEY
+    kernel.NODES_INDEX_KEY,
+    kernel.NODES_INDEX_META_KEY,
+    kernel.NODES_INDEX_KEY,
+    kernel.NODES_INDEX_META_KEY
   ]);
-  assert.deepEqual(JSON.parse(storedValues.get(Database.NODES_INDEX_KEY)), ["fresh"]);
-  const storedMeta = JSON.parse(storedValues.get(Database.NODES_INDEX_META_KEY));
-  assert.equal(GLOBALS.NodesRevisionCache?.revision, storedMeta.revision);
-  assert.deepEqual(GLOBALS.NodesIndexCache?.data, ["fresh"]);
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  assert.deepEqual(JSON.parse(storedValues.get(kernel.NODES_INDEX_KEY)), ["fresh"]);
+  const storedMeta = JSON.parse(storedValues.get(kernel.NODES_INDEX_META_KEY));
+  assert.equal(isolateState.NodesRevisionCache?.revision, storedMeta.revision);
+  assert.deepEqual(isolateState.NodesIndexCache?.data, ["fresh"]);
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("concurrent node-summary upserts merge inside the mutation chain", async () => {
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const storedValues = new Map([
-    [Database.NODES_SUMMARY_INDEX_KEY, JSON.stringify([])],
-    [Database.NODES_INDEX_META_KEY, JSON.stringify(Database.buildNodesIndexMeta([], [], {
+    [kernel.NODES_SUMMARY_INDEX_KEY, JSON.stringify([])],
+    [kernel.NODES_INDEX_META_KEY, JSON.stringify(kernel.buildNodesIndexMeta([], [], {
       updatedAt: "2026-07-01T00:00:00.000Z"
     }))]
   ]);
@@ -4254,31 +4539,31 @@ test("concurrent node-summary upserts merge inside the mutation chain", async ()
   };
 
   const [alpha, beta] = await Promise.all([
-    Database.upsertNodeSummaryEntry("alpha", { target: "https://alpha-origin.test" }, { kv }),
-    Database.upsertNodeSummaryEntry("beta", { target: "https://beta-origin.test" }, { kv })
+    kernel.upsertNodeSummaryEntry("alpha", { target: "https://alpha-origin.test" }, { kv }),
+    kernel.upsertNodeSummaryEntry("beta", { target: "https://beta-origin.test" }, { kv })
   ]);
 
   assert.deepEqual([alpha.name, beta.name], ["alpha", "beta"]);
-  const storedNames = JSON.parse(storedValues.get(Database.NODES_SUMMARY_INDEX_KEY)).map(node => node.name);
+  const storedNames = JSON.parse(storedValues.get(kernel.NODES_SUMMARY_INDEX_KEY)).map(node => node.name);
   assert.deepEqual(storedNames, ["alpha", "beta"]);
-  assert.deepEqual(GLOBALS.NodesListCache?.data.map(node => node.name), ["alpha", "beta"]);
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  assert.deepEqual(isolateState.NodesListCache?.data.map(node => node.name), ["alpha", "beta"]);
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("node-index rebuilds serialize entity loading with their commit", async () => {
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const firstListStarted = createDeferred();
   const firstListGate = createDeferred();
   const storedValues = new Map([
-    [`${Database.PREFIX}alpha`, JSON.stringify({ target: "https://alpha-origin.test" })],
-    [Database.NODES_SUMMARY_INDEX_KEY, JSON.stringify([])],
-    [Database.NODES_INDEX_META_KEY, JSON.stringify(Database.buildNodesIndexMeta([], [], {
+    [`${kernel.PREFIX}alpha`, JSON.stringify({ target: "https://alpha-origin.test" })],
+    [kernel.NODES_SUMMARY_INDEX_KEY, JSON.stringify([])],
+    [kernel.NODES_INDEX_META_KEY, JSON.stringify(kernel.buildNodesIndexMeta([], [], {
       updatedAt: "2026-07-01T00:00:00.000Z"
     }))]
   ]);
@@ -4305,36 +4590,36 @@ test("node-index rebuilds serialize entity loading with their commit", async () 
     }
   };
 
-  const olderRebuild = Database.rebuildNodeIndexesFromKv(kv);
+  const olderRebuild = kernel.rebuildNodeIndexesFromKv(kv);
   await firstListStarted.promise;
-  storedValues.set(`${Database.PREFIX}beta`, JSON.stringify({ target: "https://beta-origin.test" }));
-  const fresherRebuild = Database.rebuildNodeIndexesFromKv(kv);
+  storedValues.set(`${kernel.PREFIX}beta`, JSON.stringify({ target: "https://beta-origin.test" }));
+  const fresherRebuild = kernel.rebuildNodeIndexesFromKv(kv);
   assert.equal(listCount, 1);
   firstListGate.resolve();
 
   const [olderState, fresherState] = await Promise.all([olderRebuild, fresherRebuild]);
   assert.deepEqual(olderState.index, ["alpha"]);
   assert.deepEqual(fresherState.index, ["alpha", "beta"]);
-  const storedNames = JSON.parse(storedValues.get(Database.NODES_SUMMARY_INDEX_KEY)).map(node => node.name);
+  const storedNames = JSON.parse(storedValues.get(kernel.NODES_SUMMARY_INDEX_KEY)).map(node => node.name);
   assert.deepEqual(storedNames, ["alpha", "beta"]);
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("node-index writes reject incomplete entity truth-source reads", async () => {
   const runRejectedWrite = async (operation) => {
-    GLOBALS.NodeIndexMutationChain = Promise.resolve();
-    GLOBALS.NodesListCache = null;
-    GLOBALS.NodesIndexCache = null;
+    isolateState.NodeIndexMutationChain = Promise.resolve();
+    isolateState.NodesListCache = null;
+    isolateState.NodesIndexCache = null;
     invalidateNodesRevisionCache();
     const writes = [];
     const kv = {
       async get(key) {
-        if (key === Database.NODES_SUMMARY_INDEX_KEY) return null;
-        if (key === `${Database.PREFIX}alpha`) return { target: "https://alpha-origin.test" };
-        if (key === `${Database.PREFIX}beta`) throw new Error("temporary kv read failure");
+        if (key === kernel.NODES_SUMMARY_INDEX_KEY) return null;
+        if (key === `${kernel.PREFIX}alpha`) return { target: "https://alpha-origin.test" };
+        if (key === `${kernel.PREFIX}beta`) throw new Error("temporary kv read failure");
         return null;
       },
       async put(key, value) {
@@ -4343,8 +4628,8 @@ test("node-index writes reject incomplete entity truth-source reads", async () =
       async list() {
         return {
           keys: [
-            { name: `${Database.PREFIX}alpha` },
-            { name: `${Database.PREFIX}beta` }
+            { name: `${kernel.PREFIX}alpha` },
+            { name: `${kernel.PREFIX}beta` }
           ],
           list_complete: true
         };
@@ -4355,20 +4640,20 @@ test("node-index writes reject incomplete entity truth-source reads", async () =
     assert.deepEqual(writes, []);
   };
 
-  await runRejectedWrite(kv => Database.rebuildNodeIndexesFromKv(kv));
-  await runRejectedWrite(kv => Database.upsertNodeSummaryEntry("gamma", {
+  await runRejectedWrite(kv => kernel.rebuildNodeIndexesFromKv(kv));
+  await runRejectedWrite(kv => kernel.upsertNodeSummaryEntry("gamma", {
     target: "https://gamma-origin.test"
   }, { kv }));
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("stale revision candidates cannot overwrite current node-index metadata", async () => {
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   const storedValues = new Map();
   const kv = {
@@ -4381,51 +4666,52 @@ test("stale revision candidates cannot overwrite current node-index metadata", a
       storedValues.set(key, value);
     }
   };
-  const freshSummary = Database.buildNodeSummary("fresh", { target: "https://fresh-origin.test" }).summary;
-  const staleSummary = Database.buildNodeSummary("stale", { target: "https://stale-origin.test" }).summary;
-  await Database.persistNodesSummaryIndex([freshSummary], { kv });
-  const freshMeta = JSON.parse(storedValues.get(Database.NODES_INDEX_META_KEY));
+  const freshSummary = kernel.buildNodeSummary("fresh", { target: "https://fresh-origin.test" }).summary;
+  const staleSummary = kernel.buildNodeSummary("stale", { target: "https://stale-origin.test" }).summary;
+  await kernel.persistNodesSummaryIndex([freshSummary], { kv });
+  const freshMeta = JSON.parse(storedValues.get(kernel.NODES_INDEX_META_KEY));
 
-  const ensuredMeta = await Database.ensureNodesIndexMeta(kv, {
+  const ensuredMeta = await kernel.ensureNodesIndexMeta(kv, {
     index: ["stale"],
     nodes: [staleSummary]
   });
 
-  const storedMeta = JSON.parse(storedValues.get(Database.NODES_INDEX_META_KEY));
+  const storedMeta = JSON.parse(storedValues.get(kernel.NODES_INDEX_META_KEY));
   assert.equal(ensuredMeta.revision, freshMeta.revision);
   assert.equal(storedMeta.revision, freshMeta.revision);
-  assert.equal(GLOBALS.NodesRevisionCache?.revision, freshMeta.revision);
-  GLOBALS.NodeIndexMutationChain = Promise.resolve();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  assert.equal(isolateState.NodesRevisionCache?.revision, freshMeta.revision);
+  isolateState.NodeIndexMutationChain = Promise.resolve();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("concurrent proxy cold reads share one node entity load", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
   invalidateNodesRevisionCache();
   const entityReadStarted = createDeferred();
   const entityReadGate = createDeferred();
   let entityReadCount = 0;
   const kv = {
     async get(key) {
-      if (key === `${Database.PREFIX}alpha`) {
+      if (key === `${kernel.PREFIX}alpha`) {
         entityReadCount += 1;
         entityReadStarted.resolve();
         await entityReadGate.promise;
         return { target: "https://origin.test" };
       }
-      if (key === Database.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
+      if (key === kernel.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
       throw new Error(`unexpected KV read: ${key}`);
     },
     async put() {}
   };
-  const database = Object.create(Database);
-  database.upsertNodeSummaryEntry = async () => null;
+  const nodeOperations = { ...kernel };
+  Object.assign(nodeOperations, defineNodeRepositoryMethods({}, nodeOperations));
+  nodeOperations.upsertNodeSummaryEntry = async () => null;
 
-  const coldReads = Array.from({ length: 10 }, () => database.getNode("alpha", { ENI_KV: kv }, null));
+  const coldReads = Array.from({ length: 10 }, () => nodeOperations.getNode("alpha", { ENI_KV: kv }, null));
   await entityReadStarted.promise;
   assert.equal(entityReadCount, 1);
   entityReadGate.resolve();
@@ -4433,85 +4719,85 @@ test("concurrent proxy cold reads share one node entity load", async () => {
   const nodes = await Promise.all(coldReads);
   assert.equal(nodes.every(node => new URL(node.target).hostname === "origin.test"), true);
   assert.equal(entityReadCount, 1);
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodeCacheGenerations.clear();
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodeCacheGenerations.clear();
   invalidateNodesRevisionCache();
 });
 
 test("proxy node misses use the short-lived node cache", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   let nodeReadCount = 0;
   const kv = {
     async get(key) {
-      if (key === `${Database.PREFIX}missing`) {
+      if (key === `${kernel.PREFIX}missing`) {
         nodeReadCount += 1;
         return null;
       }
-      if (key === Database.NODES_SUMMARY_INDEX_KEY) return [];
-      if (key === Database.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
+      if (key === kernel.NODES_SUMMARY_INDEX_KEY) return [];
+      if (key === kernel.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
       throw new Error(`unexpected KV read: ${key}`);
     }
   };
   const env = { ENI_KV: kv };
 
-  assert.equal(await Database.getNode("missing", env, null), null);
-  assert.equal(await Database.getNode("missing", env, null), null);
+  assert.equal(await kernel.getNode("missing", env, null), null);
+  assert.equal(await kernel.getNode("missing", env, null), null);
   assert.equal(nodeReadCount, 1);
-  assert.equal(GLOBALS.NodeCache.get("missing")?.data, null);
-  GLOBALS.NodeCache.get("missing").exp = Date.now() - 1;
-  assert.equal(await Database.getNode("missing", env, null), null);
+  assert.equal(isolateState.NodeCache.get("missing")?.data, null);
+  isolateState.NodeCache.get("missing").exp = Date.now() - 1;
+  assert.equal(await kernel.getNode("missing", env, null), null);
   assert.equal(nodeReadCount, 2);
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeCache.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("strict admin node reads bypass the proxy negative cache", async () => {
-  GLOBALS.SingleFlightTasks.clear();
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.SingleFlightTasks.clear();
+  isolateState.NodeCache.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
   let nodeExists = false;
   let nodeReadCount = 0;
   const kv = {
     async get(key) {
-      if (key === `${Database.PREFIX}alpha`) {
+      if (key === `${kernel.PREFIX}alpha`) {
         nodeReadCount += 1;
         return nodeExists ? { target: "https://origin.test" } : null;
       }
-      if (key === Database.NODES_SUMMARY_INDEX_KEY) return [];
-      if (key === Database.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
+      if (key === kernel.NODES_SUMMARY_INDEX_KEY) return [];
+      if (key === kernel.NODES_INDEX_META_KEY) return { revision: "nodes-r1" };
       throw new Error(`unexpected KV read: ${key}`);
     }
   };
   const env = { ENI_KV: kv };
 
-  assert.equal(await Database.getNode("alpha", env, null), null);
+  assert.equal(await kernel.getNode("alpha", env, null), null);
   assert.equal(nodeReadCount, 1);
-  assert.equal(GLOBALS.NodeCache.get("alpha")?.data, null);
+  assert.equal(isolateState.NodeCache.get("alpha")?.data, null);
 
   nodeExists = true;
-  const node = await Database.getNodeForRead("alpha", env);
+  const node = await kernel.getNodeForRead("alpha", env);
   assert.equal(new URL(node.target).hostname, "origin.test");
   assert.equal(nodeReadCount, 2);
 
-  GLOBALS.NodeCache.clear();
-  GLOBALS.NodesListCache = null;
-  GLOBALS.NodesIndexCache = null;
+  isolateState.NodeCache.clear();
+  isolateState.NodesListCache = null;
+  isolateState.NodesIndexCache = null;
   invalidateNodesRevisionCache();
 });
 
 test("proxy preparation reuses the runtime config loaded by the entry route", async () => {
   let configReadCount = 0;
   const runtimeConfig = { rateLimitRpm: 0 };
-  const execution = await Proxy.prepareExecutionContext(
+  const execution = await proxyService.prepareExecutionContext(
     new Request("https://worker.test/alpha/Items"),
     { target: "https://origin.test" },
     "/Items",
@@ -4532,7 +4818,7 @@ test("proxy preparation clones request URLs only when playback parameters mutate
   const ctx = { waitUntil() {} };
 
   const plainUrl = new URL("https://worker.test/alpha/Items?api_key=test");
-  const plainExecution = await Proxy.prepareExecutionContext(
+  const plainExecution = await proxyService.prepareExecutionContext(
     new Request(plainUrl),
     node,
     "/Items",
@@ -4547,7 +4833,7 @@ test("proxy preparation clones request URLs only when playback parameters mutate
   assert.equal(plainUrl.searchParams.get("api_key"), "test");
 
   const fallbackUrl = new URL("https://worker.test/alpha/Videos/1/stream?__pb_abs=1&api_key=test");
-  const fallbackExecution = await Proxy.prepareExecutionContext(
+  const fallbackExecution = await proxyService.prepareExecutionContext(
     new Request(fallbackUrl),
     node,
     "/Videos/1/stream",
@@ -4563,7 +4849,7 @@ test("proxy preparation clones request URLs only when playback parameters mutate
 
   const relayTarget = Buffer.from("https://origin.test/Videos/1/stream", "utf8").toString("base64url");
   const relayUrl = new URL(`https://worker.test/alpha/__playback-relay/Videos/1/stream?__pb_target=${relayTarget}&api_key=test`);
-  const relayExecution = await Proxy.prepareExecutionContext(
+  const relayExecution = await proxyService.prepareExecutionContext(
     new Request(relayUrl),
     node,
     "/__playback-relay/Videos/1/stream",
@@ -4581,7 +4867,7 @@ test("proxy preparation clones request URLs only when playback parameters mutate
 test("proxy metadata preparation rekeys identity and cache TTL", async () => {
   const node = { target: "https://origin.test" };
   const ctx = { waitUntil() {} };
-  const buildExecution = (token, cacheTtlImages) => Proxy.prepareExecutionContext(
+  const buildExecution = (token, cacheTtlImages) => proxyService.prepareExecutionContext(
     new Request(`https://worker.test/alpha/Items/1/Images/Primary?api_key=${encodeURIComponent(token)}&tag=v1`),
     node,
     "/Items/1/Images/Primary",
@@ -4623,7 +4909,7 @@ test("canonical OpsStatus read merges partition, root, shadow, and latest update
     nested: { fromPartition: true },
     updatedAt: "2026-07-03T00:00:00.000Z"
   };
-  GLOBALS.OpsStatusShadowCache.set(db, {
+  isolateState.OpsStatusShadowCache.set(db, {
     pendingPatch: {
       log: {
         status: "shadow",
@@ -4635,11 +4921,11 @@ test("canonical OpsStatus read merges partition, root, shadow, and latest update
     flushPromise: null
   });
 
-  const database = Object.create(Database);
-  database.getOpsStatusSectionEntries = () => [["log", Database.OPS_STATUS_SECTION_SCOPES.log]];
+  const database = createStatusTestService(db);
+  database.getOpsStatusSectionEntries = () => [["log", kernel.OPS_STATUS_SECTION_SCOPES.log]];
   database.getOpsStatusPayloadFromDb = async (_db, scope) => {
-    if (scope === Database.OPS_STATUS_DB_SCOPE_ROOT) return rootStatus;
-    if (scope === Database.OPS_STATUS_SECTION_SCOPES.log) return partitionStatus;
+    if (scope === kernel.OPS_STATUS_DB_SCOPE_ROOT) return rootStatus;
+    if (scope === kernel.OPS_STATUS_SECTION_SCOPES.log) return partitionStatus;
     return null;
   };
 
@@ -4660,7 +4946,7 @@ test("canonical OpsStatus read merges partition, root, shadow, and latest update
 test("full OpsStatus reads the root and each section exactly once", async () => {
   const db = { prepare() {} };
   const readCounts = new Map();
-  const database = Object.create(Database);
+  const database = createStatusTestService(db);
   database.getOpsStatusPayloadFromDb = async (_db, scope) => {
     readCounts.set(scope, (readCounts.get(scope) || 0) + 1);
     return {};
@@ -4668,10 +4954,10 @@ test("full OpsStatus reads the root and each section exactly once", async () => 
 
   await database.getOpsStatus(db);
   assert.deepEqual(Object.fromEntries(readCounts), {
-    [Database.OPS_STATUS_DB_SCOPE_ROOT]: 1,
-    [Database.OPS_STATUS_SECTION_SCOPES.log]: 1,
-    [Database.OPS_STATUS_SECTION_SCOPES.scheduled]: 1,
-    [Database.OPS_STATUS_SECTION_SCOPES.dnsIpPool]: 1
+    [kernel.OPS_STATUS_DB_SCOPE_ROOT]: 1,
+    [kernel.OPS_STATUS_SECTION_SCOPES.log]: 1,
+    [kernel.OPS_STATUS_SECTION_SCOPES.scheduled]: 1,
+    [kernel.OPS_STATUS_SECTION_SCOPES.dnsIpPool]: 1
   });
 });
 
@@ -4867,7 +5153,7 @@ test("admin index resolution ignores Release fields and environment INDEX_URL", 
 });
 
 test("Worker and HTML update requires both uploaded files", async () => {
-  const { kv } = createInMemoryKvStore({ [Database.CONFIG_KEY]: {} });
+  const { kv } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: {} });
   const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-files-required" };
   invalidateRuntimeConfigCache();
   const validHtml = '<!doctype html><html><body><div id="app"></div></body></html>';
@@ -4883,7 +5169,7 @@ test("Worker and HTML update requires both uploaded files", async () => {
   ];
 
   for (const data of cases) {
-    const response = await Database.ApiHandlers.updateWorkerAndAdminIndex(data, {
+    const response = await adminActions.updateWorkerAndAdminIndex(data, {
       env,
       kv,
       ctx: null,
@@ -4900,11 +5186,11 @@ test("local index source persists in KV and renders through the same-origin vend
   const env = { ADMIN_PATH: "/admin", ENI_KV: kv };
   const html = '<!doctype html><html><head><script src="https://cdn.example.test/app.js"></script></head><body><div id="app"></div></body></html>';
   const record = await buildAdminLocalIndexUploadRecord(html, "index.html");
-  const persisted = await Database.persistAdminIndexUpload(record, { env, kv });
+  const persisted = await kernel.persistAdminIndexUpload(record, { env, kv });
   const resolved = buildResolvedAdminIndexState({}, persisted.config);
   assert.equal(resolved.indexUrlSource, "local_upload");
   assert.equal(resolved.localUploadRevision, record.revision);
-  assert.equal((await Database.getAdminIndexUploadRecord(kv, record.revision)).html, html);
+  assert.equal((await kernel.getAdminIndexUploadRecord(kv, record.revision)).html, html);
 
   const response = await renderAdminPage(
     new Request("https://worker.test/admin"),
@@ -4941,13 +5227,13 @@ test("local index source persists in KV and renders through the same-origin vend
 test("local index upload replaces a corrupted record under the same revision", async () => {
   const html = '<!doctype html><html><body><div id="app"></div></body></html>';
   const record = await buildAdminLocalIndexUploadRecord(html, "index.html");
-  const uploadKey = Database.buildAdminIndexUploadKey(record.revision);
+  const uploadKey = kernel.buildAdminIndexUploadKey(record.revision);
   const corruptedRecord = {
     ...record,
     html: '<!doctype html><html><body><div id="app">corrupted</div></body></html>'
   };
   const { kv, storedValues, putKeys } = createInMemoryKvStore({
-    [Database.CONFIG_KEY]: {},
+    [kernel.CONFIG_KEY]: {},
     [uploadKey]: corruptedRecord
   });
   const env = {
@@ -4957,12 +5243,12 @@ test("local index upload replaces a corrupted record under the same revision", a
   };
   invalidateRuntimeConfigCache();
 
-  const persisted = await Database.persistAdminIndexUpload(record, { env, kv });
+  const persisted = await kernel.persistAdminIndexUpload(record, { env, kv });
 
   assert.equal(persisted.record.html, html);
   assert.equal(JSON.parse(storedValues.get(uploadKey)).html, html);
   assert.ok(putKeys.includes(uploadKey));
-  assert.equal((await Database.getAdminIndexUploadRecord(kv, record.revision)).html, html);
+  assert.equal((await kernel.getAdminIndexUploadRecord(kv, record.revision)).html, html);
 });
 
 test("fresh remote shell enforces the byte limit after reading the body", async () => {
@@ -5002,7 +5288,7 @@ test("mutable vendor assets bypass asset cache and return no-store", async () =>
   );
   const manifestEntry = indexRecord.manifest.entries[0];
   const { kv } = createInMemoryKvStore({
-    [Database.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
+    [kernel.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
   });
   const env = { ENI_KV: kv };
   const cacheReads = [];
@@ -5057,7 +5343,7 @@ test("immutable vendor assets use asset cache and immutable browser policy", asy
   );
   const manifestEntry = indexRecord.manifest.entries[0];
   const { kv } = createInMemoryKvStore({
-    [Database.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
+    [kernel.buildAdminIndexUploadKey(indexRecord.revision)]: indexRecord
   });
   const env = { ENI_KV: kv };
   const cacheReads = [];
@@ -5121,7 +5407,7 @@ test("isolate cache defaults preserve bounded proxy headroom", () => {
 });
 
 test("oversized PlaybackInfo responses are not retained in isolate memory", async () => {
-  GLOBALS.PlaybackInfoResponseCache.clear();
+  isolateState.PlaybackInfoResponseCache.clear();
   const execution = {
     requestTraits: { isPlaybackInfoRequest: true },
     playbackInfoCacheKey: "playback-info:oversized",
@@ -5131,11 +5417,11 @@ test("oversized PlaybackInfo responses are not retained in isolate memory", asyn
     nodeDerivedCacheRevision: "rev-1"
   };
   const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
-  const stored = await Proxy.storePlaybackInfoResponseCache(execution, new Response(oversizedBody, {
+  const stored = await proxyService.storePlaybackInfoResponseCache(execution, new Response(oversizedBody, {
     headers: { "Content-Type": "application/json" }
   }));
   assert.equal(stored, false);
-  assert.equal(GLOBALS.PlaybackInfoResponseCache.size, 0);
+  assert.equal(isolateState.PlaybackInfoResponseCache.size, 0);
 });
 
 test("oversized PlaybackInfo rewrite bypasses without blocking its original stream", { timeout: 2000 }, async () => {
@@ -5150,13 +5436,13 @@ test("oversized PlaybackInfo rewrite bypasses without blocking its original stre
     requestMethod: "POST",
     playbackInfoRewrite: ""
   };
-  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
   assert.equal(result, upstreamState);
   assert.equal(execution.playbackInfoRewrite, "not_needed");
   assert.equal((await response.text()).length, oversizedBody.length);
 });
 
-test("PlaybackInfo passthrough removes non-object media sources from the delivered response", async () => {
+test("PlaybackInfo passthrough decodes nested object fields and removes invalid entries", async () => {
   const execution = {
     requestTraits: { isPlaybackInfoRequest: true },
     effectivePlaybackInfoMode: "passthrough",
@@ -5166,12 +5452,23 @@ test("PlaybackInfo passthrough removes non-object media sources from the deliver
   const upstreamState = {
     response: new Response(JSON.stringify({
       PlaySessionId: "session-1",
-      MediaSources: [
-        JSON.stringify({ Id: "encoded-source" }),
-        { Id: "valid-source", Path: "/Videos/1/stream" },
+      MediaSources: JSON.stringify([
+        JSON.stringify({
+          Id: "encoded-source",
+          MediaStreams: [JSON.stringify({ Index: 0, Codec: "h264" }), "invalid-stream"],
+          MediaAttachments: JSON.stringify([{ Codec: "srt" }, null]),
+          RequiredHttpHeaders: JSON.stringify({ "X-Media-Token": "token" })
+        }),
+        {
+          Id: "valid-source",
+          Path: "/Videos/1/stream",
+          MediaStreams: "invalid-streams",
+          MediaAttachments: null,
+          RequiredHttpHeaders: "invalid-headers"
+        },
         null,
         ["array-source"]
-      ]
+      ])
     }), {
       headers: {
         "Content-Type": "application/json",
@@ -5183,12 +5480,26 @@ test("PlaybackInfo passthrough removes non-object media sources from the deliver
     })
   };
 
-  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
   assert.notEqual(result, upstreamState);
   assert.equal(execution.playbackInfoRewrite, "applied");
   assert.deepEqual(await result.response.json(), {
     PlaySessionId: "session-1",
-    MediaSources: [{ Id: "valid-source", Path: "/Videos/1/stream" }]
+    MediaSources: [
+      {
+        Id: "encoded-source",
+        MediaStreams: [{ Index: 0, Codec: "h264" }],
+        MediaAttachments: [{ Codec: "srt" }],
+        RequiredHttpHeaders: { "X-Media-Token": "token" }
+      },
+      {
+        Id: "valid-source",
+        Path: "/Videos/1/stream",
+        MediaStreams: [],
+        MediaAttachments: [],
+        RequiredHttpHeaders: {}
+      }
+    ]
   });
   assert.equal(result.response.headers.get("Content-Length"), null);
   assert.equal(result.response.headers.get("ETag"), null);
@@ -5196,7 +5507,7 @@ test("PlaybackInfo passthrough removes non-object media sources from the deliver
   assert.equal(result.response.headers.get("X-Upstream"), "preserved");
 });
 
-test("PlaybackInfo passthrough returns an empty media source array when every entry is invalid", async () => {
+test("PlaybackInfo passthrough replaces an invalid media source container with an empty array", async () => {
   const execution = {
     requestTraits: { isPlaybackInfoRequest: true },
     effectivePlaybackInfoMode: "passthrough",
@@ -5204,18 +5515,18 @@ test("PlaybackInfo passthrough returns an empty media source array when every en
     playbackInfoRewrite: ""
   };
   const upstreamState = {
-    response: new Response(JSON.stringify({ MediaSources: ["encoded", null, []] }), {
+    response: new Response(JSON.stringify({ MediaSources: "invalid-sources" }), {
       headers: { "Content-Type": "application/json" }
     })
   };
 
-  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
   assert.deepEqual((await result.response.json()).MediaSources, []);
   assert.equal(execution.playbackInfoRewrite, "applied");
 });
 
 test("valid PlaybackInfo passthrough keeps the original response unchanged", async () => {
-  const bodyText = '{\n  "MediaSources": [{"Id":"valid-source"}],\n  "Marker": "original-bytes"\n}';
+  const bodyText = '{\n  "MediaSources": [{"Id":"valid-source","MediaStreams":[{"Index":0}],"MediaAttachments":[],"RequiredHttpHeaders":{}}],\n  "Marker": "original-bytes"\n}';
   const execution = {
     requestTraits: { isPlaybackInfoRequest: true },
     effectivePlaybackInfoMode: "passthrough",
@@ -5228,7 +5539,7 @@ test("valid PlaybackInfo passthrough keeps the original response unchanged", asy
     })
   };
 
-  const result = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+  const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
   assert.equal(result, upstreamState);
   assert.equal(result.response, upstreamState.response);
   assert.equal(execution.playbackInfoRewrite, "passthrough");
@@ -5247,7 +5558,7 @@ test("non-JSON and oversized PlaybackInfo passthrough responses remain untouched
     response: new Response("upstream text", { headers: { "Content-Type": "text/plain" } })
   };
   const textExecution = makeExecution();
-  assert.equal(await Proxy.maybeRewritePlaybackInfoResponse(textExecution, textState), textState);
+  assert.equal(await proxyService.maybeRewritePlaybackInfoResponse(textExecution, textState), textState);
   assert.equal(textExecution.playbackInfoRewrite, "passthrough");
   assert.equal(await textState.response.text(), "upstream text");
 
@@ -5256,13 +5567,13 @@ test("non-JSON and oversized PlaybackInfo passthrough responses remain untouched
     response: new Response(oversizedBody, { headers: { "Content-Type": "application/json" } })
   };
   const oversizedExecution = makeExecution();
-  assert.equal(await Proxy.maybeRewritePlaybackInfoResponse(oversizedExecution, oversizedState), oversizedState);
+  assert.equal(await proxyService.maybeRewritePlaybackInfoResponse(oversizedExecution, oversizedState), oversizedState);
   assert.equal(oversizedExecution.playbackInfoRewrite, "passthrough");
   assert.equal((await oversizedState.response.text()).length, oversizedBody.length);
 });
 
 test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching", async () => {
-  GLOBALS.PlaybackInfoResponseCache.clear();
+  isolateState.PlaybackInfoResponseCache.clear();
   const originalCloneDescriptor = Object.getOwnPropertyDescriptor(Response.prototype, "clone");
   const originalClone = originalCloneDescriptor.value;
   let cloneCount = 0;
@@ -5297,39 +5608,39 @@ test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching"
       finalUrl: new URL("https://origin.test/Items/1/PlaybackInfo")
     };
 
-    const rewrittenState = await Proxy.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+    const rewrittenState = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
     assert.equal(cloneCount, 1);
     assert.equal(execution.playbackInfoCacheBodyResolved, true);
     assert.ok(execution.playbackInfoCacheBody?.bytes > 0);
 
-    const stored = await Proxy.storePlaybackInfoResponseCache(execution, rewrittenState.response);
+    const stored = await proxyService.storePlaybackInfoResponseCache(execution, rewrittenState.response);
     assert.equal(stored, true);
     assert.equal(cloneCount, 1, "cache storage must reuse the rewrite snapshot");
-    assert.equal(GLOBALS.PlaybackInfoResponseCache.get("playback-info:single-read")?.bodyText, execution.playbackInfoCacheBody.text);
+    assert.equal(isolateState.PlaybackInfoResponseCache.get("playback-info:single-read")?.bodyText, execution.playbackInfoCacheBody.text);
   } finally {
     Object.defineProperty(Response.prototype, "clone", originalCloneDescriptor);
-    GLOBALS.PlaybackInfoResponseCache.clear();
+    isolateState.PlaybackInfoResponseCache.clear();
   }
 });
 
 test("PlaybackInfo cache evicts oldest entries at its total byte budget", () => {
-  GLOBALS.PlaybackInfoResponseCache.clear();
+  isolateState.PlaybackInfoResponseCache.clear();
   const entryBytes = Config.Defaults.PlaybackInfoCacheEntryMaxBytes;
   const entryCount = Math.floor(Config.Defaults.PlaybackInfoCacheTotalMaxBytes / entryBytes) + 1;
   for (let index = 0; index < entryCount; index += 1) {
-    GLOBALS.PlaybackInfoResponseCache.set(`entry-${index}`, {
+    isolateState.PlaybackInfoResponseCache.set(`entry-${index}`, {
       bodyText: "",
       bodyBytes: entryBytes,
       expiresAt: Date.now() + 60000
     });
   }
-  Proxy.cleanupPlaybackInfoResponseCache();
-  assert.equal(GLOBALS.PlaybackInfoResponseCache.has("entry-0"), false);
-  assert.equal(GLOBALS.PlaybackInfoResponseCache.has(`entry-${entryCount - 1}`), true);
-  const retainedBytes = [...GLOBALS.PlaybackInfoResponseCache.values()]
+  proxyService.cleanupPlaybackInfoResponseCache();
+  assert.equal(isolateState.PlaybackInfoResponseCache.has("entry-0"), false);
+  assert.equal(isolateState.PlaybackInfoResponseCache.has(`entry-${entryCount - 1}`), true);
+  const retainedBytes = [...isolateState.PlaybackInfoResponseCache.values()]
     .reduce((total, entry) => total + entry.bodyBytes, 0);
   assert.ok(retainedBytes <= Config.Defaults.PlaybackInfoCacheTotalMaxBytes);
-  GLOBALS.PlaybackInfoResponseCache.clear();
+  isolateState.PlaybackInfoResponseCache.clear();
 });
 
 test("unknown-length control requests stay streamed instead of being cloned into memory", async () => {
@@ -5344,7 +5655,7 @@ test("unknown-length control requests stay streamed instead of being cloned into
     duplex: "half"
   });
   assert.equal(request.headers.has("Content-Length"), false);
-  const transport = await Proxy.buildProxyRequestState(
+  const transport = await proxyService.buildProxyRequestState(
     request,
     {},
     "/Sessions/Playing/Progress",
@@ -5369,7 +5680,7 @@ test("unknown-length control requests stay streamed instead of being cloned into
     requestUrl: new URL("https://worker.test/Sessions/Playing/Progress?ItemId=query-item"),
     request
   };
-  const parsed = Proxy.parsePlaybackSessionControlPayload(execution, transport);
+  const parsed = proxyService.parsePlaybackSessionControlPayload(execution, transport);
   assert.equal(parsed.parseError, true);
   assert.equal(parsed.parseMode, "stream");
   assert.equal(parsed.parseErrorReason, "unbuffered_body");
@@ -5383,7 +5694,7 @@ test("unknown-length control requests stay streamed instead of being cloned into
     },
     body: JSON.stringify({ ItemId: "body-item" })
   });
-  const oversizedTransport = await Proxy.buildProxyRequestState(
+  const oversizedTransport = await proxyService.buildProxyRequestState(
     oversizedRequest,
     {},
     "/Sessions/Playing",
@@ -5403,7 +5714,7 @@ test("unknown-length control requests stay streamed instead of being cloned into
     {}
   );
   assert.equal(oversizedTransport.preparedBodyMode, "stream");
-  const oversizedParsed = Proxy.parsePlaybackSessionControlPayload({
+  const oversizedParsed = proxyService.parsePlaybackSessionControlPayload({
     requestMethod: "POST",
     requestUrl: new URL(oversizedRequest.url),
     request: oversizedRequest
@@ -5430,8 +5741,8 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
     preparedBody: new TextEncoder().encode(bodyText),
     newHeaders: new Headers({ "Content-Type": "text/plain", "Content-Length": String(bodyText.length) })
   };
-  const parsed = Proxy.parsePlaybackSessionControlPayload(execution, transport);
-  const media = Proxy.resolveServerLastWatchMedia(execution, transport);
+  const parsed = proxyService.parsePlaybackSessionControlPayload(execution, transport);
+  const media = proxyService.resolveServerLastWatchMedia(execution, transport);
   assert.equal(parsed.parseError, false);
   assert.equal(parsed.parseMode, "text_plain_json");
   assert.deepEqual(media, {
@@ -5450,7 +5761,7 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
     playbackSessionControlPayload: null,
     requestUrl: new URL("https://worker.test/Sessions/Playing?ItemId=query-fallback")
   };
-  const invalid = Proxy.parsePlaybackSessionControlPayload(invalidExecution, {
+  const invalid = proxyService.parsePlaybackSessionControlPayload(invalidExecution, {
     ...transport,
     preparedBodyText: "not-json"
   });
@@ -5462,7 +5773,7 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
     ...execution,
     playbackSessionControlPayload: null
   };
-  const arrayPayload = Proxy.parsePlaybackSessionControlPayload(arrayExecution, {
+  const arrayPayload = proxyService.parsePlaybackSessionControlPayload(arrayExecution, {
     ...transport,
     preparedBodyText: JSON.stringify([{ ItemId: "array-item" }])
   });
@@ -5472,7 +5783,7 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
 });
 
 test("playback progress relay enforces its bounded session table on insertion", () => {
-  const relayMap = GLOBALS.PlaybackProgressRelay;
+  const relayMap = isolateState.PlaybackProgressRelay;
   relayMap.clear();
   const maxEntries = Config.Defaults.VideoProgressForwardSessionMax;
   const execution = {
@@ -5482,7 +5793,7 @@ test("playback progress relay enforces its bounded session table on insertion", 
     ctx: { waitUntil() {} }
   };
   for (let index = 0; index < maxEntries + 1; index += 1) {
-    Proxy.markPlaybackProgressRelayStopped(`session-${index}`, execution);
+    proxyService.markPlaybackProgressRelayStopped(`session-${index}`, execution);
   }
   assert.equal(relayMap.size, maxEntries);
   assert.equal(relayMap.has("session-0"), false);
@@ -5493,24 +5804,24 @@ test("playback progress relay enforces its bounded session table on insertion", 
 test("incremental isolate cleanup covers nonessential proxy-adjacent caches", () => {
   const now = Date.now();
   const staleCases = [
-    [5, GLOBALS.PlaybackInfoResponseCache, "stale-playback", { expiresAt: now - 1 }],
-    [6, GLOBALS.ProxyFailoverStateCache, "stale-failover", {
+    [5, isolateState.PlaybackInfoResponseCache, "stale-playback", { expiresAt: now - 1 }],
+    [6, isolateState.ProxyFailoverStateCache, "stale-failover", {
       preferredTargetExpiresAt: now - 1,
       failingTargets: new Map(),
       inFlightProbe: null,
       lastProbeResult: null
     }],
-    [7, GLOBALS.PlaybackProgressRelay, "stale-progress", { lastTouchedAt: now - 120000 }],
-    [8, GLOBALS.ServerRecordWatchSessions, "stale-watch", { lastSeenAt: now - 31 * 60 * 1000 }],
-    [9, GLOBALS.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }]
+    [7, isolateState.PlaybackProgressRelay, "stale-progress", { lastTouchedAt: now - 120000 }],
+    [8, isolateState.ServerRecordWatchSessions, "stale-watch", { lastSeenAt: now - 31 * 60 * 1000 }],
+    [9, isolateState.DashboardMonthlyTrafficCache, "stale-month", { staleUntil: now - 1 }]
   ];
   for (const [phase, cache, key, value] of staleCases) {
     cache.clear();
     cache.set(key, value);
-    GLOBALS.CleanupState.phase = phase;
-    GLOBALS.CleanupState.lastRunAt = 0;
-    GLOBALS.CleanupState.iterators = {};
-    CacheManager.maybeCleanup();
+    isolateState.CleanupState.phase = phase;
+    isolateState.CleanupState.lastRunAt = 0;
+    isolateState.CleanupState.iterators = {};
+    cachePort.maybeCleanup();
     assert.equal(cache.has(key), false, `cleanup phase ${phase} should remove stale entry`);
   }
 });
@@ -5560,17 +5871,17 @@ function createD1Recorder() {
 
 test("D1 OpsStatus reads and writes reuse the binding-local hot cache", async () => {
   const recorder = createD1Recorder();
-  const scope = Database.OPS_STATUS_DB_SCOPE_ROOT;
+  const scope = kernel.OPS_STATUS_DB_SCOPE_ROOT;
 
-  assert.equal(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), null);
-  assert.equal(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), null);
+  assert.equal(await kernel.getOpsStatusPayloadFromDb(recorder.db, scope), null);
+  assert.equal(await kernel.getOpsStatusPayloadFromDb(recorder.db, scope), null);
   assert.equal(recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length, 1);
   assert.equal(recorder.prepared.filter(record => /^CREATE TABLE IF NOT EXISTS sys_status/i.test(record.sql.trim())).length, 1);
 
-  await Database.putOpsStatusPayloadToDb(recorder.db, scope, { log: { status: "ready" } }, Date.now());
-  assert.deepEqual(await Database.getOpsStatusPayloadFromDb(recorder.db, scope), { log: { status: "ready" } });
+  await kernel.putOpsStatusPayloadToDb(recorder.db, scope, { log: { status: "ready" } }, Date.now());
+  assert.deepEqual(await kernel.getOpsStatusPayloadFromDb(recorder.db, scope), { log: { status: "ready" } });
   const selectCountBeforePatch = recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length;
-  await Database.patchOpsStatus(recorder.db, { log: { lastFlushStatus: "success" } });
+  await kernel.patchOpsStatus(recorder.db, { log: { lastFlushStatus: "success" } });
   assert.equal(
     recorder.prepared.filter(record => /^SELECT payload FROM sys_status/i.test(record.sql.trim())).length,
     selectCountBeforePatch,
@@ -5580,9 +5891,10 @@ test("D1 OpsStatus reads and writes reuse the binding-local hot cache", async ()
 });
 
 test("Cloudflare runtime stale fallback performs one D1 cache lookup", async () => {
-  const database = Object.create(Database);
+  const cacheOperations = { ...kernel };
+  Object.assign(cacheOperations, defineAnalyticsCacheMethods({}, cacheOperations));
   let cacheReadCount = 0;
-  database.getCfRuntimeCacheEntry = async () => {
+  cacheOperations.getCfRuntimeCacheEntry = async () => {
     cacheReadCount += 1;
     return {
       payload: { cached: true },
@@ -5592,7 +5904,7 @@ test("Cloudflare runtime stale fallback performs one D1 cache lookup", async () 
     };
   };
   await assert.rejects(
-    database.loadCfRuntimeCachePayload({}, {
+    cacheOperations.loadCfRuntimeCachePayload({}, {
       cacheKey: "runtime:test",
       cacheGroup: "test",
       resourceId: "test",
@@ -5608,34 +5920,34 @@ test("Cloudflare runtime stale fallback performs one D1 cache lookup", async () 
 test("D1 schema initialization is single-flight and migration indexes match runtime queries", async () => {
   const logRecorder = createD1Recorder();
   await Promise.all([
-    Database.ensureLogsBaseSchema(logRecorder.db),
-    Database.ensureLogsBaseSchema(logRecorder.db)
+    kernel.ensureLogsBaseSchema(logRecorder.db),
+    kernel.ensureLogsBaseSchema(logRecorder.db)
   ]);
-  await Database.ensureLogsBaseSchema(logRecorder.db);
+  await kernel.ensureLogsBaseSchema(logRecorder.db);
   await Promise.all([
-    Database.ensureStatsHourlySchema(logRecorder.db),
-    Database.ensureStatsHourlySchema(logRecorder.db)
+    kernel.ensureStatsHourlySchema(logRecorder.db),
+    kernel.ensureStatsHourlySchema(logRecorder.db)
   ]);
 
   assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 1);
   assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_stats_hourly \(/.test(record.sql)).length, 1);
   assert.ok(logRecorder.prepared.some(record => /idx_proxy_logs_client_time/.test(record.sql)));
-  Database.invalidateD1SchemaReadiness(logRecorder.db, "logs");
-  await Database.ensureLogsBaseSchema(logRecorder.db);
+  kernel.invalidateD1SchemaReadiness(logRecorder.db, "logs");
+  await kernel.ensureLogsBaseSchema(logRecorder.db);
   assert.equal(logRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS proxy_logs \(/.test(record.sql)).length, 2);
 
   const dnsRecorder = createD1Recorder();
   await Promise.all([
-    Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db),
-    Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db)
+    kernel.ensureDnsIpWorkspaceSchema(dnsRecorder.db),
+    kernel.ensureDnsIpWorkspaceSchema(dnsRecorder.db)
   ]);
-  await Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
+  await kernel.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
 
   assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 1);
   assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_pool_items_updated_ip/.test(record.sql)));
   assert.ok(dnsRecorder.prepared.some(record => /idx_dns_ip_probe_cache_colo_ip_expires/.test(record.sql)));
-  Database.invalidateD1SchemaReadiness(dnsRecorder.db, "all");
-  await Database.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
+  kernel.invalidateD1SchemaReadiness(dnsRecorder.db, "all");
+  await kernel.ensureDnsIpWorkspaceSchema(dnsRecorder.db);
   assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
 
   const migrationSql = await readFile(new URL("../migrations/0003_d1_schema_v5_indexes.sql", import.meta.url), "utf8");
@@ -5649,7 +5961,7 @@ test("D1 schema initialization is single-flight and migration indexes match runt
 
 test("D1 DNS writes keep stable ids and replace sources atomically", async () => {
   const recorder = createD1Recorder();
-  await Database.upsertDnsIpPoolItems(recorder.db, [{
+  await kernel.upsertDnsIpPoolItems(recorder.db, [{
     id: "item-v2",
     ip: "203.0.113.10",
     sourceKind: "manual",
@@ -5658,7 +5970,7 @@ test("D1 DNS writes keep stable ids and replace sources atomically", async () =>
   const itemUpsertSql = recorder.prepared.find(record => /INSERT INTO dns_ip_pool_items/.test(record.sql))?.sql || "";
   assert.doesNotMatch(itemUpsertSql, /id\s*=\s*excluded\.id/);
 
-  await Database.persistDnsIpPoolSources({ db: recorder.db }, [{
+  await kernel.persistDnsIpPoolSources({ db: recorder.db }, [{
     id: "source-1",
     name: "Example source",
     url: "https://example.test/ips.txt",
@@ -5677,7 +5989,7 @@ test("D1 DNS writes keep stable ids and replace sources atomically", async () =>
 test("D1 probe cache bulk reads stay within the 100 binding limit", async () => {
   const recorder = createD1Recorder();
   const ips = Array.from({ length: 99 }, (_, index) => `203.0.113.${index + 1}`);
-  await Database.getDnsIpProbeCacheEntries(recorder.db, ips, "SJC");
+  await kernel.getDnsIpProbeCacheEntries(recorder.db, ips, "SJC");
   const bulkQueries = recorder.prepared.filter(record => /WHERE entry_colo = \? AND expires_at > \? AND ip IN/.test(record.sql));
   assert.equal(bulkQueries.length, 2);
   assert.ok(bulkQueries.every(record => record.bindings.length <= 100));
@@ -5699,8 +6011,8 @@ test("playback session keys are partitioned by node even when Emby session ids m
     preparedBodyText: JSON.stringify({ SessionId: "shared-session", PlaySessionId: "shared-play", ItemId: "movie-1" }),
     newHeaders: new Headers({ "Content-Type": "application/json" })
   };
-  const first = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-a"), transport);
-  const second = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-b"), transport);
+  const first = proxyService.resolvePlaybackProgressSessionKey(makeExecution("server-a"), transport);
+  const second = proxyService.resolvePlaybackProgressSessionKey(makeExecution("server-b"), transport);
   assert.equal(first.sessionKey, "server-a|session:shared-session");
   assert.equal(second.sessionKey, "server-b|session:shared-session");
   assert.notEqual(first.sessionKey, second.sessionKey);
@@ -5713,7 +6025,7 @@ test("playback session keys are partitioned by node even when Emby session ids m
     preparedBodyText: JSON.stringify({ DeviceId: "device-strong-value", ItemId: "movie-device" }),
     newHeaders: new Headers({ "Content-Type": "application/json" })
   };
-  const device = Proxy.resolvePlaybackProgressSessionKey(makeExecution("server-a"), deviceTransport);
+  const device = proxyService.resolvePlaybackProgressSessionKey(makeExecution("server-a"), deviceTransport);
   assert.equal(device.sessionStrength, "weak");
   assert.match(device.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
   assert.match(device.sessionFingerprint, /^[0-9a-f]{16}$/);
@@ -5733,8 +6045,8 @@ test("playback session keys are partitioned by node even when Emby session ids m
     preparedBodyText: JSON.stringify({ ItemId: "movie-1" }),
     newHeaders: new Headers({ "Content-Type": "application/json" })
   };
-  const started = Proxy.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing"), fallbackTransport);
-  const stopped = Proxy.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing/Stopped"), fallbackTransport);
+  const started = proxyService.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing"), fallbackTransport);
+  const stopped = proxyService.resolvePlaybackProgressSessionKey(makeFallbackExecution("/Sessions/Playing/Stopped"), fallbackTransport);
   assert.equal(started.sessionKey, stopped.sessionKey);
   assert.doesNotMatch(started.sessionKey, /private|device-1|movie-1/);
   assert.match(started.sessionIdentityFingerprint, /^[0-9a-f]{16}$/);
@@ -5745,13 +6057,13 @@ test("playback session keys are partitioned by node even when Emby session ids m
 test("server record playback context requires matching PlaybackInfo and item details", async () => {
   const tasks = [];
   const writes = [];
-  const originalUpsert = Database.upsertServerWatchLifecycle;
-  Database.upsertServerWatchLifecycle = async (_db, event) => {
+  const originalUpsert = kernel.upsertServerWatchLifecycle;
+  kernel.upsertServerWatchLifecycle = async (_db, event) => {
     writes.push(event);
     return { admitted: true, schemaVersion: 9 };
   };
-  GLOBALS.ServerRecordWatchSessions.clear();
-  GLOBALS.ServerRecordPlaybackContexts.clear();
+  isolateState.ServerRecordWatchSessions.clear();
+  isolateState.ServerRecordPlaybackContexts.clear();
   const makeExecution = (nodeName, method, proxyPath, search = "", traits = {}) => {
     const url = `https://proxy.test${proxyPath}${search}`;
     return {
@@ -5806,19 +6118,19 @@ test("server record playback context requires matching PlaybackInfo and item det
   };
   try {
     assert.equal(
-      Proxy.observeServerRecordPlaybackItemDetails(
+      proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
         new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
       ),
       true
     );
     await Promise.all(tasks.splice(0));
-    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
+    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
 
-    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution(), null, 503), false);
-    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
-    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
-    const verified = Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport);
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution(), null, 503), false);
+    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    const verified = proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport);
     assert.deepEqual(verified, {
       itemId: "episode-context",
       itemName: "Context episode",
@@ -5828,7 +6140,7 @@ test("server record playback context requires matching PlaybackInfo and item det
       year: 2024
     });
     const lifecycle = lifecycleExecution();
-    assert.equal(Proxy.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
     await Promise.all(tasks.splice(0));
     assert.equal(writes.length, 1);
     assert.deepEqual(writes[0].media, verified);
@@ -5844,7 +6156,7 @@ test("server record playback context requires matching PlaybackInfo and item det
         ItemName: "Event title"
       })
     };
-    assert.equal(Proxy.scheduleServerWatchLifecycle(directLifecycle, directTransport), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(directLifecycle, directTransport), true);
     await Promise.all(tasks.splice(0));
     assert.equal(writes.length, 2);
     assert.deepEqual(writes[1].media, {
@@ -5853,72 +6165,72 @@ test("server record playback context requires matching PlaybackInfo and item det
     });
     assert.equal(directLifecycle.serverWatchLifecycleDiagnostic.decision, "scheduled");
 
-    GLOBALS.ServerRecordPlaybackContexts.clear();
-    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    isolateState.ServerRecordPlaybackContexts.clear();
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
     assert.equal(
-      Proxy.observeServerRecordPlaybackItemDetails(
+      proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
         new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
       ),
       true
     );
     await Promise.all(tasks.splice(0));
-    assert.equal(Proxy.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport)?.itemId, "episode-context");
+    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport)?.itemId, "episode-context");
 
-    GLOBALS.ServerRecordPlaybackContexts.clear();
+    isolateState.ServerRecordPlaybackContexts.clear();
     assert.equal(
-      Proxy.observeServerRecordPlaybackItemDetails(
+      proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
         new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
       ),
       true
     );
     assert.equal(
-      Proxy.observeServerRecordPlaybackItemDetails(
+      proxyService.observeServerRecordPlaybackItemDetails(
         makeExecution("server-a", "GET", "/Items/episode-context/Images/Primary", "?DeviceId=device-context"),
         new Response("image", { headers: { "Content-Type": "image/jpeg" } })
       ),
       false
     );
     await Promise.all(tasks.splice(0));
-    assert.equal(Proxy.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
     assert.equal(
-      Proxy.getServerRecordPlaybackContextMedia(
+      proxyService.getServerRecordPlaybackContextMedia(
         makeExecution("server-b", "POST", "/Sessions/Playing", "?DeviceId=device-context", { isPlaybackStartedRequest: true }),
         lifecycleTransport
       ),
       null
     );
     assert.equal(
-      Proxy.getServerRecordPlaybackContextMedia(
+      proxyService.getServerRecordPlaybackContextMedia(
         makeExecution("server-a", "POST", "/Sessions/Playing", "?DeviceId=other-device", { isPlaybackStartedRequest: true }),
         { ...lifecycleTransport, preparedBodyText: JSON.stringify({ DeviceId: "other-device" }) }
       ),
       null
     );
     assert.equal(
-      Proxy.observeServerRecordPlaybackItemDetails(
+      proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
         new Response("not-json", { headers: { "Content-Type": "text/plain" } })
       ),
       false
     );
   } finally {
-    Database.upsertServerWatchLifecycle = originalUpsert;
-    GLOBALS.ServerRecordWatchSessions.clear();
-    GLOBALS.ServerRecordPlaybackContexts.clear();
+    kernel.upsertServerWatchLifecycle = originalUpsert;
+    isolateState.ServerRecordWatchSessions.clear();
+    isolateState.ServerRecordPlaybackContexts.clear();
   }
 });
 
 test("server watch lifecycle records Playing, dedupes Progress, and finalizes STOP", async () => {
   const tasks = [];
   const writes = [];
-  const originalUpsert = Database.upsertServerWatchLifecycle;
-  Database.upsertServerWatchLifecycle = async (_db, event) => {
+  const originalUpsert = kernel.upsertServerWatchLifecycle;
+  kernel.upsertServerWatchLifecycle = async (_db, event) => {
     writes.push(event);
     return { admitted: true, schemaVersion: 9 };
   };
-  GLOBALS.ServerRecordWatchSessions.clear();
+  isolateState.ServerRecordWatchSessions.clear();
   const makeExecution = (nodeName, phase, options = {}) => {
     const path = phase === "started" ? "/Sessions/Playing"
       : phase === "progress" ? "/Sessions/Playing/Progress"
@@ -5945,10 +6257,10 @@ test("server watch lifecycle records Playing, dedupes Progress, and finalizes ST
     preparedBodyText: JSON.stringify(body)
   });
   try {
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "ping")), false);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { requestMethod: "GET" })), false);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { enabled: false })), false);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { withDb: false })), false);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "ping")), false);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { requestMethod: "GET" })), false);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { enabled: false })), false);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { withDb: false })), false);
     const startedBody = {
       SessionId: "session-a",
       ItemId: "episode-1",
@@ -5960,9 +6272,9 @@ test("server watch lifecycle records Playing, dedupes Progress, and finalizes ST
       }
     };
     const startedExecution = makeExecution("server-a", "started");
-    assert.equal(Proxy.scheduleServerWatchLifecycle(startedExecution, transport(startedBody)), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(startedExecution, transport(startedBody)), true);
     for (let index = 0; index < 200; index += 1) {
-      assert.equal(Proxy.scheduleServerWatchLifecycle(
+      assert.equal(proxyService.scheduleServerWatchLifecycle(
         makeExecution("server-a", "progress", { startTime: 124_456 + index }),
         transport(startedBody)
       ), false);
@@ -5972,16 +6284,16 @@ test("server watch lifecycle records Playing, dedupes Progress, and finalizes ST
       ItemId: "episode-2",
       Item: { ...startedBody.Item, Name: "Episode two", ImageTags: { Primary: "poster-2" } }
     };
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 130_000 }), transport(changedItemBody)), true);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { startTime: 234_567 }), transport({ SessionId: "session-a" })), true);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_567 }), transport(changedItemBody)), false);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 130_000 }), transport(changedItemBody)), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { startTime: 234_567 }), transport({ SessionId: "session-a" })), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_567 }), transport(changedItemBody)), false);
     const nextItemBody = {
       ...startedBody,
       ItemId: "episode-3",
       Item: { ...startedBody.Item, Name: "Episode three", ImageTags: { Primary: "poster-3" } }
     };
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_568 }), transport(nextItemBody)), true);
-    assert.equal(Proxy.scheduleServerWatchLifecycle(makeExecution("server-b", "progress", { startTime: 345_678 }), transport({
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_568 }), transport(nextItemBody)), true);
+    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-b", "progress", { startTime: 345_678 }), transport({
       PlaySessionId: "play-b",
       ItemId: "movie-2",
       ItemName: "Movie two",
@@ -6002,32 +6314,32 @@ test("server watch lifecycle records Playing, dedupes Progress, and finalizes ST
     assert.match(writes[3].sessionFingerprint, /^[0-9a-f]{16}$/);
     assert.equal(writes[0].sessionStrength, "strong");
     assert.equal(writes[4].sessionStrength, "strong");
-    const watchLogDetail = Proxy.buildStructuredLogDetail(startedExecution, { statusCode: 200 });
+    const watchLogDetail = proxyService.buildStructuredLogDetail(startedExecution, { statusCode: 200 });
     assert.equal(watchLogDetail.watchPhase, "started");
     assert.equal(watchLogDetail.watchDecision, "scheduled");
     assert.equal(watchLogDetail.watchParseMode, "text_plain_json");
     assert.equal(watchLogDetail.watchSessionStrength, "strong");
     assert.doesNotMatch(JSON.stringify(watchLogDetail), /session-a|episode-1|Episode one|poster-1/);
-    const handleSource = Proxy.handle.toString();
-    const transportPosition = handleSource.indexOf("transport = await this.buildProxyRequestState");
-    const schedulePosition = handleSource.indexOf("this.scheduleServerWatchLifecycle(execution, transport)");
-    const upstreamPosition = handleSource.indexOf("this.executeUpstreamFlow");
+    const handleSource = proxyService.handle.toString();
+    const transportPosition = handleSource.indexOf("transport = await kernel.buildProxyRequestState");
+    const schedulePosition = handleSource.indexOf("kernel.scheduleServerWatchLifecycle(execution, transport)");
+    const upstreamPosition = handleSource.indexOf("kernel.executeUpstreamFlow");
     assert.ok(transportPosition >= 0 && transportPosition < schedulePosition);
     assert.ok(schedulePosition < upstreamPosition);
   } finally {
-    Database.upsertServerWatchLifecycle = originalUpsert;
-    GLOBALS.ServerRecordWatchSessions.clear();
+    kernel.upsertServerWatchLifecycle = originalUpsert;
+    isolateState.ServerRecordWatchSessions.clear();
   }
 });
 
 test("server watch access logs wait for final D1 decisions without blocking scheduling", async () => {
-  const originalUpsert = Database.upsertServerWatchLifecycle;
-  const originalLoggerRecord = Logger.record;
+  const originalUpsert = kernel.upsertServerWatchLifecycle;
+  const originalLoggerRecord = logger.record;
   const originalConsoleError = console.error;
   const recorded = [];
-  Logger.record = (_env, _ctx, logData) => { recorded.push(logData); };
+  logger.record = (_env, _ctx, logData) => { recorded.push(logData); };
   console.error = () => {};
-  GLOBALS.ServerRecordWatchSessions.clear();
+  isolateState.ServerRecordWatchSessions.clear();
   const cases = [
     {
       nodeName: "watch-log-v8",
@@ -6048,7 +6360,7 @@ test("server watch access logs wait for final D1 decisions without blocking sche
   try {
     for (const [index, testCase] of cases.entries()) {
       const deferred = createDeferred();
-      Database.upsertServerWatchLifecycle = () => deferred.promise;
+      kernel.upsertServerWatchLifecycle = () => deferred.promise;
       const tasks = [];
       const startTime = Date.now() - 25;
       const execution = {
@@ -6069,15 +6381,15 @@ test("server watch access logs wait for final D1 decisions without blocking sche
         newHeaders: new Headers({ "Content-Type": "application/json" })
       };
       const beforeCount = recorded.length;
-      assert.equal(Proxy.scheduleServerWatchLifecycle(execution, transport), true);
+      assert.equal(proxyService.scheduleServerWatchLifecycle(execution, transport), true);
       assert.ok(execution.serverWatchLifecycleTask instanceof Promise);
-      Proxy.recordAccessLog(execution, {
+      proxyService.recordAccessLog(execution, {
         statusCode: 200,
-        detailJson: Proxy.buildStructuredLogDetail(execution, { statusCode: 200 })
+        detailJson: proxyService.buildStructuredLogDetail(execution, { statusCode: 200 })
       });
-      Proxy.recordAccessLog(execution, {
+      proxyService.recordAccessLog(execution, {
         statusCode: 200,
-        detailJson: Proxy.buildStructuredLogDetail(execution, { statusCode: 200 })
+        detailJson: proxyService.buildStructuredLogDetail(execution, { statusCode: 200 })
       });
       assert.equal(recorded.length, beforeCount);
       const capturedResponseTime = Date.now() - startTime;
@@ -6088,18 +6400,18 @@ test("server watch access logs wait for final D1 decisions without blocking sche
       assert.ok(recorded.at(-1).responseTime <= capturedResponseTime + 10);
     }
   } finally {
-    Database.upsertServerWatchLifecycle = originalUpsert;
-    Logger.record = originalLoggerRecord;
+    kernel.upsertServerWatchLifecycle = originalUpsert;
+    logger.record = originalLoggerRecord;
     console.error = originalConsoleError;
-    GLOBALS.ServerRecordWatchSessions.clear();
+    isolateState.ServerRecordWatchSessions.clear();
   }
 });
 
 test("last-watch D1 failures stay detached from the proxy response path", async () => {
   const tasks = [];
-  const originalUpsert = Database.upsertServerWatchLifecycle;
+  const originalUpsert = kernel.upsertServerWatchLifecycle;
   const originalConsoleError = console.error;
-  Database.upsertServerWatchLifecycle = async () => { throw new Error("d1 unavailable"); };
+  kernel.upsertServerWatchLifecycle = async () => { throw new Error("d1 unavailable"); };
   console.error = () => {};
   try {
     const execution = {
@@ -6111,12 +6423,12 @@ test("last-watch D1 failures stay detached from the proxy response path", async 
       env: { DB: {} },
       ctx: { waitUntil(task) { tasks.push(task); } }
     };
-    const scheduled = Proxy.scheduleServerWatchLifecycle(execution);
+    const scheduled = proxyService.scheduleServerWatchLifecycle(execution);
     assert.equal(scheduled, true);
     await assert.doesNotReject(Promise.all(tasks));
     assert.equal(execution.serverWatchLifecycleDiagnostic.decision, "d1_unavailable");
   } finally {
-    Database.upsertServerWatchLifecycle = originalUpsert;
+    kernel.upsertServerWatchLifecycle = originalUpsert;
     console.error = originalConsoleError;
   }
 });
@@ -6147,11 +6459,11 @@ test("server record probes keep node tokens isolated and report partial counts",
       return new Response(null, { status: 404 });
     }
   }, async () => {
-    const first = await Database.probeServerRecord("server-a", {
+    const first = await kernel.probeServerRecord("server-a", {
       target: "https://a.example/emby",
       headers: { "X-Emby-Token": "token-a" }
     });
-    const second = await Database.probeServerRecord("server-b", {
+    const second = await kernel.probeServerRecord("server-b", {
       target: "https://b.example/emby",
       headers: { "X-Emby-Token": "token-b" }
     });
@@ -6169,7 +6481,7 @@ test("server record probes keep node tokens isolated and report partial counts",
 
 test("server record credentials authenticate before resource statistics and never leak", async () => {
   const requests = [];
-  GLOBALS.ServerRecordAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
   await withWorkerGlobals({
     fetch: async (url, options = {}) => {
       const parsed = new URL(url);
@@ -6210,33 +6522,33 @@ test("server record credentials authenticate before resource statistics and neve
       return new Response(null, { status: 404 });
     }
   }, async () => {
-    const result = await Database.probeServerRecord("credential-node", {
+    const result = await kernel.probeServerRecord("credential-node", {
       target: "https://credential.example/emby",
       serverRecordEmbyUsername: "stats-user"
     });
     assert.equal(result.runtime.state, "online");
     assert.deepEqual(result.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
-    const cachedResult = await Database.probeServerRecord("credential-node", {
+    const cachedResult = await kernel.probeServerRecord("credential-node", {
       target: "https://credential.example/emby",
       serverRecordEmbyUsername: "stats-user"
     });
     assert.deepEqual(cachedResult.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
-    const inheritedResult = await Database.probeServerRecord("inherited-node", {
+    const inheritedResult = await kernel.probeServerRecord("inherited-node", {
       target: "https://inherited.example/emby",
       mediaAggregationEmbyUsername: "node-user",
       mediaAggregationEmbyPassword: "node-password"
     });
     assert.deepEqual(inheritedResult.counts, { movies: 12, series: 12, episodes: 12, state: "ok", errors: {} });
     assert.equal(requests.filter(request => /AuthenticateByName/i.test(request.path)).length, 2);
-    assert.ok([...GLOBALS.ServerRecordAuthCache.values()].some(entry => entry?.nodeName === "credential-node"));
+    assert.ok([...isolateState.ServerRecordAuthCache.values()].some(entry => entry?.nodeName === "credential-node"));
     assert.doesNotMatch(JSON.stringify([result, inheritedResult]), /stats-user|node-user|node-password|(?:stats|node)-token|(?:credential|inherited)\.example/);
   });
-  GLOBALS.ServerRecordAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
 });
 
 test("server record authentication failures do not reuse a node proxy token", async () => {
   const requests = [];
-  GLOBALS.ServerRecordAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
   await withWorkerGlobals({
     fetch: async (url, options = {}) => {
       const parsed = new URL(url);
@@ -6267,7 +6579,7 @@ test("server record authentication failures do not reuse a node proxy token", as
       return new Response(null, { status: 404 });
     }
   }, async () => {
-    const result = await Database.probeServerRecord("credential-node", {
+    const result = await kernel.probeServerRecord("credential-node", {
       target: "https://credential.example/emby",
       headers: { "X-Emby-Token": "legacy-node-token" },
       serverRecordEmbyUsername: "stats-user"
@@ -6282,12 +6594,12 @@ test("server record authentication failures do not reuse a node proxy token", as
     assert.equal(requests.filter(request => /\/Items$/i.test(request.path)).length, 0);
     assert.doesNotMatch(JSON.stringify(result), /legacy-node-token|credential\.example/);
   });
-  GLOBALS.ServerRecordAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
 });
 
 test("dedicated server record authentication single-flights independently from aggregation", async () => {
-  GLOBALS.ServerRecordAuthCache.clear();
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
   let loginCalls = 0;
   await withWorkerGlobals({
     fetch: async (url) => {
@@ -6309,21 +6621,21 @@ test("dedicated server record authentication single-flights independently from a
     };
     const targetRecord = createTargetRecord(node.target);
     const [first, second] = await Promise.all([
-      Database.authenticateServerRecord("record-auth", node, targetRecord),
-      Database.authenticateServerRecord("record-auth", node, targetRecord)
+      kernel.authenticateServerRecord("record-auth", node, targetRecord),
+      kernel.authenticateServerRecord("record-auth", node, targetRecord)
     ]);
     assert.equal(first?.token, "record-token");
     assert.equal(second?.token, "record-token");
     assert.equal(loginCalls, 1);
-    assert.equal(GLOBALS.ServerRecordAuthCache.size, 1);
-    assert.equal(GLOBALS.MediaAggregationAuthCache.size, 0);
+    assert.equal(isolateState.ServerRecordAuthCache.size, 1);
+    assert.equal(isolateState.MediaAggregationAuthCache.size, 0);
   });
-  GLOBALS.ServerRecordAuthCache.clear();
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
 });
 
 test("media aggregation authentication single-flights concurrent logins", async () => {
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
   let loginCalls = 0;
   await withWorkerGlobals({
     fetch: async (url) => {
@@ -6349,24 +6661,24 @@ test("media aggregation authentication single-flights concurrent logins", async 
       requestUrl: new URL("https://worker.test/Items/1/PlaybackInfo")
     };
     const [first, second] = await Promise.all([
-      Proxy.getMediaAggregationAuth(execution, "aggregation-auth", node),
-      Proxy.getMediaAggregationAuth(execution, "aggregation-auth", node)
+      proxyService.getMediaAggregationAuth(execution, "aggregation-auth", node),
+      proxyService.getMediaAggregationAuth(execution, "aggregation-auth", node)
     ]);
     assert.equal(first?.token, "aggregation-token");
     assert.equal(second?.token, "aggregation-token");
     assert.equal(loginCalls, 1);
-    assert.equal(GLOBALS.MediaAggregationAuthCache.size, 1);
+    assert.equal(isolateState.MediaAggregationAuthCache.size, 1);
   });
-  GLOBALS.MediaAggregationAuthCache.clear();
+  isolateState.MediaAggregationAuthCache.clear();
 });
 
 test("server record probes coalesce concurrent refreshes and back off retryable failures", async () => {
-  const originalProbeServerRecord = Database.probeServerRecord;
+  const originalProbeServerRecord = kernel.probeServerRecord;
   const node = { target: "https://probe-backoff.example/emby" };
   let probeCalls = 0;
-  GLOBALS.ServerRecordsSnapshotCache.clear();
-  GLOBALS.ServerRecordProbeBackoff.clear();
-  Database.probeServerRecord = async () => {
+  isolateState.ServerRecordsSnapshotCache.clear();
+  isolateState.ServerRecordProbeBackoff.clear();
+  kernel.probeServerRecord = async () => {
     probeCalls += 1;
     return {
       runtime: { state: "timeout", checkedAt: "", errorCode: "server_record_timeout" },
@@ -6375,49 +6687,49 @@ test("server record probes coalesce concurrent refreshes and back off retryable 
   };
   try {
     const [first, second] = await Promise.all([
-      Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true }),
-      Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true })
+      kernel.getServerRecordProbe("probe-backoff", node, { forceRefresh: true }),
+      kernel.getServerRecordProbe("probe-backoff", node, { forceRefresh: true })
     ]);
     assert.equal(first.probe.source, "live");
     assert.equal(second.probe.source, "live");
     assert.equal(probeCalls, 1);
 
-    const throttled = await Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
+    const throttled = await kernel.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
     assert.equal(throttled.probe.source, "backoff");
     assert.match(throttled.probe.retryAt, /^\d{4}-\d{2}-\d{2}T/);
     assert.equal(probeCalls, 1);
 
-    Database.invalidateNodeCaches("probe-backoff");
-    const afterInvalidation = await Database.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
+    kernel.invalidateNodeCaches("probe-backoff");
+    const afterInvalidation = await kernel.getServerRecordProbe("probe-backoff", node, { forceRefresh: true });
     assert.equal(afterInvalidation.probe.source, "live");
     assert.equal(probeCalls, 2);
   } finally {
-    Database.probeServerRecord = originalProbeServerRecord;
-    GLOBALS.ServerRecordsSnapshotCache.clear();
-    GLOBALS.ServerRecordProbeBackoff.clear();
+    kernel.probeServerRecord = originalProbeServerRecord;
+    isolateState.ServerRecordsSnapshotCache.clear();
+    isolateState.ServerRecordProbeBackoff.clear();
   }
 });
 
 test("node invalidation clears server record auth and watch sessions without a PlaybackInfo cache entry", () => {
-  GLOBALS.PlaybackInfoResponseCache.clear();
-  GLOBALS.ServerRecordAuthCache.clear();
-  GLOBALS.ServerRecordWatchSessions.clear();
-  GLOBALS.ServerRecordAuthCache.set("server-record-auth:alpha", {
+  isolateState.PlaybackInfoResponseCache.clear();
+  isolateState.ServerRecordAuthCache.clear();
+  isolateState.ServerRecordWatchSessions.clear();
+  isolateState.ServerRecordAuthCache.set("server-record-auth:alpha", {
     nodeName: "alpha",
     token: "short-lived-token",
     expiresAt: Date.now() + 60000
   });
-  GLOBALS.ServerRecordWatchSessions.set("watch-alpha", { nodeName: "alpha", lastSeenAt: Date.now() });
-  GLOBALS.ServerRecordWatchSessions.set("watch-beta", { nodeName: "beta", lastSeenAt: Date.now() });
+  isolateState.ServerRecordWatchSessions.set("watch-alpha", { nodeName: "alpha", lastSeenAt: Date.now() });
+  isolateState.ServerRecordWatchSessions.set("watch-beta", { nodeName: "beta", lastSeenAt: Date.now() });
   try {
-    Database.invalidateNodeCaches("alpha");
-    assert.equal(GLOBALS.ServerRecordAuthCache.has("server-record-auth:alpha"), false);
-    assert.equal(GLOBALS.ServerRecordWatchSessions.has("watch-alpha"), false);
-    assert.equal(GLOBALS.ServerRecordWatchSessions.has("watch-beta"), true);
+    kernel.invalidateNodeCaches("alpha");
+    assert.equal(isolateState.ServerRecordAuthCache.has("server-record-auth:alpha"), false);
+    assert.equal(isolateState.ServerRecordWatchSessions.has("watch-alpha"), false);
+    assert.equal(isolateState.ServerRecordWatchSessions.has("watch-beta"), true);
   } finally {
-    GLOBALS.PlaybackInfoResponseCache.clear();
-    GLOBALS.ServerRecordAuthCache.clear();
-    GLOBALS.ServerRecordWatchSessions.clear();
+    isolateState.PlaybackInfoResponseCache.clear();
+    isolateState.ServerRecordAuthCache.clear();
+    isolateState.ServerRecordWatchSessions.clear();
   }
 });
 
@@ -6446,10 +6758,10 @@ test("server record probes derive status from Ping without using System Info fla
       return new Response(null, { status: 404 });
     }
   }, async () => {
-    const maintenance = await Database.probeServerRecord("maintenance", { target: "https://maintenance.example" });
-    const shutdown = await Database.probeServerRecord("shutdown", { target: "https://shutdown.example" });
-    const unauthorized = await Database.probeServerRecord("unauthorized", { target: "https://unauthorized.example" });
-    const pingForbidden = await Database.probeServerRecord("ping-forbidden", { target: "https://ping-forbidden.example" });
+    const maintenance = await kernel.probeServerRecord("maintenance", { target: "https://maintenance.example" });
+    const shutdown = await kernel.probeServerRecord("shutdown", { target: "https://shutdown.example" });
+    const unauthorized = await kernel.probeServerRecord("unauthorized", { target: "https://unauthorized.example" });
+    const pingForbidden = await kernel.probeServerRecord("ping-forbidden", { target: "https://ping-forbidden.example" });
     assert.equal(maintenance.runtime.state, "online");
     assert.equal(shutdown.runtime.state, "online");
     assert.equal(unauthorized.runtime.state, "online");
@@ -6473,7 +6785,7 @@ test("server record probes report unauthorized only when every target rejects cr
       return new Response(null, { status: 500 });
     }
   }, async () => {
-    const mixed = await Database.probeServerRecord("mixed", {
+    const mixed = await kernel.probeServerRecord("mixed", {
       activeLineId: "unauthorized",
       lines: [
         { id: "unauthorized", target: "https://unauthorized.example" },
@@ -6489,8 +6801,8 @@ test("server record probes report unauthorized only when every target rejects cr
 test("server record probe backoff recognizes actual network failures", async () => {
   const node = { target: "https://network-failure.example" };
   let fetchCalls = 0;
-  GLOBALS.ServerRecordsSnapshotCache.clear();
-  GLOBALS.ServerRecordProbeBackoff.clear();
+  isolateState.ServerRecordsSnapshotCache.clear();
+  isolateState.ServerRecordProbeBackoff.clear();
   try {
     await withWorkerGlobals({
       fetch: async () => {
@@ -6498,25 +6810,25 @@ test("server record probe backoff recognizes actual network failures", async () 
         throw new Error("network down");
       }
     }, async () => {
-      const first = await Database.getServerRecordProbe("network-failure", node, { forceRefresh: true });
+      const first = await kernel.getServerRecordProbe("network-failure", node, { forceRefresh: true });
       assert.equal(first.runtime.state, "offline");
       assert.equal(first.runtime.errorCode, "server_record_network_error");
       assert.equal(first.probe.source, "live");
-      const second = await Database.getServerRecordProbe("network-failure", node, { forceRefresh: true });
+      const second = await kernel.getServerRecordProbe("network-failure", node, { forceRefresh: true });
       assert.equal(second.probe.source, "backoff");
       assert.equal(fetchCalls, 1);
     });
   } finally {
-    GLOBALS.ServerRecordsSnapshotCache.clear();
-    GLOBALS.ServerRecordProbeBackoff.clear();
+    isolateState.ServerRecordsSnapshotCache.clear();
+    isolateState.ServerRecordProbeBackoff.clear();
   }
 });
 
 test("server record probe backoff recognizes actual timeout failures", async () => {
   const node = { target: "https://timeout-failure.example" };
   let fetchCalls = 0;
-  GLOBALS.ServerRecordsSnapshotCache.clear();
-  GLOBALS.ServerRecordProbeBackoff.clear();
+  isolateState.ServerRecordsSnapshotCache.clear();
+  isolateState.ServerRecordProbeBackoff.clear();
   try {
     await withWorkerGlobals({
       fetch: async () => {
@@ -6526,16 +6838,16 @@ test("server record probe backoff recognizes actual timeout failures", async () 
         throw error;
       }
     }, async () => {
-      const first = await Database.getServerRecordProbe("timeout-failure", node, { forceRefresh: true });
+      const first = await kernel.getServerRecordProbe("timeout-failure", node, { forceRefresh: true });
       assert.equal(first.runtime.state, "timeout");
       assert.equal(first.runtime.errorCode, "server_record_timeout");
-      const second = await Database.getServerRecordProbe("timeout-failure", node, { forceRefresh: true });
+      const second = await kernel.getServerRecordProbe("timeout-failure", node, { forceRefresh: true });
       assert.equal(second.probe.source, "backoff");
       assert.equal(fetchCalls, 1);
     });
   } finally {
-    GLOBALS.ServerRecordsSnapshotCache.clear();
-    GLOBALS.ServerRecordProbeBackoff.clear();
+    isolateState.ServerRecordsSnapshotCache.clear();
+    isolateState.ServerRecordProbeBackoff.clear();
   }
 });
 
@@ -6562,7 +6874,7 @@ test("server record probes follow active-line fallback order after Ping HTTP fai
       return new Response(null, { status: 404 });
     }
   }, async () => {
-    const result = await Database.probeServerRecord("fallback", {
+    const result = await kernel.probeServerRecord("fallback", {
       activeLineId: "active",
       lines: [
         { id: "backup", target: "https://backup.example" },
@@ -6572,13 +6884,13 @@ test("server record probes follow active-line fallback order after Ping HTTP fai
     assert.equal(result.runtime.state, "online");
     assert.deepEqual(hosts.slice(0, 2), ["active.example", "backup.example"]);
     assert.ok(hosts.slice(1).every(host => host === "backup.example"));
-    assert.equal(Database.normalizeServerRecordRuntimeError({ code: "SERVER_RECORD_TIMEOUT" }), "timeout");
+    assert.equal(kernel.normalizeServerRecordRuntimeError({ code: "SERVER_RECORD_TIMEOUT" }), "timeout");
   });
 });
 
 test("server record probe cache is reused unless forceRefresh is requested", async () => {
   let requestCount = 0;
-  GLOBALS.ServerRecordsSnapshotCache.clear();
+  isolateState.ServerRecordsSnapshotCache.clear();
   await withWorkerGlobals({
     fetch: async (url) => {
       requestCount += 1;
@@ -6594,14 +6906,14 @@ test("server record probe cache is reused unless forceRefresh is requested", asy
     }
   }, async () => {
     const node = { target: "https://cache.example", headers: { "X-Emby-Token": "private-token" } };
-    await Database.getServerRecordProbe("cached-node", node);
-    await Database.getServerRecordProbe("cached-node", node);
+    await kernel.getServerRecordProbe("cached-node", node);
+    await kernel.getServerRecordProbe("cached-node", node);
     assert.equal(requestCount, 5);
-    await Database.getServerRecordProbe("cached-node", node, { forceRefresh: true });
+    await kernel.getServerRecordProbe("cached-node", node, { forceRefresh: true });
     assert.equal(requestCount, 10);
-    assert.doesNotMatch(JSON.stringify(GLOBALS.ServerRecordsSnapshotCache.get("cached-node")?.value), /private-token|cache\.example/);
+    assert.doesNotMatch(JSON.stringify(isolateState.ServerRecordsSnapshotCache.get("cached-node")?.value), /private-token|cache\.example/);
   });
-  GLOBALS.ServerRecordsSnapshotCache.clear();
+  isolateState.ServerRecordsSnapshotCache.clear();
 });
 
 test("server record snapshots persist counts and expose matching last-watch media", async () => {
@@ -6623,17 +6935,17 @@ test("server record snapshots persist counts and expose matching last-watch medi
   ];
   const probedNodeNames = [];
   const originals = {
-    getNodesListStrict: CacheManager.getNodesListStrict,
-    getNodeForRead: Database.getNodeForRead,
-    getServerRecordProbe: Database.getServerRecordProbe,
-    getServerLastWatch: Database.getServerLastWatch,
-    getServerRecordSnapshots: Database.getServerRecordSnapshots,
-    persistServerRecordProbeSnapshots: Database.persistServerRecordProbeSnapshots,
+    getNodesListStrict: cachePort.getNodesListStrict,
+    getNodeForRead: kernel.getNodeForRead,
+    getServerRecordProbe: kernel.getServerRecordProbe,
+    getServerLastWatch: kernel.getServerLastWatch,
+    getServerRecordSnapshots: kernel.getServerRecordSnapshots,
+    persistServerRecordProbeSnapshots: kernel.persistServerRecordProbeSnapshots,
     consoleError: console.error
   };
-  CacheManager.getNodesListStrict = async () => nodes;
-  Database.getNodeForRead = async (name) => nodes.find(node => node.name === name) || null;
-  Database.getServerRecordProbe = async (name) => {
+  cachePort.getNodesListStrict = async () => nodes;
+  kernel.getNodeForRead = async (name) => nodes.find(node => node.name === name) || null;
+  kernel.getServerRecordProbe = async (name) => {
     probedNodeNames.push(name);
     return {
     runtime: { state: "online", checkedAt: "2026-07-21T00:00:00.000Z" },
@@ -6642,15 +6954,15 @@ test("server record snapshots persist counts and expose matching last-watch medi
       : { movies: 1, series: 2, episodes: 3, state: "ok", errors: {} }
     };
   };
-  Database.getServerLastWatch = async () => new Map([
+  kernel.getServerLastWatch = async () => new Map([
     ["server-a", { lastWatchedAt: "2026-07-21T12:34:56.000Z" }]
   ]);
   const persistedProbeEntries = [];
-  Database.persistServerRecordProbeSnapshots = async (_db, entries) => {
+  kernel.persistServerRecordProbeSnapshots = async (_db, entries) => {
     persistedProbeEntries.push(...entries);
     return entries.length;
   };
-  Database.getServerRecordSnapshots = async (_db, names) => new Map(names.map(name => [name, name === "server-a"
+  kernel.getServerRecordSnapshots = async (_db, names) => new Map(names.map(name => [name, name === "server-a"
     ? {
         counts: { movies: 8, series: 9, episodes: 10, state: "ok", errors: {}, checkedAt: "2026-07-20T00:00:00.000Z", source: "persisted" },
         lastItem: {
@@ -6674,7 +6986,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
       ctx: {},
       request: new Request("https://admin.example/admin")
     };
-    const available = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
+    const available = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
     assert.deepEqual(probedNodeNames, ["server-a", "server-b"]);
     assert.equal(persistedProbeEntries.length, 2);
     assert.ok(available.records.every(record => record.counts.persisted === true));
@@ -6699,14 +7011,14 @@ test("server record snapshots persist counts and expose matching last-watch medi
     assert.deepEqual(available.availableNodes.map(record => record.expiryEnabled), [true, false]);
     assert.doesNotMatch(JSON.stringify(available), /totalSeconds|private-token|origin-[ab]\.example/);
 
-    const getCompleteSnapshots = Database.getServerRecordSnapshots;
-    Database.getServerRecordSnapshots = async (_db, names) => new Map(names.map(name => [name, {
+    const getCompleteSnapshots = kernel.getServerRecordSnapshots;
+    kernel.getServerRecordSnapshots = async (_db, names) => new Map(names.map(name => [name, {
       counts: {},
       lastItem: name === "server-a"
         ? { itemId: "incomplete-item", watchedAt: "2026-07-21T12:34:56.000Z" }
         : {}
     }]));
-    const incompleteMedia = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
+    const incompleteMedia = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
     assert.deepEqual(incompleteMedia.records[0].watch, {
       lastWatchedAt: "2026-07-21T12:34:56.000Z",
       state: "ok",
@@ -6723,37 +7035,37 @@ test("server record snapshots persist counts and expose matching last-watch medi
         watchedAt: "2026-07-21T12:34:56.000Z"
       }
     });
-    Database.getServerRecordSnapshots = getCompleteSnapshots;
+    kernel.getServerRecordSnapshots = getCompleteSnapshots;
 
     probedNodeNames.length = 0;
-    const metadataOnly = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
+    const metadataOnly = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
     assert.deepEqual(probedNodeNames, []);
     assert.ok(metadataOnly.records.every(record => record.runtime.state === "not_checked"));
     assert.ok(metadataOnly.records.every(record => record.runtime.errorCode === "manual_refresh_required"));
     assert.deepEqual(metadataOnly.records.map(record => [record.counts.movies, record.counts.source]), [[8, "persisted"], [11, "persisted"]]);
 
-    const targeted = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, refreshNodeName: "server-b" });
+    const targeted = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, refreshNodeName: "server-b" });
     assert.deepEqual(probedNodeNames, ["server-b"]);
     assert.deepEqual(targeted.records.map(record => record.nodeName), ["server-b"]);
     assert.deepEqual(targeted.records.map(record => record.runtime.state), ["online"]);
 
-    Database.persistServerRecordProbeSnapshots = async () => { throw new Error("snapshot unavailable"); };
-    const persistenceDegraded = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
+    kernel.persistServerRecordProbeSnapshots = async () => { throw new Error("snapshot unavailable"); };
+    const persistenceDegraded = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
     assert.equal(persistenceDegraded.persistence.state, "unavailable");
     assert.deepEqual(persistenceDegraded.records.map(record => record.counts.movies), [1, null]);
 
-    Database.persistServerRecordProbeSnapshots = originals.persistServerRecordProbeSnapshots;
-    Database.getServerLastWatch = async () => { throw new Error("d1 unavailable"); };
-    const unavailable = await Database.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
+    kernel.persistServerRecordProbeSnapshots = originals.persistServerRecordProbeSnapshots;
+    kernel.getServerLastWatch = async () => { throw new Error("d1 unavailable"); };
+    const unavailable = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, options);
     assert.ok(unavailable.records.every(record => record.watch.state === "unavailable"));
     assert.ok(unavailable.records.every(record => record.watch.lastWatchedAt === ""));
   } finally {
-    CacheManager.getNodesListStrict = originals.getNodesListStrict;
-    Database.getNodeForRead = originals.getNodeForRead;
-    Database.getServerRecordProbe = originals.getServerRecordProbe;
-    Database.getServerLastWatch = originals.getServerLastWatch;
-    Database.getServerRecordSnapshots = originals.getServerRecordSnapshots;
-    Database.persistServerRecordProbeSnapshots = originals.persistServerRecordProbeSnapshots;
+    cachePort.getNodesListStrict = originals.getNodesListStrict;
+    kernel.getNodeForRead = originals.getNodeForRead;
+    kernel.getServerRecordProbe = originals.getServerRecordProbe;
+    kernel.getServerLastWatch = originals.getServerLastWatch;
+    kernel.getServerRecordSnapshots = originals.getServerRecordSnapshots;
+    kernel.persistServerRecordProbeSnapshots = originals.persistServerRecordProbeSnapshots;
     console.error = originals.consoleError;
   }
 });
@@ -6761,7 +7073,12 @@ test("server record snapshots persist counts and expose matching last-watch medi
 test("server record settings preserve node routes and credentials while normalizing legacy tags", () => {
   const existingNode = {
     target: "https://origin.example/emby",
-    lines: [{ id: "primary", target: "https://origin.example/emby" }],
+    lines: [{
+      id: "primary",
+      target: "https://origin.example/emby",
+      transportPolicy: { responseCompatibility: "flutter" },
+      extensionFlags: ["preserve"]
+    }],
     activeLineId: "primary",
     headers: { "X-Emby-Token": "private-token", "X-Custom-Route": "route-a" },
     serverRecordEmbyUsername: "stats-user",
@@ -6770,11 +7087,11 @@ test("server record settings preserve node routes and credentials while normaliz
     mediaAggregationEmbyPassword: " node-password ",
     tag: "高码服"
   };
-  const normalized = Database.normalizeNode("server-a", existingNode).data;
+  const normalized = kernel.normalizeNode("server-a", existingNode).data;
   assert.deepEqual(normalized.tags, ["高码服"]);
   assert.equal(normalized.tag, "高码服");
 
-  const updated = Database.buildNodeRecord("server-a", {
+  const updated = kernel.buildNodeRecord("server-a", {
     tags: ["低码服", "低码服", " 备用服 "],
     tag: "低码服",
     serverRecord: { enabled: true, expiresAt: "2027-01-31" }
@@ -6795,7 +7112,7 @@ test("server record settings preserve node routes and credentials while normaliz
     expiryDays: 30
   });
 
-  const rolling = Database.buildNodeRecord("server-a", {
+  const rolling = kernel.buildNodeRecord("server-a", {
     serverRecord: { enabled: true, expiryEnabled: true, expiryMode: "rolling", expiresAt: "2027-01-31", expiryDays: 45 }
   }, existingNode);
   assert.deepEqual(rolling.serverRecord, {
@@ -6810,16 +7127,20 @@ test("server record settings preserve node routes and credentials while normaliz
     responseCompatibility: { playbackInfoItemShape: "object" },
     customProxyFlags: ["preserve", "server-record-save"]
   };
-  const patched = Database.buildPreparedServerRecordSettingsMutation("server-a", {
+  const patched = kernel.buildPreparedServerRecordSettingsMutation("server-a", {
     ...existingNode,
     ...extensionState
   }, {
     tags: ["观察中"],
+    serverRecordEmbyUsername: existingNode.serverRecordEmbyUsername,
+    serverRecordEmbyPassword: existingNode.serverRecordEmbyPassword,
     serverRecord: { enabled: true, expiryEnabled: false }
   });
   assert.deepEqual(patched.nextNode.responseCompatibility, extensionState.responseCompatibility);
   assert.deepEqual(patched.nextNode.customProxyFlags, extensionState.customProxyFlags);
-  assert.deepEqual(patched.nextNode.lines, normalized.lines);
-  assert.deepEqual(patched.nextNode.headers, normalized.headers);
+  assert.deepEqual(patched.previousNode, { ...existingNode, ...extensionState });
+  assert.deepEqual(patched.nextNode.lines, existingNode.lines);
+  assert.deepEqual(patched.nextNode.headers, existingNode.headers);
+  assert.equal(patched.nextNode.serverRecordEmbyCredentialsConfigured, true);
   assert.equal(patched.nextNode.serverRecord.enabled, true);
 });

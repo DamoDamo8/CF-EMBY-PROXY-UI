@@ -1,6 +1,6 @@
 # Repository Runtime Guide
 
-版本：13.3
+版本：13.5
 
 默认语言：中文
 
@@ -10,7 +10,8 @@
 
 正式代码与治理真相源：
 
-- `worker.js`：Cloudflare Worker 单入口、API、代理、鉴权、KV/D1、日志与 scheduled 任务。
+- `worker/`：Cloudflare Worker 的 ESM 正式源码真相源。
+- `worker.js`：由 Vite 从 `worker/index.js` 生成并提交的单文件 ESM 发布产物；Wrangler、Release 和管理台双文件更新只使用该文件。
 - `frontend/`：管理台模板、同步脚本、唯一入口和 Vite 构建。
 - `worker.md`：核心约束与阅读入口。
 - `docs/`：按职责拆分的详细契约。
@@ -44,7 +45,7 @@
 
 ## 核心约束
 
-1. 保持 `worker.js` 单入口和 JSDoc 风格。没有明确批准，不迁移为全量 TypeScript 或多 Worker 架构。
+1. Worker 源码保持静态 ESM 与 JSDoc 风格，默认导出只允许出现在 `worker/index.js`；没有明确批准，不迁移为全量 TypeScript 或多 Worker 架构。根 `worker.js` 必须通过 `npm run build:worker` 生成，不得手工编辑。
 2. 不把完整前端运行时代码重新内嵌进 `worker.js`；Worker 只保留壳、后端能力和极小降级内容。
 3. `frontend/index.html` 是唯一管理台入口，不新增第二套首页或替代入口。
 4. 管理台保持现有 SaaS 控制台信息架构。未经批准，不改成官网、内容站、文档页或另一套管理台。
@@ -56,6 +57,7 @@
 10. 正式发布源固定为 `axuitomo/CF-EMBY-PROXY-UI`，正式版本只认 GitHub Release。
 11. 不在仓库内创建或维护 wiki、知识库镜像及额外文档站点；管理台可以引用外部 WIKI 教程入口。
 12. 根 `migrations/` 是 D1 schema 版本与结构契约的真相源。生产数据库操作优先使用已登录的项目管理台，其次使用 Cloudflare Dashboard；Wrangler 只用于管理台不可用、旧 binding 不支持 Sessions API、本地验证或灾难恢复。管理台“初始化 DB”必须先取得 Time Travel bookmark，完成白名单兼容修复并复检结构后，才可幂等采纳对应 migration 基线；普通热路径、scheduled 和其他兼容 API 不得登记 migration。
+13. Worker 后端按外部工作流收敛为 `AdminConsoleFacade`、`NodeProxyFacade` 与 `ScheduledMaintenanceFacade`，业务实现归属 `worker/runtime/application-facades.js`；`createWorkerApplication()` 是唯一生产组合函数，`worker/index.js` 只适配 Cloudflare `{ fetch, scheduled }`，`worker/testing/hooks.js` 只适配测试。管理鉴权必须由 `AdminConsoleFacade.handle()` 自身完成；节点工作流必须显式接收 `routeContext`；scheduled 工作流必须由 Facade 调用一次 `ctx.waitUntil()` 并通过注入的观测接口记录异常。禁止恢复 capability port、兼容操作袋、`dataService`、`public/**/service.js` 或纯转发模块。除无业务逻辑的入口与测试适配器外，生产模块不得低于 300 行或只有唯一调用者；共享 `core` / `platform` 模块必须不少于 300 行，并由至少两个 Facade 合计直接调用 10 次以上。`env`、`ctx`、Request 和 bindings 显式传递，模块加载阶段不得访问 KV、D1 或网络。
 
 ## 默认工作上下文
 

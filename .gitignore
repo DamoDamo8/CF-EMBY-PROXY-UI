@@ -10,7 +10,8 @@ npm-debug.log*
 .ace-tool/
 .venv/
 bundled/
-package-lock.json
+.worker-dist/
+.worker.js.tmp
 prompts/
 banker/
 .admin-ui.from-*.html

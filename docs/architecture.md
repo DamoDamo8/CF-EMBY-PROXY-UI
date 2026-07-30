@@ -23,6 +23,29 @@ flowchart LR
 
 `scheduled()` 不参与前端资源刷新。
 
+## Worker ESM 用例门面
+
+`worker/` 是可编辑源码，根 `worker.js` 是由 Vite 生成并提交的单文件 ESM 产物。Cloudflare 唯一入口是 `worker/index.js`，只默认导出 `{ fetch, scheduled }`；生产入口不导入 `worker/testing/`。
+
+```text
+worker/
+├─ index.js                       # Cloudflare 协议适配器
+├─ runtime/
+│  └─ application-facades.js      # 三个外部工作流及完整业务实现
+└─ testing/
+   └─ hooks.js                    # 测试组合与 isolate 重置适配器
+```
+
+`createWorkerApplication()` 是唯一生产组合函数：它构造共享内核、三个具名 Facade 与冻结的 Worker handler。`fetch` 先在组合层识别管理与节点工作流；普通节点路径不会先进入管理 Facade，host-prefix 与旧入口所需的完整路由信息统一构造成 `routeContext` 后显式传给 `NodeProxyFacade.handle()`。`scheduled` 不重建运行时，直接进入 `ScheduledMaintenanceFacade.handle()`。
+
+`AdminConsoleFacade` 负责首页、管理台鉴权与壳交付、vendor 代理、预热、管理动作、配置/备份、节点/DNS、数据库维护、通知和观测；鉴权属于 Facade 自身，绕过 Worker handler 直接调用 `handle()` 也不能执行未认证读写。`NodeProxyFacade` 负责节点解析、host-prefix 与旧入口兼容、访问策略、上游代理、故障转移、缓存、PlaybackInfo 聚合及播放记录，并拒绝缺失 `routeContext` 的调用。`ScheduledMaintenanceFacade` 负责租约保护下的 D1 整理、状态写入、日报和告警；`handle()` 只向 `ctx.waitUntil()` 提交一个完整任务，租约、部分失败和告警异常统一经构造器注入的 logger 进入观测链。三个类通过构造器接收运行时依赖，对外只以 `handle(...)` 承接相应工作流。
+
+业务代码不再按缓存、模型、方法或版本化 `public/**/service.js` 拆分，也不保留 capability port、兼容操作袋、`dataService`、纯 re-export 或只调用一次的技术转发层。除无业务逻辑的 `index.js` 与 `testing/hooks.js` 外，生产模块必须不少于 300 行且至少有两个直接调用者；共享 `core` / `platform` 仅在至少两个 Facade 合计存在 10 次以上直接调用时允许保留，并同样不得低于 300 行。未达到门槛的实现合并回所属 Facade。
+
+默认导出只保留在 `worker/index.js`。`env`、`ctx` 与 Request 在调用链显式传递；Cloudflare binding、Cache API、WebCrypto 与 isolate 状态留在 Facade 内核的平台实现区域，不在入口或测试适配器中复制。默认 `createWorkerApplication()` 不暴露测试内核；`worker/testing/hooks.js` 仅在测试组合中显式开启测试支持，并把可替换依赖按 `kv`、`d1`、`cache`、`fetch`、`clock` 分区，同时复用同一套 Facade 与 Worker handler。
+
+架构门禁拒绝小型或单调用者业务模块、技术转发、循环依赖、反向依赖、Node/bare imports、动态 `import()`、生产代码引用 testing/旧兼容面、业务 `create*` factory 及入口外默认导出。版本化基线 `scripts/worker-architecture-baseline.json` 记录重构前的 `144 modules / 873 edges` 及来源说明；门禁实时计算当前图、Facade 实际源码跨度和共享直接调用计数，不把基线值当作当前期望。负向 fixture 覆盖小模块、单调用者、转发层、循环、反向依赖、旧兼容引用和伪 Facade。
+
 ## 路由职责
 
 | 路由 | 职责 |
@@ -65,7 +88,7 @@ flowchart LR
 
 ## Worker 壳
 
-- `worker.js` 保留 API、鉴权、代理、KV/D1、日志、scheduled 和资源交付能力。
+- `worker/` 的用例门面源码保留 API、鉴权、代理、KV/D1、日志、scheduled 和资源交付能力；根 `worker.js` 是行为等价的生成产物。
 - `/admin` 只从 KV 读取内容寻址的本地 `index.html`；未上传时进入启动门，不再读取 Release、环境 `INDEX_URL` 或内嵌完整管理台。
 - 本地上传版本保存为 `sys:admin_index_upload:v1:<sha256>`，配置中的 `indexUrl` 使用 `https://admin-local-index.invalid/<sha256>/index.html` 作为内部版本标识。该地址不会被浏览器直接请求。
 - Worker 优先替换上传 HTML 中已有的 `#admin-bootstrap` JSON。只有壳缺少 bootstrap 或 loader 时才回退到注入模式。
@@ -112,6 +135,7 @@ frontend/admin-runtime.template.html
 - 模块级 `GLOBALS` 只承担单个 Worker isolate 内的尽力读优化；KV、D1 和 Cache API 仍是真相源。isolate 被回收或请求落到另一个 isolate/PoP 时允许重新加载，不能依赖这里的状态实现跨请求一致性。
 - 运行配置使用 60 秒内存 TTL。同一缓存 namespace、同一失效代次的并发刷新通过 single-flight 合并；读取期只在内存中吸收旧字段，不向 KV 隐式写回，持久化由显式保存、恢复或 KV 整理负责。主配置写入成功后立即预填新缓存，较早启动的读取不得把旧值重新写回。
 - 代理 CORS、IP 黑名单和地域 allow/block 规则按运行配置对象派生一个 `WeakMap` profile；原始规则字符串变化时 profile 自动失效，热请求复用已去重的 `Set`，不在每次请求中重复 `split/map/filter`。
+- 路由决策模式按“节点 `routingDecisionMode` > 全局 `routingDecisionMode`”解析；节点值为 `inherit` 时继承全局配置。`legacy` 使用兼容入口卸载标记，`simplified` 直接从当前请求分类字段裁决；强制 Worker 代理边界和重定向安全策略不受模式切换影响。
 - 代理节点读取路径的正缓存使用 60 秒 TTL，确认不存在的节点使用 1 秒负缓存，二者共用 512 条有界 LRU；同一节点、同一失效代次的并发冷读取通过 single-flight 合并。管理台严格节点读取不使用负缓存。播放路由热快照使用 24 小时 TTL 和 256 条上限，并复用快照中的节点派生 revision。
 - PlaybackInfo 成功 JSON 使用同 isolate 的短期响应缓存，TTL 最长 60 秒、最多 64 条；单条响应体最多 256 KiB，所有条目的响应体合计最多 4 MiB，超过任一预算时不缓存或按 LRU 淘汰。重写路径只物化一次有界 body，后续缓存写入复用该快照，不重复 `clone()`/读取。缓存键覆盖节点派生 revision、请求方法/路径/查询/body、鉴权身份、重写模式、聚合策略 revision 和池内全部节点的 `cacheRevision`。存在后台聚合任务，或认证、网络、超时、响应超限、非法 JSON 等节点失败时，部分响应不进入 60 秒缓存；节点或策略变化会使旧键立即不可命中。缓存响应不保留 `Set-Cookie` 或失效的实体校验头。
 - 影视资源版本聚合使用配置中的 `mediaAggregationNodes` 组成节点池。请求任一池内节点的 `PlaybackInfo` 时，Worker 解析 `Type`、ProviderIds、标题/原始标题、年份及 Episode 的 Series/季集身份，再按 TMDB、IMDb、严格标题年份顺序匹配。任何双方共有的强 ID 冲突都会拒绝合并；标题兜底只接受同类型、规范化标题和年份完全一致。Episode 优先匹配所属 Series 强 ID，否则匹配 Series 标题年份，并要求季号、集号及可选结束集号完全一致。`mediaAggregationMatchMode: strict` 可关闭标题年份兜底。

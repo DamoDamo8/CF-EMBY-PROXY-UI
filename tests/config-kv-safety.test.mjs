@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-await import("../worker.js");
+import { createTestApplication } from "../worker/testing/hooks.js";
+import {
+  defineKvTidyMethods,
+  defineSnapshotMethods,
+  invalidateRuntimeConfigCache
+} from "../worker/runtime/application-facades.js";
 
-const hooks = globalThis.__EMBY_PROXY_NODE_TEST_HOOKS__;
+const hooks = createTestApplication();
 assert.ok(hooks, "worker.js must expose Node test hooks");
 
-const { Database, buildAdminLocalIndexUploadRecord, invalidateRuntimeConfigCache } = hooks;
+const { testPlatform } = hooks;
+const { adminActions, adminShell } = testPlatform.fetch;
+const { buildAdminLocalIndexUploadRecord } = adminShell;
+const kernel = testPlatform.kv;
 
 function createDeferred() {
   let resolve;
@@ -21,10 +29,10 @@ function createKv(initialValues = {}) {
     key,
     typeof value === "string" ? value : JSON.stringify(value)
   ]));
-  const operations = [];
+  const kernel = [];
   return {
     values,
-    operations,
+    kernel,
     kv: {
       async get(key, options = {}) {
         const value = values.get(key);
@@ -32,11 +40,11 @@ function createKv(initialValues = {}) {
         return options.type === "json" ? JSON.parse(value) : value;
       },
       async put(key, value) {
-        operations.push({ type: "put", key, value: String(value) });
+        kernel.push({ type: "put", key, value: String(value) });
         values.set(key, String(value));
       },
       async delete(key) {
-        operations.push({ type: "delete", key });
+        kernel.push({ type: "delete", key });
         values.delete(key);
       },
       async list(options = {}) {
@@ -52,21 +60,21 @@ function createKv(initialValues = {}) {
 
 test("persistRuntimeConfig rejects writes when KV is not configured", async () => {
   await assert.rejects(
-    Database.persistRuntimeConfig({ rateLimitRpm: 20 }, { env: {} }),
+    kernel.persistRuntimeConfig({ rateLimitRpm: 20 }, { env: {} }),
     error => error?.code === "KV_NOT_CONFIGURED" && error?.status === 503
   );
 });
 
 test("applyKvMutationsWithRollback restores only mutations that completed", async () => {
-  const { kv, values, operations } = createKv({ first: "old-first", second: "old-second" });
+  const { kv, values, kernel: kvOperations } = createKv({ first: "old-first", second: "old-second" });
   kv.put = async (key, value) => {
-    operations.push({ type: "put", key, value: String(value) });
+    kvOperations.push({ type: "put", key, value: String(value) });
     if (key === "second") throw new Error("second write failed");
     values.set(key, String(value));
   };
 
   await assert.rejects(
-    Database.applyKvMutationsWithRollback(kv, [
+    kernel.applyKvMutationsWithRollback(kv, [
       { type: "put", key: "first", value: "new-first" },
       { type: "put", key: "second", value: "new-second" }
     ]),
@@ -75,7 +83,7 @@ test("applyKvMutationsWithRollback restores only mutations that completed", asyn
 
   assert.equal(values.get("first"), "old-first");
   assert.equal(values.get("second"), "old-second");
-  assert.deepEqual(operations.map(operation => operation.key), ["first", "second", "first"]);
+  assert.deepEqual(kvOperations.map(operation => operation.key), ["first", "second", "first"]);
 });
 
 test("applyKvMutationsWithRollback preserves concurrent values and reports conflicts", async () => {
@@ -89,7 +97,7 @@ test("applyKvMutationsWithRollback preserves concurrent values and reports confl
   };
 
   await assert.rejects(
-    Database.applyKvMutationsWithRollback(kv, [
+    kernel.applyKvMutationsWithRollback(kv, [
       { type: "put", key: "first", value: "new-first" },
       { type: "put", key: "second", value: "new-second" }
     ]),
@@ -103,7 +111,7 @@ test("applyKvMutationsWithRollback preserves concurrent values and reports confl
 
 test("listKvKeysStrict fails closed for missing and repeated cursors", async () => {
   await assert.rejects(
-    Database.listKvKeysStrict({
+    kernel.listKvKeysStrict({
       async list() {
         return { keys: [{ name: "node:a" }], list_complete: false };
       }
@@ -113,7 +121,7 @@ test("listKvKeysStrict fails closed for missing and repeated cursors", async () 
 
   let page = 0;
   await assert.rejects(
-    Database.listKvKeysStrict({
+    kernel.listKvKeysStrict({
       async list() {
         page += 1;
         return { keys: [], list_complete: false, cursor: "same-cursor" };
@@ -126,38 +134,38 @@ test("listKvKeysStrict fails closed for missing and repeated cursors", async () 
 
 test("readRepairableRuntimeConfig fails closed when the config read fails", async () => {
   await assert.rejects(
-    Database.readRepairableRuntimeConfig({
+    kernel.readRepairableRuntimeConfig({
       async get() {
         throw new Error("temporary KV outage");
       }
     }),
     error => error?.code === "KV_TIDY_CONFIG_READ_FAILED"
       && error?.status === 503
-      && error?.details?.key === Database.CONFIG_KEY
+      && error?.details?.key === kernel.CONFIG_KEY
   );
 });
 
 test("KV tidy plan tokens verify signatures and reject tampering and expiry", async () => {
   const env = { JWT_SECRET: "test-tidy-secret" };
   const plan = {
-    scannedKeys: ["node:a", Database.CONFIG_KEY],
-    mutationPlan: [{ type: "put", key: Database.CONFIG_KEY, value: "{}" }],
+    scannedKeys: ["node:a", kernel.CONFIG_KEY],
+    mutationPlan: [{ type: "put", key: kernel.CONFIG_KEY, value: "{}" }],
     rebuiltNodeSummaries: [{ name: "a", target: "https://a.example" }]
   };
-  plan.planHash = Database.buildKvTidyPlanHash(plan);
-  const token = await Database.createKvTidyPlanToken(env, plan, { nowMs: 1_000, ttlMs: 60_000 });
+  plan.planHash = kernel.buildKvTidyPlanHash(plan);
+  const token = await kernel.createKvTidyPlanToken(env, plan, { nowMs: 1_000, ttlMs: 60_000 });
 
-  const payload = await Database.verifyKvTidyPlanToken(env, token, { nowMs: 30_000 });
+  const payload = await kernel.verifyKvTidyPlanToken(env, token, { nowMs: 30_000 });
   assert.equal(payload.planHash, plan.planHash);
 
   const [payloadPart, signature] = token.split(".");
   const tamperedToken = `${payloadPart}.${signature.slice(0, -1)}${signature.endsWith("a") ? "b" : "a"}`;
   await assert.rejects(
-    Database.verifyKvTidyPlanToken(env, tamperedToken, { nowMs: 30_000 }),
+    kernel.verifyKvTidyPlanToken(env, tamperedToken, { nowMs: 30_000 }),
     error => error?.code === "TIDY_PLAN_INVALID" && error?.status === 409
   );
   await assert.rejects(
-    Database.verifyKvTidyPlanToken(env, token, { nowMs: 61_000 }),
+    kernel.verifyKvTidyPlanToken(env, token, { nowMs: 61_000 }),
     error => error?.code === "TIDY_PLAN_STALE"
       && error?.details?.reason === "expired"
   );
@@ -165,7 +173,7 @@ test("KV tidy plan tokens verify signatures and reject tampering and expiry", as
 
 test("KV tidy plan hashes bind config and snapshot revisions", () => {
   const basePlan = {
-    scannedKeys: [Database.CONFIG_KEY, Database.CONFIG_SNAPSHOTS_KEY],
+    scannedKeys: [kernel.CONFIG_KEY, kernel.CONFIG_SNAPSHOTS_KEY],
     mutationPlan: [],
     rebuiltNodeSummaries: [],
     revisions: {
@@ -175,12 +183,12 @@ test("KV tidy plan hashes bind config and snapshot revisions", () => {
       snapshotsContentHash: "snapshots-h1"
     }
   };
-  const previewHash = Database.buildKvTidyPlanHash(basePlan);
-  assert.notEqual(Database.buildKvTidyPlanHash({
+  const previewHash = kernel.buildKvTidyPlanHash(basePlan);
+  assert.notEqual(kernel.buildKvTidyPlanHash({
     ...basePlan,
     revisions: { ...basePlan.revisions, configRevision: "config-r2" }
   }), previewHash);
-  assert.notEqual(Database.buildKvTidyPlanHash({
+  assert.notEqual(kernel.buildKvTidyPlanHash({
     ...basePlan,
     revisions: { ...basePlan.revisions, snapshotsContentHash: "snapshots-h2" }
   }), previewHash);
@@ -189,13 +197,15 @@ test("KV tidy plan hashes bind config and snapshot revisions", () => {
 test("tidyKvData rejects a signed preview when the rebuilt plan hash changes", async () => {
   const env = { JWT_SECRET: "test-tidy-secret" };
   const previewPlan = { planHash: "preview-hash" };
-  const planToken = await Database.createKvTidyPlanToken(env, previewPlan);
-  const database = Object.create(Database);
-  database.buildKvTidyPlan = async () => ({ planHash: "current-hash", quotaBudget: { blocked: false } });
-  database.applyKvTidyPlan = async () => assert.fail("stale plans must not be applied");
+  const planToken = await kernel.createKvTidyPlanToken(env, previewPlan);
+  const tidyOperations = { ...kernel };
+  Object.assign(tidyOperations, defineKvTidyMethods({}, tidyOperations));
+  tidyOperations.verifyKvTidyPlanToken = (...args) => kernel.verifyKvTidyPlanToken(...args);
+  tidyOperations.buildKvTidyPlan = async () => ({ planHash: "current-hash", quotaBudget: { blocked: false } });
+  tidyOperations.applyKvTidyPlan = async () => assert.fail("stale plans must not be applied");
 
   await assert.rejects(
-    database.tidyKvData(env, { planToken }),
+    tidyOperations.tidyKvData(env, { planToken }),
     error => error?.code === "TIDY_PLAN_STALE"
       && error?.details?.reason === "plan_changed"
       && error?.details?.previewPlanHash === "preview-hash"
@@ -205,7 +215,7 @@ test("tidyKvData rejects a signed preview when the rebuilt plan hash changes", a
 
 test("KV tidy quota includes puts, deletes, rollback writes, and rollback deletes", async () => {
   const { kv } = createKv({ existing: "old-value" });
-  const budget = await Database.resolveKvTidyQuotaBudget({}, [
+  const budget = await kernel.resolveKvTidyQuotaBudget({}, [
     { type: "put", key: "existing", value: "new-value" },
     { type: "delete", key: "missing", value: "" }
   ], { kv, config: {} });
@@ -235,16 +245,16 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     mediaAggregationEmbyPassword: "current-emby-secret"
   };
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: currentConfig,
-    [Database.CONFIG_SNAPSHOTS_KEY]: []
+    [kernel.CONFIG_KEY]: currentConfig,
+    [kernel.CONFIG_SNAPSHOTS_KEY]: []
   });
-  const mutationPlan = await Database.buildRuntimeConfigMutationPlan(
+  const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(
     kv,
     previousConfig,
     currentConfig,
     { reason: "test_snapshot" }
   );
-  const snapshotsMutation = mutationPlan.find(mutation => mutation.key === Database.CONFIG_SNAPSHOTS_KEY);
+  const snapshotsMutation = mutationPlan.find(mutation => mutation.key === kernel.CONFIG_SNAPSHOTS_KEY);
   const [snapshot] = JSON.parse(snapshotsMutation.value);
   assert.equal(snapshot.config.cfApiToken, undefined);
   assert.equal(snapshot.config.tgBotToken, undefined);
@@ -258,7 +268,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   };
   invalidateRuntimeConfigCache();
   try {
-    const restoredConfig = await Database.restoreTidyKvMigrationSnapshot({
+    const restoredConfig = await kernel.restoreTidyKvMigrationSnapshot({
       id: "snapshot-1",
       config: { rateLimitRpm: 5 },
       rollbackPayload: { version: 1, kvEntries: [] }
@@ -270,14 +280,14 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     assert.equal(restoredConfig.doubanBrowserToken, "current-douban-browser-token");
     assert.equal(restoredConfig.mediaAggregationEmbyPassword, "current-emby-secret");
 
-    const restoredFromRollback = await Database.restoreTidyKvMigrationSnapshot({
+    const restoredFromRollback = await kernel.restoreTidyKvMigrationSnapshot({
       id: "snapshot-2",
       config: { rateLimitRpm: 4 },
       rollbackPayload: {
         version: 1,
         kvEntries: [
           {
-            key: Database.CONFIG_KEY,
+            key: kernel.CONFIG_KEY,
             exists: true,
             value: JSON.stringify({
               rateLimitRpm: 3,
@@ -286,7 +296,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
             })
           },
           {
-            key: Database.CONFIG_SNAPSHOTS_KEY,
+            key: kernel.CONFIG_SNAPSHOTS_KEY,
             exists: true,
             value: JSON.stringify([{ id: "old", config: { rateLimitRpm: 2, cfApiToken: "leaked-secret" } }])
           }
@@ -296,7 +306,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
     assert.equal(restoredFromRollback.rateLimitRpm, 3);
     assert.equal(restoredFromRollback.cfApiToken, "current-cf-secret");
     assert.equal(restoredFromRollback.tgBotToken, "current-tg-secret");
-    const persistedSnapshots = JSON.parse(await kv.get(Database.CONFIG_SNAPSHOTS_KEY));
+    const persistedSnapshots = JSON.parse(await kv.get(kernel.CONFIG_SNAPSHOTS_KEY));
     assert.ok(persistedSnapshots.length >= 1);
     assert.ok(persistedSnapshots.every(item => item?.config?.cfApiToken === undefined && item?.config?.tgBotToken === undefined));
   } finally {
@@ -314,14 +324,14 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     mediaAggregationEmbyUsername: "current-emby-user",
     mediaAggregationEmbyPassword: "current-emby-password"
   };
-  const { kv } = createKv({ [Database.CONFIG_KEY]: currentConfig });
+  const { kv } = createKv({ [kernel.CONFIG_KEY]: currentConfig });
   const env = {
     ENI_KV: kv,
     __CONFIG_CACHE_NAMESPACE: "config-kv-safety-settings-roundtrip"
   };
   invalidateRuntimeConfigCache();
   try {
-    const exportedResponse = await Database.ApiHandlers.exportSettings({}, {
+    const exportedResponse = await adminActions.exportSettings({}, {
       env,
       request: new Request("https://worker.test/admin")
     });
@@ -334,8 +344,8 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     assert.equal(backup.config.mediaAggregationEmbyUsername, undefined);
     assert.equal(backup.config.mediaAggregationEmbyPassword, undefined);
 
-    await Database.ApiHandlers.importSettings(backup, { env, ctx: null, kv, meta: {} });
-    const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    await adminActions.importSettings(backup, { env, ctx: null, kv, meta: {} });
+    const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
     assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
@@ -349,7 +359,7 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
 
 test("legacy tmdbApiKey is permanently removed by save, export, import, and KV tidy", async () => {
   const legacySecret = "legacy-tmdb-secret";
-  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 20, tmdbApiKey: legacySecret } });
+  const { kv } = createKv({ [kernel.CONFIG_KEY]: { rateLimitRpm: 20, tmdbApiKey: legacySecret } });
   const env = {
     ENI_KV: kv,
     JWT_SECRET: "legacy-tmdb-tidy-secret",
@@ -357,38 +367,38 @@ test("legacy tmdbApiKey is permanently removed by save, export, import, and KV t
   };
   invalidateRuntimeConfigCache();
   try {
-    const saveResponse = await Database.ApiHandlers.saveConfig({
+    const saveResponse = await adminActions.saveConfig({
       config: { rateLimitRpm: 25, tmdbApiKey: "ignored-replacement" }
     }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
     assert.equal(saveResponse.status, 200);
-    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
 
-    await kv.put(Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 30, tmdbApiKey: legacySecret }));
+    await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 30, tmdbApiKey: legacySecret }));
     invalidateRuntimeConfigCache();
-    const defaultExport = await Database.ApiHandlers.exportSettings({}, {
+    const defaultExport = await adminActions.exportSettings({}, {
       env,
       request: new Request("https://worker.test/admin")
     });
-    const secretExport = await Database.ApiHandlers.exportSettings({ includeSecrets: true }, {
+    const secretExport = await adminActions.exportSettings({ includeSecrets: true }, {
       env,
       request: new Request("https://worker.test/admin", { headers: { "X-Admin-Confirm": "exportSettings" } })
     });
     assert.equal((await defaultExport.json()).config.tmdbApiKey, undefined);
     assert.equal((await secretExport.json()).config.tmdbApiKey, undefined);
 
-    const imported = await Database.ApiHandlers.importSettings({
+    const imported = await adminActions.importSettings({
       config: { rateLimitRpm: 35, tmdbApiKey: "imported-legacy-secret" }
     }, { env, ctx: null, kv, meta: {} });
     assert.equal(imported.status, 200);
-    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
 
-    await kv.put(Database.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 40, tmdbApiKey: legacySecret }));
+    await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 40, tmdbApiKey: legacySecret }));
     invalidateRuntimeConfigCache();
-    const plan = await Database.buildKvTidyPlan(env, { kv });
-    assert.ok(plan.mutationPlan.some(mutation => mutation.type === "put" && mutation.key === Database.CONFIG_KEY));
-    const planToken = await Database.createKvTidyPlanToken(env, plan);
-    await Database.tidyKvData(env, { kv, planToken });
-    assert.equal((await kv.get(Database.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
+    const plan = await kernel.buildKvTidyPlan(env, { kv });
+    assert.ok(plan.mutationPlan.some(mutation => mutation.type === "put" && mutation.key === kernel.CONFIG_KEY));
+    const planToken = await kernel.createKvTidyPlanToken(env, plan);
+    await kernel.tidyKvData(env, { kv, planToken });
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -419,11 +429,11 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     serverRecordEmbyUsername: "record-user",
     serverRecordEmbyPassword: "record-password"
   };
-  const uploadKey = Database.buildAdminIndexUploadKey(adminIndexRecord.revision);
+  const uploadKey = kernel.buildAdminIndexUploadKey(adminIndexRecord.revision);
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: currentConfig,
-    [Database.NODES_INDEX_KEY]: ["backup"],
-    [`${Database.PREFIX}backup`]: currentNode,
+    [kernel.CONFIG_KEY]: currentConfig,
+    [kernel.NODES_INDEX_KEY]: ["backup"],
+    [`${kernel.PREFIX}backup`]: currentNode,
     [uploadKey]: adminIndexRecord
   });
   const env = {
@@ -432,7 +442,7 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
   };
   invalidateRuntimeConfigCache();
   try {
-    const rejectedResponse = await Database.ApiHandlers.exportConfig({ includeEmbyCredentials: true }, {
+    const rejectedResponse = await adminActions.exportConfig({ includeEmbyCredentials: true }, {
       env,
       ctx: null,
       request: new Request("https://worker.test/admin")
@@ -440,7 +450,7 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     assert.equal(rejectedResponse.status, 428);
     assert.equal((await rejectedResponse.json()).error.code, "CONFIRMATION_REQUIRED");
 
-    const redactedResponse = await Database.ApiHandlers.exportConfig({}, {
+    const redactedResponse = await adminActions.exportConfig({}, {
       env,
       ctx: null,
       request: new Request("https://worker.test/admin")
@@ -455,7 +465,7 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     assert.equal(redactedBackup.nodes[0].serverRecordEmbyUsername, undefined);
     assert.equal(redactedBackup.nodes[0].serverRecordEmbyPassword, undefined);
 
-    const exportedResponse = await Database.ApiHandlers.exportConfig({ includeEmbyCredentials: true }, {
+    const exportedResponse = await adminActions.exportConfig({ includeEmbyCredentials: true }, {
       env,
       ctx: null,
       request: new Request("https://worker.test/admin", {
@@ -480,27 +490,27 @@ test("full backup requires confirmation before retaining Emby credentials", asyn
     assert.equal(backup.adminIndexUpload.html, adminIndexRecord.html);
 
     await kv.delete(uploadKey);
-    await Database.ApiHandlers.importFull(backup, { env, ctx: null, kv });
-    const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    await adminActions.importFull(backup, { env, ctx: null, kv });
+    const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
     assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
     assert.equal(restored.doubanBrowserToken, "current-douban-browser-token");
     assert.equal(restored.mediaAggregationEmbyUsername, "global-user");
     assert.equal(restored.mediaAggregationEmbyPassword, "global-password");
-    const restoredNode = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    const restoredNode = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
     assert.equal(restoredNode.mediaAggregationEmbyUsername, "node-user");
     assert.equal(restoredNode.mediaAggregationEmbyPassword, "node-password");
     assert.equal(restoredNode.serverRecordEmbyUsername, "record-user");
     assert.equal(restoredNode.serverRecordEmbyPassword, "record-password");
-    assert.equal((await Database.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
+    assert.equal((await kernel.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
   } finally {
     invalidateRuntimeConfigCache();
   }
 });
 
 test("full import rejects a server record password without a username before writing", async () => {
-  const { kv, operations } = createKv({ [Database.CONFIG_KEY]: {} });
+  const { kv, kernel: kvOperations } = createKv({ [kernel.CONFIG_KEY]: {} });
   const env = {
     ENI_KV: kv,
     HOST: "proxy.example",
@@ -508,7 +518,7 @@ test("full import rejects a server record password without a username before wri
   };
   invalidateRuntimeConfigCache();
   try {
-    const response = await Database.ApiHandlers.importFull({
+    const response = await adminActions.importFull({
       nodes: [{
         name: "orphan-password",
         target: "https://origin.example",
@@ -518,8 +528,8 @@ test("full import rejects a server record password without a username before wri
     const payload = await response.json();
     assert.equal(response.status, 400);
     assert.equal(payload.error.code, "SERVER_RECORD_CREDENTIALS_INCOMPLETE");
-    assert.equal(await kv.get(`${Database.PREFIX}orphan-password`, { type: "json" }), null);
-    assert.deepEqual(operations, []);
+    assert.equal(await kv.get(`${kernel.PREFIX}orphan-password`, { type: "json" }), null);
+    assert.deepEqual(kvOperations, []);
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -541,10 +551,10 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
     activeLineId: "main"
   };
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: {},
-    [Database.NODES_INDEX_KEY]: ["primary", "backup"],
-    [`${Database.PREFIX}primary`]: primaryNode,
-    [`${Database.PREFIX}backup`]: backupNode
+    [kernel.CONFIG_KEY]: {},
+    [kernel.NODES_INDEX_KEY]: ["primary", "backup"],
+    [`${kernel.PREFIX}primary`]: primaryNode,
+    [`${kernel.PREFIX}backup`]: backupNode
   });
   const env = {
     ENI_KV: kv,
@@ -552,7 +562,7 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
   };
   invalidateRuntimeConfigCache();
   try {
-    const response = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+    const response = await adminActions.saveMediaAggregationPolicyShortcuts({
       selectedNodeNames: ["primary", "backup"],
       username: "",
       password: ""
@@ -562,7 +572,7 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
     assert.equal(payload.error.code, "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED");
     assert.deepEqual(payload.error.details.nodeNames, ["backup"]);
 
-    const successResponse = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+    const successResponse = await adminActions.saveMediaAggregationPolicyShortcuts({
       selectedNodeNames: ["primary", "backup"],
       username: "global-user",
       password: "",
@@ -573,34 +583,34 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
     const successPayload = await successResponse.json();
     assert.equal(successResponse.status, 200);
     assert.equal(successPayload.success, true);
-    const savedConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const savedConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(savedConfig.mediaAggregationEmbyUsername, "global-user");
     assert.equal(savedConfig.mediaAggregationEmbyPassword, "");
     assert.equal(savedConfig.mediaAggregationMatchMode, "strict");
     assert.equal(savedConfig.mediaAggregationFirstResultTimeoutMs, 2200);
     assert.equal(savedConfig.mediaAggregationGracePeriodMs, 600);
-    const managedPrimary = await kv.get(`${Database.PREFIX}primary`, { type: "json" });
-    const managedBackup = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    const managedPrimary = await kv.get(`${kernel.PREFIX}primary`, { type: "json" });
+    const managedBackup = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
     assert.equal(managedPrimary.playbackInfoMode, "rewrite");
     assert.equal(managedPrimary.mediaAggregationManagedRewrite, true);
     assert.equal(managedBackup.mediaAggregationManagedRewrite, true);
 
-    await kv.put(`${Database.PREFIX}backup`, JSON.stringify({
+    await kv.put(`${kernel.PREFIX}backup`, JSON.stringify({
       ...managedBackup,
       playbackInfoMode: "rewrite",
       mediaAggregationManagedRewrite: false
     }));
-    const disabledResponse = await Database.ApiHandlers.saveMediaAggregationPolicyShortcuts({
+    const disabledResponse = await adminActions.saveMediaAggregationPolicyShortcuts({
       selectedNodeNames: [],
       username: "global-user"
     }, { env, ctx: null, kv });
     assert.equal(disabledResponse.status, 200);
-    const disabledConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const disabledConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(disabledConfig.mediaAggregationMatchMode, "strict");
     assert.equal(disabledConfig.mediaAggregationFirstResultTimeoutMs, 2200);
     assert.equal(disabledConfig.mediaAggregationGracePeriodMs, 600);
-    const restoredPrimary = await kv.get(`${Database.PREFIX}primary`, { type: "json" });
-    const preservedBackup = await kv.get(`${Database.PREFIX}backup`, { type: "json" });
+    const restoredPrimary = await kv.get(`${kernel.PREFIX}primary`, { type: "json" });
+    const preservedBackup = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
     assert.equal(restoredPrimary.playbackInfoMode, "inherit");
     assert.equal(restoredPrimary.mediaAggregationManagedRewrite, false);
     assert.equal(preservedBackup.playbackInfoMode, "rewrite");
@@ -611,13 +621,13 @@ test("media aggregation shortcut requires usernames and accepts an empty global 
 });
 
 test("full backup export rejects payloads that cannot fit the import request limit", async () => {
-  const { kv } = createKv({ [Database.CONFIG_KEY]: { rateLimitRpm: 30 } });
+  const { kv } = createKv({ [kernel.CONFIG_KEY]: { rateLimitRpm: 30 } });
   const env = {
     ENI_KV: kv,
     __CONFIG_CACHE_NAMESPACE: "config-kv-safety-full-export-limit"
   };
-  const originalLoadAllNodeEntitiesFromKvStrict = Database.loadAllNodeEntitiesFromKvStrict;
-  Database.loadAllNodeEntitiesFromKvStrict = async () => [{
+  const originalLoadAllNodeEntitiesFromKvStrict = kernel.loadAllNodeEntitiesFromKvStrict;
+  kernel.loadAllNodeEntitiesFromKvStrict = async () => [{
     name: "oversized",
     target: "https://origin.test",
     remark: "x".repeat(12 * 1024 * 1024)
@@ -625,7 +635,7 @@ test("full backup export rejects payloads that cannot fit the import request lim
   invalidateRuntimeConfigCache();
 
   try {
-    const response = await Database.ApiHandlers.exportConfig({}, {
+    const response = await adminActions.exportConfig({}, {
       env,
       ctx: null,
       request: new Request("https://worker.test/admin")
@@ -636,7 +646,7 @@ test("full backup export rejects payloads that cannot fit the import request lim
     assert.ok(payload.error.details.importRequestBytes > payload.error.details.maxBytes);
     assert.equal(payload.error.details.nodeCount, 1);
   } finally {
-    Database.loadAllNodeEntitiesFromKvStrict = originalLoadAllNodeEntitiesFromKvStrict;
+    kernel.loadAllNodeEntitiesFromKvStrict = originalLoadAllNodeEntitiesFromKvStrict;
     invalidateRuntimeConfigCache();
   }
 });
@@ -654,9 +664,9 @@ test("Worker HTML rollback preserves settings saved after activation", async () 
   const activatedConfig = { uiRadiusPx: 8, indexUrl: activatedIndex.sourceUrl };
   const concurrentlySavedConfig = { uiRadiusPx: 33, indexUrl: activatedIndex.sourceUrl };
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: concurrentlySavedConfig,
-    [Database.buildAdminIndexUploadKey(previousIndex.revision)]: previousIndex,
-    [Database.buildAdminIndexUploadKey(activatedIndex.revision)]: activatedIndex
+    [kernel.CONFIG_KEY]: concurrentlySavedConfig,
+    [kernel.buildAdminIndexUploadKey(previousIndex.revision)]: previousIndex,
+    [kernel.buildAdminIndexUploadKey(activatedIndex.revision)]: activatedIndex
   });
   const env = {
     ENI_KV: kv,
@@ -665,12 +675,12 @@ test("Worker HTML rollback preserves settings saved after activation", async () 
   invalidateRuntimeConfigCache();
 
   try {
-    const rollback = await Database.rollbackAdminIndexUploadActivation(
+    const rollback = await kernel.rollbackAdminIndexUploadActivation(
       previousConfig,
       activatedConfig,
       { env, kv, ctx: null }
     );
-    const finalConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const finalConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(rollback.skipped, false);
     assert.equal(finalConfig.uiRadiusPx, 33);
     assert.equal(finalConfig.indexUrl, previousIndex.sourceUrl);
@@ -680,7 +690,7 @@ test("Worker HTML rollback preserves settings saved after activation", async () 
 });
 
 test("local HTML activation retains only versions referenced by config and snapshots", async () => {
-  const { kv, values } = createKv({ [Database.CONFIG_KEY]: {} });
+  const { kv, values } = createKv({ [kernel.CONFIG_KEY]: {} });
   const env = {
     ENI_KV: kv,
     __CONFIG_CACHE_NAMESPACE: "config-kv-safety-admin-index-retention"
@@ -693,20 +703,20 @@ test("local HTML activation retains only versions referenced by config and snaps
         `<!doctype html><html><body><div id="app">version-${index}</div></body></html>`,
         "index.html"
       );
-      await Database.persistAdminIndexUpload(record, { env, kv, ctx: null });
+      await kernel.persistAdminIndexUpload(record, { env, kv, ctx: null });
     }
 
-    const config = await kv.get(Database.CONFIG_KEY, { type: "json" });
-    const snapshots = await Database.getConfigSnapshotsForRead(kv, { withConfig: true });
-    const referencedRevisions = Database.collectReferencedAdminIndexUploadRevisions(config, snapshots);
+    const config = await kv.get(kernel.CONFIG_KEY, { type: "json" });
+    const snapshots = await kernel.getConfigSnapshotsForRead(kv, { withConfig: true });
+    const referencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(config, snapshots);
     const storedUploadKeys = [...values.keys()]
-      .filter(key => key.startsWith(Database.ADMIN_INDEX_UPLOAD_PREFIX));
+      .filter(key => key.startsWith(kernel.ADMIN_INDEX_UPLOAD_PREFIX));
     assert.equal(snapshots.length, 5);
     assert.equal(referencedRevisions.size, 6);
     assert.equal(storedUploadKeys.length, 6);
     assert.deepEqual(
       new Set(storedUploadKeys),
-      new Set([...referencedRevisions].map(revision => Database.buildAdminIndexUploadKey(revision)))
+      new Set([...referencedRevisions].map(revision => kernel.buildAdminIndexUploadKey(revision)))
     );
   } finally {
     invalidateRuntimeConfigCache();
@@ -722,10 +732,10 @@ test("KV tidy removes orphaned local HTML records and preserves referenced versi
     '<!doctype html><html><body><div id="app">orphaned</div></body></html>',
     "index.html"
   );
-  const referencedKey = Database.buildAdminIndexUploadKey(referencedIndex.revision);
-  const orphanedKey = Database.buildAdminIndexUploadKey(orphanedIndex.revision);
+  const referencedKey = kernel.buildAdminIndexUploadKey(referencedIndex.revision);
+  const orphanedKey = kernel.buildAdminIndexUploadKey(orphanedIndex.revision);
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: { indexUrl: referencedIndex.sourceUrl },
+    [kernel.CONFIG_KEY]: { indexUrl: referencedIndex.sourceUrl },
     [referencedKey]: referencedIndex,
     [orphanedKey]: orphanedIndex
   });
@@ -737,7 +747,7 @@ test("KV tidy removes orphaned local HTML records and preserves referenced versi
   invalidateRuntimeConfigCache();
 
   try {
-    const plan = await Database.buildKvTidyPlan(env, { kv });
+    const plan = await kernel.buildKvTidyPlan(env, { kv });
     const deletedKeys = plan.mutationPlan
       .filter(mutation => mutation.type === "delete")
       .map(mutation => mutation.key);
@@ -754,18 +764,18 @@ test("KV tidy removes orphaned local HTML records and preserves referenced versi
 
 test("KV tidy preserves D1-owned legacy keys until D1 compatibility is ready", async () => {
   const legacyKeys = [
-    Database.LEGACY_DNS_IP_POOL_SOURCES_KEY,
-    Database.LEGACY_OPS_STATUS_KEY,
-    Database.LEGACY_TELEGRAM_ALERT_STATE_KEY
+    kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY,
+    kernel.LEGACY_OPS_STATUS_KEY,
+    kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY
   ];
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: {},
-    [Database.LEGACY_DNS_IP_POOL_SOURCES_KEY]: [{ id: "legacy-source" }],
-    [Database.LEGACY_OPS_STATUS_KEY]: { scheduled: { status: "legacy" } },
-    [Database.LEGACY_TELEGRAM_ALERT_STATE_KEY]: { lastAlertAt: "2026-07-25T00:00:00.000Z" }
+    [kernel.CONFIG_KEY]: {},
+    [kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY]: [{ id: "legacy-source" }],
+    [kernel.LEGACY_OPS_STATUS_KEY]: { scheduled: { status: "legacy" } },
+    [kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY]: { lastAlertAt: "2026-07-25T00:00:00.000Z" }
   });
 
-  const plan = await Database.buildKvTidyPlan({ ENI_KV: kv }, { kv });
+  const plan = await kernel.buildKvTidyPlan({ ENI_KV: kv }, { kv });
   const deletedKeys = plan.mutationPlan
     .filter(mutation => mutation.type === "delete")
     .map(mutation => mutation.key);
@@ -779,14 +789,14 @@ test("KV tidy preserves D1-owned legacy keys until D1 compatibility is ready", a
 });
 
 test("KV tidy performs no KV deletes when the D1 compatibility copy fails", async () => {
-  const { kv, operations, values } = createKv({ legacy: { status: "old" } });
-  const originalApplyKvD1LegacyMigrations = Database.applyKvD1LegacyMigrations;
-  Database.applyKvD1LegacyMigrations = async () => {
+  const { kv, kernel: kvOperations, values } = createKv({ legacy: { status: "old" } });
+  const originalApplyKvD1LegacyMigrations = kernel.applyKvD1LegacyMigrations;
+  kernel.applyKvD1LegacyMigrations = async () => {
     throw new Error("d1 copy failed");
   };
   try {
     await assert.rejects(
-      Database.applyKvTidyPlan({
+      kernel.applyKvTidyPlan({
         mutationPlan: [{ type: "delete", key: "legacy" }],
         d1LegacyMigrations: [{ key: "legacy", kind: "ops_status_root", payload: { status: "old" } }],
         summary: {},
@@ -795,20 +805,20 @@ test("KV tidy performs no KV deletes when the D1 compatibility copy fails", asyn
       /d1 copy failed/
     );
     assert.equal(values.has("legacy"), true);
-    assert.deepEqual(operations, []);
+    assert.deepEqual(kvOperations, []);
   } finally {
-    Database.applyKvD1LegacyMigrations = originalApplyKvD1LegacyMigrations;
+    kernel.applyKvD1LegacyMigrations = originalApplyKvD1LegacyMigrations;
   }
 });
 
 test("KV tidy rejects malformed D1-owned legacy payloads before any KV delete", async () => {
-  const legacyKey = Database.LEGACY_OPS_STATUS_KEY;
-  const { kv, operations, values } = createKv({
+  const legacyKey = kernel.LEGACY_OPS_STATUS_KEY;
+  const { kv, kernel: kvOperations, values } = createKv({
     [legacyKey]: ["unexpected-array-state"]
   });
 
   await assert.rejects(
-    Database.applyKvTidyPlan({
+    kernel.applyKvTidyPlan({
       mutationPlan: [{ type: "delete", key: legacyKey }],
       d1LegacyMigrations: [{
         key: legacyKey,
@@ -823,36 +833,36 @@ test("KV tidy rejects malformed D1-owned legacy payloads before any KV delete", 
   );
 
   assert.equal(values.has(legacyKey), true);
-  assert.deepEqual(operations, []);
+  assert.deepEqual(kvOperations, []);
 });
 
 test("KV legacy DNS migration rejects lossy source normalization", async () => {
   assert.throws(
-    () => Database.normalizeKvD1LegacyMigrationPayload(
+    () => kernel.normalizeKvD1LegacyMigrationPayload(
       "dns_ip_pool_sources",
       [{ url: "https://missing-id.example/ips.txt" }],
-      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
     ),
     error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
       && error?.details?.reason === "missing_source_id:0"
   );
   assert.throws(
-    () => Database.normalizeKvD1LegacyMigrationPayload(
+    () => kernel.normalizeKvD1LegacyMigrationPayload(
       "dns_ip_pool_sources",
       [{ id: "missing-target", name: "Broken source" }],
-      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
     ),
     error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
       && error?.details?.reason === "missing_source_target:0"
   );
   assert.throws(
-    () => Database.normalizeKvD1LegacyMigrationPayload(
+    () => kernel.normalizeKvD1LegacyMigrationPayload(
       "dns_ip_pool_sources",
       [
         { id: "duplicate", url: "https://one.example/ips.txt" },
         { id: "duplicate", url: "https://two.example/ips.txt" }
       ],
-      Database.LEGACY_DNS_IP_POOL_SOURCES_KEY
+      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
     ),
     error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
       && error?.details?.reason === "duplicate_or_missing_source_id"
@@ -866,8 +876,8 @@ test("full import keeps a competing config save queued until rollback completes"
     tgBotToken: "current-tg-secret"
   };
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: currentConfig,
-    [`${Database.PREFIX}alpha`]: {
+    [kernel.CONFIG_KEY]: currentConfig,
+    [`${kernel.PREFIX}alpha`]: {
       target: "https://origin.test",
       entryMode: "kv_route"
     }
@@ -878,8 +888,8 @@ test("full import keeps a competing config save queued until rollback completes"
   };
   const nodeMutationStarted = createDeferred();
   const releaseNodeMutation = createDeferred();
-  const originalApplyPreparedNodeMutations = Database.applyPreparedNodeMutations;
-  Database.applyPreparedNodeMutations = async () => {
+  const originalApplyPreparedNodeMutations = kernel.applyPreparedNodeMutations;
+  kernel.applyPreparedNodeMutations = async () => {
     nodeMutationStarted.resolve();
     await releaseNodeMutation.promise;
     throw new Error("node_mutation_failed");
@@ -887,7 +897,7 @@ test("full import keeps a competing config save queued until rollback completes"
   invalidateRuntimeConfigCache();
 
   try {
-    const importPromise = Database.ApiHandlers.importFull({
+    const importPromise = adminActions.importFull({
       config: { ...currentConfig, rateLimitRpm: 20 },
       nodes: [{
         name: "alpha",
@@ -898,7 +908,7 @@ test("full import keeps a competing config save queued until rollback completes"
     await nodeMutationStarted.promise;
 
     let competingSaveSettled = false;
-    const competingSave = Database.persistRuntimeConfig({
+    const competingSave = kernel.persistRuntimeConfig({
       ...currentConfig,
       rateLimitRpm: 30
     }, { env, kv, ctx: null }).finally(() => {
@@ -911,13 +921,13 @@ test("full import keeps a competing config save queued until rollback completes"
     await assert.rejects(importPromise, /node_mutation_failed/);
     await competingSave;
 
-    const finalConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const finalConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(finalConfig.rateLimitRpm, 30);
     assert.equal(finalConfig.cfApiToken, "current-cf-secret");
     assert.equal(finalConfig.tgBotToken, "current-tg-secret");
   } finally {
     releaseNodeMutation.resolve();
-    Database.applyPreparedNodeMutations = originalApplyPreparedNodeMutations;
+    kernel.applyPreparedNodeMutations = originalApplyPreparedNodeMutations;
     invalidateRuntimeConfigCache();
   }
 });
@@ -925,8 +935,8 @@ test("full import keeps a competing config save queued until rollback completes"
 test("full import keeps a competing node save queued and the later node value wins", async () => {
   const currentConfig = { rateLimitRpm: 10 };
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: currentConfig,
-    [`${Database.PREFIX}alpha`]: {
+    [kernel.CONFIG_KEY]: currentConfig,
+    [`${kernel.PREFIX}alpha`]: {
       target: "https://old-origin.test",
       entryMode: "kv_route"
     }
@@ -937,21 +947,21 @@ test("full import keeps a competing node save queued and the later node value wi
   };
   const indexRebuildStarted = createDeferred();
   const releaseIndexRebuild = createDeferred();
-  const originalRebuildNodeIndexesFromKv = Database.rebuildNodeIndexesFromKv;
+  const originalRebuildNodeIndexesFromKv = kernel.rebuildNodeIndexesFromKv;
   let indexRebuildCallCount = 0;
-  Database.rebuildNodeIndexesFromKv = async (...args) => {
+  kernel.rebuildNodeIndexesFromKv = async (...args) => {
     indexRebuildCallCount += 1;
     if (indexRebuildCallCount === 1) {
       indexRebuildStarted.resolve();
       await releaseIndexRebuild.promise;
       throw new Error("import_node_index_rebuild_failed");
     }
-    return await originalRebuildNodeIndexesFromKv.apply(Database, args);
+    return await originalRebuildNodeIndexesFromKv.apply(kernel, args);
   };
   invalidateRuntimeConfigCache();
 
   try {
-    const importPromise = Database.ApiHandlers.importFull({
+    const importPromise = adminActions.importFull({
       config: { rateLimitRpm: 20 },
       nodes: [{
         name: "alpha",
@@ -961,11 +971,11 @@ test("full import keeps a competing node save queued and the later node value wi
     }, { env, ctx: null, kv });
     await indexRebuildStarted.promise;
 
-    const importedNode = await kv.get(`${Database.PREFIX}alpha`, { type: "json" });
+    const importedNode = await kv.get(`${kernel.PREFIX}alpha`, { type: "json" });
     assert.equal(importedNode.target, "https://imported-origin.test:443");
 
     let competingSaveSettled = false;
-    const competingSave = Database.ApiHandlers.saveOrImport({
+    const competingSave = adminActions.saveOrImport({
       name: "alpha",
       originalName: "alpha",
       target: "https://concurrent-origin.test",
@@ -981,20 +991,20 @@ test("full import keeps a competing node save queued and the later node value wi
     const competingResponse = await competingSave;
     assert.equal(competingResponse.status, 200);
 
-    const finalConfig = await kv.get(Database.CONFIG_KEY, { type: "json" });
-    const finalNode = await kv.get(`${Database.PREFIX}alpha`, { type: "json" });
+    const finalConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
+    const finalNode = await kv.get(`${kernel.PREFIX}alpha`, { type: "json" });
     assert.equal(finalConfig.rateLimitRpm, 10);
     assert.equal(finalNode.target, "https://concurrent-origin.test:443");
   } finally {
     releaseIndexRebuild.resolve();
-    Database.rebuildNodeIndexesFromKv = originalRebuildNodeIndexesFromKv;
+    kernel.rebuildNodeIndexesFromKv = originalRebuildNodeIndexesFromKv;
     invalidateRuntimeConfigCache();
   }
 });
 
 test("settings import honors an explicitly cleared secret", async () => {
   const { kv } = createKv({
-    [Database.CONFIG_KEY]: {
+    [kernel.CONFIG_KEY]: {
       cfApiToken: "current-cf-secret",
       tgBotToken: "current-tg-secret"
     }
@@ -1005,10 +1015,10 @@ test("settings import honors an explicitly cleared secret", async () => {
   };
   invalidateRuntimeConfigCache();
   try {
-    await Database.ApiHandlers.importSettings({
+    await adminActions.importSettings({
       config: { cfApiToken: "", tgBotToken: "replacement-tg-secret" }
     }, { env, ctx: null, kv, meta: {} });
-    const restored = await kv.get(Database.CONFIG_KEY, { type: "json" });
+    const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "");
     assert.equal(restored.tgBotToken, "replacement-tg-secret");
   } finally {
@@ -1017,18 +1027,19 @@ test("settings import honors an explicitly cleared secret", async () => {
 });
 
 test("config and DNS restoration still restores raw KV when DNS compensation fails", async () => {
-  const database = Object.create(Database);
+  const snapshotOperations = { ...kernel };
+  Object.assign(snapshotOperations, defineSnapshotMethods({}, snapshotOperations));
   let rawStateRestored = false;
-  database.commitRuntimeConfig = async () => {
+  snapshotOperations.commitRuntimeConfig = async () => {
     throw new Error("dns_restore_failed");
   };
-  database.restoreCapturedRuntimeConfigState = async () => {
+  snapshotOperations.restoreCapturedRuntimeConfigState = async () => {
     rawStateRestored = true;
     return { rateLimitRpm: 10 };
   };
 
   await assert.rejects(
-    database.restoreCapturedRuntimeConfigAndDnsState({ config: { rateLimitRpm: 10 } }, {}),
+    snapshotOperations.restoreCapturedRuntimeConfigAndDnsState({ config: { rateLimitRpm: 10 } }, {}),
     error => error?.code === "CONFIG_DNS_RESTORE_FAILED"
       && error?.details?.dnsRestoreError === "dns_restore_failed"
       && error?.details?.kvRestoreError === ""

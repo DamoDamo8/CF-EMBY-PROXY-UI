@@ -9,9 +9,21 @@ const frontendDirectory = path.join(repositoryRoot, 'frontend');
 
 const requiredChecks = [
   {
-    name: 'Worker syntax',
+    name: 'Worker source syntax',
     command: process.execPath,
-    args: ['--check', 'worker.js'],
+    args: ['./scripts/check-worker-syntax.mjs'],
+    cwd: repositoryRoot
+  },
+  {
+    name: 'Worker ESM architecture',
+    command: process.execPath,
+    args: ['./scripts/check-worker-architecture.mjs'],
+    cwd: repositoryRoot
+  },
+  {
+    name: 'Worker bundle freshness',
+    command: process.execPath,
+    args: ['./scripts/check-worker-bundle.mjs'],
     cwd: repositoryRoot
   },
   {
@@ -22,6 +34,7 @@ const requiredChecks = [
       'tests/worker-defensive-boundaries.test.mjs',
       'tests/config-kv-safety.test.mjs',
       'tests/d1-migrations.test.mjs',
+      'tests/worker-bundle-smoke.test.mjs',
       'tests/frontend-runtime-enhancements.test.mjs'
     ],
     cwd: repositoryRoot

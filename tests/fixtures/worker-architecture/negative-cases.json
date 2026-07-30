@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "name": "small-business-module",
+      "expectedCodes": ["SMALL_MODULE"],
+      "files": {
+        "runtime/small.js": "export function useful() { return 1; }"
+      }
+    },
+    {
+      "name": "single-production-caller",
+      "expectedCodes": ["SINGLE_CALLER"],
+      "files": {
+        "runtime/caller.js": { "source": "import { useful } from './single.js';\nexport function call() { return useful() + 1; }", "padLines": 301 },
+        "runtime/single.js": { "source": "export function useful() { return 1; }", "padLines": 301 }
+      }
+    },
+    {
+      "name": "technical-forwarder",
+      "expectedCodes": ["FORWARDING_MODULE"],
+      "files": {
+        "runtime/forwarder.js": { "source": "export function forward(request) { return target(request); }", "padLines": 301 }
+      }
+    },
+    {
+      "name": "import-cycle",
+      "expectedCodes": ["CYCLE"],
+      "files": {
+        "runtime/a.js": { "source": "import './b.js';\nexport const a = 1;", "padLines": 301 },
+        "runtime/b.js": { "source": "import './a.js';\nexport const b = 1;", "padLines": 301 }
+      }
+    },
+    {
+      "name": "reverse-layer-dependency",
+      "expectedCodes": ["REVERSE_DEPENDENCY"],
+      "files": {
+        "core/shared.js": { "source": "import '../runtime/use-case.js';\nexport const shared = 1;", "padLines": 301 },
+        "runtime/use-case.js": { "source": "export const useCase = 1;", "padLines": 301 }
+      }
+    },
+    {
+      "name": "legacy-operation-reference",
+      "expectedCodes": ["LEGACY_REFERENCE"],
+      "files": {
+        "runtime/legacy.js": { "source": "const dataService = {};\nexport { dataService };", "padLines": 301 }
+      }
+    },
+    {
+      "name": "fake-facades",
+      "expectedCodes": ["FACADE_FORWARDING", "FACADE_AUTH", "FACADE_WAIT_UNTIL"],
+      "files": {
+        "runtime/application-facades.js": {
+          "source": "const dependency = { handle() {} };\nvar AdminConsoleFacade = class { constructor({ service }) { this.service = service; } handle(request, env, ctx) { return this.service.handle(request, env, ctx); } };\nvar NodeProxyFacade = class { constructor({ service }) { this.service = service; } handle(request, env, ctx, routeContext) { return this.service.handle(request, env, ctx, routeContext); } };\nvar ScheduledMaintenanceFacade = class { constructor({ service }) { this.service = service; } handle(event, env, ctx) { return this.service.handle(event, env, ctx); } };\nexport { AdminConsoleFacade, NodeProxyFacade, ScheduledMaintenanceFacade };",
+          "padLines": 1000
+        }
+      }
+    }
+  ]
+}

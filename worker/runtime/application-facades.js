@@ -1,5 +1,7 @@
-// GENERATED FILE. Edit worker/ ESM sources and run npm run build:worker.
-//#region worker/runtime/application-facades.js
+//#region worker/features/admin/api.js
+
+//#endregion
+//#region worker/kernel/isolate-state.js
 var cacheState = {
 	NodeCache: /* @__PURE__ */ new Map(),
 	PlaybackRouteHotCache: /* @__PURE__ */ new Map(),
@@ -94,6 +96,8 @@ var isolateState = createIsolateStateFacade([
 	runtimeState,
 	databaseReadinessState
 ]);
+//#endregion
+//#region worker/core/primitives.js
 function normalizeNodeNameList(input) {
 	const rawList = Array.isArray(input) ? input : String(input || "").split(/[\\r\\n,，;；|]+/);
 	const seen = /* @__PURE__ */ new Set();
@@ -170,6 +174,8 @@ function isLikelyColoCode(value) {
 	if (!text) return false;
 	return /^[a-z]{3,4}$/i.test(text);
 }
+//#endregion
+//#region worker/core/errors.js
 function getErrorMessage(error, fallback = "unknown_error") {
 	const message = String(error?.message || "").trim();
 	if (message) return message;
@@ -261,6 +267,8 @@ function isAbortLikeError(error) {
 	if (error.name === "AbortError") return true;
 	return String(error.message || "").toLowerCase().includes("abort");
 }
+//#endregion
+//#region worker/core/http-constants.js
 var REMOTE_JSON_RESPONSE_MAX_BYTES = 4 * 1024 * 1024;
 var REMOTE_ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
 var SECURITY_RESPONSE_HEADERS = Object.freeze({
@@ -275,6 +283,8 @@ var corsHeaders = Object.freeze({
 	"Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, HEAD",
 	"Access-Control-Allow-Headers": "Content-Type, Authorization, X-Emby-Authorization, X-Emby-Token, X-Emby-Client, X-Emby-Device-Id, X-Emby-Device-Name, X-Emby-Client-Version, X-MediaBrowser-Authorization, X-MediaBrowser-Token"
 });
+//#endregion
+//#region worker/core/http-headers.js
 function mergeVaryHeader(headers, value) {
 	const current = headers.get("Vary");
 	if (!current) {
@@ -289,14 +299,20 @@ function applySecurityHeaders(headers) {
 	Object.entries(SECURITY_RESPONSE_HEADERS).forEach(([k, v]) => headers.set(k, v));
 	return headers;
 }
+//#endregion
+//#region worker/core/serialization.js
 function serializeConfigValue(value) {
 	if (Array.isArray(value)) return JSON.stringify(value);
 	if (isPlainObject(value)) return JSON.stringify(value);
 	if (value === void 0) return "";
 	return JSON.stringify(value);
 }
+//#endregion
+//#region worker/core/time.js
 var nowMs = () => Date.now();
 var sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+//#endregion
+//#region worker/kernel/runtime-globals.js
 function getDefaultCacheHandle(runtimeGlobals = globalThis) {
 	try {
 		return runtimeGlobals?.caches?.default ?? null;
@@ -307,6 +323,8 @@ function getDefaultCacheHandle(runtimeGlobals = globalThis) {
 function getCryptoSubtle(runtimeGlobals = globalThis) {
 	return runtimeGlobals.crypto.subtle;
 }
+//#endregion
+//#region worker/kernel/hashing.js
 function hashStableText(input = "") {
 	const text = String(input || "");
 	let hash = 2166136261;
@@ -330,6 +348,8 @@ async function sha256HexText(input = "") {
 	const digest = await getCryptoSubtle().digest("SHA-256", new TextEncoder().encode(String(input || "")));
 	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
+//#endregion
+//#region worker/features/config/api.js
 var AUTH_DEFAULTS = Object.freeze({
 	JwtExpiry: 3600 * 24 * 30,
 	LoginLockDuration: 900,
@@ -484,6 +504,8 @@ var CONFIG_DEFAULTS = Object.freeze({
 	...BUILD_DEFAULTS
 });
 var Config = Object.freeze({ Defaults: CONFIG_DEFAULTS });
+//#endregion
+//#region worker/features/maintenance/time-model.js
 function normalizeScheduleUtcOffsetMinutes(value) {
 	return clampIntegerConfig(value, Config.Defaults.ScheduleUtcOffsetMinutes, -720, 840);
 }
@@ -659,6 +681,8 @@ function getDueScheduledClockSlots(previousState = {}, clockTimes = [], utcOffse
 		reason: "clock_slots_due"
 	};
 }
+//#endregion
+//#region worker/features/nodes/policy-model.js
 function normalizeNodeMediaAuthMode(value = "") {
 	const normalized = String(value || "").trim().toLowerCase();
 	if (normalized === "inherit") return "inherit";
@@ -812,6 +836,8 @@ function buildServerRecordExpiry(record = {}, lastWatchedAt = "", config = {}, n
 		expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
 	};
 }
+//#endregion
+//#region worker/features/dns/pool-model.js
 var IP_TEXT_CANDIDATE_REGEX = /\b(?:(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)|[0-9a-f:]{2,})\b/gi;
 var CF_COLO_META = {
 	AKL: {
@@ -1689,6 +1715,8 @@ function buildDnsIpWorkspaceSummary(currentHostItems = [], sharedPoolItems = [])
 		combined: summarizeDnsIpWorkspaceItems([...currentHostRows, ...sharedPoolRows])
 	};
 }
+//#endregion
+//#region worker/features/dns/hostname-model.js
 function resolveConfiguredHost(env) {
 	return normalizeHostnameText(env?.HOST);
 }
@@ -1783,6 +1811,8 @@ function scoreHostnameCandidate(hostname, options = {}) {
 	score -= Math.min(path.length, 30);
 	return score;
 }
+//#endregion
+//#region worker/features/admin/index-source.js
 var ADMIN_LOCAL_INDEX_SOURCE_ORIGIN = "https://admin-local-index.invalid";
 var ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX = "local-";
 var ADMIN_LOCAL_INDEX_KV_PREFIX = "sys:admin_index_upload:v1:";
@@ -1897,6 +1927,8 @@ function assertHostPrefixDnsSyncReady(config = {}, env = null) {
 		host: requirementState.host
 	});
 }
+//#endregion
+//#region worker/features/proxy/constants.js
 var DEFAULT_PING_TIMEOUT_MS = PROXY_DEFAULTS.PingTimeoutMs;
 var DEFAULT_UPSTREAM_TIMEOUT_MS = PROXY_DEFAULTS.UpstreamTimeoutMs;
 var DEFAULT_UPSTREAM_RETRY_ATTEMPTS = PROXY_DEFAULTS.UpstreamRetryAttempts;
@@ -2015,6 +2047,8 @@ var LEGACY_PROXY_CONTEXT_FALLBACK_ROOTS = /* @__PURE__ */ new Set([
 	"sessions",
 	"system"
 ]);
+//#endregion
+//#region worker/features/proxy/routing/path-model.js
 function getCorsHeadersForResponse(env, request, originOverride = null) {
 	const reqOrigin = request.headers.get("Origin");
 	const reqHeaders = request.headers.get("Access-Control-Request-Headers") || corsHeaders["Access-Control-Allow-Headers"];
@@ -2076,6 +2110,8 @@ function decodeBase64UrlUtf8(value = "") {
 	const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
 	return new TextDecoder().decode(bytes);
 }
+//#endregion
+//#region worker/features/admin/route-model.js
 function normalizeAdminPath(value) {
 	const fallback = "/admin";
 	const raw = String(value || "").trim();
@@ -2246,6 +2282,8 @@ function resolveRequestCountryMeta(request) {
 		countryName: resolveCountryNameFromCode(countryCode)
 	};
 }
+//#endregion
+//#region worker/features/admin/shell-template.js
 function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 	const { statusPort } = dependencies;
 	const ADMIN_FALLBACK_HTML_TEMPLATE = "<!DOCTYPE html><html lang=\"zh-CN\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0, viewport-fit=cover\"><link rel=\"icon\" href=\"/favicon.ico\" sizes=\"any\"><title>Emby Proxy Admin Shell</title><script id=\"admin-bootstrap\" type=\"application/json\">__ADMIN_BOOTSTRAP_JSON__<\/script><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#0f172a 0,#020617 44%,#020617 100%);color:#e2e8f0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,\"Segoe UI\",sans-serif}a{color:inherit;text-decoration:none}.admin-fallback-shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:32px 18px}.admin-fallback-card{width:min(100%,980px);border:1px solid rgba(51,65,85,.92);border-radius:30px;background:rgba(15,23,42,.94);box-shadow:0 32px 96px rgba(2,6,23,.52);padding:28px;backdrop-filter:blur(20px)}.admin-fallback-pill{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:8px 14px;background:rgba(59,130,246,.12);border:1px solid rgba(96,165,250,.32);color:#bfdbfe;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase}.admin-fallback-title{margin:20px 0 0;font-size:clamp(1.9rem,4vw,3rem);line-height:1.08;color:#fff}.admin-fallback-copy{margin:14px 0 0;max-width:54rem;color:#cbd5e1;font-size:15px;line-height:1.8}.admin-fallback-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-top:24px}.admin-fallback-stat{border:1px solid rgba(51,65,85,.9);border-radius:22px;background:rgba(2,6,23,.48);padding:16px}.admin-fallback-k{font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:#64748b}.admin-fallback-v{margin-top:10px;font-size:15px;line-height:1.7;color:#f8fafc;word-break:break-word}.admin-fallback-actions{display:flex;flex-wrap:wrap;gap:12px;margin-top:24px}.admin-fallback-btn{display:inline-flex;align-items:center;justify-content:center;border-radius:16px;padding:12px 18px;font-size:14px;font-weight:700;transition:transform .18s ease,background-color .18s ease,border-color .18s ease}.admin-fallback-btn:hover{transform:translateY(-1px)}.admin-fallback-btn-primary{background:#2563eb;color:#fff;border:1px solid rgba(147,197,253,.7);box-shadow:0 12px 28px rgba(37,99,235,.24)}.admin-fallback-btn-primary:hover{background:#1d4ed8;border-color:#93c5fd}.admin-fallback-btn-secondary{background:rgba(15,23,42,.5);color:#e2e8f0;border:1px solid rgba(51,65,85,.95)}.admin-fallback-btn-secondary:hover{background:rgba(30,41,59,.85)}.admin-fallback-panel{margin-top:24px;border:1px solid rgba(51,65,85,.9);border-radius:24px;background:rgba(2,6,23,.4);padding:20px}.admin-fallback-panel h2{margin:0;font-size:15px;color:#fff}.admin-fallback-panel p{margin:10px 0 0;font-size:14px;line-height:1.7;color:#cbd5e1}.admin-fallback-panel details{margin-top:16px}.admin-fallback-panel summary{cursor:pointer;color:#93c5fd;font-weight:700}.admin-fallback-panel pre{overflow:auto;margin:12px 0 0;padding:14px;border-radius:18px;background:#020617;color:#cbd5e1;font-size:12px;line-height:1.6}.admin-fallback-note{margin-top:16px;color:#94a3b8;font-size:13px;line-height:1.7}@media (max-width:640px){.admin-fallback-shell{padding:18px 12px}.admin-fallback-card,.admin-fallback-stat,.admin-fallback-panel{border-radius:22px}.admin-fallback-card{padding:22px}.admin-fallback-actions{flex-direction:column}.admin-fallback-btn{width:100%}}</style></head><body><main class=\"admin-fallback-shell\"><section class=\"admin-fallback-card\"><div class=\"admin-fallback-pill\">Admin Shell</div><h1 class=\"admin-fallback-title\">管理台壳层正在处理中</h1><p class=\"admin-fallback-copy\">Worker 继续负责管理台壳、登录与统一后台 API；页面主体会根据当前状态注入设置页、远端壳或错误态内容。</p>__INIT_HEALTH_BANNER____ADMIN_APP_ROOT__</section></main></body></html>";
@@ -2919,6 +2957,8 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 		buildConditionalNotModifiedResponseFromStoredResponse
 	};
 }
+//#endregion
+//#region worker/features/admin/shell-assets.js
 function defineAdminShellAssets(dependencies = {}, shell = {}) {
 	function buildAdminRemoteBootstrapMarkup(bootstrapJson = "{}") {
 		return `${buildAdminRemoteBootstrapScriptMarkup(bootstrapJson)}${ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML}`;
@@ -3550,9 +3590,13 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 		buildAdminRemoteShellVariantEtag
 	};
 }
+//#endregion
+//#region worker/kernel/fetch.js
 function fetchRequest(input, init) {
 	return fetch(input, init);
 }
+//#endregion
+//#region worker/core/http-body.js
 function parseContentLengthHeader(value) {
 	const raw = String(value || "").trim();
 	if (!/^\d+$/.test(raw)) return null;
@@ -3660,6 +3704,8 @@ function getCaseInsensitivePayloadValue(payload = {}, names = []) {
 	}
 	return "";
 }
+//#endregion
+//#region worker/features/config/cache.js
 function buildSingleFlightKey(parts = []) {
 	return (Array.isArray(parts) ? parts : [parts]).map((item) => String(item ?? "").trim()).filter(Boolean).join(":");
 }
@@ -3689,6 +3735,8 @@ function primeRuntimeConfigCache(env, config) {
 		namespace: getRuntimeConfigCacheNamespace(env)
 	};
 }
+//#endregion
+//#region worker/features/maintenance/mutation-queues.js
 async function runKvDataMutation(mutation) {
 	const mutationTask = runtimeState.KvDataMutationChain.catch(() => null).then(() => mutation());
 	runtimeState.KvDataMutationChain = mutationTask.catch(() => null);
@@ -3707,6 +3755,8 @@ async function runAdminRemoteShellCacheMutation(cacheKeyUrl, mutation) {
 	cacheState.AdminRemoteShellCacheMutationChains.set(mutationKey, nextMutation);
 	return await nextMutation;
 }
+//#endregion
+//#region worker/features/admin/shell-cache.js
 function defineAdminShellCache(dependencies = {}, shell = {}) {
 	function buildAdminRemoteShellStoredResponse(html = "", options = {}) {
 		const headers = shell.buildAdminHtmlResponseHeaders(options.variantEtag || "", shell.ADMIN_REMOTE_SHELL_EDGE_CACHE_CONTROL);
@@ -4086,6 +4136,8 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		loadAdminRemoteShellColdCache
 	};
 }
+//#endregion
+//#region worker/features/admin/shell-delivery.js
 function defineAdminShellDelivery(dependencies = {}, shell = {}) {
 	const { indexRepository } = dependencies;
 	async function renderAdminIndexSetupPage(request, env, ctx, initHealth = buildInitHealth(env), config = {}, setupReason = "index_url_not_configured") {
@@ -4331,6 +4383,8 @@ function defineAdminShellDelivery(dependencies = {}, shell = {}) {
 		renderAdminReleaseVendorAsset
 	};
 }
+//#endregion
+//#region worker/core/http.js
 function jsonHeaders(extra = {}) {
 	return {
 		...SECURITY_RESPONSE_HEADERS,
@@ -4378,6 +4432,8 @@ async function normalizeJsonApiResponse(response) {
 	const details = payload?.error?.details ?? payload?.details ?? null;
 	return jsonError(code, message, response.status || 500, details);
 }
+//#endregion
+//#region worker/features/config/routing-model.js
 function normalizeRoutingDecisionMode(value = "") {
 	return String(value || "").trim().toLowerCase() === "simplified" ? "simplified" : "legacy";
 }
@@ -4393,6 +4449,8 @@ function resolveProtocolStrategyFromLegacyConfig(config = {}) {
 	if (!enableH2 && !enableH3) return "compat";
 	return config?.peakDowngrade === false ? "aggressive" : "balanced";
 }
+//#endregion
+//#region worker/features/maintenance/report-model.js
 var DAILY_TELEGRAM_REPORT_KIND_DEFINITIONS = Object.freeze([
 	{
 		kind: "summary",
@@ -4467,6 +4525,8 @@ function resolveEffectiveRoutingDecisionMode(node = {}, currentConfig = {}) {
 	const nodeMode = normalizeNodeRoutingDecisionMode(node?.routingDecisionMode);
 	return nodeMode === "inherit" ? resolveRoutingDecisionMode(currentConfig) : nodeMode;
 }
+//#endregion
+//#region worker/features/proxy/transport/url-model.js
 function normalizePortText(value) {
 	const trimmed = String(value ?? "").trim();
 	if (!trimmed) return "";
@@ -4550,6 +4610,8 @@ function targetNeedsDefaultPortCanonicalization(targetValue = "") {
 function toGraphQLString(value) {
 	return JSON.stringify(String(value ?? ""));
 }
+//#endregion
+//#region worker/features/nodes/target-model.js
 var DEFAULT_NODE_LINE_HEAD_PROBE_PATH = "/emby/system/info/public";
 function normalizeTargetBasePath(pathname = "/") {
 	const safePath = sanitizeProxyPath(pathname || "/");
@@ -4622,6 +4684,8 @@ function shouldUseSegmentFastUpstreamBuilder(method = "GET", requestTraits = {},
 	if (options.isExternalRedirect === true) return false;
 	return true;
 }
+//#endregion
+//#region worker/features/nodes/legacy-model.js
 var NODE_LEGACY_DIRECT_MODE_KEYS = ["proxyMode", "mode"];
 var NODE_LEGACY_DIRECT_BOOLEAN_KEYS = [
 	"direct",
@@ -4772,12 +4836,16 @@ function consumeProxyLinkVariantPrefix(rawPath = "") {
 		needsTrailingSlashRedirect: pathParts.length === 2 && !withLeadingSlash.endsWith("/")
 	};
 }
+//#endregion
+//#region worker/kernel/bindings.js
 function getKvBinding(env = {}) {
 	return env.ENI_KV || env.KV || env.EMBY_KV || env.EMBY_PROXY || null;
 }
 function getD1Binding(env = {}) {
 	return env.DB || env.D1 || env.PROXY_LOGS || null;
 }
+//#endregion
+//#region worker/features/auth/api.js
 var LOGIN_JSON_REQUEST_MAX_BYTES = 16 * 1024;
 async function signHmac(secret, data) {
 	const encoder = new TextEncoder();
@@ -4814,87 +4882,120 @@ var AdminConsoleFacade = class {
 		});
 		this.#validateActionCatalog();
 	}
+
 	async handle(request, env, ctx) {
-		const routeContext = this.#buildFetchRouteContext(request, env);
-		const { requestHost, configuredHost, configuredLegacyHost } = routeContext;
-		const requestMethod = request.method;
-		const isGetOrHead = requestMethod === "GET" || requestMethod === "HEAD";
-		if (isGetOrHead && routeContext.pathnameLower === "/favicon.ico") return this.#renderFavicon(requestMethod);
-		const runtimeConfig = await this.configReader.getRuntimeConfig(env);
-		const isLegacyHostRequest = !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
-		const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!configuredHost && !isLegacyHostRequest;
-		const hostPrefixMatch = hostPrefixProxyActive ? resolveHostPrefixMatch(requestHost, configuredHost) : null;
-		const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
-		if (hostPrefixMatch || isConfiguredHostSubdomain) return null;
-		if (requestMethod === "GET" && routeContext.normalizedPathname === "/") return this.#renderLandingPage(env, routeContext.initHealth);
-		const adminReleaseVendorRoute = isGetOrHead ? this.#resolveVendorRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
-		if (adminReleaseVendorRoute) {
-			if (!await this.#verifyRequest(request, env)) return this.#buildVendorErrorResponse("Unauthorized", 401);
-			return this.#renderVendorAsset(request, env, ctx, adminReleaseVendorRoute, runtimeConfig);
-		}
-		if (isGetOrHead && this.#isWarmRoute(routeContext.normalizedPathname, routeContext.adminPath)) {
-			if (!await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminLoginPath);
-			return this.#renderWarmResponse(request, env, routeContext.initHealth, runtimeConfig);
-		}
-		if (isGetOrHead && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower)) {
-			if (await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminPath);
-			return this.#renderLogin(request, env, routeContext.initHealth);
-		}
-		if (isGetOrHead && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) {
-			if (!await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminLoginPath);
-			return this.#renderPage(request, env, ctx, routeContext.initHealth);
-		}
-		if (requestMethod === "OPTIONS" && this.#isAdminPreflightRoute(routeContext)) return this.#buildRouteCorsResponse(request, env, null);
-		if (requestMethod === "POST" && (pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower) || this.#isLegacyAdminLoginRoute(routeContext))) return this.#handleLogin(request, env);
-		if (requestMethod !== "POST" || !pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) return null;
-		if (!await this.#verifyRequest(request, env)) return jsonError("UNAUTHORIZED", "未授权", 401);
-		try {
-			return await normalizeJsonApiResponse(await this.#handleActionRequest(request, env, ctx));
-		} catch (e) {
-			const normalizedError = normalizeAppErrorForResponse(e, {
-				code: "INTERNAL_ERROR",
-				message: "Server Error",
-				status: 500
-			});
-			logRuntimeFailure("admin_api.unhandled_error", e, {
-				path: routeContext.pathnameLower,
-				method: requestMethod,
-				responseCode: normalizedError.code,
-				responseStatus: normalizedError.status
-			}, "error");
-			return jsonError(normalizedError.code, normalizedError.message, normalizedError.status, normalizedError.details);
-		}
-	}
+				const routeContext = this.#buildFetchRouteContext(request, env);
+				const { requestHost, configuredHost, configuredLegacyHost } = routeContext;
+				const requestMethod = request.method;
+				const isGetOrHead = requestMethod === "GET" || requestMethod === "HEAD";
+				if (isGetOrHead && routeContext.pathnameLower === "/favicon.ico") return this.#renderFavicon(requestMethod);
+				const runtimeConfig = await this.configReader.getRuntimeConfig(env);
+				const isLegacyHostRequest = !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
+				const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!configuredHost && !isLegacyHostRequest;
+				const hostPrefixMatch = hostPrefixProxyActive ? resolveHostPrefixMatch(requestHost, configuredHost) : null;
+				const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
+				if (hostPrefixMatch || isConfiguredHostSubdomain) return null;
+				if (requestMethod === "GET" && routeContext.normalizedPathname === "/") return this.#renderLandingPage(env, routeContext.initHealth);
+				const adminReleaseVendorRoute = isGetOrHead ? this.#resolveVendorRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
+				if (adminReleaseVendorRoute) {
+					if (!await this.#verifyRequest(request, env)) return this.#buildVendorErrorResponse("Unauthorized", 401);
+					return this.#renderVendorAsset(request, env, ctx, adminReleaseVendorRoute, runtimeConfig);
+				}
+				if (isGetOrHead && this.#isWarmRoute(routeContext.normalizedPathname, routeContext.adminPath)) {
+					if (!await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminLoginPath);
+					return this.#renderWarmResponse(request, env, routeContext.initHealth, runtimeConfig);
+				}
+				if (isGetOrHead && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower)) {
+					if (await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminPath);
+					return this.#renderLogin(request, env, routeContext.initHealth);
+				}
+				if (isGetOrHead && pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) {
+					if (!await this.#verifyRequest(request, env)) return this.#buildRedirectResponse(request, routeContext.adminLoginPath);
+					return this.#renderPage(request, env, ctx, routeContext.initHealth);
+				}
+				if (requestMethod === "OPTIONS" && this.#isAdminPreflightRoute(routeContext)) return this.#buildRouteCorsResponse(request, env, null);
+				if (requestMethod === "POST" && (pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower) || this.#isLegacyAdminLoginRoute(routeContext))) return this.#handleLogin(request, env);
+				if (requestMethod !== "POST" || !pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminPathLower)) return null;
+				if (!await this.#verifyRequest(request, env)) return jsonError("UNAUTHORIZED", "未授权", 401);
+				try {
+					return await normalizeJsonApiResponse(await this.#handleActionRequest(request, env, ctx));
+				} catch (e) {
+					const normalizedError = normalizeAppErrorForResponse(e, {
+						code: "INTERNAL_ERROR",
+						message: "Server Error",
+						status: 500
+					});
+					logRuntimeFailure("admin_api.unhandled_error", e, {
+						path: routeContext.pathnameLower,
+						method: requestMethod,
+						responseCode: normalizedError.code,
+						responseStatus: normalizedError.status
+					}, "error");
+					return jsonError(normalizedError.code, normalizedError.message, normalizedError.status, normalizedError.details);
+				}
+			}
+
 	#validateActionCatalog() {
 		for (const [actionName, handler] of Object.entries(this.actionHandlers)) {
-			if (!this.#normalizeActionName(actionName)) throw new TypeError("Admin action names cannot be empty");
-			if (typeof handler !== "function") throw new TypeError(`Admin action ${actionName} is not a function`);
+			if (!this.#normalizeActionName(actionName)) {
+				throw new TypeError("Admin action names cannot be empty");
+			}
+			if (typeof handler !== "function") {
+				throw new TypeError(`Admin action ${actionName} is not a function`);
+			}
 		}
-		for (const [alias, target] of Object.entries(this.actionAliases)) if (!this.actionHandlers[target]) throw new Error(`Admin action alias ${alias} targets missing action ${target}`);
+		for (const [alias, target] of Object.entries(this.actionAliases)) {
+			if (!this.actionHandlers[target]) {
+				throw new Error(`Admin action alias ${alias} targets missing action ${target}`);
+			}
+		}
 	}
+
 	#normalizeActionName(value) {
 		return String(value || "").trim();
 	}
+
 	#resolveAction(actionName) {
 		const normalized = this.#normalizeActionName(actionName);
 		const resolved = this.actionAliases[normalized] || normalized;
 		return this.actionHandlers[resolved] || null;
 	}
+
 	async #handleActionRequest(request, env, ctx) {
 		const kv = this.bindingService.getKV(env);
-		if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
+		if (!kv) {
+			return jsonError(
+				"KV_NOT_CONFIGURED",
+				"请先绑定 ENI_KV / KV Namespace",
+				503
+			);
+		}
 		let payload;
 		try {
-			const body = await readResponseTextWithLimit(request, ADMIN_JSON_REQUEST_MAX_BYTES);
-			if (body.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
+			const body = await readResponseTextWithLimit(
+				request,
+				ADMIN_JSON_REQUEST_MAX_BYTES
+			);
+			if (body.exceeded) {
+				return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
+			}
 			payload = JSON.parse(body.text || "");
 		} catch {
 			return jsonError("INVALID_JSON", "请求 JSON 无效", 400);
 		}
 		const normalized = this.requestModel.normalizeAdminActionRequest(payload);
-		if (!normalized) return jsonError("INVALID_REQUEST", "请求体必须是 JSON 对象", 400);
+		if (!normalized) {
+			return jsonError("INVALID_REQUEST", "请求体必须是 JSON 对象", 400);
+		}
 		const handler = this.#resolveAction(normalized.action);
-		if (!handler) return jsonError("INVALID_ACTION", "未知的管理动作", 400, { action: normalized.action || null });
+		if (!handler) {
+			return jsonError(
+				"INVALID_ACTION",
+				"未知的管理动作",
+				400,
+				{ action: normalized.action || null }
+			);
+		}
 		return handler(normalized.data, {
 			action: normalized.action,
 			meta: normalized.meta,
@@ -4905,166 +5006,188 @@ var AdminConsoleFacade = class {
 			db: this.bindingService.getDB(env)
 		});
 	}
+
 	#isLegacyAdminLoginRoute(routeContext) {
-		return routeContext.adminPathLower === "/admin" && routeContext.pathnameLower === "/api/auth/login" && routeContext.root === "api" && routeContext.segments[1] === "auth" && routeContext.segments[2] === "login";
-	}
+				return routeContext.adminPathLower === "/admin" && routeContext.pathnameLower === "/api/auth/login" && routeContext.root === "api" && routeContext.segments[1] === "auth" && routeContext.segments[2] === "login";
+			}
+
 	#isAdminPreflightRoute(routeContext) {
-		return pathnameMatchesPrefix(routeContext.pathnameLower, routeContext.adminPathLower) || pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower) || this.#isLegacyAdminLoginRoute(routeContext);
-	}
+				return pathnameMatchesPrefix(routeContext.pathnameLower, routeContext.adminPathLower) || pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower) || this.#isLegacyAdminLoginRoute(routeContext);
+			}
+
 	#buildRouteCorsResponse(request, env, body, status = 200) {
-		return this.shellService.buildEdgeCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
-	}
+				return this.shellService.buildEdgeCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
+			}
+
 	#buildFetchRouteContext(request, env) {
-		const requestUrl = new URL(request.url);
-		const requestHost = normalizeHostnameText(requestUrl.hostname);
-		const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
-		const pathnameLower = normalizedPathname.toLowerCase();
-		const adminPath = getAdminPath(env);
-		const adminPathLower = adminPath.toLowerCase();
-		const adminLoginPath = buildAdminLoginPath(adminPath);
-		const adminLoginPathLower = adminLoginPath.toLowerCase();
-		const initHealth = warnInitHealthOnce(env, {
-			adminPath,
-			loginPath: adminLoginPath
-		});
-		const segments = normalizedPathname.split("/").filter(Boolean);
-		const rootRaw = segments[0] || "";
-		const root = safeDecodeSegment(rootRaw).toLowerCase();
-		return {
-			initHealth,
-			requestUrl,
-			requestHost,
-			configuredHost: resolveConfiguredHost(env),
-			configuredLegacyHost: resolveConfiguredLegacyHost(env),
-			normalizedPathname,
-			pathnameLower,
-			adminPath,
-			adminPathLower,
-			adminLoginPath,
-			adminLoginPathLower,
-			segments,
-			rootRaw,
-			root
-		};
-	}
+				const requestUrl = new URL(request.url);
+				const requestHost = normalizeHostnameText(requestUrl.hostname);
+				const normalizedPathname = sanitizeProxyPath(requestUrl.pathname);
+				const pathnameLower = normalizedPathname.toLowerCase();
+				const adminPath = getAdminPath(env);
+				const adminPathLower = adminPath.toLowerCase();
+				const adminLoginPath = buildAdminLoginPath(adminPath);
+				const adminLoginPathLower = adminLoginPath.toLowerCase();
+				const initHealth = warnInitHealthOnce(env, {
+					adminPath,
+					loginPath: adminLoginPath
+				});
+				const segments = normalizedPathname.split("/").filter(Boolean);
+				const rootRaw = segments[0] || "";
+				const root = safeDecodeSegment(rootRaw).toLowerCase();
+				return {
+					initHealth,
+					requestUrl,
+					requestHost,
+					configuredHost: resolveConfiguredHost(env),
+					configuredLegacyHost: resolveConfiguredLegacyHost(env),
+					normalizedPathname,
+					pathnameLower,
+					adminPath,
+					adminPathLower,
+					adminLoginPath,
+					adminLoginPathLower,
+					segments,
+					rootRaw,
+					root
+				};
+			}
+
 	async #handleLogin(request, env) {
-		const ip = request.headers.get("cf-connecting-ip") || "unknown";
-		const db = this.repository.getDB(env);
-		const adminCookiePath = getAdminCookiePath(env);
-		const config = await this.configReader.getRuntimeConfig(env);
-		const expSeconds = Math.max(1, parseInt(config.jwtExpiryDays) || 30) * 86400;
-		try {
-			const failEntry = await withNonCriticalFallback(this.repository.getAuthFailureEntry(db, ip), "auth.login.read_auth_failure", { ip }, null);
-			const failCount = Math.max(0, Number(failEntry?.failCount) || 0);
-			if (failCount >= Config.Defaults.MaxLoginAttempts) return jsonError("TOO_MANY_ATTEMPTS", "账户已锁定，请稍后再试", 429);
-			let password = "";
-			if ((request.headers.get("content-type") || "").includes("application/json")) {
-				const bodyResult = await readResponseTextWithLimit(request, LOGIN_JSON_REQUEST_MAX_BYTES);
-				if (bodyResult.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
-				const body = JSON.parse(bodyResult.text || "{}");
-				password = typeof body.password === "string" ? body.password : "";
+				const ip = request.headers.get("cf-connecting-ip") || "unknown";
+				const db = this.repository.getDB(env);
+				const adminCookiePath = getAdminCookiePath(env);
+				const config = await this.configReader.getRuntimeConfig(env);
+				const expSeconds = Math.max(1, parseInt(config.jwtExpiryDays) || 30) * 86400;
+				try {
+					const failEntry = await withNonCriticalFallback(this.repository.getAuthFailureEntry(db, ip), "auth.login.read_auth_failure", { ip }, null);
+					const failCount = Math.max(0, Number(failEntry?.failCount) || 0);
+					if (failCount >= Config.Defaults.MaxLoginAttempts) return jsonError("TOO_MANY_ATTEMPTS", "账户已锁定，请稍后再试", 429);
+					let password = "";
+					if ((request.headers.get("content-type") || "").includes("application/json")) {
+						const bodyResult = await readResponseTextWithLimit(request, LOGIN_JSON_REQUEST_MAX_BYTES);
+						if (bodyResult.exceeded) return jsonError("REQUEST_TOO_LARGE", "请求体过大", 413);
+						const body = JSON.parse(bodyResult.text || "{}");
+						password = typeof body.password === "string" ? body.password : "";
+					}
+					if (!env.JWT_SECRET) return jsonError("SERVER_MISCONFIGURED", "JWT_SECRET 未配置", 503);
+					if (!env.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
+					if (password && password === env.ADMIN_PASS) {
+						if (failEntry) await withNonCriticalFallback(this.repository.deleteAuthFailureEntry(db, ip), "auth.login.clear_auth_failure", { ip }, false);
+						const jwt = await this.#generateJwt(env.JWT_SECRET, expSeconds);
+						return jsonResponse({
+							ok: true,
+							expiresIn: expSeconds
+						}, 200, { "Set-Cookie": `auth_token=${jwt}; Path=${adminCookiePath}; Max-Age=${expSeconds}; HttpOnly; Secure; SameSite=Strict` });
+					}
+					const nextFailCount = failCount + 1;
+					await withNonCriticalFallback(this.repository.upsertAuthFailureEntry(db, ip, {
+						failCount: nextFailCount,
+						expiresAt: nowMs() + Config.Defaults.LoginLockDuration * 1e3
+					}), "auth.login.write_auth_failure", {
+						ip,
+						nextFailCount
+					}, null);
+					return jsonResponse({
+						ok: false,
+						error: {
+							code: "INVALID_PASSWORD",
+							message: "密码错误"
+						},
+						remain: Math.max(0, Config.Defaults.MaxLoginAttempts - nextFailCount)
+					}, 401);
+				} catch (e) {
+					return jsonError("INVALID_REQUEST", "请求无效", 400, { reason: e.message });
+				}
 			}
-			if (!env.JWT_SECRET) return jsonError("SERVER_MISCONFIGURED", "JWT_SECRET 未配置", 503);
-			if (!env.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
-			if (password && password === env.ADMIN_PASS) {
-				if (failEntry) await withNonCriticalFallback(this.repository.deleteAuthFailureEntry(db, ip), "auth.login.clear_auth_failure", { ip }, false);
-				const jwt = await this.#generateJwt(env.JWT_SECRET, expSeconds);
-				return jsonResponse({
-					ok: true,
-					expiresIn: expSeconds
-				}, 200, { "Set-Cookie": `auth_token=${jwt}; Path=${adminCookiePath}; Max-Age=${expSeconds}; HttpOnly; Secure; SameSite=Strict` });
-			}
-			const nextFailCount = failCount + 1;
-			await withNonCriticalFallback(this.repository.upsertAuthFailureEntry(db, ip, {
-				failCount: nextFailCount,
-				expiresAt: nowMs() + Config.Defaults.LoginLockDuration * 1e3
-			}), "auth.login.write_auth_failure", {
-				ip,
-				nextFailCount
-			}, null);
-			return jsonResponse({
-				ok: false,
-				error: {
-					code: "INVALID_PASSWORD",
-					message: "密码错误"
-				},
-				remain: Math.max(0, Config.Defaults.MaxLoginAttempts - nextFailCount)
-			}, 401);
-		} catch (e) {
-			return jsonError("INVALID_REQUEST", "请求无效", 400, { reason: e.message });
-		}
-	}
+
 	async #verifyRequest(request, env) {
-		try {
-			const secret = env.JWT_SECRET;
-			if (!secret) return false;
-			const auth = request.headers.get("Authorization") || "";
-			let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
-			if (!token) {
-				const match = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)auth_token=([^;]+)/);
-				token = match ? match[1] : null;
+				try {
+					const secret = env.JWT_SECRET;
+					if (!secret) return false;
+					const auth = request.headers.get("Authorization") || "";
+					let token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+					if (!token) {
+						const match = (request.headers.get("Cookie") || "").match(/(?:^|;\s*)auth_token=([^;]+)/);
+						token = match ? match[1] : null;
+					}
+					if (!token) return false;
+					return await this.#verifyJwt(token, secret);
+				} catch {
+					return false;
+				}
 			}
-			if (!token) return false;
-			return await this.#verifyJwt(token, secret);
-		} catch {
-			return false;
-		}
-	}
+
 	async #generateJwt(secret, expiresIn) {
-		const encHeader = btoa(JSON.stringify({
-			alg: "HS256",
-			typ: "JWT"
-		})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-		const encPayload = btoa(JSON.stringify({
-			sub: "admin",
-			exp: Math.floor(Date.now() / 1e3) + expiresIn
-		})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-		return `${encHeader}.${encPayload}.${await this.#sign(secret, `${encHeader}.${encPayload}`)}`;
-	}
+				const encHeader = btoa(JSON.stringify({
+					alg: "HS256",
+					typ: "JWT"
+				})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+				const encPayload = btoa(JSON.stringify({
+					sub: "admin",
+					exp: Math.floor(Date.now() / 1e3) + expiresIn
+				})).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+				return `${encHeader}.${encPayload}.${await this.#sign(secret, `${encHeader}.${encPayload}`)}`;
+			}
+
 	async #verifyJwt(token, secret) {
-		const parts = token.split(".");
-		if (parts.length !== 3) return false;
-		if (parts[2] !== await this.#sign(secret, `${parts[0]}.${parts[1]}`)) return false;
-		try {
-			return JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))).exp > Math.floor(Date.now() / 1e3);
-		} catch {
-			return false;
-		}
-	}
+				const parts = token.split(".");
+				if (parts.length !== 3) return false;
+				if (parts[2] !== await this.#sign(secret, `${parts[0]}.${parts[1]}`)) return false;
+				try {
+					return JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/"))).exp > Math.floor(Date.now() / 1e3);
+				} catch {
+					return false;
+				}
+			}
+
 	async #sign(secret, data) {
-		return signHmac(secret, data);
-	}
+				return signHmac(secret, data);
+			}
+
 	#renderLandingPage(env, initHealth) {
 		return this.shellService.renderLandingPage(env, initHealth);
 	}
+
 	#renderLogin(request, env, initHealth) {
 		return this.shellService.renderAdminLoginPage(request, env, initHealth);
 	}
+
 	#renderPage(request, env, ctx, initHealth) {
 		return this.shellService.renderAdminPage(request, env, ctx, initHealth);
 	}
+
 	#renderVendorAsset(request, env, ctx, route, runtimeConfig) {
 		return this.shellService.renderAdminReleaseVendorAsset(request, env, ctx, route, runtimeConfig);
 	}
+
 	#renderWarmResponse(request, env, initHealth, runtimeConfig) {
 		return this.shellService.renderAdminWarmResponse(request, env, initHealth, runtimeConfig);
 	}
+
 	#renderFavicon(method) {
 		return this.shellService.renderFaviconResponse(method);
 	}
+
 	#resolveVendorRoute(pathname, adminPath) {
 		return this.shellService.resolveAdminReleaseVendorRouteMatch(pathname, adminPath);
 	}
+
 	#isWarmRoute(pathname, adminPath) {
 		return this.shellService.isAdminWarmRoute(pathname, adminPath);
 	}
+
 	#buildRedirectResponse(request, pathname) {
 		return this.shellService.buildRequestPathRedirectResponse(request, pathname);
 	}
+
 	#buildVendorErrorResponse(...args) {
 		return this.shellService.buildAdminReleaseVendorErrorResponse(...args);
 	}
+
 };
+//#endregion
+//#region worker/features/proxy/playback/identity.js
 var MEDIA_AGGREGATION_SOURCE_ID_PREFIX = "AGG2";
 var MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX = "AGG1";
 var MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS = Object.freeze(["tmdb", "imdb"]);
@@ -5371,6 +5494,8 @@ async function verifyMediaAggregationSourceSignature(source, secret = "") {
 	if (!source || source.version !== "AGG2" || !secret) return false;
 	return source.signature === await signHmac(String(secret), String(source.signedPayload || ""));
 }
+//#endregion
+//#region worker/features/nodes/poster-model.js
 function normalizePosterBrowserOrigin(value = "") {
 	try {
 		const url = new URL(String(value || "").trim());
@@ -5484,6 +5609,8 @@ function resolveMediaAggregationApiPrefix(proxyPath = "") {
 	const index = normalizedPath.toLowerCase().lastIndexOf("/items/");
 	return index > 0 ? normalizedPath.slice(0, index) : "";
 }
+//#endregion
+//#region worker/features/observability/log-model.js
 function classifyLogResourceScope(requestPath = "", category = "") {
 	const path = String(requestPath || "").trim().toLowerCase();
 	const normalizedCategory = String(category || "").trim().toLowerCase();
@@ -5691,12 +5818,16 @@ function quoteSqlIdentifier(name) {
 function normalizeSqlIdentifierSearchText(sql) {
 	return String(sql || "").toLowerCase().replace(/["`\[\]]/g, "").replace(/\s+/g, " ").trim();
 }
+//#endregion
+//#region worker/features/config/cloudflare-model.js
 function normalizeCloudflareQuotaPlanOverride(value = "") {
 	const normalizedValue = String(value || "").trim().toLowerCase();
 	if (normalizedValue === "paid") return "paid";
 	if (normalizedValue === "free") return "free";
 	return "";
 }
+//#endregion
+//#region worker/features/config/dns-model.js
 function isEditableDnsRecordType(value = "") {
 	const upper = String(value || "").trim().toUpperCase();
 	return upper === "A" || upper === "AAAA" || upper === "CNAME";
@@ -5721,6 +5852,8 @@ function normalizeDnsFallbackCnameConfigValue(value = "") {
 	if (!text) return "";
 	return getDnsContentValidationError("CNAME", text) ? "" : text;
 }
+//#endregion
+//#region worker/features/config/schema.js
 var CONFIG_LEGACY_LOG_INCLUDE_FIELDS = [
 	"logIncludeClientIp",
 	"logIncludeColo",
@@ -6154,6 +6287,8 @@ function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, help
 	for (const key of rules.booleanFalseFields || []) config[key] = config[key] === true;
 	return filterConfigAllowedFields(config, rules);
 }
+//#endregion
+//#region worker/features/config/model.js
 function migrateRuntimeConfigLegacyAliases(input = {}) {
 	const rawConfig = input && typeof input === "object" && !Array.isArray(input) ? input : {};
 	const migratedConfig = { ...rawConfig };
@@ -6544,6 +6679,8 @@ function buildKvTidyFieldGroups(payload = {}) {
 function collectTidyPreviewNames(values = []) {
 	return (Array.isArray(values) ? values : []).map((value) => value?.name || value?.id);
 }
+//#endregion
+//#region worker/kernel/kv.js
 async function kvGetStrict(kv, key, options = {}) {
 	if (!kv) return null;
 	const normalizedKey = String(key || "").trim();
@@ -6573,6 +6710,8 @@ async function kvListStrict(kv, options = {}) {
 		throw createStructuredKvReadError("list", { prefix }, getErrorMessage(error));
 	}
 }
+//#endregion
+//#region worker/features/config/repository.js
 var CONFIG_KEY = "sys:theme";
 function classifyCloudflareAnalyticsError(message, options = {}) {
 	const raw = String(message || "").trim();
@@ -6656,6 +6795,8 @@ async function getRuntimeConfigStrict(env) {
 	if (!kv) return {};
 	return sanitizeRuntimeConfig(await kvGetStrict(kv, "sys:theme", { type: "json" }) || {});
 }
+//#endregion
+//#region worker/features/admin/shell-views.js
 function defineAdminShellViews(dependencies = {}, shell = {}) {
 	const { indexRepository } = dependencies;
 	async function renderAdminPage(request, env, ctx, initHealth = buildInitHealth(env), config = null) {
@@ -7093,6 +7234,8 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
 		buildEdgeCorsResponse
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/path-classification.js
 function isSmartStrmMediaProxyPath(proxyPath = "") {
 	return /(?:^|\/)smartstrm(?:$|[/?])/i.test(String(proxyPath || ""));
 }
@@ -7127,6 +7270,8 @@ function isPlaybackSessionStartedPath(proxyPath = "") {
 	if (isPlaybackSessionProgressPath(text) || isPlaybackSessionStoppedPath(text) || isPlaybackSessionPingPath(text)) return false;
 	return /\/sessions\/playing(?:\/started)?(?:$|[/?])/i.test(text);
 }
+//#endregion
+//#region worker/features/admin/shell-routing.js
 function defineAdminShellRouting(dependencies = {}, shell = {}) {
 	function isPlaybackCriticalSegments(segments, startIndex) {
 		let segmentIndex = startIndex;
@@ -7138,6 +7283,8 @@ function defineAdminShellRouting(dependencies = {}, shell = {}) {
 	}
 	return { isPlaybackCriticalSegments };
 }
+//#endregion
+//#region worker/features/admin/shell.js
 function defineAdminShell(dependencies = {}) {
 	const shell = {};
 	for (const [name, value] of Object.entries(defineAdminShellTemplate(dependencies, shell))) shell[name] = value;
@@ -7148,6 +7295,8 @@ function defineAdminShell(dependencies = {}) {
 	for (const [name, value] of Object.entries(defineAdminShellRouting(dependencies, shell))) shell[name] = value;
 	return shell;
 }
+//#endregion
+//#region worker/features/admin/action-registry.js
 function normalizeActionName(value) {
 	return String(value || "").trim();
 }
@@ -7177,6 +7326,8 @@ function defineActionRegistry(groups = [], options = {}) {
 		}
 	});
 }
+//#endregion
+//#region worker/features/observability/cloudflare-client.js
 function formatBytes(bytes) {
 	if (!bytes || bytes === 0) return "0 B";
 	const k = 1024, sizes = [
@@ -7760,6 +7911,8 @@ async function fetchCloudflareD1WriteHotspotMetrics({ accountId, apiToken, datab
 		return Number(left.hour) - Number(right.hour);
 	});
 }
+//#endregion
+//#region worker/features/admin/worker-placement-model.js
 async function fetchCloudflareWorkerUsageMetrics({ cfAccountId, cfZoneId, cfApiToken, startIso, endIso, utcOffsetMinutes = Config.Defaults.ScheduleUtcOffsetMinutes }) {
 	if (!cfAccountId || !cfApiToken) return null;
 	const accountData = await fetchCloudflareGraphQLAccount(cfAccountId, cfApiToken, `
@@ -8207,6 +8360,8 @@ function createCloudflareWorkerPlacementPermissionError(code = "WORKER_PLACEMENT
 		requiredPermissions: getCloudflareWorkerPlacementPermissionEntries(kind, options)
 	});
 }
+//#endregion
+//#region worker/features/admin/worker-placement.js
 function createWorkerPlacementStatusPayload(overrides = {}) {
 	const normalizedOverrides = overrides && typeof overrides === "object" && !Array.isArray(overrides) ? overrides : {};
 	const hasCurrentValue = Object.prototype.hasOwnProperty.call(normalizedOverrides, "currentValue");
@@ -8710,6 +8865,8 @@ async function clearCloudflareWorkerPlacementToDefault(accountId, scriptName, ap
 		rollbackError
 	});
 }
+//#endregion
+//#region worker/features/admin/actions/dashboard.js
 function defineDashboardActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, buildAdminShellState, buildAdminUiContract, withAdminShellRuntimeStatus } = dependencies;
@@ -9006,8 +9163,12 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/constants.js
 var KV_TIDY_PLAN_TOKEN_TTL_MS = 600 * 1e3;
 var D1_TIDY_PLAN_TOKEN_TTL_MS = KV_TIDY_PLAN_TOKEN_TTL_MS;
+//#endregion
+//#region worker/features/maintenance/tidy-model.js
 function normalizeTidyMaintenanceMode(value = "", mode = "manual") {
 	const normalizedMode = String(mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
 	const normalizedValue = String(value || "").trim().toLowerCase();
@@ -9017,6 +9178,8 @@ function normalizeTidyMaintenanceMode(value = "", mode = "manual") {
 function isFullTidyMaintenanceMode(value = "", mode = "manual") {
 	return normalizeTidyMaintenanceMode(value, mode) === "full";
 }
+//#endregion
+//#region worker/features/admin/worker-upload.js
 function normalizeCloudflareWorkerScriptUploadFileName(fileName = "worker.js") {
 	const basename = String(fileName || "").trim().split(/[\\/]+/).pop() || "";
 	return basename && /\.js$/i.test(basename) ? basename : "";
@@ -9106,6 +9269,8 @@ function normalizeCloudflareWorkerScriptUpdateErrorMessage(error) {
 	return message;
 }
 var ADMIN_WORKER_UPLOAD_MAX_BYTES = 3 * 1024 * 1024;
+//#endregion
+//#region worker/features/admin/actions/config.js
 function defineConfigActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { buildAdminLocalIndexUploadRecord } = dependencies;
@@ -9440,6 +9605,8 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/backup.js
 function defineBackupActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, Logger } = dependencies;
@@ -9731,6 +9898,8 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/policy-model.js
 function reconcileNamedNodeSelection(currentSelection = [], options = {}) {
 	const renameMapInput = options.renameMap instanceof Map ? options.renameMap : new Map(Object.entries(options.renameMap && typeof options.renameMap === "object" ? options.renameMap : {}));
 	const renameMap = /* @__PURE__ */ new Map();
@@ -9822,6 +9991,8 @@ function resolveProtocolRuntimeProfile(config = {}, options = {}) {
 		isPeakHour
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/nodes.js
 function defineNodeActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, buildAdminLocalIndexUploadRecord } = dependencies;
@@ -10444,6 +10615,8 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/maintenance.js
 function defineMaintenanceActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	return {
@@ -10525,6 +10698,8 @@ function defineMaintenanceActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/dns/record-model.js
 function normalizeDnsEditModeValue(value = "") {
 	return String(value || "").trim().toLowerCase() === "a" ? "a" : "cname";
 }
@@ -10663,6 +10838,8 @@ function finalizeDnsRecordSyncSummary(mode = "a", summaryByType = {}, options = 
 		unchangedOnly: changedCount === 0 && identicalCount > 0
 	};
 }
+//#endregion
+//#region worker/features/dns/persistence.js
 async function resolveAdminDnsContext(config = {}, request) {
 	const cfZoneId = String(config?.cfZoneId || "").trim();
 	const cfApiToken = String(config?.cfApiToken || "").trim();
@@ -10957,6 +11134,8 @@ async function persistCloudflareDnsRecordsForHost({ env, kv, dnsHistoryRepositor
 		throw e;
 	}
 }
+//#endregion
+//#region worker/features/admin/actions/dns-records.js
 function defineDnsRecordActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { persistCloudflareDnsRecordsForHost } = dependencies;
@@ -11185,6 +11364,8 @@ function defineDnsRecordActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/core/concurrency.js
 async function runWithConcurrency(items, limit, worker) {
 	const queue = Array.isArray(items) ? items : [];
 	if (queue.length === 0) return [];
@@ -11205,6 +11386,8 @@ async function runWithConcurrency(items, limit, worker) {
 	await Promise.all(runners);
 	return Promise.all(results);
 }
+//#endregion
+//#region worker/features/dns/refresh.js
 var DNS_JSON_RESOLVERS = Object.freeze([{
 	id: "cloudflare",
 	label: "Cloudflare",
@@ -11738,6 +11921,8 @@ async function runDnsIpPoolSourcesLiveRefresh({ kv = null, db = null, ctx = null
 		expiresAt
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/dns-pool.js
 function defineDnsPoolActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { buildDnsIpPoolWorkspacePreviewItems, buildDnsIpWorkspaceItems, releaseDnsIpPoolFetchRefreshLock, runDnsIpPoolSourcesLiveRefresh, tryAcquireDnsIpPoolFetchRefreshLock } = dependencies;
@@ -12154,6 +12339,8 @@ function defineDnsPoolActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/notifications.js
 function defineNotificationActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	return {
@@ -12268,6 +12455,8 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/admin/actions/database.js
 function defineDatabaseActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { LogQueryPlanner } = dependencies;
@@ -12448,6 +12637,8 @@ function defineDatabaseActions(dependencies = {}, actions = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/admin/database-methods.js
 function defineAdminActionRegistry(dependencies = {}) {
 	const { kernel } = dependencies;
 	const handlers = {};
@@ -12523,8 +12714,13 @@ function defineAdminActionRegistry(dependencies = {}) {
 	return registry;
 }
 function defineDatabaseAdminMethods(dependencies = {}) {
-	return { adminActionHandlers: defineAdminActionRegistry(dependencies).handlers };
+	const registry = defineAdminActionRegistry(dependencies);
+	return {
+		adminActionHandlers: registry.handlers
+	};
 }
+//#endregion
+//#region worker/core/objects.js
 function mergeStatusPatch(base, patch) {
 	const source = isPlainObject(base) ? base : {};
 	const delta = isPlainObject(patch) ? patch : {};
@@ -12555,6 +12751,8 @@ function touchMapEntry(map, key) {
 	map.set(key, value);
 	return value;
 }
+//#endregion
+//#region worker/features/nodes/cache-state.js
 function invalidateNodesRevisionCache() {
 	cacheState.NodesRevisionCacheGeneration += 1;
 	cacheState.NodesRevisionCache = null;
@@ -12603,6 +12801,8 @@ async function runNodeIndexMutation(mutation) {
 	runtimeState.NodeIndexMutationChain = mutationTask.catch(() => null);
 	return await mutationTask;
 }
+//#endregion
+//#region worker/features/observability/dashboard-model.js
 var CF_DASH_CACHE_DB_KEY_PREFIX = "cf_dashboard_cache:";
 var LEGACY_CF_DASH_CACHE_KV_KEY_PREFIX = "sys:cf_dash_cache";
 var DASHBOARD_MONTHLY_TRAFFIC_CACHE_TTL_MS = 1800 * 1e3;
@@ -12838,6 +13038,8 @@ function withDashboardSnapshotCacheStatus(snapshot = {}, cacheStatus = "live", o
 		})
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/state.js
 function releasePlaybackProgressRelayEntry(entry) {
 	if (!entry || typeof entry !== "object") return;
 	entry.pendingSnapshot = null;
@@ -12857,6 +13059,8 @@ function setBoundedPlaybackProgressRelayEntry(sessionKey, entry) {
 	setBoundedMapEntry(relayMap, sessionKey, entry, Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1));
 	return entry;
 }
+//#endregion
+//#region worker/features/proxy/routing/url-model.js
 function buildUpstreamProxyUrl(targetBase, proxyPath = "/") {
 	const baseUrl = isTargetRecord(targetBase) ? new URL(targetBase.targetUrl.toString()) : targetBase instanceof URL ? new URL(targetBase.toString()) : new URL(String(targetBase || ""));
 	const basePath = isTargetRecord(targetBase) ? targetBase.normalizedBasePath : normalizeTargetBasePath(baseUrl.pathname);
@@ -13199,6 +13403,8 @@ function tryNormalizeEmbeddedSameOriginPlaybackProxyPath(proxyPath = "", request
 	}
 	return null;
 }
+//#endregion
+//#region worker/features/proxy/transport/cookies.js
 function parseCookieHeader(cookieHeader) {
 	const map = /* @__PURE__ */ new Map();
 	if (!cookieHeader || typeof cookieHeader !== "string") return map;
@@ -13342,6 +13548,8 @@ function buildEmbyWebProxyDisabledResponse(requestMethod = "GET", dynamicCors = 
 		headers
 	});
 }
+//#endregion
+//#region worker/features/proxy/transport/header-model.js
 function normalizeWorkerCacheParamName(name = "") {
 	return String(name || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
 }
@@ -13374,6 +13582,8 @@ function isPotentialPrivateMediaAuthHeaderName(name = "") {
 	if (!normalized || MEDIA_REDIRECT_SAFE_HEADER_NAMES.has(normalized) || normalized === "cookie") return false;
 	return normalized.includes("authorization") || normalized.includes("api-key") || normalized.includes("apikey") || normalized.includes("access-key") || normalized.includes("accesskey") || normalized.includes("access-token") || normalized.includes("accesstoken") || normalized.includes("session") || normalized.includes("credential") || normalized.includes("signature") || normalized.includes("secret") || normalized.includes("auth") || normalized.includes("token");
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/model.js
 var WORKER_CACHE_DROP_QUERY_PARAMS = /* @__PURE__ */ new Set([
 	"apikey",
 	"accesstoken",
@@ -13719,6 +13929,8 @@ function rankMetadataWarmPath(pathname = "") {
 	if (SUBTITLE_EXTENSION_REGEX.test(lowerPath)) return 2;
 	return 3;
 }
+//#endregion
+//#region worker/features/maintenance/kv-tidy-methods.js
 function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
@@ -14292,6 +14504,8 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/d1-tidy-methods.js
 function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
@@ -14680,6 +14894,8 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/snapshot-methods.js
 function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
@@ -15069,6 +15285,8 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/config-persistence-methods.js
 function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
@@ -15310,6 +15528,8 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/telegram-methods.js
 function defineTelegramMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
@@ -15630,6 +15850,8 @@ function defineTelegramMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/maintenance/database-methods.js
 function defineDatabaseMaintenanceMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineKvTidyMethods(dependencies, kernel),
@@ -15639,468 +15861,493 @@ function defineDatabaseMaintenanceMethods(dependencies = {}, kernel = {}) {
 		...defineTelegramMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/maintenance/runtime-schedule.js
 var ScheduledMaintenanceFacade = class {
 	constructor({ logger, service }) {
 		this.logger = logger;
 		this.service = service;
 	}
+
 	handle(event, env, ctx) {
-		if (!ctx || typeof ctx.waitUntil !== "function") throw new TypeError("ScheduledMaintenanceFacade.handle requires ctx.waitUntil");
+		if (!ctx || typeof ctx.waitUntil !== 'function') {
+			throw new TypeError('ScheduledMaintenanceFacade.handle requires ctx.waitUntil');
+		}
 		const task = this.#runScheduled(event, env, ctx);
 		ctx.waitUntil(task);
 	}
+
 	#getStatusSection(status = {}, ...keys) {
-		for (const key of keys) {
-			if (!key) continue;
-			const section = status?.[key];
-			if (isPlainObject(section)) return section;
-		}
-		return {};
-	}
+				for (const key of keys) {
+					if (!key) continue;
+					const section = status?.[key];
+					if (isPlainObject(section)) return section;
+				}
+				return {};
+			}
+
 	#markPartialFailure(status = "success") {
-		return status === "success" ? "partial_failure" : status;
-	}
+				return status === "success" ? "partial_failure" : status;
+			}
+
 	#getPendingDueAt(pendingItems = []) {
-		return String(pendingItems[0]?.dueAt || "");
-	}
+				return String(pendingItems[0]?.dueAt || "");
+			}
+
 	#normalizeFixedQueueState(fixedQueue = {}, localDateKey = "") {
-		const nextLocalDateKey = String(localDateKey || fixedQueue?.localDateKey || "");
-		return nextLocalDateKey ? {
-			...fixedQueue,
-			localDateKey: nextLocalDateKey,
-			executedSlots: normalizeScheduleClockTimeList(fixedQueue?.executedSlots || [], [])
-		} : {
-			...fixedQueue,
-			executedSlots: normalizeScheduleClockTimeList(fixedQueue?.executedSlots || [], [])
-		};
-	}
+				const nextLocalDateKey = String(localDateKey || fixedQueue?.localDateKey || "");
+				return nextLocalDateKey ? {
+					...fixedQueue,
+					localDateKey: nextLocalDateKey,
+					executedSlots: normalizeScheduleClockTimeList(fixedQueue?.executedSlots || [], [])
+				} : {
+					...fixedQueue,
+					executedSlots: normalizeScheduleClockTimeList(fixedQueue?.executedSlots || [], [])
+				};
+			}
+
 	#appendFixedQueueSlot(fixedQueue = {}, localDateKey = "", clockTime = "") {
-		return this.#normalizeFixedQueueState({
-			...fixedQueue,
-			executedSlots: [...fixedQueue?.executedSlots || [], clockTime]
-		}, localDateKey);
-	}
+				return this.#normalizeFixedQueueState({
+					...fixedQueue,
+					executedSlots: [...fixedQueue?.executedSlots || [], clockTime]
+				}, localDateKey);
+			}
+
 	#buildClockProcessedMeta(localDateKey = "", processedSlots = []) {
-		const lastSuccessSlot = processedSlots[processedSlots.length - 1] || "";
-		return {
-			processedSlots,
-			lastPlannedSlot: lastSuccessSlot ? `${localDateKey} ${lastSuccessSlot}` : "",
-			reason: processedSlots.length > 1 ? "clock_slots_processed" : "clock_slot_processed"
-		};
-	}
+				const lastSuccessSlot = processedSlots[processedSlots.length - 1] || "";
+				return {
+					processedSlots,
+					lastPlannedSlot: lastSuccessSlot ? `${localDateKey} ${lastSuccessSlot}` : "",
+					reason: processedSlots.length > 1 ? "clock_slots_processed" : "clock_slot_processed"
+				};
+			}
+
 	#buildSkippedState(baseState = {}, skippedAt = "", reason = "", extra = {}) {
-		return {
-			...baseState,
-			status: "skipped",
-			lastSkippedAt: skippedAt,
-			reason,
-			...extra
-		};
-	}
-	#buildPendingState(baseState = {}, reason = "", extra = {}) {
-		return {
-			...baseState,
-			status: "pending",
-			reason,
-			...extra
-		};
-	}
-	#buildSuccessState(baseState = {}, successAt = "", extra = {}) {
-		return {
-			...baseState,
-			status: "success",
-			lastSuccessAt: successAt,
-			...extra
-		};
-	}
-	#buildFailedState(baseState = {}, failedAt = "", error = "", extra = {}) {
-		return {
-			...baseState,
-			status: "failed",
-			lastErrorAt: failedAt,
-			lastError: error,
-			...extra
-		};
-	}
-	#buildStateFromResult(baseState = {}, result = {}, options = {}) {
-		const safeResult = isPlainObject(result) ? result : {};
-		const extra = isPlainObject(options.extra) ? options.extra : {};
-		if (safeResult.status === "success") return this.#buildSuccessState(baseState, String(safeResult.lastSuccessAt || options.at || "").trim(), {
-			...safeResult,
-			...extra
-		});
-		if (safeResult.status === "failed") return this.#buildFailedState(baseState, String(safeResult.lastErrorAt || options.at || "").trim(), String(safeResult.lastError || options.error || "").trim(), {
-			...safeResult,
-			...extra
-		});
-		return this.#buildSkippedState(baseState, String(safeResult.lastSkippedAt || options.at || "").trim(), String(safeResult.reason || options.defaultReason || "").trim(), {
-			...safeResult,
-			...extra
-		});
-	}
-	#createNonCriticalRunner(leaseToken = "") {
-		return async (promise, scope, context = null, fallbackValue = null) => {
-			try {
-				return await promise;
-			} catch (error) {
-				this.logger.error(`scheduled.${scope}`, error, {
-					leaseToken,
-					...isPlainObject(context) ? context : {}
-				});
-				return fallbackValue;
-			}
-		};
-	}
-	#buildBusyStatusPatch(scheduledNowIso, lease, reason) {
-		return { scheduled: {
-			lastSkippedAt: scheduledNowIso,
-			lastSkipReason: reason,
-			lock: {
-				status: "busy",
-				reason,
-				expiresAt: lease.lock?.expiresAt || null,
-				backend: String(lease?.backend || lease?.lock?.backend || "").trim() || "d1"
-			}
-		} };
-	}
-	#buildSkippedStatusPatch(scheduledNowIso, reason, backend = "d1") {
-		const safeReason = String(reason || "scheduled_skipped").trim() || "scheduled_skipped";
-		return { scheduled: {
-			status: "skipped",
-			lastSkippedAt: scheduledNowIso,
-			lastSkipReason: safeReason,
-			lastFinishedAt: scheduledNowIso,
-			lock: {
-				status: "skipped",
-				reason: safeReason,
-				backend: String(backend || "").trim() || "d1"
-			}
-		} };
-	}
-	#buildRunningStatusPatch(startedAt, leaseToken, leaseState, scheduledLeaseMs) {
-		return { scheduled: {
-			status: "running",
-			lastStartedAt: startedAt,
-			lock: {
-				status: "held",
-				token: leaseToken,
-				expiresAt: leaseState.lock?.expiresAt || nowMs() + scheduledLeaseMs
-			}
-		} };
-	}
-	#buildFinalLockState(leaseState, finishedAt, released) {
-		if (leaseState.lostReason) return {
-			status: "lost",
-			reason: leaseState.lostReason,
-			lastCheckedAt: finishedAt
-		};
-		return {
-			status: released ? "released" : "release_skipped",
-			releasedAt: finishedAt
-		};
-	}
-	#createLeaseController({ leaseStores, leaseToken, scheduledLeaseMs, leaseBackend = "", initialLock = null }) {
-		const leaseState = {
-			active: true,
-			lostReason: null,
-			lock: initialLock
-		};
-		const renew = async () => {
-			if (!leaseState.active) return null;
-			const renewed = await this.service.renewScheduledLease(leaseStores, leaseToken, scheduledLeaseMs, { backend: leaseBackend });
-			if (!renewed) {
-				leaseState.active = false;
-				leaseState.lostReason = leaseState.lostReason || "lease_lost";
-				return null;
-			}
-			leaseState.lock = renewed;
-			return renewed;
-		};
-		const ensureActive = async () => {
-			if (!leaseState.active) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
-			const renewed = await renew();
-			if (!renewed) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
-			return renewed;
-		};
-		const refreshIntervalMs = Math.max(5e3, Math.min(Math.floor(scheduledLeaseMs / 3), 6e4));
-		return {
-			leaseState,
-			ensureActive,
-			keepalivePromise: (async () => {
-				while (leaseState.active) {
-					let remainingMs = refreshIntervalMs;
-					while (leaseState.active && remainingMs > 0) {
-						const sliceMs = Math.min(remainingMs, 1e3);
-						await sleepMs(sliceMs);
-						remainingMs -= sliceMs;
-					}
-					if (!leaseState.active) break;
-					await renew();
-				}
-			})().catch((error) => {
-				leaseState.active = false;
-				leaseState.lostReason = leaseState.lostReason || "lease_renew_failed";
-				this.logger.error("scheduled.lease_keepalive", error, {
-					leaseToken,
-					backend: leaseBackend || "unknown",
-					lostReason: leaseState.lostReason
-				});
-			})
-		};
-	}
-	async #runScheduled(event, env, ctx) {
-		const db = this.service.getDB(env);
-		const kv = this.service.getKV(env);
-		if (!kv && !db) return;
-		const scheduledLeaseStore = { db };
-		const runtimeConfig = await getRuntimeConfig(env);
-		const scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(runtimeConfig?.scheduleUtcOffsetMinutes);
-		const scheduledNow = event?.scheduledTime !== void 0 ? new Date(event.scheduledTime) : /* @__PURE__ */ new Date();
-		const scheduledNowIso = buildScheduleLocalIso(scheduledNow, scheduleUtcOffsetMinutes);
-		const makeScheduledIso = (value = /* @__PURE__ */ new Date()) => buildScheduleLocalIso(value, scheduleUtcOffsetMinutes);
-		const scheduledLeaseMs = clampIntegerConfig(runtimeConfig?.scheduledLeaseMs, Config.Defaults.ScheduledLeaseMs, Config.Defaults.ScheduledLeaseMinMs, 900 * 1e3);
-		const leaseToken = `${nowMs()}-${Math.random().toString(36).slice(2, 10)}`;
-		const scheduledNonCritical = this.#createNonCriticalRunner(leaseToken);
-		const patchScheduledSkip = async (reason) => {
-			const safeReason = String(reason || "db_unavailable").trim() || "db_unavailable";
-			await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildSkippedStatusPatch(scheduledNowIso, safeReason, "d1")), "patch_skipped_status", {
-				reason: safeReason,
-				backend: "d1"
-			}, null);
-		};
-		if (!db) {
-			await patchScheduledSkip("db_not_configured");
-			return;
-		}
-		const lease = await this.service.tryAcquireScheduledLeaseWithDb(db, {
-			token: leaseToken,
-			leaseMs: scheduledLeaseMs
-		});
-		if (!lease.acquired) {
-			const leaseBusyReason = String(lease.reason || "lease_not_acquired");
-			if (leaseBusyReason === "db_not_configured" || leaseBusyReason === "db_unavailable" || leaseBusyReason === "db_init_failed") {
-				await patchScheduledSkip(leaseBusyReason);
-				return;
-			}
-			await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildBusyStatusPatch(scheduledNowIso, lease, leaseBusyReason)), "patch_busy_status", { reason: leaseBusyReason }, null);
-			return;
-		}
-		const leaseBackend = String(lease.backend || lease.lock?.backend || "").trim().toLowerCase();
-		const { leaseState, ensureActive: ensureLeaseActive, keepalivePromise: leaseKeepalive } = this.#createLeaseController({
-			leaseStores: scheduledLeaseStore,
-			leaseToken,
-			scheduledLeaseMs,
-			leaseBackend,
-			initialLock: lease.lock || null
-		});
-		const startedAt = scheduledNowIso;
-		await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildRunningStatusPatch(startedAt, leaseToken, leaseState, scheduledLeaseMs)), "patch_running_status", { startedAt }, null);
-		const scheduledState = {
-			status: "success",
-			lastStartedAt: startedAt,
-			lastFinishedAt: null,
-			lastSuccessAt: null,
-			lastErrorAt: null,
-			lastError: null,
-			d1Tidy: {},
-			cleanup: {},
-			kvTidy: {},
-			tgDailyReport: {},
-			serverExpiryWarnings: {},
-			alerts: {}
-		};
-		const nowIso = () => makeScheduledIso(/* @__PURE__ */ new Date());
-		try {
-			const config = runtimeConfig || {};
-			const previousScheduledStatus = await scheduledNonCritical(this.service.getOpsStatusSection(env, "scheduled"), "read_previous_status", null, {});
-			if (db) try {
-				await ensureLeaseActive();
-				const dayWindow = buildOffsetDayWindow(scheduledNow, config.scheduleUtcOffsetMinutes);
-				const statsBucketDate = dayWindow.dateKey;
-				const statsStartTs = dayWindow.startTs;
-				const statsEndTs = dayWindow.endTs;
-				const statsUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config.scheduleUtcOffsetMinutes);
-				const previousCleanupStatus = this.service.getPreviousD1TidyState(previousScheduledStatus);
-				const d1Result = await this.service.tidyD1Data(env, {
-					db,
-					kv,
-					ctx,
-					config,
-					mode: "scheduled",
-					maintenanceMode: "smart",
-					previousScheduledState: previousScheduledStatus,
-					previousCleanupStatus,
-					scheduledNow,
-					dayWindow,
-					statsBucketDate,
-					statsStartTs,
-					statsEndTs,
-					statsUtcOffsetMinutes,
-					beforeEachStep: ensureLeaseActive
-				});
-				const d1FinishedAt = nowIso();
-				const d1StatusPayload = this.service.buildD1TidyStatusPayload(d1Result.summary, {
-					mode: "scheduled",
-					maintenanceMode: "smart",
-					triggeredBy: "scheduled",
-					timestamp: d1FinishedAt
-				});
-				scheduledState.d1Tidy = d1StatusPayload.d1Tidy;
-				scheduledState.cleanup = d1StatusPayload.cleanup;
-				if (scheduledState.d1Tidy.status === "partial_failure" || scheduledState.d1Tidy.status === "failed") scheduledState.status = "partial_failure";
-				await ensureLeaseActive();
-			} catch (dbErr) {
-				scheduledState.status = "partial_failure";
-				const failedStatusPayload = this.service.buildD1TidyStatusPayload({
-					status: "failed",
-					lastError: dbErr?.message || String(dbErr),
-					maintenanceMode: "smart"
-				}, {
-					mode: "scheduled",
-					maintenanceMode: "smart",
-					triggeredBy: "scheduled",
-					timestamp: nowIso()
-				});
-				scheduledState.d1Tidy = failedStatusPayload.d1Tidy;
-				scheduledState.cleanup = failedStatusPayload.cleanup;
-				this.logger.error("Scheduled DB Cleanup Error: ", dbErr);
-			}
-			else {
-				const skippedStatusPayload = this.service.buildD1TidyStatusPayload({
+				return {
+					...baseState,
 					status: "skipped",
-					reason: "db_not_configured",
-					maintenanceMode: "smart"
-				}, {
-					mode: "scheduled",
-					maintenanceMode: "smart",
-					triggeredBy: "scheduled",
-					timestamp: nowIso()
-				});
-				scheduledState.d1Tidy = skippedStatusPayload.d1Tidy;
-				scheduledState.cleanup = skippedStatusPayload.cleanup;
+					lastSkippedAt: skippedAt,
+					reason,
+					...extra
+				};
 			}
-			scheduledState.kvTidy = {
-				...this.#getStatusSection(previousScheduledStatus, "kvTidy"),
-				mode: "manual_only",
-				lastAutoSkipAt: nowIso(),
-				autoSkipReason: "manual_only"
-			};
-			const { tgBotToken, tgChatId } = config;
-			const previousTgDailyReportState = this.#getStatusSection(previousScheduledStatus, "tgDailyReport", "report");
-			const previousAlertsState = this.#getStatusSection(previousScheduledStatus, "alerts");
-			const previousServerExpiryState = this.#getStatusSection(previousScheduledStatus, "serverExpiryWarnings");
-			const tgDailyReportClockTimes = normalizeScheduleClockTimeList(config.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
-			const dailyReportDueState = getDueScheduledClockSlots(previousTgDailyReportState, tgDailyReportClockTimes, scheduleUtcOffsetMinutes, scheduledNow);
-			const selectedDailyReportKinds = resolveDailyTelegramReportKinds(config, config);
-			const baseDailyReportState = {
-				...previousTgDailyReportState,
-				clockTimes: tgDailyReportClockTimes,
-				reportKinds: selectedDailyReportKinds
-			};
-			if (config.tgDailyReportEnabled === true) {
-				let nextReportFixedQueue = this.#normalizeFixedQueueState(dailyReportDueState.fixedQueue);
-				if (!selectedDailyReportKinds.length) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "report_kinds_disabled", { fixedQueue: nextReportFixedQueue });
-				else if (!tgBotToken || !tgChatId) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "telegram_not_configured", { fixedQueue: nextReportFixedQueue });
-				else if (dailyReportDueState.due !== true) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), dailyReportDueState.reason || "time_not_matched", { fixedQueue: nextReportFixedQueue });
-				else {
-					let processedSlots = [];
-					let reportFailed = null;
-					let totalSentCount = 0;
-					for (const clockTime of dailyReportDueState.dueSlots) try {
+
+	#buildPendingState(baseState = {}, reason = "", extra = {}) {
+				return {
+					...baseState,
+					status: "pending",
+					reason,
+					...extra
+				};
+			}
+
+	#buildSuccessState(baseState = {}, successAt = "", extra = {}) {
+				return {
+					...baseState,
+					status: "success",
+					lastSuccessAt: successAt,
+					...extra
+				};
+			}
+
+	#buildFailedState(baseState = {}, failedAt = "", error = "", extra = {}) {
+				return {
+					...baseState,
+					status: "failed",
+					lastErrorAt: failedAt,
+					lastError: error,
+					...extra
+				};
+			}
+
+	#buildStateFromResult(baseState = {}, result = {}, options = {}) {
+				const safeResult = isPlainObject(result) ? result : {};
+				const extra = isPlainObject(options.extra) ? options.extra : {};
+				if (safeResult.status === "success") return this.#buildSuccessState(baseState, String(safeResult.lastSuccessAt || options.at || "").trim(), {
+					...safeResult,
+					...extra
+				});
+				if (safeResult.status === "failed") return this.#buildFailedState(baseState, String(safeResult.lastErrorAt || options.at || "").trim(), String(safeResult.lastError || options.error || "").trim(), {
+					...safeResult,
+					...extra
+				});
+				return this.#buildSkippedState(baseState, String(safeResult.lastSkippedAt || options.at || "").trim(), String(safeResult.reason || options.defaultReason || "").trim(), {
+					...safeResult,
+					...extra
+				});
+			}
+
+	#createNonCriticalRunner(leaseToken = "") {
+				return async (promise, scope, context = null, fallbackValue = null) => {
+					try {
+						return await promise;
+					} catch (error) {
+						this.logger.error(`scheduled.${scope}`, error, {
+							leaseToken,
+							...isPlainObject(context) ? context : {}
+						});
+						return fallbackValue;
+					}
+				};
+			}
+
+	#buildBusyStatusPatch(scheduledNowIso, lease, reason) {
+				return { scheduled: {
+					lastSkippedAt: scheduledNowIso,
+					lastSkipReason: reason,
+					lock: {
+						status: "busy",
+						reason,
+						expiresAt: lease.lock?.expiresAt || null,
+						backend: String(lease?.backend || lease?.lock?.backend || "").trim() || "d1"
+					}
+				} };
+			}
+
+	#buildSkippedStatusPatch(scheduledNowIso, reason, backend = "d1") {
+				const safeReason = String(reason || "scheduled_skipped").trim() || "scheduled_skipped";
+				return { scheduled: {
+					status: "skipped",
+					lastSkippedAt: scheduledNowIso,
+					lastSkipReason: safeReason,
+					lastFinishedAt: scheduledNowIso,
+					lock: {
+						status: "skipped",
+						reason: safeReason,
+						backend: String(backend || "").trim() || "d1"
+					}
+				} };
+			}
+
+	#buildRunningStatusPatch(startedAt, leaseToken, leaseState, scheduledLeaseMs) {
+				return { scheduled: {
+					status: "running",
+					lastStartedAt: startedAt,
+					lock: {
+						status: "held",
+						token: leaseToken,
+						expiresAt: leaseState.lock?.expiresAt || nowMs() + scheduledLeaseMs
+					}
+				} };
+			}
+
+	#buildFinalLockState(leaseState, finishedAt, released) {
+				if (leaseState.lostReason) return {
+					status: "lost",
+					reason: leaseState.lostReason,
+					lastCheckedAt: finishedAt
+				};
+				return {
+					status: released ? "released" : "release_skipped",
+					releasedAt: finishedAt
+				};
+			}
+
+	#createLeaseController({ leaseStores, leaseToken, scheduledLeaseMs, leaseBackend = "", initialLock = null }) {
+				const leaseState = {
+					active: true,
+					lostReason: null,
+					lock: initialLock
+				};
+				const renew = async () => {
+					if (!leaseState.active) return null;
+					const renewed = await this.service.renewScheduledLease(leaseStores, leaseToken, scheduledLeaseMs, { backend: leaseBackend });
+					if (!renewed) {
+						leaseState.active = false;
+						leaseState.lostReason = leaseState.lostReason || "lease_lost";
+						return null;
+					}
+					leaseState.lock = renewed;
+					return renewed;
+				};
+				const ensureActive = async () => {
+					if (!leaseState.active) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
+					const renewed = await renew();
+					if (!renewed) throw new Error(leaseState.lostReason || "scheduled_lease_lost");
+					return renewed;
+				};
+				const refreshIntervalMs = Math.max(5e3, Math.min(Math.floor(scheduledLeaseMs / 3), 6e4));
+				return {
+					leaseState,
+					ensureActive,
+					keepalivePromise: (async () => {
+						while (leaseState.active) {
+							let remainingMs = refreshIntervalMs;
+							while (leaseState.active && remainingMs > 0) {
+								const sliceMs = Math.min(remainingMs, 1e3);
+								await sleepMs(sliceMs);
+								remainingMs -= sliceMs;
+							}
+							if (!leaseState.active) break;
+							await renew();
+						}
+					})().catch((error) => {
+						leaseState.active = false;
+						leaseState.lostReason = leaseState.lostReason || "lease_renew_failed";
+						this.logger.error("scheduled.lease_keepalive", error, {
+							leaseToken,
+							backend: leaseBackend || "unknown",
+							lostReason: leaseState.lostReason
+						});
+					})
+				};
+			}
+
+	async #runScheduled(event, env, ctx) {
+				const db = this.service.getDB(env);
+				const kv = this.service.getKV(env);
+				if (!kv && !db) return;
+				const scheduledLeaseStore = { db };
+				const runtimeConfig = await getRuntimeConfig(env);
+				const scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(runtimeConfig?.scheduleUtcOffsetMinutes);
+				const scheduledNow = event?.scheduledTime !== void 0 ? new Date(event.scheduledTime) : /* @__PURE__ */ new Date();
+				const scheduledNowIso = buildScheduleLocalIso(scheduledNow, scheduleUtcOffsetMinutes);
+				const makeScheduledIso = (value = /* @__PURE__ */ new Date()) => buildScheduleLocalIso(value, scheduleUtcOffsetMinutes);
+				const scheduledLeaseMs = clampIntegerConfig(runtimeConfig?.scheduledLeaseMs, Config.Defaults.ScheduledLeaseMs, Config.Defaults.ScheduledLeaseMinMs, 900 * 1e3);
+				const leaseToken = `${nowMs()}-${Math.random().toString(36).slice(2, 10)}`;
+				const scheduledNonCritical = this.#createNonCriticalRunner(leaseToken);
+				const patchScheduledSkip = async (reason) => {
+					const safeReason = String(reason || "db_unavailable").trim() || "db_unavailable";
+					await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildSkippedStatusPatch(scheduledNowIso, safeReason, "d1")), "patch_skipped_status", {
+						reason: safeReason,
+						backend: "d1"
+					}, null);
+				};
+				if (!db) {
+					await patchScheduledSkip("db_not_configured");
+					return;
+				}
+				const lease = await this.service.tryAcquireScheduledLeaseWithDb(db, {
+					token: leaseToken,
+					leaseMs: scheduledLeaseMs
+				});
+				if (!lease.acquired) {
+					const leaseBusyReason = String(lease.reason || "lease_not_acquired");
+					if (leaseBusyReason === "db_not_configured" || leaseBusyReason === "db_unavailable" || leaseBusyReason === "db_init_failed") {
+						await patchScheduledSkip(leaseBusyReason);
+						return;
+					}
+					await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildBusyStatusPatch(scheduledNowIso, lease, leaseBusyReason)), "patch_busy_status", { reason: leaseBusyReason }, null);
+					return;
+				}
+				const leaseBackend = String(lease.backend || lease.lock?.backend || "").trim().toLowerCase();
+				const { leaseState, ensureActive: ensureLeaseActive, keepalivePromise: leaseKeepalive } = this.#createLeaseController({
+					leaseStores: scheduledLeaseStore,
+					leaseToken,
+					scheduledLeaseMs,
+					leaseBackend,
+					initialLock: lease.lock || null
+				});
+				const startedAt = scheduledNowIso;
+				await scheduledNonCritical(this.service.patchOpsStatus(env, this.#buildRunningStatusPatch(startedAt, leaseToken, leaseState, scheduledLeaseMs)), "patch_running_status", { startedAt }, null);
+				const scheduledState = {
+					status: "success",
+					lastStartedAt: startedAt,
+					lastFinishedAt: null,
+					lastSuccessAt: null,
+					lastErrorAt: null,
+					lastError: null,
+					d1Tidy: {},
+					cleanup: {},
+					kvTidy: {},
+					tgDailyReport: {},
+					serverExpiryWarnings: {},
+					alerts: {}
+				};
+				const nowIso = () => makeScheduledIso(/* @__PURE__ */ new Date());
+				try {
+					const config = runtimeConfig || {};
+					const previousScheduledStatus = await scheduledNonCritical(this.service.getOpsStatusSection(env, "scheduled"), "read_previous_status", null, {});
+					if (db) try {
 						await ensureLeaseActive();
-						const reportResult = await this.service.sendDailyTelegramReport(env, {
-							now: scheduledNow,
-							reportKinds: selectedDailyReportKinds
+						const dayWindow = buildOffsetDayWindow(scheduledNow, config.scheduleUtcOffsetMinutes);
+						const statsBucketDate = dayWindow.dateKey;
+						const statsStartTs = dayWindow.startTs;
+						const statsEndTs = dayWindow.endTs;
+						const statsUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config.scheduleUtcOffsetMinutes);
+						const previousCleanupStatus = this.service.getPreviousD1TidyState(previousScheduledStatus);
+						const d1Result = await this.service.tidyD1Data(env, {
+							db,
+							kv,
+							ctx,
+							config,
+							mode: "scheduled",
+							maintenanceMode: "smart",
+							previousScheduledState: previousScheduledStatus,
+							previousCleanupStatus,
+							scheduledNow,
+							dayWindow,
+							statsBucketDate,
+							statsStartTs,
+							statsEndTs,
+							statsUtcOffsetMinutes,
+							beforeEachStep: ensureLeaseActive
 						});
-						totalSentCount += Number(reportResult?.sentCount) || 0;
-						processedSlots.push(clockTime);
-						nextReportFixedQueue = this.#appendFixedQueueSlot(nextReportFixedQueue, dailyReportDueState.context.dateKey, clockTime);
-					} catch (reportErr) {
-						reportFailed = reportErr;
-						this.logger.error("Scheduled Daily Report Error: ", reportErr);
-						break;
+						const d1FinishedAt = nowIso();
+						const d1StatusPayload = this.service.buildD1TidyStatusPayload(d1Result.summary, {
+							mode: "scheduled",
+							maintenanceMode: "smart",
+							triggeredBy: "scheduled",
+							timestamp: d1FinishedAt
+						});
+						scheduledState.d1Tidy = d1StatusPayload.d1Tidy;
+						scheduledState.cleanup = d1StatusPayload.cleanup;
+						if (scheduledState.d1Tidy.status === "partial_failure" || scheduledState.d1Tidy.status === "failed") scheduledState.status = "partial_failure";
+						await ensureLeaseActive();
+					} catch (dbErr) {
+						scheduledState.status = "partial_failure";
+						const failedStatusPayload = this.service.buildD1TidyStatusPayload({
+							status: "failed",
+							lastError: dbErr?.message || String(dbErr),
+							maintenanceMode: "smart"
+						}, {
+							mode: "scheduled",
+							maintenanceMode: "smart",
+							triggeredBy: "scheduled",
+							timestamp: nowIso()
+						});
+						scheduledState.d1Tidy = failedStatusPayload.d1Tidy;
+						scheduledState.cleanup = failedStatusPayload.cleanup;
+						this.logger.error("Scheduled DB Cleanup Error: ", dbErr);
 					}
-					if (!reportFailed) scheduledState.tgDailyReport = this.#buildSuccessState(baseDailyReportState, nowIso(), {
-						fixedQueue: nextReportFixedQueue,
-						sentCount: totalSentCount,
-						...this.#buildClockProcessedMeta(dailyReportDueState.context.dateKey, processedSlots)
-					});
 					else {
-						scheduledState.status = this.#markPartialFailure(scheduledState.status);
-						scheduledState.tgDailyReport = this.#buildFailedState(baseDailyReportState, nowIso(), reportFailed?.message || String(reportFailed), {
-							fixedQueue: nextReportFixedQueue,
-							processedSlots
+						const skippedStatusPayload = this.service.buildD1TidyStatusPayload({
+							status: "skipped",
+							reason: "db_not_configured",
+							maintenanceMode: "smart"
+						}, {
+							mode: "scheduled",
+							maintenanceMode: "smart",
+							triggeredBy: "scheduled",
+							timestamp: nowIso()
 						});
+						scheduledState.d1Tidy = skippedStatusPayload.d1Tidy;
+						scheduledState.cleanup = skippedStatusPayload.cleanup;
 					}
-				}
-			} else scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "disabled", { fixedQueue: dailyReportDueState.fixedQueue });
-			const expiryDueState = getDueScheduledClockSlots(previousServerExpiryState, ["00:00"], scheduleUtcOffsetMinutes, scheduledNow);
-			try {
-				if (expiryDueState.due !== true) scheduledState.serverExpiryWarnings = this.#buildSkippedState(previousServerExpiryState, nowIso(), expiryDueState.reason || "daily_refresh_not_due", { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
-				else {
-					await ensureLeaseActive();
-					const expiryWarningResult = await this.service.maybeSendServerExpiryWarnings(env, {
-						config,
-						db,
-						kv,
-						ctx,
-						now: scheduledNow
-					});
-					const stateMeta = {
-						fixedQueue: this.#appendFixedQueueSlot(this.#normalizeFixedQueueState(expiryDueState.fixedQueue), expiryDueState.context.dateKey, "00:00"),
-						refreshedCount: Number(expiryWarningResult.refreshedCount) || 0,
-						issueCount: Number(expiryWarningResult.issueCount) || 0,
-						reason: expiryWarningResult.reason || "no_due_warnings"
+					scheduledState.kvTidy = {
+						...this.#getStatusSection(previousScheduledStatus, "kvTidy"),
+						mode: "manual_only",
+						lastAutoSkipAt: nowIso(),
+						autoSkipReason: "manual_only"
 					};
-					scheduledState.serverExpiryWarnings = expiryWarningResult.sent === true ? this.#buildSuccessState(previousServerExpiryState, nowIso(), stateMeta) : this.#buildSkippedState(previousServerExpiryState, nowIso(), stateMeta.reason, stateMeta);
+					const { tgBotToken, tgChatId } = config;
+					const previousTgDailyReportState = this.#getStatusSection(previousScheduledStatus, "tgDailyReport", "report");
+					const previousAlertsState = this.#getStatusSection(previousScheduledStatus, "alerts");
+					const previousServerExpiryState = this.#getStatusSection(previousScheduledStatus, "serverExpiryWarnings");
+					const tgDailyReportClockTimes = normalizeScheduleClockTimeList(config.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
+					const dailyReportDueState = getDueScheduledClockSlots(previousTgDailyReportState, tgDailyReportClockTimes, scheduleUtcOffsetMinutes, scheduledNow);
+					const selectedDailyReportKinds = resolveDailyTelegramReportKinds(config, config);
+					const baseDailyReportState = {
+						...previousTgDailyReportState,
+						clockTimes: tgDailyReportClockTimes,
+						reportKinds: selectedDailyReportKinds
+					};
+					if (config.tgDailyReportEnabled === true) {
+						let nextReportFixedQueue = this.#normalizeFixedQueueState(dailyReportDueState.fixedQueue);
+						if (!selectedDailyReportKinds.length) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "report_kinds_disabled", { fixedQueue: nextReportFixedQueue });
+						else if (!tgBotToken || !tgChatId) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "telegram_not_configured", { fixedQueue: nextReportFixedQueue });
+						else if (dailyReportDueState.due !== true) scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), dailyReportDueState.reason || "time_not_matched", { fixedQueue: nextReportFixedQueue });
+						else {
+							let processedSlots = [];
+							let reportFailed = null;
+							let totalSentCount = 0;
+							for (const clockTime of dailyReportDueState.dueSlots) try {
+								await ensureLeaseActive();
+								const reportResult = await this.service.sendDailyTelegramReport(env, {
+									now: scheduledNow,
+									reportKinds: selectedDailyReportKinds
+								});
+								totalSentCount += Number(reportResult?.sentCount) || 0;
+								processedSlots.push(clockTime);
+								nextReportFixedQueue = this.#appendFixedQueueSlot(nextReportFixedQueue, dailyReportDueState.context.dateKey, clockTime);
+							} catch (reportErr) {
+								reportFailed = reportErr;
+								this.logger.error("Scheduled Daily Report Error: ", reportErr);
+								break;
+							}
+							if (!reportFailed) scheduledState.tgDailyReport = this.#buildSuccessState(baseDailyReportState, nowIso(), {
+								fixedQueue: nextReportFixedQueue,
+								sentCount: totalSentCount,
+								...this.#buildClockProcessedMeta(dailyReportDueState.context.dateKey, processedSlots)
+							});
+							else {
+								scheduledState.status = this.#markPartialFailure(scheduledState.status);
+								scheduledState.tgDailyReport = this.#buildFailedState(baseDailyReportState, nowIso(), reportFailed?.message || String(reportFailed), {
+									fixedQueue: nextReportFixedQueue,
+									processedSlots
+								});
+							}
+						}
+					} else scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "disabled", { fixedQueue: dailyReportDueState.fixedQueue });
+					const expiryDueState = getDueScheduledClockSlots(previousServerExpiryState, ["00:00"], scheduleUtcOffsetMinutes, scheduledNow);
+					try {
+						if (expiryDueState.due !== true) scheduledState.serverExpiryWarnings = this.#buildSkippedState(previousServerExpiryState, nowIso(), expiryDueState.reason || "daily_refresh_not_due", { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
+						else {
+							await ensureLeaseActive();
+							const expiryWarningResult = await this.service.maybeSendServerExpiryWarnings(env, {
+								config,
+								db,
+								kv,
+								ctx,
+								now: scheduledNow
+							});
+							const stateMeta = {
+								fixedQueue: this.#appendFixedQueueSlot(this.#normalizeFixedQueueState(expiryDueState.fixedQueue), expiryDueState.context.dateKey, "00:00"),
+								refreshedCount: Number(expiryWarningResult.refreshedCount) || 0,
+								issueCount: Number(expiryWarningResult.issueCount) || 0,
+								reason: expiryWarningResult.reason || "no_due_warnings"
+							};
+							scheduledState.serverExpiryWarnings = expiryWarningResult.sent === true ? this.#buildSuccessState(previousServerExpiryState, nowIso(), stateMeta) : this.#buildSkippedState(previousServerExpiryState, nowIso(), stateMeta.reason, stateMeta);
+						}
+					} catch (expiryWarningError) {
+						scheduledState.status = this.#markPartialFailure(scheduledState.status);
+						scheduledState.serverExpiryWarnings = this.#buildFailedState(previousServerExpiryState, nowIso(), expiryWarningError?.message || String(expiryWarningError), { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
+						this.logger.error("Scheduled Server Expiry Warning Error: ", expiryWarningError);
+					}
+					try {
+						await ensureLeaseActive();
+						const alertResult = await this.service.maybeSendRuntimeAlerts(env, scheduledState);
+						alertResult.sent;
+						const alertPolledAt = nowIso();
+						scheduledState.alerts = alertResult.sent === true ? this.#buildSuccessState(previousAlertsState, alertPolledAt, {
+							lastPolledAt: alertPolledAt,
+							lastSkippedAt: previousAlertsState.lastSkippedAt || "",
+							issueCount: Number(alertResult.issueCount) || 0,
+							reason: alertResult.reason || "alert_sent"
+						}) : this.#buildSkippedState(previousAlertsState, alertPolledAt, alertResult.reason || "no_alerts", {
+							lastPolledAt: alertPolledAt,
+							lastSuccessAt: previousAlertsState.lastSuccessAt || "",
+							issueCount: Number(alertResult.issueCount) || 0
+						});
+					} catch (alertErr) {
+						scheduledState.status = this.#markPartialFailure(scheduledState.status);
+						const alertFailedAt = nowIso();
+						scheduledState.alerts = this.#buildFailedState(previousAlertsState, alertFailedAt, alertErr?.message || String(alertErr), { lastPolledAt: alertFailedAt });
+						this.logger.error("Scheduled Alert Error: ", alertErr);
+					}
+				} catch (err) {
+					scheduledState.status = "failed";
+					scheduledState.lastErrorAt = nowIso();
+					scheduledState.lastError = err?.message || String(err);
+					this.logger.error("Scheduled Task Error: ", err);
+				} finally {
+					leaseState.active = false;
+					await leaseKeepalive;
+					const finishedAt = nowIso();
+					scheduledState.lastFinishedAt = finishedAt;
+					if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
+					const released = leaseState.lostReason ? false : await scheduledNonCritical(this.service.releaseScheduledLease(scheduledLeaseStore, leaseToken, { backend: leaseBackend }), "release_lease", { backend: leaseBackend }, false);
+					scheduledState.lock = this.#buildFinalLockState(leaseState, finishedAt, released);
+					await scheduledNonCritical(this.service.patchOpsStatus(env, { scheduled: scheduledState }), "patch_final_status", {
+						finishedAt,
+						finalStatus: scheduledState.status,
+						leaseLostReason: leaseState.lostReason || ""
+					}, null);
 				}
-			} catch (expiryWarningError) {
-				scheduledState.status = this.#markPartialFailure(scheduledState.status);
-				scheduledState.serverExpiryWarnings = this.#buildFailedState(previousServerExpiryState, nowIso(), expiryWarningError?.message || String(expiryWarningError), { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
-				this.logger.error("Scheduled Server Expiry Warning Error: ", expiryWarningError);
-			}
-			try {
-				await ensureLeaseActive();
-				const alertResult = await this.service.maybeSendRuntimeAlerts(env, scheduledState);
-				alertResult.sent;
-				const alertPolledAt = nowIso();
-				scheduledState.alerts = alertResult.sent === true ? this.#buildSuccessState(previousAlertsState, alertPolledAt, {
-					lastPolledAt: alertPolledAt,
-					lastSkippedAt: previousAlertsState.lastSkippedAt || "",
-					issueCount: Number(alertResult.issueCount) || 0,
-					reason: alertResult.reason || "alert_sent"
-				}) : this.#buildSkippedState(previousAlertsState, alertPolledAt, alertResult.reason || "no_alerts", {
-					lastPolledAt: alertPolledAt,
-					lastSuccessAt: previousAlertsState.lastSuccessAt || "",
-					issueCount: Number(alertResult.issueCount) || 0
-				});
-			} catch (alertErr) {
-				scheduledState.status = this.#markPartialFailure(scheduledState.status);
-				const alertFailedAt = nowIso();
-				scheduledState.alerts = this.#buildFailedState(previousAlertsState, alertFailedAt, alertErr?.message || String(alertErr), { lastPolledAt: alertFailedAt });
-				this.logger.error("Scheduled Alert Error: ", alertErr);
-			}
-		} catch (err) {
-			scheduledState.status = "failed";
-			scheduledState.lastErrorAt = nowIso();
-			scheduledState.lastError = err?.message || String(err);
-			this.logger.error("Scheduled Task Error: ", err);
-		} finally {
-			leaseState.active = false;
-			await leaseKeepalive;
-			const finishedAt = nowIso();
-			scheduledState.lastFinishedAt = finishedAt;
-			if (scheduledState.status === "success") scheduledState.lastSuccessAt = finishedAt;
-			const released = leaseState.lostReason ? false : await scheduledNonCritical(this.service.releaseScheduledLease(scheduledLeaseStore, leaseToken, { backend: leaseBackend }), "release_lease", { backend: leaseBackend }, false);
-			scheduledState.lock = this.#buildFinalLockState(leaseState, finishedAt, released);
-			await scheduledNonCritical(this.service.patchOpsStatus(env, { scheduled: scheduledState }), "patch_final_status", {
-				finishedAt,
-				finalStatus: scheduledState.status,
-				leaseLostReason: leaseState.lostReason || ""
-			}, null);
 		}
-	}
 };
+//#endregion
+//#region worker/features/nodes/node-model-methods.js
 function defineNodeModelMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
@@ -16245,6 +16492,8 @@ function defineNodeModelMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/transport/media-auth.js
 function getMediaAuthorizationScheme(value = "") {
 	const normalized = String(value || "").trim().toLowerCase();
 	if (normalized.startsWith("emby ")) return "emby";
@@ -16526,6 +16775,8 @@ function buildProxyAccessRuleProfile(currentConfig = {}) {
 	if (configKey) cacheState.ProxyAccessRuleProfileCache.set(configKey, profile);
 	return profile;
 }
+//#endregion
+//#region worker/features/nodes/server-record-methods.js
 function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
@@ -17081,6 +17332,8 @@ function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/nodes/node-mutation-methods.js
 function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
@@ -17576,6 +17829,8 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/nodes/node-repository-methods.js
 function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
@@ -17702,6 +17957,8 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/nodes/database-methods.js
 function defineDatabaseNodeServiceMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineNodeModelMethods(dependencies, kernel),
@@ -17710,6 +17967,8 @@ function defineDatabaseNodeServiceMethods(dependencies = {}, kernel = {}) {
 		...defineNodeRepositoryMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/observability/log-query-planner.js
 var LOGS_FTS_TABLE = "proxy_logs_fts";
 function buildLogQueryPlanner(dependencies = {}) {
 	const planner = {
@@ -17995,6 +18254,8 @@ function buildLogQueryPlanner(dependencies = {}) {
 	};
 	return planner;
 }
+//#endregion
+//#region worker/features/observability/log-serialization.js
 var LOG_DETAIL_JSON_MAX_LENGTH = 8192;
 function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LENGTH) {
 	const limit = Math.max(2, Math.floor(Number(maxLength) || 8192));
@@ -18008,6 +18269,8 @@ function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LE
 	const truncated = JSON.stringify({ truncated: true });
 	return truncated.length <= limit ? truncated : "{}";
 }
+//#endregion
+//#region worker/features/observability/logger.js
 var SYS_STATUS_TABLE$1 = "sys_status";
 function buildLogger(dependencies = {}) {
 	const { logRepository } = dependencies;
@@ -18244,6 +18507,8 @@ function buildLogger(dependencies = {}) {
 	};
 	return logger;
 }
+//#endregion
+//#region worker/features/observability/status-methods.js
 var SYS_STATUS_TABLE = "sys_status";
 var SCHEDULED_LOCKS_TABLE = "sys_locks";
 var SCHEDULED_LOCK_SCOPE = "scheduled";
@@ -18549,6 +18814,8 @@ function defineDatabaseStatusMethods(dependencies = {}) {
 	};
 	return statusMethods;
 }
+//#endregion
+//#region worker/features/proxy/transport/lifecycle.js
 function createLifecycleAbortError(reason, detail = "") {
 	const normalizedReason = String(reason || "request_aborted").trim() || "request_aborted";
 	/** @type {AppError} */
@@ -18737,6 +19004,8 @@ async function sleepWithRequestLifecycle(ms, requestLifecycle = null) {
 		});
 	});
 }
+//#endregion
+//#region worker/features/proxy/failover/cache-delivery-methods.js
 function defineProxyCacheDeliveryMethods(dependencies = {}, kernel = {}) {
 	return {
 		async tryServeMetadataCache(execution) {
@@ -19010,6 +19279,8 @@ function defineProxyCacheDeliveryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/failover/upstream-delivery-methods.js
 function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 	return {
 		async executeUpstreamFlow(execution, transport, buildFetchOptions) {
@@ -19376,6 +19647,8 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/failover/aggregation-delivery-methods.js
 function defineProxyAggregationDeliveryMethods(dependencies = {}, kernel = {}) {
 	const { nodeRepository } = dependencies;
 	return {
@@ -19694,6 +19967,8 @@ function defineProxyAggregationDeliveryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/failover/handler-delivery-methods.js
 function defineProxyHandlerDeliveryMethods(dependencies = {}, kernel = {}) {
 	return {
 		buildErrorResponse(execution, err) {
@@ -19828,6 +20103,8 @@ function defineProxyHandlerDeliveryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/failover/delivery-methods.js
 function defineProxyDeliveryMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineProxyCacheDeliveryMethods(dependencies, kernel),
@@ -19836,6 +20113,8 @@ function defineProxyDeliveryMethods(dependencies = {}, kernel = {}) {
 		...defineProxyHandlerDeliveryMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/diagnostic-methods.js
 function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 	const { Logger } = dependencies;
 	return {
@@ -20207,6 +20486,8 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/metadata-response-methods.js
 function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 	const { Logger } = dependencies;
 	return {
@@ -20554,6 +20835,8 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/upstream-fetch-methods.js
 function defineProxyUpstreamFetchMethods(dependencies = {}, kernel = {}) {
 	const { Logger } = dependencies;
 	return {
@@ -20826,6 +21109,8 @@ function defineProxyUpstreamFetchMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/access-log-methods.js
 function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 	const { Logger } = dependencies;
 	return {
@@ -20887,6 +21172,8 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/metadata-cache/observability-methods.js
 function defineProxyObservabilityMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineProxyDiagnosticMethods(dependencies, kernel),
@@ -20895,6 +21182,8 @@ function defineProxyObservabilityMethods(dependencies = {}, kernel = {}) {
 		...defineProxyAccessLogMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/aggregation-auth-methods.js
 function definePlaybackAggregationAuthMethods(dependencies = {}, kernel = {}) {
 	return {
 		buildMediaAggregationRequestHeaders(execution, node, targetUrl, auth = null) {
@@ -21279,6 +21568,8 @@ function definePlaybackAggregationAuthMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/aggregation-rewrite-methods.js
 function definePlaybackAggregationRewriteMethods(dependencies = {}, kernel = {}) {
 	const { nodeRepository } = dependencies;
 	return {
@@ -21837,12 +22128,16 @@ function definePlaybackAggregationRewriteMethods(dependencies = {}, kernel = {})
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/aggregation-methods.js
 function defineProxyPlaybackMethods(dependencies = {}, kernel = {}) {
 	return {
 		...definePlaybackAggregationAuthMethods(dependencies, kernel),
 		...definePlaybackAggregationRewriteMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/execution-cache-methods.js
 function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager } = dependencies;
 	return {
@@ -22252,6 +22547,8 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/watch-lifecycle-methods.js
 function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, watchRepository } = dependencies;
 	return {
@@ -22711,6 +23008,8 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/progress-relay-methods.js
 function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager } = dependencies;
 	return {
@@ -22987,6 +23286,8 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/playback/lifecycle-methods.js
 function defineProxyLifecycleMethods(dependencies = {}, kernel = {}) {
 	return {
 		...definePlaybackExecutionCacheMethods(dependencies, kernel),
@@ -22994,6 +23295,8 @@ function defineProxyLifecycleMethods(dependencies = {}, kernel = {}) {
 		...definePlaybackProgressRelayMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/decision-methods.js
 function defineProxyRoutingDecisionMethods(dependencies = {}, kernel = {}) {
 	const { nodeRepository } = dependencies;
 	return {
@@ -23286,6 +23589,8 @@ function defineProxyRoutingDecisionMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/failover-state-methods.js
 function defineProxyFailoverStateMethods(dependencies = {}, kernel = {}) {
 	const { nodeRepository } = dependencies;
 	return {
@@ -23550,6 +23855,8 @@ function defineProxyFailoverStateMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/failover-probe-methods.js
 function defineProxyFailoverProbeMethods(dependencies = {}, kernel = {}) {
 	return {
 		buildFailoverProbeHeaders() {
@@ -23890,6 +24197,8 @@ function defineProxyFailoverProbeMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/proxy/routing/methods.js
 function defineProxyRoutingMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineProxyRoutingDecisionMethods(dependencies, kernel),
@@ -23897,6 +24206,8 @@ function defineProxyRoutingMethods(dependencies = {}, kernel = {}) {
 		...defineProxyFailoverProbeMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/proxy/transport/methods.js
 function defineProxyTransportMethods(dependencies = {}) {
 	const {} = dependencies;
 	const methods = {
@@ -24235,6 +24546,8 @@ function defineProxyTransportMethods(dependencies = {}) {
 	};
 	return methods;
 }
+//#endregion
+//#region worker/features/proxy/api.js
 function defineNodeProxyKernel({ configReader, nodeRepository, watchRepository, logger, cachePort, fetchPort }) {
 	const internals = {};
 	const dependencies = {
@@ -24253,7 +24566,9 @@ function defineNodeProxyKernel({ configReader, nodeRepository, watchRepository, 
 		defineProxyRoutingMethods(dependencies, internals),
 		defineProxyTransportMethods(dependencies)
 	];
-	for (const group of methodGroups) for (const [name, value] of Object.entries(group)) internals[name] = value;
+	for (const group of methodGroups) {
+		for (const [name, value] of Object.entries(group)) internals[name] = value;
+	}
 	return internals;
 }
 function buildNodeProxyWorkflow({ configReader, nodeRepository, watchRepository, logger, cachePort, fetchPort }) {
@@ -24270,6 +24585,8 @@ function buildNodeProxyWorkflow({ configReader, nodeRepository, watchRepository,
 		testingSupport: internals
 	});
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-stats-methods.js
 function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -24512,6 +24829,8 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-dns-methods.js
 function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -24880,6 +25199,8 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-status-methods.js
 function defineAnalyticsStatusMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -25092,6 +25413,8 @@ function defineAnalyticsStatusMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-cache-methods.js
 function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -25396,6 +25719,8 @@ function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-dashboard-methods.js
 function defineAnalyticsDashboardMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -25745,6 +26070,8 @@ function defineAnalyticsDashboardMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-runtime-methods.js
 function defineAnalyticsRuntimeMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, withAdminShellRuntimeStatus } = dependencies;
 	return {
@@ -26261,6 +26588,8 @@ function defineAnalyticsRuntimeMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/analytics-methods.js
 function defineDatabaseAnalyticsMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineAnalyticsStatsMethods(dependencies, kernel),
@@ -26271,6 +26600,8 @@ function defineDatabaseAnalyticsMethods(dependencies = {}, kernel = {}) {
 		...defineAnalyticsRuntimeMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/schema-revision-methods.js
 function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 	return {
 		getKV(env) {
@@ -26754,6 +27085,8 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/schema-inspection-methods.js
 function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 	return {
 		async hasLogsFtsTable(db) {
@@ -27584,6 +27917,8 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/schema-records-methods.js
 function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 	return {
 		async ensureLogsBaseSchema(db) {
@@ -28234,6 +28569,8 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/schema-bootstrap-methods.js
 function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 	return {
 		normalizeD1SchemaProfile(profile = "") {
@@ -28370,6 +28707,8 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/schema-methods.js
 function defineDatabaseSchemaMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineSchemaRevisionMethods(dependencies, kernel),
@@ -28378,6 +28717,8 @@ function defineDatabaseSchemaMethods(dependencies = {}, kernel = {}) {
 		...defineSchemaBootstrapMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/features/storage/d1/tidy-executor.js
 function buildD1TidyExecutor() {
 	const executor = {
 		createSummary(executionPlan = {}, mode = "manual", flags = {}) {
@@ -28521,6 +28862,8 @@ function buildD1TidyExecutor() {
 	};
 	return executor;
 }
+//#endregion
+//#region worker/features/storage/d1/tidy-planner.js
 function buildD1TidyPlanner() {
 	return {
 		buildContext(runtimeConfig = {}, options = {}) {
@@ -28702,6 +29045,8 @@ function buildD1TidyPlanner() {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/contract.js
 var DATA_SERVICE_CONSTANTS = Object.freeze({
 	PREFIX: "node:",
 	CONFIG_KEY: "sys:theme",
@@ -28761,6 +29106,8 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 		dnsIpPool: "sys:ops_status:dns_ip_pool:v1"
 	})
 });
+//#endregion
+//#region worker/features/storage/kv/cache-manager.js
 var SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS = 1800 * 1e3;
 function buildCacheServices(dependencies = {}) {
 	const { nodeRepository } = dependencies;
@@ -28893,6 +29240,8 @@ function buildCacheServices(dependencies = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/kv/node-index-methods.js
 function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 	const {} = dependencies;
 	return {
@@ -29435,6 +29784,8 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/kv/dns-history-methods.js
 function defineDnsHistoryMethods(dependencies = {}, kernel = {}) {
 	const {} = dependencies;
 	return {
@@ -29569,6 +29920,8 @@ function defineDnsHistoryMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/kv/kv-safety-methods.js
 function defineKvSafetyMethods(dependencies = {}, kernel = {}) {
 	const {} = dependencies;
 	return {
@@ -29834,6 +30187,8 @@ function defineKvSafetyMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/kv/kv-tidy-methods.js
 function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 	const {} = dependencies;
 	return {
@@ -30236,6 +30591,8 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 		}
 	};
 }
+//#endregion
+//#region worker/features/storage/kv/node-methods.js
 function defineDatabaseNodeKvMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineNodeIndexMethods(dependencies, kernel),
@@ -30244,6 +30601,8 @@ function defineDatabaseNodeKvMethods(dependencies = {}, kernel = {}) {
 		...defineNodeKvTidyMethods(dependencies, kernel)
 	};
 }
+//#endregion
+//#region worker/runtime/entry.js
 var NodeProxyFacade = class {
 	constructor({ configReader, httpService, nodeRouteReader, proxyApi }) {
 		this.configReader = configReader;
@@ -30251,301 +30610,321 @@ var NodeProxyFacade = class {
 		this.nodeRouteReader = nodeRouteReader;
 		this.proxyApi = proxyApi;
 	}
+
 	#buildRouteCorsResponse(request, env, body, status = 200) {
-		return this.httpService.buildCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
-	}
-	#buildTrailingSlashRedirectResponse(request, normalizedPathname) {
-		const redirectUrl = new URL(request.url);
-		redirectUrl.pathname = normalizedPathname + "/";
-		const headers = new Headers({
-			Location: redirectUrl.toString(),
-			"Cache-Control": "no-store"
-		});
-		applySecurityHeaders(headers);
-		const redirectStatus = request.method === "GET" || request.method === "HEAD" ? 301 : 307;
-		return new Response(null, {
-			status: redirectStatus,
-			headers
-		});
-	}
-	#buildCanonicalHostRedirectResponse(request, targetHost) {
-		const normalizedTargetHost = normalizeHostnameText(targetHost);
-		if (!normalizedTargetHost) return null;
-		const redirectUrl = new URL(request.url);
-		redirectUrl.hostname = normalizedTargetHost;
-		const headers = new Headers({
-			Location: redirectUrl.toString(),
-			"Cache-Control": "no-store"
-		});
-		applySecurityHeaders(headers);
-		return new Response(null, {
-			status: 301,
-			headers
-		});
-	}
-	#appendSetCookieHeader(response, setCookieValue = "") {
-		const normalizedSetCookieValue = String(setCookieValue || "").trim();
-		if (!response || !normalizedSetCookieValue || response.status === 101) return response;
-		const headers = new Headers(response.headers || {});
-		headers.append("Set-Cookie", normalizedSetCookieValue);
-		return new Response(response.body, {
-			status: response.status,
-			statusText: response.statusText,
-			headers
-		});
-	}
-	#buildLegacyProxyContextNotFoundResponse(request, env) {
-		const response = this.#buildRouteCorsResponse(request, env, "Not Found", 404);
-		return this.#appendSetCookieHeader(response, buildLegacyProxyContextClearCookie());
-	}
-	async #maybeAttachLegacyProxyContextResponse(response, requestHost, nodeName, env) {
-		if (!response || response.status === 101) return response;
-		const cookieValue = await buildLegacyProxyContextCookieValue(nodeName, requestHost, env);
-		if (!cookieValue) return response;
-		return this.#appendSetCookieHeader(response, buildLegacyProxyContextSetCookie(cookieValue));
-	}
-	#isPlaybackCriticalRouteContext(routeContext) {
-		const segments = routeContext.segments;
-		if (segments.length <= 1) return false;
-		if (this.httpService.isPlaybackCriticalSegments(segments, 1)) return true;
-		if (segments.length <= 2) return false;
-		return this.httpService.isPlaybackCriticalSegments(segments, 2);
-	}
-	async #resolveProxyRouteContext(routeContext, env, ctx, request) {
-		if (!routeContext.root) return null;
-		const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
-		let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(routeContext.root, env) : null;
-		const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
-		const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(routeContext.root, env, ctx);
-		if (!nodeData) return null;
-		if (isHostPrefixEntryMode(nodeData?.entryMode)) return null;
-		const secret = nodeData.secret;
-		const routePrefix = buildProxyPrefix(routeContext.root, secret);
-		const rootPrefixLen = 1 + routeContext.rootRaw.length;
-		const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
-		const pathNormalizationState = tryNormalizeEmbeddedSameOriginPlaybackProxyPath(rawPathAfterRoot, routeContext.requestUrl, routePrefix);
-		const normalizedPathAfterRoot = pathNormalizationState?.normalizedPath || rawPathAfterRoot;
-		const normalizedPathname = `/${routeContext.rootRaw}${normalizedPathAfterRoot === "/" ? "/" : normalizedPathAfterRoot}`;
-		const normalizedSegments = pathNormalizationState ? normalizedPathname.split("/").filter(Boolean) : routeContext.segments;
-		let prefixLen = rootPrefixLen;
-		if (secret) {
-			const secretRaw = normalizedSegments[1] || "";
-			if (safeDecodeSegment(secretRaw) !== secret) return null;
-			prefixLen += 1 + secretRaw.length;
-		}
-		const normalizedRemainingInput = normalizedPathname.substring(prefixLen);
-		const normalizedRequestUrl = pathNormalizationState ? (() => {
-			const nextUrl = new URL(routeContext.requestUrl.toString());
-			nextUrl.pathname = normalizedPathname;
-			return nextUrl;
-		})() : routeContext.requestUrl;
-		const linkVariantState = consumeProxyLinkVariantPrefix(normalizedRemainingInput);
-		let remaining = linkVariantState.remaining;
-		if (normalizedRemainingInput === "" && !normalizedRequestUrl.pathname.endsWith("/") || linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, normalizedPathname) };
-		if (remaining === "") remaining = "/";
-		if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(routeContext.root, nodeData, env);
-		return {
-			nodeData,
-			secret,
-			remaining: sanitizeProxyPath(remaining),
-			linkVariant: linkVariantState.linkVariant,
-			requestUrl: normalizedRequestUrl,
-			pathNormalizationState,
-			playbackRouteHotSnapshot,
-			targetHotCacheState,
-			entryMode: "kv_route"
-		};
-	}
-	#isHostPrefixPlaybackCriticalRouteContext(routeContext) {
-		if (!routeContext) return false;
-		return isPlaybackCriticalProxyPath(consumeProxyLinkVariantPrefix(routeContext.normalizedPathname)?.remaining || "/");
-	}
-	async #resolveHostPrefixProxyRouteContext(routeContext, env, ctx, request) {
-		const hostPrefixMatch = routeContext?.hostPrefixMatch;
-		if (!hostPrefixMatch?.prefix) return null;
-		const nodeName = hostPrefixMatch.prefix;
-		const playbackHotEligible = this.#isHostPrefixPlaybackCriticalRouteContext(routeContext);
-		let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-		const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
-		const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
-		if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
-		const linkVariantState = consumeProxyLinkVariantPrefix(routeContext.normalizedPathname);
-		let remaining = linkVariantState.remaining;
-		if (linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, routeContext.normalizedPathname) };
-		if (remaining === "") remaining = "/";
-		if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
-		return {
-			nodeData,
-			secret: "",
-			remaining: sanitizeProxyPath(remaining),
-			linkVariant: linkVariantState.linkVariant,
-			requestUrl: routeContext.requestUrl,
-			playbackRouteHotSnapshot,
-			targetHotCacheState,
-			entryMode: "host_prefix"
-		};
-	}
-	#isHostPrefixPathCompatHostRequest(routeContext) {
-		const requestHost = routeContext?.requestHost || "";
-		const configuredHost = routeContext?.configuredHost || "";
-		const configuredLegacyHost = routeContext?.configuredLegacyHost || "";
-		if (!requestHost) return false;
-		if (configuredHost && requestHost === configuredHost) return true;
-		return !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
-	}
-	async #resolveHostPrefixPathCompatRouteContext(routeContext, env, ctx, request, options = {}) {
-		if (!this.#isHostPrefixPathCompatHostRequest(routeContext) || !routeContext?.root) return null;
-		const nodeName = routeContext.root;
-		const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
-		let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-		const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
-		const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
-		if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
-		const routePrefix = buildProxyPrefix(nodeName, "", { entryMode: "kv_route" });
-		const rootPrefixLen = 1 + routeContext.rootRaw.length;
-		const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
-		const pathNormalizationState = tryNormalizeEmbeddedSameOriginPlaybackProxyPath(rawPathAfterRoot, routeContext.requestUrl, routePrefix);
-		const normalizedPathAfterRoot = pathNormalizationState?.normalizedPath || rawPathAfterRoot;
-		const normalizedPathname = `/${routeContext.rootRaw}${normalizedPathAfterRoot === "/" ? "/" : normalizedPathAfterRoot}`;
-		const normalizedRemainingInput = normalizedPathname.substring(rootPrefixLen);
-		const normalizedRequestUrl = pathNormalizationState ? (() => {
-			const nextUrl = new URL(routeContext.requestUrl.toString());
-			nextUrl.pathname = normalizedPathname;
-			return nextUrl;
-		})() : routeContext.requestUrl;
-		const linkVariantState = consumeProxyLinkVariantPrefix(normalizedRemainingInput);
-		let remaining = linkVariantState.remaining;
-		if (normalizedRemainingInput === "" && !normalizedRequestUrl.pathname.endsWith("/") || linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, normalizedPathname) };
-		if (remaining === "") remaining = "/";
-		if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
-		return {
-			nodeData,
-			nodeName,
-			secret: "",
-			remaining: sanitizeProxyPath(remaining),
-			linkVariant: linkVariantState.linkVariant,
-			requestUrl: normalizedRequestUrl,
-			pathNormalizationState,
-			playbackRouteHotSnapshot,
-			targetHotCacheState,
-			entryMode: "kv_route",
-			routeKindOverride: options.isLegacyHostRequest === true ? "legacy_host_prefix_path_compat" : "host_prefix_path_compat",
-			attachLegacyProxyContext: options.isLegacyHostRequest === true
-		};
-	}
-	async #resolveLegacyHostCookieRouteContext(routeContext, env, ctx, request) {
-		if (!isLegacyProxyContextFallbackPath(routeContext?.normalizedPathname)) return null;
-		const cookieHeader = request.headers.get("Cookie") || "";
-		const cookieValue = String(parseCookieHeader(cookieHeader).get("legacy_proxy_ctx") || "").trim();
-		if (!cookieValue) return null;
-		const parsedContext = await parseLegacyProxyContextCookieValue(cookieValue, env, { requestHost: routeContext.requestHost });
-		if (parsedContext?.ok !== true) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
-		const nodeName = String(parsedContext.payload?.node || "").trim().toLowerCase();
-		if (!nodeName) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
-		const playbackHotEligible = isPlaybackCriticalProxyPath(routeContext.normalizedPathname);
-		let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-		const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
-		const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
-		if (!nodeData) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
-		const hostPrefixCompat = isHostPrefixEntryMode(nodeData?.entryMode);
-		if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
-		return {
-			nodeData,
-			nodeName,
-			secret: hostPrefixCompat ? "" : nodeData.secret,
-			remaining: routeContext.normalizedPathname,
-			linkVariant: "main",
-			requestUrl: routeContext.requestUrl,
-			playbackRouteHotSnapshot,
-			targetHotCacheState,
-			entryMode: "kv_route",
-			routeKindOverride: hostPrefixCompat ? "legacy_host_context_cookie_host_prefix_compat" : "legacy_host_context_cookie"
-		};
-	}
-	async handle(request, env, ctx, routeContext) {
-		if (!routeContext) throw new TypeError("NodeProxyFacade.handle requires routeContext");
-		const { requestHost, configuredHost, configuredLegacyHost } = routeContext;
-		const runtimeConfig = await this.configReader.getRuntimeConfig(env);
-		const isLegacyHostRequest = !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
-		const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!configuredHost && !isLegacyHostRequest;
-		routeContext.hostPrefixMatch = hostPrefixProxyActive ? resolveHostPrefixMatch(requestHost, configuredHost) : null;
-		const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
-		if (routeContext.hostPrefixMatch) {
-			const hostPrefixRoute = await this.#resolveHostPrefixProxyRouteContext(routeContext, env, ctx, request);
-			if (hostPrefixRoute?.response) return hostPrefixRoute.response;
-			if (hostPrefixRoute?.nodeData) return this.proxyApi.handle(request, hostPrefixRoute.nodeData, hostPrefixRoute.remaining, routeContext.hostPrefixMatch.prefix, hostPrefixRoute.secret, env, ctx, {
-				requestUrl: hostPrefixRoute.requestUrl || routeContext.requestUrl,
-				linkVariant: hostPrefixRoute.linkVariant,
-				targetHotCacheState: hostPrefixRoute.targetHotCacheState,
-				cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords : null,
-				nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-				runtimeConfig,
-				runtimeRouteContext: routeContext,
-				entryMode: hostPrefixRoute.entryMode
-			});
-			return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
-		}
-		if (isConfiguredHostSubdomain) return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
-		const hostPrefixCompatRoute = await this.#resolveHostPrefixPathCompatRouteContext(routeContext, env, ctx, request, { isLegacyHostRequest });
-		if (hostPrefixCompatRoute?.response) return hostPrefixCompatRoute.response;
-		if (hostPrefixCompatRoute?.nodeData) {
-			const hostPrefixCompatResponse = await this.proxyApi.handle(request, hostPrefixCompatRoute.nodeData, hostPrefixCompatRoute.remaining, hostPrefixCompatRoute.nodeName, hostPrefixCompatRoute.secret, env, ctx, {
-				requestUrl: hostPrefixCompatRoute.requestUrl || routeContext.requestUrl,
-				linkVariant: hostPrefixCompatRoute.linkVariant,
-				pathNormalizationState: hostPrefixCompatRoute.pathNormalizationState,
-				targetHotCacheState: hostPrefixCompatRoute.targetHotCacheState,
-				cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords : null,
-				nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-				runtimeConfig,
-				runtimeRouteContext: routeContext,
-				entryMode: hostPrefixCompatRoute.entryMode,
-				routeKindOverride: hostPrefixCompatRoute.routeKindOverride
-			});
-			return hostPrefixCompatRoute.attachLegacyProxyContext === true ? await this.#maybeAttachLegacyProxyContextResponse(hostPrefixCompatResponse, requestHost, hostPrefixCompatRoute.nodeName, env) : hostPrefixCompatResponse;
-		}
-		const proxyRoute = await this.#resolveProxyRouteContext(routeContext, env, ctx, request);
-		if (proxyRoute?.response) return proxyRoute.response;
-		if (proxyRoute?.nodeData) {
-			const proxyResponse = await this.proxyApi.handle(request, proxyRoute.nodeData, proxyRoute.remaining, routeContext.root, proxyRoute.secret, env, ctx, {
-				requestUrl: proxyRoute.requestUrl || routeContext.requestUrl,
-				linkVariant: proxyRoute.linkVariant,
-				pathNormalizationState: proxyRoute.pathNormalizationState,
-				targetHotCacheState: proxyRoute.targetHotCacheState,
-				cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords) ? proxyRoute.playbackRouteHotSnapshot.targetRecords : null,
-				nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-				runtimeConfig,
-				runtimeRouteContext: routeContext,
-				entryMode: proxyRoute.entryMode
-			});
-			return isLegacyHostRequest ? await this.#maybeAttachLegacyProxyContextResponse(proxyResponse, requestHost, routeContext.root, env) : proxyResponse;
-		}
-		if (isLegacyHostRequest && isLegacyProxyContextFallbackPath(routeContext.normalizedPathname)) {
-			const legacyCookieRoute = await this.#resolveLegacyHostCookieRouteContext(routeContext, env, ctx, request);
-			if (legacyCookieRoute?.response) return legacyCookieRoute.response;
-			if (legacyCookieRoute?.nodeData) {
-				const legacyCookieResponse = await this.proxyApi.handle(request, legacyCookieRoute.nodeData, legacyCookieRoute.remaining, legacyCookieRoute.nodeName, legacyCookieRoute.secret, env, ctx, {
-					requestUrl: legacyCookieRoute.requestUrl || routeContext.requestUrl,
-					linkVariant: legacyCookieRoute.linkVariant,
-					targetHotCacheState: legacyCookieRoute.targetHotCacheState,
-					cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords) ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords : null,
-					nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
-					runtimeConfig,
-					runtimeRouteContext: routeContext,
-					entryMode: legacyCookieRoute.entryMode,
-					routeKindOverride: legacyCookieRoute.routeKindOverride
-				});
-				return this.#maybeAttachLegacyProxyContextResponse(legacyCookieResponse, requestHost, legacyCookieRoute.nodeName, env);
+				return this.httpService.buildCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
 			}
-		}
-		return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
-	}
+
+	#buildTrailingSlashRedirectResponse(request, normalizedPathname) {
+				const redirectUrl = new URL(request.url);
+				redirectUrl.pathname = normalizedPathname + "/";
+				const headers = new Headers({
+					Location: redirectUrl.toString(),
+					"Cache-Control": "no-store"
+				});
+				applySecurityHeaders(headers);
+				const redirectStatus = request.method === "GET" || request.method === "HEAD" ? 301 : 307;
+				return new Response(null, {
+					status: redirectStatus,
+					headers
+				});
+			}
+
+	#buildCanonicalHostRedirectResponse(request, targetHost) {
+				const normalizedTargetHost = normalizeHostnameText(targetHost);
+				if (!normalizedTargetHost) return null;
+				const redirectUrl = new URL(request.url);
+				redirectUrl.hostname = normalizedTargetHost;
+				const headers = new Headers({
+					Location: redirectUrl.toString(),
+					"Cache-Control": "no-store"
+				});
+				applySecurityHeaders(headers);
+				return new Response(null, {
+					status: 301,
+					headers
+				});
+			}
+
+	#appendSetCookieHeader(response, setCookieValue = "") {
+				const normalizedSetCookieValue = String(setCookieValue || "").trim();
+				if (!response || !normalizedSetCookieValue || response.status === 101) return response;
+				const headers = new Headers(response.headers || {});
+				headers.append("Set-Cookie", normalizedSetCookieValue);
+				return new Response(response.body, {
+					status: response.status,
+					statusText: response.statusText,
+					headers
+				});
+			}
+
+	#buildLegacyProxyContextNotFoundResponse(request, env) {
+				const response = this.#buildRouteCorsResponse(request, env, "Not Found", 404);
+				return this.#appendSetCookieHeader(response, buildLegacyProxyContextClearCookie());
+			}
+
+	async #maybeAttachLegacyProxyContextResponse(response, requestHost, nodeName, env) {
+				if (!response || response.status === 101) return response;
+				const cookieValue = await buildLegacyProxyContextCookieValue(nodeName, requestHost, env);
+				if (!cookieValue) return response;
+				return this.#appendSetCookieHeader(response, buildLegacyProxyContextSetCookie(cookieValue));
+			}
+
+	#isPlaybackCriticalRouteContext(routeContext) {
+				const segments = routeContext.segments;
+				if (segments.length <= 1) return false;
+				if (this.httpService.isPlaybackCriticalSegments(segments, 1)) return true;
+				if (segments.length <= 2) return false;
+				return this.httpService.isPlaybackCriticalSegments(segments, 2);
+			}
+
+	async #resolveProxyRouteContext(routeContext, env, ctx, request) {
+				if (!routeContext.root) return null;
+				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
+				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(routeContext.root, env) : null;
+				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(routeContext.root, env, ctx);
+				if (!nodeData) return null;
+				if (isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const secret = nodeData.secret;
+				const routePrefix = buildProxyPrefix(routeContext.root, secret);
+				const rootPrefixLen = 1 + routeContext.rootRaw.length;
+				const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
+				const pathNormalizationState = tryNormalizeEmbeddedSameOriginPlaybackProxyPath(rawPathAfterRoot, routeContext.requestUrl, routePrefix);
+				const normalizedPathAfterRoot = pathNormalizationState?.normalizedPath || rawPathAfterRoot;
+				const normalizedPathname = `/${routeContext.rootRaw}${normalizedPathAfterRoot === "/" ? "/" : normalizedPathAfterRoot}`;
+				const normalizedSegments = pathNormalizationState ? normalizedPathname.split("/").filter(Boolean) : routeContext.segments;
+				let prefixLen = rootPrefixLen;
+				if (secret) {
+					const secretRaw = normalizedSegments[1] || "";
+					if (safeDecodeSegment(secretRaw) !== secret) return null;
+					prefixLen += 1 + secretRaw.length;
+				}
+				const normalizedRemainingInput = normalizedPathname.substring(prefixLen);
+				const normalizedRequestUrl = pathNormalizationState ? (() => {
+					const nextUrl = new URL(routeContext.requestUrl.toString());
+					nextUrl.pathname = normalizedPathname;
+					return nextUrl;
+				})() : routeContext.requestUrl;
+				const linkVariantState = consumeProxyLinkVariantPrefix(normalizedRemainingInput);
+				let remaining = linkVariantState.remaining;
+				if (normalizedRemainingInput === "" && !normalizedRequestUrl.pathname.endsWith("/") || linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, normalizedPathname) };
+				if (remaining === "") remaining = "/";
+				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(routeContext.root, nodeData, env);
+				return {
+					nodeData,
+					secret,
+					remaining: sanitizeProxyPath(remaining),
+					linkVariant: linkVariantState.linkVariant,
+					requestUrl: normalizedRequestUrl,
+					pathNormalizationState,
+					playbackRouteHotSnapshot,
+					targetHotCacheState,
+					entryMode: "kv_route"
+				};
+			}
+
+	#isHostPrefixPlaybackCriticalRouteContext(routeContext) {
+				if (!routeContext) return false;
+				return isPlaybackCriticalProxyPath(consumeProxyLinkVariantPrefix(routeContext.normalizedPathname)?.remaining || "/");
+			}
+
+	async #resolveHostPrefixProxyRouteContext(routeContext, env, ctx, request) {
+				const hostPrefixMatch = routeContext?.hostPrefixMatch;
+				if (!hostPrefixMatch?.prefix) return null;
+				const nodeName = hostPrefixMatch.prefix;
+				const playbackHotEligible = this.#isHostPrefixPlaybackCriticalRouteContext(routeContext);
+				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
+				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
+				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const linkVariantState = consumeProxyLinkVariantPrefix(routeContext.normalizedPathname);
+				let remaining = linkVariantState.remaining;
+				if (linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, routeContext.normalizedPathname) };
+				if (remaining === "") remaining = "/";
+				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
+				return {
+					nodeData,
+					secret: "",
+					remaining: sanitizeProxyPath(remaining),
+					linkVariant: linkVariantState.linkVariant,
+					requestUrl: routeContext.requestUrl,
+					playbackRouteHotSnapshot,
+					targetHotCacheState,
+					entryMode: "host_prefix"
+				};
+			}
+
+	#isHostPrefixPathCompatHostRequest(routeContext) {
+				const requestHost = routeContext?.requestHost || "";
+				const configuredHost = routeContext?.configuredHost || "";
+				const configuredLegacyHost = routeContext?.configuredLegacyHost || "";
+				if (!requestHost) return false;
+				if (configuredHost && requestHost === configuredHost) return true;
+				return !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
+			}
+
+	async #resolveHostPrefixPathCompatRouteContext(routeContext, env, ctx, request, options = {}) {
+				if (!this.#isHostPrefixPathCompatHostRequest(routeContext) || !routeContext?.root) return null;
+				const nodeName = routeContext.root;
+				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
+				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
+				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
+				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const routePrefix = buildProxyPrefix(nodeName, "", { entryMode: "kv_route" });
+				const rootPrefixLen = 1 + routeContext.rootRaw.length;
+				const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
+				const pathNormalizationState = tryNormalizeEmbeddedSameOriginPlaybackProxyPath(rawPathAfterRoot, routeContext.requestUrl, routePrefix);
+				const normalizedPathAfterRoot = pathNormalizationState?.normalizedPath || rawPathAfterRoot;
+				const normalizedPathname = `/${routeContext.rootRaw}${normalizedPathAfterRoot === "/" ? "/" : normalizedPathAfterRoot}`;
+				const normalizedRemainingInput = normalizedPathname.substring(rootPrefixLen);
+				const normalizedRequestUrl = pathNormalizationState ? (() => {
+					const nextUrl = new URL(routeContext.requestUrl.toString());
+					nextUrl.pathname = normalizedPathname;
+					return nextUrl;
+				})() : routeContext.requestUrl;
+				const linkVariantState = consumeProxyLinkVariantPrefix(normalizedRemainingInput);
+				let remaining = linkVariantState.remaining;
+				if (normalizedRemainingInput === "" && !normalizedRequestUrl.pathname.endsWith("/") || linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, normalizedPathname) };
+				if (remaining === "") remaining = "/";
+				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
+				return {
+					nodeData,
+					nodeName,
+					secret: "",
+					remaining: sanitizeProxyPath(remaining),
+					linkVariant: linkVariantState.linkVariant,
+					requestUrl: normalizedRequestUrl,
+					pathNormalizationState,
+					playbackRouteHotSnapshot,
+					targetHotCacheState,
+					entryMode: "kv_route",
+					routeKindOverride: options.isLegacyHostRequest === true ? "legacy_host_prefix_path_compat" : "host_prefix_path_compat",
+					attachLegacyProxyContext: options.isLegacyHostRequest === true
+				};
+			}
+
+	async #resolveLegacyHostCookieRouteContext(routeContext, env, ctx, request) {
+				if (!isLegacyProxyContextFallbackPath(routeContext?.normalizedPathname)) return null;
+				const cookieHeader = request.headers.get("Cookie") || "";
+				const cookieValue = String(parseCookieHeader(cookieHeader).get("legacy_proxy_ctx") || "").trim();
+				if (!cookieValue) return null;
+				const parsedContext = await parseLegacyProxyContextCookieValue(cookieValue, env, { requestHost: routeContext.requestHost });
+				if (parsedContext?.ok !== true) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
+				const nodeName = String(parsedContext.payload?.node || "").trim().toLowerCase();
+				if (!nodeName) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
+				const playbackHotEligible = isPlaybackCriticalProxyPath(routeContext.normalizedPathname);
+				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
+				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
+				if (!nodeData) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
+				const hostPrefixCompat = isHostPrefixEntryMode(nodeData?.entryMode);
+				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
+				return {
+					nodeData,
+					nodeName,
+					secret: hostPrefixCompat ? "" : nodeData.secret,
+					remaining: routeContext.normalizedPathname,
+					linkVariant: "main",
+					requestUrl: routeContext.requestUrl,
+					playbackRouteHotSnapshot,
+					targetHotCacheState,
+					entryMode: "kv_route",
+					routeKindOverride: hostPrefixCompat ? "legacy_host_context_cookie_host_prefix_compat" : "legacy_host_context_cookie"
+				};
+			}
+
+	async handle(request, env, ctx, routeContext) {
+				if (!routeContext) throw new TypeError("NodeProxyFacade.handle requires routeContext");
+				const { requestHost, configuredHost, configuredLegacyHost } = routeContext;
+				const runtimeConfig = await this.configReader.getRuntimeConfig(env);
+				const isLegacyHostRequest = !!(configuredLegacyHost && configuredLegacyHost !== configuredHost && requestHost === configuredLegacyHost);
+				const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true && !!configuredHost && !isLegacyHostRequest;
+				routeContext.hostPrefixMatch = hostPrefixProxyActive ? resolveHostPrefixMatch(requestHost, configuredHost) : null;
+				const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
+				if (routeContext.hostPrefixMatch) {
+					const hostPrefixRoute = await this.#resolveHostPrefixProxyRouteContext(routeContext, env, ctx, request);
+					if (hostPrefixRoute?.response) return hostPrefixRoute.response;
+					if (hostPrefixRoute?.nodeData) return this.proxyApi.handle(request, hostPrefixRoute.nodeData, hostPrefixRoute.remaining, routeContext.hostPrefixMatch.prefix, hostPrefixRoute.secret, env, ctx, {
+						requestUrl: hostPrefixRoute.requestUrl || routeContext.requestUrl,
+						linkVariant: hostPrefixRoute.linkVariant,
+						targetHotCacheState: hostPrefixRoute.targetHotCacheState,
+						cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords : null,
+						nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+						runtimeConfig,
+						runtimeRouteContext: routeContext,
+						entryMode: hostPrefixRoute.entryMode
+					});
+					return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
+				}
+				if (isConfiguredHostSubdomain) return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
+				const hostPrefixCompatRoute = await this.#resolveHostPrefixPathCompatRouteContext(routeContext, env, ctx, request, { isLegacyHostRequest });
+				if (hostPrefixCompatRoute?.response) return hostPrefixCompatRoute.response;
+				if (hostPrefixCompatRoute?.nodeData) {
+					const hostPrefixCompatResponse = await this.proxyApi.handle(request, hostPrefixCompatRoute.nodeData, hostPrefixCompatRoute.remaining, hostPrefixCompatRoute.nodeName, hostPrefixCompatRoute.secret, env, ctx, {
+						requestUrl: hostPrefixCompatRoute.requestUrl || routeContext.requestUrl,
+						linkVariant: hostPrefixCompatRoute.linkVariant,
+						pathNormalizationState: hostPrefixCompatRoute.pathNormalizationState,
+						targetHotCacheState: hostPrefixCompatRoute.targetHotCacheState,
+						cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords : null,
+						nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+						runtimeConfig,
+						runtimeRouteContext: routeContext,
+						entryMode: hostPrefixCompatRoute.entryMode,
+						routeKindOverride: hostPrefixCompatRoute.routeKindOverride
+					});
+					return hostPrefixCompatRoute.attachLegacyProxyContext === true ? await this.#maybeAttachLegacyProxyContextResponse(hostPrefixCompatResponse, requestHost, hostPrefixCompatRoute.nodeName, env) : hostPrefixCompatResponse;
+				}
+				const proxyRoute = await this.#resolveProxyRouteContext(routeContext, env, ctx, request);
+				if (proxyRoute?.response) return proxyRoute.response;
+				if (proxyRoute?.nodeData) {
+					const proxyResponse = await this.proxyApi.handle(request, proxyRoute.nodeData, proxyRoute.remaining, routeContext.root, proxyRoute.secret, env, ctx, {
+						requestUrl: proxyRoute.requestUrl || routeContext.requestUrl,
+						linkVariant: proxyRoute.linkVariant,
+						pathNormalizationState: proxyRoute.pathNormalizationState,
+						targetHotCacheState: proxyRoute.targetHotCacheState,
+						cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords) ? proxyRoute.playbackRouteHotSnapshot.targetRecords : null,
+						nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+						runtimeConfig,
+						runtimeRouteContext: routeContext,
+						entryMode: proxyRoute.entryMode
+					});
+					return isLegacyHostRequest ? await this.#maybeAttachLegacyProxyContextResponse(proxyResponse, requestHost, routeContext.root, env) : proxyResponse;
+				}
+				if (isLegacyHostRequest && isLegacyProxyContextFallbackPath(routeContext.normalizedPathname)) {
+					const legacyCookieRoute = await this.#resolveLegacyHostCookieRouteContext(routeContext, env, ctx, request);
+					if (legacyCookieRoute?.response) return legacyCookieRoute.response;
+					if (legacyCookieRoute?.nodeData) {
+						const legacyCookieResponse = await this.proxyApi.handle(request, legacyCookieRoute.nodeData, legacyCookieRoute.remaining, legacyCookieRoute.nodeName, legacyCookieRoute.secret, env, ctx, {
+							requestUrl: legacyCookieRoute.requestUrl || routeContext.requestUrl,
+							linkVariant: legacyCookieRoute.linkVariant,
+							targetHotCacheState: legacyCookieRoute.targetHotCacheState,
+							cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords) ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords : null,
+							nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
+							runtimeConfig,
+							runtimeRouteContext: routeContext,
+							entryMode: legacyCookieRoute.entryMode,
+							routeKindOverride: legacyCookieRoute.routeKindOverride
+						});
+						return this.#maybeAttachLegacyProxyContextResponse(legacyCookieResponse, requestHost, legacyCookieRoute.nodeName, env);
+					}
+				}
+				return this.#buildRouteCorsResponse(request, env, "Not Found", 404);
+			}
 };
+//#endregion
+//#region worker/features/maintenance/api.js
+
+//#endregion
+//#region worker/runtime/application-facades.js
 /**
 * The management console is one operator workflow: authenticate, render the
 * console and execute its declared actions.  Its implementation deliberately
 * stays behind this class instead of leaking a generic operation bag to the
 * runtime entry.
 */
+
 function buildDnsWorkflowServices(kernel) {
 	return Object.freeze({
 		persistCloudflareDnsRecordsForHost(options) {
@@ -30588,50 +30967,44 @@ function buildDnsWorkflowServices(kernel) {
 }
 function attachApplicationServices(kernel, services) {
 	const shellService = services.shellService;
-	const serviceGroups = [
-		defineDatabaseAdminMethods({
-			kernel,
-			bindingPort: kernel,
-			CacheManager: services.cacheManager,
-			LogQueryPlanner: services.logQueryPlanner,
-			Logger: services.logger,
-			requestModel: kernel,
-			buildAdminLocalIndexUploadRecord: shellService.buildAdminLocalIndexUploadRecord,
-			buildAdminShellState: shellService.buildAdminShellState,
-			buildAdminUiContract: shellService.buildAdminUiContract,
-			buildDnsIpPoolWorkspacePreviewItems: services.dns.buildDnsIpPoolWorkspacePreviewItems,
-			buildDnsIpWorkspaceItems: services.dns.buildDnsIpWorkspaceItems,
-			persistCloudflareDnsRecordsForHost: services.dns.persistCloudflareDnsRecordsForHost,
-			releaseDnsIpPoolFetchRefreshLock: services.dns.releaseDnsIpPoolFetchRefreshLock,
-			runDnsIpPoolSourcesLiveRefresh: services.dns.runDnsIpPoolSourcesLiveRefresh,
-			tryAcquireDnsIpPoolFetchRefreshLock: services.dns.tryAcquireDnsIpPoolFetchRefreshLock,
-			withAdminShellRuntimeStatus: shellService.withAdminShellRuntimeStatus
-		}),
-		defineDatabaseMaintenanceMethods({
-			D1TidyExecutor: services.d1TidyExecutor,
-			D1TidyPlanner: services.d1TidyPlanner,
-			Logger: services.logger,
-			buildAdminReleaseVendorManifest: shellService.buildAdminReleaseVendorManifest,
-			normalizeAdminReleaseVendorManifestRecord: shellService.normalizeAdminReleaseVendorManifestRecord,
-			validateAdminShellHtmlSource: shellService.validateAdminShellHtmlSource
-		}, kernel),
-		defineDatabaseNodeServiceMethods({
-			CacheManager: services.cacheManager,
-			persistCloudflareDnsRecordsForHost: services.dns.persistCloudflareDnsRecordsForHost
-		}, kernel),
-		defineDatabaseStatusMethods({
-			bindingPort: kernel,
-			schemaReadinessPort: kernel,
-			statusPersistence: kernel
-		}),
-		defineDatabaseAnalyticsMethods({
-			CacheManager: services.cacheManager,
-			withAdminShellRuntimeStatus: shellService.withAdminShellRuntimeStatus
-		}, kernel),
-		defineDatabaseSchemaMethods({}, kernel),
-		defineDatabaseNodeKvMethods({}, kernel)
-	];
-	for (const group of serviceGroups) for (const [name, value] of Object.entries(group)) kernel[name] = value;
+	const serviceGroups = [defineDatabaseAdminMethods({
+		kernel,
+		bindingPort: kernel,
+		CacheManager: services.cacheManager,
+		LogQueryPlanner: services.logQueryPlanner,
+		Logger: services.logger,
+		requestModel: kernel,
+		buildAdminLocalIndexUploadRecord: shellService.buildAdminLocalIndexUploadRecord,
+		buildAdminShellState: shellService.buildAdminShellState,
+		buildAdminUiContract: shellService.buildAdminUiContract,
+		buildDnsIpPoolWorkspacePreviewItems: services.dns.buildDnsIpPoolWorkspacePreviewItems,
+		buildDnsIpWorkspaceItems: services.dns.buildDnsIpWorkspaceItems,
+		persistCloudflareDnsRecordsForHost: services.dns.persistCloudflareDnsRecordsForHost,
+		releaseDnsIpPoolFetchRefreshLock: services.dns.releaseDnsIpPoolFetchRefreshLock,
+		runDnsIpPoolSourcesLiveRefresh: services.dns.runDnsIpPoolSourcesLiveRefresh,
+		tryAcquireDnsIpPoolFetchRefreshLock: services.dns.tryAcquireDnsIpPoolFetchRefreshLock,
+		withAdminShellRuntimeStatus: shellService.withAdminShellRuntimeStatus
+	}), defineDatabaseMaintenanceMethods({
+		D1TidyExecutor: services.d1TidyExecutor,
+		D1TidyPlanner: services.d1TidyPlanner,
+		Logger: services.logger,
+		buildAdminReleaseVendorManifest: shellService.buildAdminReleaseVendorManifest,
+		normalizeAdminReleaseVendorManifestRecord: shellService.normalizeAdminReleaseVendorManifestRecord,
+		validateAdminShellHtmlSource: shellService.validateAdminShellHtmlSource
+	}, kernel), defineDatabaseNodeServiceMethods({
+		CacheManager: services.cacheManager,
+		persistCloudflareDnsRecordsForHost: services.dns.persistCloudflareDnsRecordsForHost
+	}, kernel), defineDatabaseStatusMethods({
+		bindingPort: kernel,
+		schemaReadinessPort: kernel,
+		statusPersistence: kernel
+	}), defineDatabaseAnalyticsMethods({
+		CacheManager: services.cacheManager,
+		withAdminShellRuntimeStatus: shellService.withAdminShellRuntimeStatus
+	}, kernel), defineDatabaseSchemaMethods({}, kernel), defineDatabaseNodeKvMethods({}, kernel)];
+	for (const group of serviceGroups) {
+		for (const [name, value] of Object.entries(group)) kernel[name] = value;
+	}
 	return kernel;
 }
 /**
@@ -30678,7 +31051,7 @@ function createWorkerApplication({ includeTestingSupport = false } = {}) {
 			isPlaybackCriticalSegments: shellService.isPlaybackCriticalSegments
 		}),
 		nodeRouteReader: kernel,
-		proxyApi
+		proxyApi,
 	});
 	const scheduledMaintenance = new ScheduledMaintenanceFacade({
 		logger,
@@ -30718,60 +31091,147 @@ function createWorkerApplication({ includeTestingSupport = false } = {}) {
 		};
 	};
 	const isPotentialAdminWorkflowRoute = (routeContext, requestMethod) => {
-		if ((requestMethod === "GET" || requestMethod === "HEAD") && routeContext.pathnameLower === "/favicon.ico") return true;
+		const isGetOrHead = requestMethod === "GET" || requestMethod === "HEAD";
+		if (isGetOrHead && routeContext.pathnameLower === "/favicon.ico") return true;
 		if (requestMethod === "GET" && routeContext.normalizedPathname === "/") return true;
 		if (pathnameMatchesPrefix(routeContext.pathnameLower, routeContext.adminPathLower)) return true;
 		if (pathnameMatchesExactOrTrailingSlash(routeContext.pathnameLower, routeContext.adminLoginPathLower)) return true;
-		return routeContext.adminPathLower === "/admin" && routeContext.pathnameLower === "/api/auth/login" && routeContext.root === "api" && routeContext.segments[1] === "auth" && routeContext.segments[2] === "login";
+		return routeContext.adminPathLower === "/admin"
+			&& routeContext.pathnameLower === "/api/auth/login"
+			&& routeContext.root === "api"
+			&& routeContext.segments[1] === "auth"
+			&& routeContext.segments[2] === "login";
 	};
+	const workerHandler = Object.freeze({
+		async fetch(request, env, ctx) {
+			const routeContext = buildNodeRouteContext(request, env);
+			const requestMethod = request.method;
+			const isFaviconRoute = (requestMethod === "GET" || requestMethod === "HEAD")
+				&& routeContext.pathnameLower === "/favicon.ico";
+			if (!isFaviconRoute) {
+				const runtimeConfig = await configReader.getRuntimeConfig(env);
+				const isLegacyHostRequest = !!(
+					routeContext.configuredLegacyHost
+					&& routeContext.configuredLegacyHost !== routeContext.configuredHost
+					&& routeContext.requestHost === routeContext.configuredLegacyHost
+				);
+				const hostPrefixProxyActive = runtimeConfig.enableHostPrefixProxy === true
+					&& !!routeContext.configuredHost
+					&& !isLegacyHostRequest;
+				const isConfiguredHostSubdomain = hostPrefixProxyActive
+					&& routeContext.requestHost !== routeContext.configuredHost
+					&& routeContext.requestHost.endsWith(`.${routeContext.configuredHost}`);
+				if (isConfiguredHostSubdomain) return nodeProxy.handle(request, env, ctx, routeContext);
+			}
+			if (isPotentialAdminWorkflowRoute(routeContext, requestMethod)) {
+				const adminResponse = await adminConsole.handle(request, env, ctx);
+				if (adminResponse) return adminResponse;
+			}
+			return nodeProxy.handle(request, env, ctx, routeContext);
+		},
+		scheduled(event, env, ctx) {
+			return scheduledMaintenance.handle(event, env, ctx);
+		}
+	});
 	const application = {
 		adminConsole,
 		nodeProxy,
 		scheduledMaintenance,
-		workerHandler: Object.freeze({
-			async fetch(request, env, ctx) {
-				const routeContext = buildNodeRouteContext(request, env);
-				const requestMethod = request.method;
-				if (!((requestMethod === "GET" || requestMethod === "HEAD") && routeContext.pathnameLower === "/favicon.ico")) {
-					const runtimeConfig = await configReader.getRuntimeConfig(env);
-					const isLegacyHostRequest = !!(routeContext.configuredLegacyHost && routeContext.configuredLegacyHost !== routeContext.configuredHost && routeContext.requestHost === routeContext.configuredLegacyHost);
-					if (runtimeConfig.enableHostPrefixProxy === true && !!routeContext.configuredHost && !isLegacyHostRequest && routeContext.requestHost !== routeContext.configuredHost && routeContext.requestHost.endsWith(`.${routeContext.configuredHost}`)) return nodeProxy.handle(request, env, ctx, routeContext);
-				}
-				if (isPotentialAdminWorkflowRoute(routeContext, requestMethod)) {
-					const adminResponse = await adminConsole.handle(request, env, ctx);
-					if (adminResponse) return adminResponse;
-				}
-				return nodeProxy.handle(request, env, ctx, routeContext);
-			},
-			scheduled(event, env, ctx) {
-				return scheduledMaintenance.handle(event, env, ctx);
-			}
-		})
+		workerHandler
 	};
-	if (includeTestingSupport === true) application.testingSupport = Object.freeze({
-		cacheManager,
-		kernel,
-		logger,
-		shellService,
-		buildNodeRouteContext,
-		buildRouteCorsResponse(request, env, body, status = 200) {
-			return shellService.buildEdgeCorsResponse(getCorsHeadersForResponse(env, request), body, status, { mergeOriginVary: true });
-		},
-		isPlaybackCriticalRouteContext(routeContext) {
-			const segments = Array.isArray(routeContext?.segments) ? routeContext.segments : [];
-			if (segments.length <= 1) return false;
-			if (shellService.isPlaybackCriticalSegments(segments, 1)) return true;
-			return segments.length > 2 && shellService.isPlaybackCriticalSegments(segments, 2);
-		},
-		buildMediaAggregationSourceId,
-		isolateState,
-		mediaAggregationProviderIdsMatch,
-		proxyService: proxyApi.testingSupport
-	});
+	if (includeTestingSupport === true) {
+		application.testingSupport = Object.freeze({
+			cacheManager,
+			kernel,
+			logger,
+			shellService,
+			buildNodeRouteContext,
+			buildRouteCorsResponse(request, env, body, status = 200) {
+				return shellService.buildEdgeCorsResponse(
+					getCorsHeadersForResponse(env, request),
+					body,
+					status,
+					{ mergeOriginVary: true }
+				);
+			},
+			isPlaybackCriticalRouteContext(routeContext) {
+				const segments = Array.isArray(routeContext?.segments) ? routeContext.segments : [];
+				if (segments.length <= 1) return false;
+				if (shellService.isPlaybackCriticalSegments(segments, 1)) return true;
+				return segments.length > 2 && shellService.isPlaybackCriticalSegments(segments, 2);
+			},
+			buildMediaAggregationSourceId,
+			isolateState,
+			mediaAggregationProviderIdsMatch,
+			proxyService: proxyApi.testingSupport
+		});
+	}
 	return Object.freeze(application);
 }
 //#endregion
-//#region worker/index.js
-var { workerHandler } = createWorkerApplication();
-//#endregion
-export { workerHandler as default };
+
+export {
+  AdminConsoleFacade,
+  Config,
+  NodeProxyFacade,
+  ScheduledMaintenanceFacade,
+  buildCanonicalWorkerMetadataCacheKey,
+  buildDailyTelegramSummaryMessage,
+  buildDnsIpWorkspaceSummary,
+  buildFastSegmentUpstreamUrlText,
+  buildMediaAggregationIdentity,
+  buildMediaAggregationMatchFingerprintHash,
+  buildMediaAggregationSourceId,
+  buildMediaAggregationSourceIdV2,
+  buildPosterBrowserConfig,
+  buildProbeUpstreamUrl,
+  buildProxyAccessRuleProfile,
+  buildResolvedAdminIndexState,
+  buildServerRecordExpiry,
+  buildServerRecordPosterMetadata,
+  buildUpstreamProxyUrl,
+  buildWorkerMetadataCacheIdentityPartition,
+  buildWorkerMetadataCacheLookupRequest,
+  buildWorkerMetadataCachePolicyRevision,
+  buildWorkerMetadataPrewarmIdentityPartition,
+  cacheState,
+  defineAnalyticsCacheMethods,
+  defineDatabaseStatusMethods,
+  defineKvTidyMethods,
+  defineNodeRepositoryMethods,
+  defineNodeProxyKernel,
+  defineSchemaInspectionMethods,
+  defineSnapshotMethods,
+  createTargetRecord,
+  createWorkerApplication,
+  databaseReadinessState,
+  fetchRequest,
+  getDueScheduledClockSlots,
+  getRuntimeConfig,
+  hasConfiguredMediaAggregationNodeCredentials,
+  hasWorkerMetadataPrivateIdentity,
+  invalidateNodesRevisionCache,
+  invalidateRuntimeConfigCache,
+  isEmbyWebProxyPath,
+  isTargetRecord,
+  isolateState,
+  matchMediaAggregationIdentities,
+  mediaAggregationProviderIdsMatch,
+  normalizeMediaAggregationProviderIds,
+  normalizeMediaAggregationTitle,
+  normalizePosterBrowserOrigin,
+  normalizeTmdbBrowserToken,
+  parseMediaAggregationSourceId,
+  readMediaAggregationCredentialPair,
+  resolveEffectiveRoutingDecisionMode,
+  resolveMediaAggregationCredentials,
+  resolvePlaybackInfoRewriteUrlMode,
+  resolveRoutingDecisionMode,
+  runSingleFlight,
+  runWithConcurrency,
+  runtimeState,
+  sanitizeRuntimeConfig,
+  serializeBoundedLogDetailJson,
+  shouldUseSegmentFastUpstreamBuilder,
+  verifyMediaAggregationSourceSignature
+};
