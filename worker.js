@@ -5553,13 +5553,23 @@ function extractPlaybackInfoItemPathState(proxyPath = "") {
 }
 function extractUserItemDetailsPathState(proxyPath = "") {
 	const normalizedPath = sanitizeProxyPath(proxyPath);
-	const match = /^(?:.*\/)?(?:users\/[^/]+\/)?items\/([^/]+)\/?$/i.exec(normalizedPath);
-	if (!match) return { itemId: "" };
-	let itemId = String(match[1] || "").trim();
+	const match = /^(?:.*\/)?users\/([^/]+)\/items\/([^/]+)\/?$/i.exec(normalizedPath);
+	if (!match) return {
+		userId: "",
+		itemId: ""
+	};
+	let userId = String(match[1] || "").trim();
+	let itemId = String(match[2] || "").trim();
+	try {
+		userId = decodeURIComponent(userId);
+	} catch {}
 	try {
 		itemId = decodeURIComponent(itemId);
 	} catch {}
-	return { itemId: itemId.trim().slice(0, 256) };
+	return {
+		userId: userId.trim().slice(0, 256),
+		itemId: itemId.trim().slice(0, 256)
+	};
 }
 function resolveMediaAggregationApiPrefix(proxyPath = "") {
 	const normalizedPath = sanitizeProxyPath(proxyPath);
@@ -19553,10 +19563,7 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 					proxiedExternalRedirect: finalUpstreamState.proxiedExternalRedirect === true
 				}));
 			}
-			if (execution.requestTraits.isPlaybackInfoRequest === true) {
-				kernel.recordServerRecordPlaybackInfoIntent(execution, transport, finalStatus);
-				await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
-			}
+			if (execution.requestTraits.isPlaybackInfoRequest === true) await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
 			kernel.observeServerRecordPlaybackItemDetails(execution, finalUpstreamState.response);
 			await kernel.maybePrewarmMetadataResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
 				proxyPath: execution.proxyPath,
@@ -20033,7 +20040,6 @@ function defineProxyHandlerDeliveryMethods(dependencies = {}, kernel = {}) {
 					effectiveRealClientIpMode: execution.effectiveRealClientIpMode,
 					effectiveMediaAuthMode: execution.effectiveMediaAuthMode
 				});
-				kernel.scheduleServerWatchLifecycle(execution, transport);
 				const aggregationRoute = await kernel.resolveMediaAggregationPlaybackRoute(execution, transport);
 				if (aggregationRoute) {
 					execution = aggregationRoute.execution;
@@ -21949,6 +21955,7 @@ function definePlaybackAggregationRewriteMethods(dependencies = {}, kernel = {})
 			const rewriteEnabled = normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) === "rewrite";
 			const bypassState = rewriteEnabled ? "not_needed" : "passthrough";
 			const response = upstreamState?.response;
+			kernel.recordServerRecordPlaybackInfoIntent(execution, null, Number(response?.status) || 0);
 			if (!response || !(response.status >= 200 && response.status < 300)) {
 				execution.playbackInfoRewrite = bypassState;
 				return upstreamState;
@@ -22682,16 +22689,12 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 		recordServerRecordPlaybackInfoIntent(execution, transport = null, responseStatus = 200) {
 			const status = Number(responseStatus) || 0;
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true || String(execution?.requestMethod || "").toUpperCase() !== "POST" || status < 200 || status >= 300 || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
-			const isPlayback = [...execution?.requestUrl?.searchParams?.entries?.() || []].some(([key, value]) => String(key || "").trim().toLowerCase() === "isplayback" && String(value || "").trim().toLowerCase() === "true");
-			const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim().slice(0, 256);
-			if (!isPlayback || !itemId) return false;
+			if (![...execution?.requestUrl?.searchParams?.entries?.() || []].some(([key, value]) => String(key || "").trim().toLowerCase() === "isplayback" && String(value || "").trim().toLowerCase() === "true") || !String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim()) return false;
+			execution.serverRecordPlaybackInfoIntent = { observedAt: nowMs() };
 			return kernel.updateServerRecordPlaybackContexts(execution, transport, (existing, now) => {
-				const details = existing?.details && String(existing.details.itemId || "") === itemId ? existing.details : null;
+				const details = existing?.details || null;
 				return {
-					intent: {
-						itemId,
-						observedAt: now
-					},
+					intent: { observedAt: now },
 					details,
 					verifiedMedia: details?.media || null
 				};
@@ -22704,10 +22707,13 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 			return buildServerRecordMediaMetadata(payload, expectedItemId, { allowMissingItemId: true });
 		},
 		observeServerRecordPlaybackInfoPayload(execution, payload = {}) {
-			if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+			if (!execution?.serverRecordPlaybackInfoIntent || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
 			const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim().slice(0, 256);
 			const media = kernel.buildServerRecordPlaybackInfoMedia(payload, itemId);
-			return !!media?.itemName && kernel.recordServerRecordPlaybackItemDetails(execution, media, "playback_info");
+			if (!media?.itemName || !kernel.recordServerRecordPlaybackItemDetails(execution, media, "playback_info")) return false;
+			const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
+			if (verification?.source !== "playback_info") return false;
+			return kernel.scheduleObservedServerRecordWatch(execution, verification.media, "playback_info");
 		},
 		recordServerRecordPlaybackItemDetails(execution, media = {}, source = "item_details") {
 			const itemId = String(media?.itemId || "").trim().slice(0, 256);
@@ -22721,11 +22727,11 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 					source: normalizedSource,
 					observedAt: now
 				};
-				const intent = existing?.intent && String(existing.intent.itemId || "") === itemId ? existing.intent : null;
+				const intent = existing?.intent || null;
 				return {
 					intent,
 					details,
-					verifiedMedia: intent ? details.media : null
+					verifiedMedia: normalizedSource === "item_details" || intent ? details.media : null
 				};
 			});
 		},
@@ -22738,40 +22744,56 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 			for (const contextKey of kernel.resolveServerRecordPlaybackContextKeys(execution, null)) {
 				const context = contexts.get(contextKey);
 				const media = context?.verifiedMedia;
-				const intentItemId = String(context?.intent?.itemId || "").trim();
 				const intentObservedAt = Number(context?.intent?.observedAt) || 0;
-				if (!media || !intentObservedAt || intentItemId !== String(media.itemId || "").trim() || expected && String(media.itemId || "") !== expected) continue;
+				const source = String(context?.details?.source || "").trim();
+				if (!media || source === "playback_info" && !intentObservedAt || expected && String(media.itemId || "") !== expected) continue;
 				touchMapEntry(contexts, contextKey);
 				return {
 					media: { ...media },
-					intentObservedAt
+					intentObservedAt,
+					source
 				};
 			}
 			return null;
 		},
-		async persistObservedServerRecordPosterMetadata(execution, media = {}) {
+		async persistObservedServerRecordWatch(execution, media = {}, source = "item_details") {
 			const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
 			const itemId = String(media?.itemId || "").trim().slice(0, 256);
 			const db = watchRepository.getDB(execution?.env);
 			if (!db || !nodeName || !itemId) return false;
 			const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
-			if (!verification) return false;
-			const [snapshots, lastWatchByNode] = await Promise.all([watchRepository.getServerRecordSnapshots(db, [nodeName]), watchRepository.getServerLastWatch(db, [nodeName])]);
-			const lastItem = snapshots.get(nodeName)?.lastItem || {};
-			const watchedAt = String(lastItem.watchedAt || "").trim();
-			const lastWatchedAt = String(lastWatchByNode.get(nodeName)?.lastWatchedAt || "").trim();
-			const watchedAtMs = Date.parse(watchedAt);
-			if (String(lastItem.itemId || "").trim() !== itemId || !Number.isFinite(watchedAtMs) || watchedAtMs < verification.intentObservedAt || !areServerRecordWatchTimesCompatible(watchedAt, lastWatchedAt)) return false;
-			return await watchRepository.persistServerRecordPosterSearchMetadata(db, {
-				nodeName,
-				itemId,
-				watchedAt
-			}, media);
+			if (!verification || verification.source !== source) return false;
+			const requestStartedAt = Number(execution?.startTime);
+			const watchedAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
+			return await watchRepository.upsertServerLastWatch(db, nodeName, new Date(watchedAtMs).toISOString(), media);
+		},
+		scheduleObservedServerRecordWatch(execution, media = {}, source = "item_details") {
+			if (!execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
+			const task = kernel.persistObservedServerRecordWatch(execution, media, source).catch((error) => {
+				console.error("server record observed media write failed", error);
+				return false;
+			});
+			execution.ctx.waitUntil(task);
+			return true;
 		},
 		observeServerRecordPlaybackItemDetails(execution, response) {
 			if (String(execution?.requestMethod || "").toUpperCase() !== "GET" || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true || !(Number(response?.status) >= 200 && Number(response?.status) < 300) || !String(response?.headers?.get?.("Content-Type") || "").toLowerCase().includes("json") || !execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
-			const itemId = String(extractUserItemDetailsPathState(execution?.proxyPath || "").itemId || "").trim();
-			if (!itemId || !kernel.resolveServerRecordPlaybackContextKeys(execution).length) return false;
+			const pathState = extractUserItemDetailsPathState(execution?.proxyPath || "");
+			const itemId = String(pathState.itemId || "").trim();
+			const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
+			const queryValue = (name) => {
+				for (const [key, value] of requestUrl?.searchParams?.entries?.() || []) if (String(key || "").trim().toLowerCase() === name.toLowerCase()) return String(value || "").trim();
+				return "";
+			};
+			const listHas = (value, required) => new Set(String(value || "").split(",").map((part) => part.trim().toLowerCase()).filter(Boolean)).has(required.toLowerCase());
+			const requestHeaders = execution?.request?.headers;
+			const hasAuthorization = [
+				"Authorization",
+				"X-Emby-Token",
+				"X-MediaBrowser-Token"
+			].some((name) => String(requestHeaders?.get?.(name) || "").trim());
+			const hasExpectedQuery = listHas(queryValue("EnableImageTypes"), "Primary") && queryValue("ImageTypeLimit") === "1" && listHas(queryValue("Fields"), "ProviderIds") && listHas(queryValue("Fields"), "ExternalUrls");
+			if (!pathState.userId || !itemId || !hasAuthorization || !hasExpectedQuery || !kernel.resolveServerRecordPlaybackContextKeys(execution).length) return false;
 			let responseCopy;
 			try {
 				responseCopy = response.clone();
@@ -22788,8 +22810,8 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 				}
 				const media = kernel.buildServerRecordPlaybackContextMedia(payload, itemId);
 				if (!media || !kernel.recordServerRecordPlaybackItemDetails(execution, media, "item_details")) return false;
-				const verifiedMedia = kernel.getServerRecordPlaybackContextMedia(execution, null, itemId);
-				return verifiedMedia ? await kernel.persistObservedServerRecordPosterMetadata(execution, verifiedMedia) : false;
+				const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
+				return verification?.source === "item_details" ? await kernel.persistObservedServerRecordWatch(execution, verification.media, "item_details") : false;
 			}).catch(() => false);
 			execution.ctx.waitUntil(task);
 			return true;

@@ -7,7 +7,7 @@
 ## 范围与边界
 
 - 只覆盖“服务器记录”卡片中的最近观看海报，不扩展到其他管理台页面或 Emby `/web`。
-- 播放透传优先被动解析同节点 Item 详情 JSON 响应中的 `Id`、`Name`、`Type`、`SeriesName`、`OriginalTitle`、`ProductionYear` 与 `ImageTags.Primary`；PlaybackInfo JSON 响应中的同名顶层字段作为次级证据。两类证据必须与节点、ItemId 和播放身份匹配后才能参与最近观看写入。
+- 最近观看主路径被动解析客户端已有的 `GET /Users/<UserId>/Items/<ItemId>`：请求必须携带包含 `Primary` 的 `EnableImageTypes`、`ImageTypeLimit=1`、包含 `ProviderIds,ExternalUrls` 的 `Fields` 及现有 Emby 授权头；成功 JSON 响应中的 `Id`、`Name`、`Type`、`SeriesName`、`OriginalTitle`、`ProductionYear` 与 `ImageTags.Primary` 直接更新最近观看。成功的 `POST /Items/<ItemId>/PlaybackInfo?IsPlayback=true` 只作为缺少该详情响应时的自包含保底；intent 不保存或跨请求关联 ItemId。`Playing`、`Progress` 与 `Stopped` 不更新服务器记录观看时间。
 - 用户显式执行单卡或全部刷新时，Worker 可以只为当前 ID-only 最近媒体补读一次同节点元数据：优先调用 HAR 已验证的用户 Item 详情接口，失败或缺少 `Name` 时回退 `/Items/<ItemId>/PlaybackInfo`。普通进入页面、scheduled 和普通读取仍不访问 Emby。
 - 卡片标题严格使用最终选定 JSON 响应中的 `Name` 原文，例如 `摩登家庭 - S01E01` 必须原样展示；`SeriesName` 只参与供应商海报搜索，不再与 `Name` 拼接成展示标题。
 - `ItemId` 只允许牵引同节点 Item 详情、PlaybackInfo、Primary 海报和缓存身份，不参与 TMDB/豆瓣搜索或候选匹配。年份缺失时允许按唯一名称和类型精确匹配。

@@ -2416,18 +2416,20 @@ test("server watch media extracts passive original titles and years", () => {
     }),
     requestTraits: { isPlaybackInfoRequest: true }
   }), true);
-  assert.equal([...isolateState.ServerRecordPlaybackContexts.values()][0]?.intent?.itemId.length, 256);
+  assert.equal([...isolateState.ServerRecordPlaybackContexts.values()][0]?.intent?.itemId, undefined);
+  assert.ok(Number.isFinite([...isolateState.ServerRecordPlaybackContexts.values()][0]?.intent?.observedAt));
   isolateState.ServerRecordPlaybackContexts.clear();
 
+  const detailUrl = "https://worker.test/Users/user-a/Items/episode-1?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&ImageTypeLimit=1&Fields=ProviderIds%2CExternalUrls&DeviceId=device-a";
   assert.equal(
     proxyService.observeServerRecordPlaybackItemDetails(
       {
         nodeName: "server-a",
         node: { serverRecord: { enabled: true } },
         requestMethod: "GET",
-        proxyPath: "/Items/episode-1",
-        requestUrl: new URL("https://worker.test/Items/episode-1?DeviceId=device-a"),
-        request: new Request("https://worker.test/Items/episode-1?DeviceId=device-a"),
+        proxyPath: "/Users/user-a/Items/episode-1",
+        requestUrl: new URL(detailUrl),
+        request: new Request(detailUrl, { headers: { "X-Emby-Token": "private-token", "X-Emby-Device-Id": "device-a" } }),
         ctx: { waitUntil() {} }
       },
       new Response(JSON.stringify({ Id: "episode-1", Name: "第 1 集" }), {
@@ -2518,49 +2520,67 @@ test("server record metadata recovery prefers HAR item details and falls back to
   }
 });
 
-test("HAR item details remain primary when PlaybackInfo JSON arrives later", () => {
+test("HAR item details remain primary when PlaybackInfo fallback arrives later", async () => {
+  const tasks = [];
+  const writes = [];
+  const originalUpsert = kernel.upsertServerLastWatch;
+  kernel.upsertServerLastWatch = async (_db, nodeName, watchedAt, media) => {
+    writes.push({ nodeName, watchedAt, media });
+    return true;
+  };
   isolateState.ServerRecordPlaybackContexts.clear();
   const execution = {
     nodeName: "nay",
     node: { serverRecord: { enabled: true } },
+    startTime: 123_456,
     requestMethod: "POST",
     proxyPath: "/Items/248122/PlaybackInfo",
     requestUrl: new URL("https://proxy.test/Items/248122/PlaybackInfo?IsPlayback=true&DeviceId=device-a"),
     request: new Request("https://proxy.test/Items/248122/PlaybackInfo?IsPlayback=true&DeviceId=device-a", { method: "POST" }),
-    requestTraits: { isPlaybackInfoRequest: true }
+    requestTraits: { isPlaybackInfoRequest: true },
+    env: { DB: {} },
+    ctx: { waitUntil(task) { tasks.push(task); } }
   };
-  assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(execution), true);
-  assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
-    Id: "248122",
-    Name: "PlaybackInfo fallback",
-    ImageTags: { Primary: "fallback-tag" }
-  }), true);
-  assert.equal(proxyService.getServerRecordPlaybackContextMedia(execution, null, "248122")?.itemName, "PlaybackInfo fallback");
+  try {
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(execution), true);
+    assert.equal(execution.serverRecordPlaybackInfoIntent.itemId, undefined);
+    assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
+      Id: "248122",
+      Name: "PlaybackInfo fallback",
+      ImageTags: { Primary: "fallback-tag" }
+    }), true);
+    await Promise.all(tasks.splice(0));
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].media.itemName, "PlaybackInfo fallback");
 
-  assert.equal(proxyService.recordServerRecordPlaybackItemDetails(execution, {
-    itemId: "248122",
-    itemName: "摩登家庭 - S01E01",
-    itemType: "Episode",
-    seriesName: "摩登家庭",
-    originalTitle: "Modern Family",
-    year: 2009,
-    imageTag: "har-primary-tag"
-  }, "item_details"), true);
-  assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
-    Id: "248122",
-    Name: "Late fallback must not replace detail",
-    ImageTags: { Primary: "late-fallback-tag" }
-  }), true);
-  assert.deepEqual(proxyService.getServerRecordPlaybackContextMedia(execution, null, "248122"), {
-    itemId: "248122",
-    itemName: "摩登家庭 - S01E01",
-    itemType: "Episode",
-    seriesName: "摩登家庭",
-    originalTitle: "Modern Family",
-    year: 2009,
-    imageTag: "har-primary-tag"
-  });
-  isolateState.ServerRecordPlaybackContexts.clear();
+    assert.equal(proxyService.recordServerRecordPlaybackItemDetails(execution, {
+      itemId: "248122",
+      itemName: "摩登家庭 - S01E01",
+      itemType: "Episode",
+      seriesName: "摩登家庭",
+      originalTitle: "Modern Family",
+      year: 2009,
+      imageTag: "har-primary-tag"
+    }, "item_details"), true);
+    assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
+      Id: "248122",
+      Name: "Late fallback must not replace detail",
+      ImageTags: { Primary: "late-fallback-tag" }
+    }), false);
+    assert.deepEqual(proxyService.getServerRecordPlaybackContextMedia(execution, null, "248122"), {
+      itemId: "248122",
+      itemName: "摩登家庭 - S01E01",
+      itemType: "Episode",
+      seriesName: "摩登家庭",
+      originalTitle: "Modern Family",
+      year: 2009,
+      imageTag: "har-primary-tag"
+    });
+    assert.equal(writes.length, 1);
+  } finally {
+    kernel.upsertServerLastWatch = originalUpsert;
+    isolateState.ServerRecordPlaybackContexts.clear();
+  }
 });
 
 
@@ -6232,15 +6252,14 @@ test("playback session keys are partitioned by node even when Emby session ids m
   assert.doesNotMatch(`${started.sessionIdentityFingerprint}:${started.sessionFingerprint}`, /private|device-1|movie-1/);
 });
 
-test("server record playback context requires matching PlaybackInfo and item details", async () => {
+test("server record watch prefers the authenticated HAR user-item response and uses PlaybackInfo only as fallback", async () => {
   const tasks = [];
   const writes = [];
-  const originalUpsert = kernel.upsertServerWatchLifecycle;
-  kernel.upsertServerWatchLifecycle = async (_db, event) => {
-    writes.push(event);
-    return { admitted: true, schemaVersion: 9 };
+  const originalUpsert = kernel.upsertServerLastWatch;
+  kernel.upsertServerLastWatch = async (_db, nodeName, watchedAt, media) => {
+    writes.push({ nodeName, watchedAt, media });
+    return true;
   };
-  isolateState.ServerRecordWatchSessions.clear();
   isolateState.ServerRecordPlaybackContexts.clear();
   const makeExecution = (nodeName, method, proxyPath, search = "", traits = {}) => {
     const url = `https://proxy.test${proxyPath}${search}`;
@@ -6253,7 +6272,7 @@ test("server record playback context requires matching PlaybackInfo and item det
       requestUrl: new URL(url),
       request: new Request(url, {
         method,
-        headers: { "X-Emby-Device-Id": "device-context" }
+        headers: { "X-Emby-Device-Id": "device-context", "X-Emby-Token": "private-token" }
       }),
       requestTraits: traits,
       env: { DB: {} },
@@ -6273,7 +6292,7 @@ test("server record playback context requires matching PlaybackInfo and item det
     "server-a",
     "GET",
     "/Users/user-a/Items/episode-context",
-    "?DeviceId=device-context"
+    "?EnableImageTypes=Primary%2CBackdrop%2CThumb%2CLogo&ImageTypeLimit=1&Fields=ProviderIds%2CExternalUrls&DeviceId=device-context"
   );
   const playbackExecution = () => makeExecution(
     "server-a",
@@ -6282,18 +6301,6 @@ test("server record playback context requires matching PlaybackInfo and item det
     "?IsPlayback=true&DeviceId=device-context",
     { isPlaybackInfoRequest: true }
   );
-  const lifecycleExecution = () => makeExecution(
-    "server-a",
-    "POST",
-    "/Sessions/Playing",
-    "?DeviceId=device-context",
-    { isPlaybackStartedRequest: true }
-  );
-  const lifecycleTransport = {
-    preparedBodyMode: "buffered",
-    preparedBodyText: JSON.stringify({ SessionId: "context-session", DeviceId: "device-context" }),
-    newHeaders: new Headers({ "Content-Type": "text/plain" })
-  };
   try {
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
@@ -6303,13 +6310,20 @@ test("server record playback context requires matching PlaybackInfo and item det
       true
     );
     await Promise.all(tasks.splice(0));
-    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
-
-    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution(), null, 503), false);
-    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport), null);
-    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
-    const verified = proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport);
-    assert.deepEqual(verified, {
+    assert.deepEqual(writes, [{
+      nodeName: "server-a",
+      watchedAt: new Date(123_456).toISOString(),
+      media: {
+        itemId: "episode-context",
+        itemName: "Context episode",
+        itemType: "Episode",
+        seriesName: "Context series",
+        originalTitle: "Original context series",
+        year: 2024,
+        imageTag: "context-poster"
+      }
+    }]);
+    assert.deepEqual(proxyService.getServerRecordPlaybackContextMedia(detailExecution(), null, "episode-context"), {
       itemId: "episode-context",
       itemName: "Context episode",
       itemType: "Episode",
@@ -6318,200 +6332,50 @@ test("server record playback context requires matching PlaybackInfo and item det
       year: 2024,
       imageTag: "context-poster"
     });
-    const lifecycle = lifecycleExecution();
-    assert.equal(proxyService.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
-    await Promise.all(tasks.splice(0));
-    assert.equal(writes.length, 1);
-    assert.deepEqual(writes[0].media, verified);
-    assert.equal(lifecycle.serverWatchLifecycleDiagnostic.decision, "fallback_playback_context");
 
-    const directLifecycle = lifecycleExecution();
-    const directTransport = {
-      ...lifecycleTransport,
-      preparedBodyText: JSON.stringify({
-        SessionId: "context-session-direct",
-        DeviceId: "device-context",
-        ItemId: "episode-context",
-        ItemName: "Event title"
-      })
-    };
-    assert.equal(proxyService.scheduleServerWatchLifecycle(directLifecycle, directTransport), true);
+    isolateState.ServerRecordPlaybackContexts.clear();
+    const playback = playbackExecution();
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playback, null, 503), false);
+    assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(playback, detailPayload), false);
+    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playback), true);
+    assert.equal(playback.serverRecordPlaybackInfoIntent.itemId, undefined);
+    assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(playback, detailPayload), true);
     await Promise.all(tasks.splice(0));
     assert.equal(writes.length, 2);
-    assert.deepEqual(writes[1].media, {
-      ...verified,
-      itemName: "Event title"
-    });
-    assert.equal(directLifecycle.serverWatchLifecycleDiagnostic.decision, "scheduled");
+    assert.equal(writes[1].media.itemName, "Context episode");
 
-    isolateState.ServerRecordPlaybackContexts.clear();
-    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
-        detailExecution(),
-        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json; charset=utf-8" } })
-      ),
-      true
-    );
-    await Promise.all(tasks.splice(0));
-    assert.equal(proxyService.getServerRecordPlaybackContextMedia(lifecycleExecution(), lifecycleTransport)?.itemId, "episode-context");
-
-    isolateState.ServerRecordPlaybackContexts.clear();
-    assert.equal(
-      proxyService.observeServerRecordPlaybackItemDetails(
-        detailExecution(),
-        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json; charset=utf-8" } })
-      ),
-      true
-    );
-    assert.equal(
-      proxyService.observeServerRecordPlaybackItemDetails(
-        makeExecution("server-a", "GET", "/Items/episode-context/Images/Primary", "?DeviceId=device-context"),
-        new Response("image", { headers: { "Content-Type": "image/jpeg" } })
+        makeExecution("server-a", "GET", "/Items/episode-context", "?EnableImageTypes=Primary&ImageTypeLimit=1&Fields=ProviderIds%2CExternalUrls&DeviceId=device-context"),
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
       ),
       false
     );
-    await Promise.all(tasks.splice(0));
-    assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(playbackExecution()), true);
-    assert.equal(
-      proxyService.getServerRecordPlaybackContextMedia(
-        makeExecution("server-b", "POST", "/Sessions/Playing", "?DeviceId=device-context", { isPlaybackStartedRequest: true }),
-        lifecycleTransport
-      ),
-      null
-    );
-    assert.equal(
-      proxyService.getServerRecordPlaybackContextMedia(
-        makeExecution("server-a", "POST", "/Sessions/Playing", "?DeviceId=other-device", { isPlaybackStartedRequest: true }),
-        { ...lifecycleTransport, preparedBodyText: JSON.stringify({ DeviceId: "other-device" }) }
-      ),
-      null
-    );
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
-        detailExecution(),
-        new Response("not-json", { headers: { "Content-Type": "text/plain" } })
+        makeExecution("server-a", "GET", "/Users/user-a/Items/episode-context", "?EnableImageTypes=Primary&ImageTypeLimit=1&Fields=ProviderIds&DeviceId=device-context"),
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
       ),
       false
     );
+    const noToken = detailExecution();
+    noToken.request = new Request(noToken.requestUrl, { headers: { "X-Emby-Device-Id": "device-context" } });
+    assert.equal(proxyService.observeServerRecordPlaybackItemDetails(noToken, new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })), false);
+    assert.equal(proxyService.observeServerRecordPlaybackItemDetails(detailExecution(), new Response("not-json", { headers: { "Content-Type": "text/plain" } })), false);
   } finally {
-    kernel.upsertServerWatchLifecycle = originalUpsert;
-    isolateState.ServerRecordWatchSessions.clear();
+    kernel.upsertServerLastWatch = originalUpsert;
     isolateState.ServerRecordPlaybackContexts.clear();
   }
 });
 
-test("server watch lifecycle records Playing, dedupes Progress, and finalizes STOP", async () => {
-  const tasks = [];
-  const writes = [];
-  const originalUpsert = kernel.upsertServerWatchLifecycle;
-  kernel.upsertServerWatchLifecycle = async (_db, event) => {
-    writes.push(event);
-    return { admitted: true, schemaVersion: 9 };
-  };
-  isolateState.ServerRecordWatchSessions.clear();
-  const makeExecution = (nodeName, phase, options = {}) => {
-    const path = phase === "started" ? "/Sessions/Playing"
-      : phase === "progress" ? "/Sessions/Playing/Progress"
-        : phase === "stopped" ? "/Sessions/Playing/Stopped" : "/Sessions/Ping";
-    return {
-      nodeName,
-      node: { serverRecord: { enabled: options.enabled !== false } },
-      startTime: options.startTime || 123_456,
-      requestMethod: options.requestMethod || "POST",
-      requestUrl: new URL(`https://proxy.test${path}`),
-      request: new Request(`https://proxy.test${path}`, { method: options.requestMethod || "POST" }),
-      requestTraits: {
-        isPlaybackStartedRequest: phase === "started",
-        isPlaybackProgressRequest: phase === "progress",
-        isPlaybackStoppedRequest: phase === "stopped"
-      },
-      env: options.withDb === false ? {} : { DB: {} },
-      ctx: { waitUntil(task) { tasks.push(task); } }
-    };
-  };
-  const transport = body => ({
-    preparedBodyMode: "buffered",
-    newHeaders: new Headers({ "Content-Type": "text/plain" }),
-    preparedBodyText: JSON.stringify(body)
-  });
-  try {
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "ping")), false);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { requestMethod: "GET" })), false);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { enabled: false })), false);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "started", { withDb: false })), false);
-    const startedBody = {
-      SessionId: "session-a",
-      ItemId: "episode-1",
-      Item: {
-        Name: "Episode one",
-        Type: "Episode",
-        SeriesName: "Series one",
-        ImageTags: { Primary: "poster-1" }
-      }
-    };
-    const startedExecution = makeExecution("server-a", "started");
-    assert.equal(proxyService.scheduleServerWatchLifecycle(startedExecution, transport(startedBody)), true);
-    for (let index = 0; index < 200; index += 1) {
-      assert.equal(proxyService.scheduleServerWatchLifecycle(
-        makeExecution("server-a", "progress", { startTime: 124_456 + index }),
-        transport(startedBody)
-      ), false);
-    }
-    const changedItemBody = {
-      ...startedBody,
-      ItemId: "episode-2",
-      Item: { ...startedBody.Item, Name: "Episode two", ImageTags: { Primary: "poster-2" } }
-    };
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 130_000 }), transport(changedItemBody)), true);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "stopped", { startTime: 234_567 }), transport({ SessionId: "session-a" })), true);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_567 }), transport(changedItemBody)), false);
-    const nextItemBody = {
-      ...startedBody,
-      ItemId: "episode-3",
-      Item: { ...startedBody.Item, Name: "Episode three", ImageTags: { Primary: "poster-3" } }
-    };
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-a", "progress", { startTime: 235_568 }), transport(nextItemBody)), true);
-    assert.equal(proxyService.scheduleServerWatchLifecycle(makeExecution("server-b", "progress", { startTime: 345_678 }), transport({
-      PlaySessionId: "play-b",
-      ItemId: "movie-2",
-      ItemName: "Movie two",
-      ItemType: "Movie"
-    })), true);
-    await Promise.all(tasks);
-    assert.equal(writes.length, 5);
-    assert.deepEqual(writes.map(write => [write.nodeName, write.phase, write.eventAt]), [
-      ["server-a", "started", new Date(123_456).toISOString()],
-      ["server-a", "progress", new Date(130_000).toISOString()],
-      ["server-a", "stopped", new Date(234_567).toISOString()],
-      ["server-a", "progress", new Date(235_568).toISOString()],
-      ["server-b", "progress", new Date(345_678).toISOString()]
-    ]);
-    assert.notEqual(writes[0].sessionFingerprint, writes[1].sessionFingerprint);
-    assert.deepEqual(writes[2].media, writes[1].media);
-    assert.notEqual(writes[2].sessionFingerprint, writes[3].sessionFingerprint);
-    assert.match(writes[3].sessionFingerprint, /^[0-9a-f]{16}$/);
-    assert.equal(writes[0].sessionStrength, "strong");
-    assert.equal(writes[4].sessionStrength, "strong");
-    const watchLogDetail = proxyService.buildStructuredLogDetail(startedExecution, { statusCode: 200 });
-    assert.equal(watchLogDetail.watchPhase, "started");
-    assert.equal(watchLogDetail.watchDecision, "scheduled");
-    assert.equal(watchLogDetail.watchParseMode, "text_plain_json");
-    assert.equal(watchLogDetail.watchSessionStrength, "strong");
-    assert.doesNotMatch(JSON.stringify(watchLogDetail), /session-a|episode-1|Episode one|poster-1/);
-    const handleSource = proxyService.handle.toString();
-    const transportPosition = handleSource.indexOf("transport = await kernel.buildProxyRequestState");
-    const schedulePosition = handleSource.indexOf("kernel.scheduleServerWatchLifecycle(execution, transport)");
-    const upstreamPosition = handleSource.indexOf("kernel.executeUpstreamFlow");
-    assert.ok(transportPosition >= 0 && transportPosition < schedulePosition);
-    assert.ok(schedulePosition < upstreamPosition);
-  } finally {
-    kernel.upsertServerWatchLifecycle = originalUpsert;
-    isolateState.ServerRecordWatchSessions.clear();
-  }
+test("Playing, Progress, and Stopped are not server-record watch-time sources", () => {
+  const handleSource = proxyService.handle.toString();
+  assert.doesNotMatch(handleSource, /scheduleServerWatchLifecycle/);
+  assert.match(handleSource, /buildProxyRequestState/);
+  assert.match(handleSource, /executeUpstreamFlow/);
 });
 
-test("server watch access logs wait for final D1 decisions without blocking scheduling", async () => {
+test("legacy watch lifecycle diagnostics remain detached for schema compatibility", async () => {
   const originalUpsert = kernel.upsertServerWatchLifecycle;
   const originalLoggerRecord = logger.record;
   const originalConsoleError = console.error;
@@ -6586,29 +6450,38 @@ test("server watch access logs wait for final D1 decisions without blocking sche
   }
 });
 
-test("last-watch D1 failures stay detached from the proxy response path", async () => {
+test("observed-media D1 failures stay detached from the proxy response path", async () => {
   const tasks = [];
-  const originalUpsert = kernel.upsertServerWatchLifecycle;
+  const originalUpsert = kernel.upsertServerLastWatch;
   const originalConsoleError = console.error;
-  kernel.upsertServerWatchLifecycle = async () => { throw new Error("d1 unavailable"); };
+  kernel.upsertServerLastWatch = async () => { throw new Error("d1 unavailable"); };
   console.error = () => {};
   try {
     const execution = {
       nodeName: "server-a",
       node: { serverRecord: { enabled: true } },
       startTime: 123_456,
-      requestMethod: "POST",
-      requestTraits: { isPlaybackStoppedRequest: true },
+      requestMethod: "GET",
+      proxyPath: "/Users/user-a/Items/item-a",
+      requestUrl: new URL("https://proxy.test/Users/user-a/Items/item-a?EnableImageTypes=Primary&ImageTypeLimit=1&Fields=ProviderIds%2CExternalUrls&DeviceId=device-a"),
+      request: new Request("https://proxy.test/Users/user-a/Items/item-a?EnableImageTypes=Primary&ImageTypeLimit=1&Fields=ProviderIds%2CExternalUrls&DeviceId=device-a", {
+        headers: { "X-Emby-Token": "private-token", "X-Emby-Device-Id": "device-a" }
+      }),
       env: { DB: {} },
       ctx: { waitUntil(task) { tasks.push(task); } }
     };
-    const scheduled = proxyService.scheduleServerWatchLifecycle(execution);
+    const scheduled = proxyService.observeServerRecordPlaybackItemDetails(execution, new Response(JSON.stringify({
+      Id: "item-a",
+      Name: "Item A",
+      Type: "Movie",
+      ImageTags: { Primary: "poster-a" }
+    }), { headers: { "Content-Type": "application/json" } }));
     assert.equal(scheduled, true);
     await assert.doesNotReject(Promise.all(tasks));
-    assert.equal(execution.serverWatchLifecycleDiagnostic.decision, "d1_unavailable");
   } finally {
-    kernel.upsertServerWatchLifecycle = originalUpsert;
+    kernel.upsertServerLastWatch = originalUpsert;
     console.error = originalConsoleError;
+    isolateState.ServerRecordPlaybackContexts.clear();
   }
 });
 
