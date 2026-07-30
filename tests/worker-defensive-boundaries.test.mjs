@@ -2105,7 +2105,7 @@ test("admin warm route is exact and follows the configured admin path", () => {
   assert.equal(isAdminWarmRoute("/admin/__warm/asset", "/admin"), false);
 });
 
-test("retired server record poster URLs return ordinary 404 without upstream requests", async () => {
+test("server record poster routes are exact, authenticated, and delegated by node", async () => {
   const env = { ADMIN_PATH: "/console", ADMIN_PASS: "poster-password", JWT_SECRET: "poster-jwt-secret" };
   const login = await workerHandler.fetch(new Request("https://worker.test/console/login", {
     method: "POST",
@@ -2113,15 +2113,79 @@ test("retired server record poster URLs return ordinary 404 without upstream req
     body: JSON.stringify({ password: "poster-password" })
   }), env, { waitUntil() {} });
   const authCookie = (login.headers.get("Set-Cookie") || "").match(/auth_token=[^;]+/)?.[0] || "";
-  let externalRequests = 0;
-  await withWorkerGlobals({ fetch: async () => { externalRequests += 1; return new Response("unexpected"); } }, async () => {
+  const originalGetPoster = kernel.getServerRecordPosterResponse;
+  const posterRequests = [];
+  kernel.getServerRecordPosterResponse = async (_env, nodeName, method) => {
+    posterRequests.push({ nodeName, method });
+    return new Response(new Uint8Array([255, 216, 255]), {
+      headers: { "Content-Type": "image/jpeg", "Cache-Control": "private, max-age=300" }
+    });
+  };
+  try {
+    const unauthorized = await workerHandler.fetch(new Request(
+      "https://worker.test/console/__server-record-poster/server-a"
+    ), env, { waitUntil() {} });
+    assert.equal(unauthorized.status, 401);
+    assert.equal(unauthorized.headers.get("Cache-Control"), "no-store, max-age=0");
+
+    await workerHandler.fetch(new Request(
+      "https://worker.test/console/__server-record-poster/server-a/extra",
+      { headers: { Cookie: authCookie } }
+    ), env, { waitUntil() {} });
+    assert.equal(posterRequests.length, 0);
+
     const response = await workerHandler.fetch(new Request(
       "https://worker.test/console/__server-record-poster/server-a",
       { headers: { Cookie: authCookie } }
     ), env, { waitUntil() {} });
-    assert.equal(response.status, 404);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "image/jpeg");
+    assert.deepEqual(posterRequests, [{ nodeName: "server-a", method: "GET" }]);
+  } finally {
+    kernel.getServerRecordPosterResponse = originalGetPoster;
+  }
+});
+
+test("server record poster retrieval binds the current item and image tag without leaking credentials", async () => {
+  const watchedAt = "2026-07-30T05:00:00.000Z";
+  const originals = {
+    getServerRecordSnapshots: kernel.getServerRecordSnapshots,
+    getServerLastWatch: kernel.getServerLastWatch,
+    getNodeForRead: kernel.getNodeForRead
+  };
+  let upstreamRequest = null;
+  kernel.getServerRecordSnapshots = async () => new Map([["server-a", {
+    lastItem: { itemId: "248122", imageTag: "primary-image-tag", watchedAt }
+  }]]);
+  kernel.getServerLastWatch = async () => new Map([["server-a", { lastWatchedAt: watchedAt }]]);
+  kernel.getNodeForRead = async () => ({
+    target: "https://origin.example/emby",
+    headers: { "X-Emby-Token": "upstream-private-token" },
+    serverRecord: { enabled: true }
   });
-  assert.equal(externalRequests, 0);
+  try {
+    await withWorkerGlobals({
+      fetch: async (url, options) => {
+        upstreamRequest = { url: new URL(url), headers: new Headers(options.headers) };
+        return new Response(new Uint8Array([255, 216, 255]), {
+          headers: { "Content-Type": "image/jpeg" }
+        });
+      }
+    }, async () => {
+      const response = await kernel.getServerRecordPosterResponse({ DB: {} }, "server-a", "GET");
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get("Content-Type"), "image/jpeg");
+      assert.equal(response.headers.get("Vary"), "Cookie");
+      assert.doesNotMatch(JSON.stringify([...response.headers]), /upstream-private-token|origin\.example/i);
+    });
+    assert.equal(upstreamRequest.url.pathname, "/emby/Items/248122/Images/Primary");
+    assert.equal(upstreamRequest.url.searchParams.get("tag"), "primary-image-tag");
+    assert.equal(upstreamRequest.headers.get("X-Emby-Token"), "upstream-private-token");
+  } finally {
+    kernel.getServerRecordSnapshots = originals.getServerRecordSnapshots;
+    kernel.getServerLastWatch = originals.getServerLastWatch;
+    kernel.getNodeForRead = originals.getNodeForRead;
+  }
 });
 
 test("poster browser config action is authenticated, no-store, and isolated from legacy bindings", async () => {
@@ -2252,7 +2316,8 @@ test("server watch media extracts passive original titles and years", () => {
     itemType: "Episode",
     seriesName: "机智的一休",
     originalTitle: "Ikkyu-san",
-    year: 1975
+    year: 1975,
+    imageTag: ""
   });
   assert.deepEqual(
     proxyService.buildServerRecordPlaybackContextMedia({
@@ -2264,7 +2329,7 @@ test("server watch media extracts passive original titles and years", () => {
       SeriesProductionYear: 1975,
       OriginalTitle: "Episode Original Title",
       ProductionYear: 2026,
-      SeriesPrimaryImageTag: "series-poster-tag"
+      ImageTags: { Primary: "episode-poster-tag" }
     }, "episode-1"),
     {
       itemId: "episode-1",
@@ -2272,7 +2337,8 @@ test("server watch media extracts passive original titles and years", () => {
       itemType: "Episode",
       seriesName: "机智的一休",
       originalTitle: "Ikkyu-san",
-      year: 1975
+      year: 1975,
+      imageTag: "episode-poster-tag"
     }
   );
   assert.deepEqual(
@@ -2290,7 +2356,8 @@ test("server watch media extracts passive original titles and years", () => {
       itemType: "Episode",
       seriesName: "机智的一休",
       originalTitle: "",
-      year: null
+      year: null,
+      imageTag: ""
     }
   );
   const oversized = "x".repeat(300);
@@ -2384,6 +2451,116 @@ test("server watch media extracts passive original titles and years", () => {
     ),
     false
   );
+});
+
+test("server record metadata recovery prefers HAR item details and falls back to PlaybackInfo Name", async () => {
+  const originalFetchEndpoint = kernel.fetchServerRecordEndpoint;
+  const originalAuthenticate = kernel.authenticateServerRecord;
+  const requests = [];
+  const node = {
+    target: "https://origin.example/emby",
+    serverRecordEmbyUsername: "record-user",
+    serverRecordEmbyPassword: "record-password",
+    serverRecord: { enabled: true }
+  };
+  try {
+    kernel.authenticateServerRecord = async () => ({ token: "short-lived-token", userId: "user-har" });
+    kernel.fetchServerRecordEndpoint = async (_target, path, _headers, options = {}) => {
+      requests.push({ path, options });
+      return {
+        ok: true,
+        parseError: false,
+        json: {
+          Id: "248122",
+          Name: "摩登家庭 - S01E01",
+          Type: "Episode",
+          SeriesName: "摩登家庭",
+          ImageTags: { Primary: "har-primary-tag" }
+        }
+      };
+    };
+    const preferred = await kernel.recoverServerRecordMediaMetadata("nay", node, { itemId: "248122" });
+    assert.equal(preferred.itemName, "摩登家庭 - S01E01");
+    assert.equal(preferred.imageTag, "har-primary-tag");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].path, "/Users/user-har/Items/248122");
+    assert.deepEqual(requests[0].options.query, {
+      EnableImageTypes: "Primary,Backdrop,Thumb,Logo",
+      ImageTypeLimit: "1",
+      Fields: "ProviderIds,ExternalUrls"
+    });
+
+    requests.length = 0;
+    kernel.fetchServerRecordEndpoint = async (_target, path, _headers, options = {}) => {
+      requests.push({ path, options });
+      if (!path.endsWith("/PlaybackInfo")) return { ok: true, parseError: false, json: { Id: "248122", Name: "" } };
+      return {
+        ok: true,
+        parseError: false,
+        json: {
+          Id: "248122",
+          Name: "摩登家庭 - S01E01",
+          Type: "Episode",
+          ImageTags: { Primary: "playback-primary-tag" }
+        }
+      };
+    };
+    const fallback = await kernel.recoverServerRecordMediaMetadata("nay", node, { itemId: "248122" });
+    assert.equal(fallback.itemName, "摩登家庭 - S01E01");
+    assert.equal(fallback.imageTag, "playback-primary-tag");
+    assert.deepEqual(requests.map(({ path }) => path), ["/Users/user-har/Items/248122", "/Items/248122/PlaybackInfo"]);
+    assert.equal(requests[1].options.method, "POST");
+    assert.equal(requests[1].options.expectJson, true);
+    assert.deepEqual(requests[1].options.query, { UserId: "user-har" });
+  } finally {
+    kernel.fetchServerRecordEndpoint = originalFetchEndpoint;
+    kernel.authenticateServerRecord = originalAuthenticate;
+  }
+});
+
+test("HAR item details remain primary when PlaybackInfo JSON arrives later", () => {
+  isolateState.ServerRecordPlaybackContexts.clear();
+  const execution = {
+    nodeName: "nay",
+    node: { serverRecord: { enabled: true } },
+    requestMethod: "POST",
+    proxyPath: "/Items/248122/PlaybackInfo",
+    requestUrl: new URL("https://proxy.test/Items/248122/PlaybackInfo?IsPlayback=true&DeviceId=device-a"),
+    request: new Request("https://proxy.test/Items/248122/PlaybackInfo?IsPlayback=true&DeviceId=device-a", { method: "POST" }),
+    requestTraits: { isPlaybackInfoRequest: true }
+  };
+  assert.equal(proxyService.recordServerRecordPlaybackInfoIntent(execution), true);
+  assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
+    Id: "248122",
+    Name: "PlaybackInfo fallback",
+    ImageTags: { Primary: "fallback-tag" }
+  }), true);
+  assert.equal(proxyService.getServerRecordPlaybackContextMedia(execution, null, "248122")?.itemName, "PlaybackInfo fallback");
+
+  assert.equal(proxyService.recordServerRecordPlaybackItemDetails(execution, {
+    itemId: "248122",
+    itemName: "摩登家庭 - S01E01",
+    itemType: "Episode",
+    seriesName: "摩登家庭",
+    originalTitle: "Modern Family",
+    year: 2009,
+    imageTag: "har-primary-tag"
+  }, "item_details"), true);
+  assert.equal(proxyService.observeServerRecordPlaybackInfoPayload(execution, {
+    Id: "248122",
+    Name: "Late fallback must not replace detail",
+    ImageTags: { Primary: "late-fallback-tag" }
+  }), true);
+  assert.deepEqual(proxyService.getServerRecordPlaybackContextMedia(execution, null, "248122"), {
+    itemId: "248122",
+    itemName: "摩登家庭 - S01E01",
+    itemType: "Episode",
+    seriesName: "摩登家庭",
+    originalTitle: "Modern Family",
+    year: 2009,
+    imageTag: "har-primary-tag"
+  });
+  isolateState.ServerRecordPlaybackContexts.clear();
 });
 
 
@@ -5751,7 +5928,8 @@ test("Hills text/plain playback controls parse bounded JSON without changing tra
     itemType: "Episode",
     seriesName: "Series 1",
     originalTitle: "",
-    year: null
+    year: null,
+    imageTag: ""
   });
   assert.equal(transport.preparedBodyText, bodyText);
   assert.equal(transport.newHeaders.get("Content-Type"), "text/plain");
@@ -6120,7 +6298,7 @@ test("server record playback context requires matching PlaybackInfo and item det
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
-        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json; charset=utf-8" } })
       ),
       true
     );
@@ -6137,7 +6315,8 @@ test("server record playback context requires matching PlaybackInfo and item det
       itemType: "Episode",
       seriesName: "Context series",
       originalTitle: "Original context series",
-      year: 2024
+      year: 2024,
+      imageTag: "context-poster"
     });
     const lifecycle = lifecycleExecution();
     assert.equal(proxyService.scheduleServerWatchLifecycle(lifecycle, lifecycleTransport), true);
@@ -6170,7 +6349,7 @@ test("server record playback context requires matching PlaybackInfo and item det
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
-        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json; charset=utf-8" } })
       ),
       true
     );
@@ -6181,7 +6360,7 @@ test("server record playback context requires matching PlaybackInfo and item det
     assert.equal(
       proxyService.observeServerRecordPlaybackItemDetails(
         detailExecution(),
-        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json" } })
+        new Response(JSON.stringify(detailPayload), { headers: { "Content-Type": "application/json; charset=utf-8" } })
       ),
       true
     );
@@ -6972,6 +7151,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
           seriesName: "Series one",
           originalTitle: "Original Series One",
           year: 2025,
+          imageTag: "episode-poster-tag",
           watchedAt: "2026-07-21T12:31:00.000Z"
         }
       }
@@ -6990,6 +7170,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
     assert.deepEqual(probedNodeNames, ["server-a", "server-b"]);
     assert.equal(persistedProbeEntries.length, 2);
     assert.ok(available.records.every(record => record.counts.persisted === true));
+    assert.match(available.records[0].watch.posterUrl, /^\/admin\/__server-record-poster\/server-a\?v=[a-z0-9]+$/);
     assert.deepEqual(available.records[0].watch, {
       lastWatchedAt: "2026-07-21T12:34:56.000Z",
       state: "ok",
@@ -6997,6 +7178,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
       itemName: "Episode one",
       itemType: "Episode",
       seriesName: "Series one",
+      posterUrl: available.records[0].watch.posterUrl,
       posterSearch: {
         itemId: "episode-1",
         mediaType: "tv",
@@ -7007,7 +7189,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
       }
     });
     assert.equal(available.records[1].watch.itemId, "");
-    assert.equal("posterUrl" in available.records[1].watch, false);
+    assert.equal(available.records[1].watch.posterUrl, "");
     assert.deepEqual(available.availableNodes.map(record => record.expiryEnabled), [true, false]);
     assert.doesNotMatch(JSON.stringify(available), /totalSeconds|private-token|origin-[ab]\.example/);
 
@@ -7019,6 +7201,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
         : {}
     }]));
     const incompleteMedia = await kernel.getServerRecordsSnapshotPayload({ HOST: "proxy.example" }, { ...options, skipProbe: true });
+    assert.match(incompleteMedia.records[0].watch.posterUrl, /^\/admin\/__server-record-poster\/server-a\?v=[a-z0-9]+$/);
     assert.deepEqual(incompleteMedia.records[0].watch, {
       lastWatchedAt: "2026-07-21T12:34:56.000Z",
       state: "ok",
@@ -7026,6 +7209,7 @@ test("server record snapshots persist counts and expose matching last-watch medi
       itemName: "",
       itemType: "",
       seriesName: "",
+      posterUrl: incompleteMedia.records[0].watch.posterUrl,
       posterSearch: {
         itemId: "incomplete-item",
         mediaType: "",

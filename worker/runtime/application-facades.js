@@ -1964,6 +1964,14 @@ var DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnapsho
 var SERVER_RECORD_WATCH_TERMINAL_TTL_MS = 600 * 1e3;
 var SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS = 720 * 60 * 1e3;
 var SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS = 120 * 1e3;
+var SERVER_RECORD_POSTER_MAX_BYTES = 5 * 1024 * 1024;
+var SERVER_RECORD_POSTER_CONTENT_TYPES = /* @__PURE__ */ new Set([
+	"image/jpeg",
+	"image/png",
+	"image/webp",
+	"image/avif",
+	"image/gif"
+]);
 var DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
@@ -2362,6 +2370,7 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 	const ADMIN_RELEASE_PROXY_PATH_SEGMENT = "__release";
 	const ADMIN_RELEASE_VENDOR_PATH_SEGMENT = "vendor";
 	const ADMIN_WARM_PATH_SEGMENT = "__warm";
+	const ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT = "__server-record-poster";
 	const ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN = "https://admin-release-vendor-cache.invalid";
 	const ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN = "https://admin-release-vendor-manifest.invalid";
 	const ADMIN_RELEASE_VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -2917,6 +2926,7 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 		ADMIN_RELEASE_PROXY_PATH_SEGMENT,
 		ADMIN_RELEASE_VENDOR_PATH_SEGMENT,
 		ADMIN_WARM_PATH_SEGMENT,
+		ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT,
 		ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN,
 		ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN,
 		ADMIN_RELEASE_VENDOR_CACHE_CONTROL,
@@ -3931,6 +3941,20 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
 		return (sanitizeProxyPath(pathname || "/").replace(/\/+$/, "") || "/").toLowerCase() === `${normalizedAdminPath}/${shell.ADMIN_WARM_PATH_SEGMENT}`.toLowerCase();
 	}
+	function resolveAdminServerRecordPosterRouteMatch(pathname = "", adminPath = "/admin") {
+		const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
+		const normalizedPathname = sanitizeProxyPath(pathname || "/");
+		const prefix = `${normalizedAdminPath}/${shell.ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT}/`;
+		if (!normalizedPathname.toLowerCase().startsWith(prefix.toLowerCase())) return null;
+		const rawNodeName = normalizedPathname.slice(prefix.length);
+		if (!rawNodeName || rawNodeName.includes("/")) return null;
+		try {
+			const nodeName = decodeURIComponent(rawNodeName).trim().toLowerCase();
+			return nodeName && nodeName.length <= 128 && !nodeName.includes("/") ? { nodeName } : null;
+		} catch {
+			return null;
+		}
+	}
 	function getAdminRemoteShellCachedAt(response) {
 		const cachedAt = Number.parseInt(String(response?.headers?.get?.(shell.ADMIN_REMOTE_SHELL_CACHED_AT_HEADER) || ""), 10);
 		return Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : 0;
@@ -4126,6 +4150,7 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		resolveAdminReleaseVendorManifestEntry,
 		resolveAdminReleaseVendorRouteMatch,
 		isAdminWarmRoute,
+		resolveAdminServerRecordPosterRouteMatch,
 		getAdminRemoteShellCachedAt,
 		shouldRevalidateAdminRemoteShell,
 		validateAdminShellHtmlSource,
@@ -4896,6 +4921,16 @@ var AdminConsoleFacade = class {
 				const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
 				if (hostPrefixMatch || isConfiguredHostSubdomain) return null;
 				if (requestMethod === "GET" && routeContext.normalizedPathname === "/") return this.#renderLandingPage(env, routeContext.initHealth);
+				const serverRecordPosterRoute = isGetOrHead ? this.#resolveServerRecordPosterRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
+				if (serverRecordPosterRoute) {
+					if (!await this.#verifyRequest(request, env)) return this.#buildServerRecordPosterErrorResponse(401);
+					try {
+						return await this.repository.getServerRecordPosterResponse(env, serverRecordPosterRoute.nodeName, requestMethod) || this.#buildServerRecordPosterErrorResponse(404);
+					} catch (error) {
+						console.error("server record poster route failed", error);
+						return this.#buildServerRecordPosterErrorResponse(502);
+					}
+				}
 				const adminReleaseVendorRoute = isGetOrHead ? this.#resolveVendorRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
 				if (adminReleaseVendorRoute) {
 					if (!await this.#verifyRequest(request, env)) return this.#buildVendorErrorResponse("Unauthorized", 401);
@@ -5171,6 +5206,20 @@ var AdminConsoleFacade = class {
 
 	#resolveVendorRoute(pathname, adminPath) {
 		return this.shellService.resolveAdminReleaseVendorRouteMatch(pathname, adminPath);
+	}
+
+	#resolveServerRecordPosterRoute(pathname, adminPath) {
+		return this.shellService.resolveAdminServerRecordPosterRouteMatch(pathname, adminPath);
+	}
+
+	#buildServerRecordPosterErrorResponse(status = 404) {
+		return new Response(null, {
+			status,
+			headers: {
+				"Cache-Control": "no-store, max-age=0",
+				"X-Content-Type-Options": "nosniff"
+			}
+		});
 	}
 
 	#isWarmRoute(pathname, adminPath) {
@@ -5551,6 +5600,42 @@ function inferServerRecordPosterMediaKind(itemType = "", seriesName = "") {
 	const type = String(itemType || "").trim().toLowerCase();
 	if (type === "movie") return "movie";
 	if (["series", "episode"].includes(type) || normalizeServerRecordPosterTitle(seriesName)) return "tv";
+	return "";
+}
+function readServerRecordPrimaryImageTag(item = {}) {
+	if (!isPlainObject(item)) return "";
+	const normalizedItem = normalizeCaseInsensitiveObject(item);
+	const imageTags = normalizeCaseInsensitiveObject(isPlainObject(normalizedItem.imagetags) ? normalizedItem.imagetags : {});
+	return String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(normalizedItem, ["PrimaryImageTag"]) || "").trim().slice(0, 256);
+}
+function buildServerRecordMediaMetadata(payload = {}, expectedItemId = "", options = {}) {
+	const item = normalizeCaseInsensitiveObject(isPlainObject(payload) ? payload : {});
+	const expected = String(expectedItemId || "").trim().slice(0, 256);
+	const payloadItemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
+	const itemId = payloadItemId || (options.allowMissingItemId === true ? expected : "");
+	if (!itemId || expected && itemId !== expected) return null;
+	const posterSearch = buildServerRecordPosterMetadata(item);
+	return {
+		itemId,
+		itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim().slice(0, 256),
+		itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim().slice(0, 64),
+		seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim().slice(0, 256),
+		originalTitle: String(posterSearch?.originalTitle || ""),
+		year: posterSearch?.productionYear ?? null,
+		imageTag: readServerRecordPrimaryImageTag(item)
+	};
+}
+function sniffServerRecordPosterMime(bytes = new Uint8Array()) {
+	const has = (...values) => values.every((value, index) => bytes[index] === value);
+	if (bytes.length >= 3 && has(255, 216, 255)) return "image/jpeg";
+	if (bytes.length >= 8 && has(137, 80, 78, 71, 13, 10, 26, 10)) return "image/png";
+	const ascii = (start, length) => String.fromCharCode(...bytes.slice(start, start + length));
+	if (bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(ascii(0, 6))) return "image/gif";
+	if (bytes.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") return "image/webp";
+	if (bytes.length >= 16 && ascii(4, 4) === "ftyp") {
+		const brands = ascii(8, Math.min(bytes.length - 8, 56));
+		if (brands.includes("avif") || brands.includes("avis")) return "image/avif";
+	}
 	return "";
 }
 function buildServerRecordPosterMetadata(item = {}, seriesItem = {}) {
@@ -16849,6 +16934,137 @@ function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 				clearTimeout(timeoutId);
 			}
 		},
+		async recoverServerRecordMediaMetadata(nodeName = "", node = {}, candidate = {}) {
+			const itemId = String(candidate?.itemId || "").trim().slice(0, 256);
+			if (!itemId) return null;
+			const baseHeaders = kernel.buildServerRecordRequestHeaders(node);
+			const credentials = resolveServerRecordCredentials(node);
+			const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
+			for (const targetRecord of targetRecords) {
+				const headers = new Headers(baseHeaders);
+				let userId = "";
+				if (credentials.configured) {
+					stripSensitiveProxyAuthHeaders(headers);
+					headers.delete("Cookie");
+					const auth = await kernel.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
+					if (!auth?.token) continue;
+					headers.set("X-Emby-Token", auth.token);
+					userId = String(auth.userId || "").trim();
+				}
+				const detailPath = userId ? `/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}` : `/Items/${encodeURIComponent(itemId)}`;
+				try {
+					const detail = await kernel.fetchServerRecordEndpoint(targetRecord, detailPath, headers, {
+						expectJson: true,
+						query: {
+							EnableImageTypes: "Primary,Backdrop,Thumb,Logo",
+							ImageTypeLimit: "1",
+							Fields: "ProviderIds,ExternalUrls"
+						}
+					});
+					const media = detail.ok && !detail.parseError ? buildServerRecordMediaMetadata(detail.json, itemId) : null;
+					if (media?.itemName) return media;
+				} catch {}
+				try {
+					const playbackHeaders = new Headers(headers);
+					playbackHeaders.set("Content-Type", "application/json");
+					const playbackInfo = await kernel.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, playbackHeaders, {
+						method: "POST",
+						body: "{}",
+						expectJson: true,
+						query: userId ? { UserId: userId } : {}
+					});
+					const media = playbackInfo.ok && !playbackInfo.parseError ? buildServerRecordMediaMetadata(playbackInfo.json, itemId, { allowMissingItemId: true }) : null;
+					if (media?.itemName) return media;
+				} catch {}
+			}
+			return null;
+		},
+		async buildServerRecordPosterImageResponse(upstream, requestMethod = "GET") {
+			const contentType = String(upstream?.headers?.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
+			const declaredLength = Number(upstream?.headers?.get("Content-Length"));
+			if (!upstream?.ok || !SERVER_RECORD_POSTER_CONTENT_TYPES.has(contentType) || Number.isFinite(declaredLength) && declaredLength > SERVER_RECORD_POSTER_MAX_BYTES) {
+				try {
+					await upstream?.body?.cancel?.();
+				} catch {}
+				return null;
+			}
+			if (String(requestMethod || "GET").toUpperCase() === "HEAD") return new Response(null, {
+				status: 200,
+				headers: {
+					"Content-Type": contentType,
+					"Cache-Control": "private, max-age=300, stale-while-revalidate=60",
+					"Content-Security-Policy": "default-src 'none'; sandbox",
+					"Cross-Origin-Resource-Policy": "same-origin",
+					"X-Content-Type-Options": "nosniff",
+					"Vary": "Cookie"
+				}
+			});
+			const body = await readResponseBytesWithLimit(upstream, SERVER_RECORD_POSTER_MAX_BYTES);
+			if (body.exceeded || sniffServerRecordPosterMime(body.bodyBytes) !== contentType) return null;
+			return new Response(body.bodyBytes, {
+				status: 200,
+				headers: {
+					"Content-Type": contentType,
+					"Content-Length": String(body.bodyBytes.byteLength),
+					"Cache-Control": "private, max-age=300, stale-while-revalidate=60",
+					"Content-Security-Policy": "default-src 'none'; sandbox",
+					"Cross-Origin-Resource-Policy": "same-origin",
+					"X-Content-Type-Options": "nosniff",
+					"Vary": "Cookie"
+				}
+			});
+		},
+		async getServerRecordPosterResponse(env, nodeName = "", requestMethod = "GET") {
+			const normalizedName = String(nodeName || "").trim().toLowerCase();
+			const db = kernel.getDB(env);
+			if (!db || !normalizedName) return null;
+			const [snapshots, lastWatchByNode] = await Promise.all([kernel.getServerRecordSnapshots(db, [normalizedName]), kernel.getServerLastWatch(db, [normalizedName])]);
+			const lastItem = snapshots.get(normalizedName)?.lastItem || {};
+			const itemId = String(lastItem.itemId || "").trim();
+			if (!itemId || !areServerRecordWatchTimesCompatible(lastItem.watchedAt, lastWatchByNode.get(normalizedName)?.lastWatchedAt)) return null;
+			const node = await kernel.getNodeForRead(normalizedName, env);
+			if (!node || normalizeServerRecordSettings(node?.serverRecord).enabled !== true) return null;
+			const baseHeaders = kernel.buildServerRecordRequestHeaders(node);
+			const credentials = resolveServerRecordCredentials(node);
+			for (const targetRecord of buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord)) {
+				const headers = new Headers(baseHeaders);
+				if (credentials.configured) {
+					stripSensitiveProxyAuthHeaders(headers);
+					headers.delete("Cookie");
+					const auth = await kernel.authenticateServerRecord(normalizedName, node, targetRecord, baseHeaders);
+					if (!auth?.token) continue;
+					headers.set("X-Emby-Token", auth.token);
+				}
+				headers.set("Accept", "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8");
+				const controller = new AbortController();
+				const timeoutId = setTimeout(() => controller.abort("server_record_poster_timeout"), 8e3);
+				try {
+					const posterUrl = buildUpstreamProxyUrl(targetRecord, `/Items/${encodeURIComponent(itemId)}/Images/Primary`);
+					const imageTag = String(lastItem.imageTag || "").trim();
+					if (imageTag) posterUrl.searchParams.set("tag", imageTag);
+					const upstream = await fetchRequest(posterUrl.toString(), {
+						method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
+						headers,
+						cache: "no-store",
+						redirect: "error",
+						signal: controller.signal
+					});
+					const response = await kernel.buildServerRecordPosterImageResponse(upstream, requestMethod);
+					if (response) return response;
+				} catch {} finally {
+					clearTimeout(timeoutId);
+				}
+			}
+			return null;
+		},
+		buildServerRecordPosterUrl(env, nodeName = "", snapshot = {}) {
+			const normalizedName = String(nodeName || "").trim().toLowerCase();
+			const itemId = String(snapshot?.itemId || "").trim();
+			if (!normalizedName || !itemId) return "";
+			const adminPath = getAdminPath(env).replace(/\/+$/, "") || "/admin";
+			const revision = hashStableText(`${String(snapshot?.watchedAt || "")}|${String(snapshot?.imageTag || "")}`);
+			return `${adminPath}/__server-record-poster/${encodeURIComponent(normalizedName)}?v=${encodeURIComponent(revision)}`;
+		},
 		normalizeServerRecordRuntimeError(error = null, status = 0) {
 			if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
 			if (status === 401 || status === 403) return "unauthorized";
@@ -17188,12 +17404,12 @@ function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 			}).filter((node) => node.nodeName);
 			const enabledNodes = availableNodes.filter((node) => node.enabled);
 			const probes = /* @__PURE__ */ new Map();
+			const fullNodes = /* @__PURE__ */ new Map();
 			const refreshNodeName = String(options?.refreshNodeName || "").trim().toLowerCase();
 			const recordNodes = refreshNodeName ? enabledNodes.filter((node) => node.nodeName === refreshNodeName) : enabledNodes;
 			const probeNodes = options.skipProbe === true ? [] : recordNodes;
 			const probedNodeNames = new Set(probeNodes.map((node) => node.nodeName));
 			if (options.skipProbe !== true) {
-				const fullNodes = /* @__PURE__ */ new Map();
 				await runWithConcurrency(probeNodes, 4, async (summary) => {
 					const node = await kernel.getNodeForRead(summary.nodeName, env);
 					if (node) fullNodes.set(summary.nodeName, node);
@@ -17224,6 +17440,24 @@ function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 			} catch (error) {
 				watchState = "unavailable";
 				console.error("server last watch read failed", error);
+			}
+			if (options.forceRefresh === true && options.db && snapshotState === "ok" && watchState === "ok") {
+				let recovered = false;
+				await runWithConcurrency(recordNodes, 4, async (summary) => {
+					const snapshot = recordSnapshots.get(summary.nodeName)?.lastItem || {};
+					const watch = lastWatchByNode.get(summary.nodeName) || {};
+					if (!String(snapshot.itemId || "").trim() || String(snapshot.itemName || "").trim() || !areServerRecordWatchTimesCompatible(snapshot.watchedAt, watch.lastWatchedAt)) return;
+					const node = fullNodes.get(summary.nodeName) || await kernel.getNodeForRead(summary.nodeName, env);
+					if (!node) return;
+					const media = await kernel.recoverServerRecordMediaMetadata(summary.nodeName, node, snapshot);
+					if (!media?.itemName) return;
+					recovered = await kernel.persistServerRecordPosterSearchMetadata(options.db, {
+						nodeName: summary.nodeName,
+						itemId: snapshot.itemId,
+						watchedAt: snapshot.watchedAt
+					}, media) || recovered;
+				});
+				if (recovered) recordSnapshots = await kernel.getServerRecordSnapshots(options.db, recordNodes.map((node) => node.nodeName));
 			}
 			return {
 				records: recordNodes.map((summary) => {
@@ -17277,6 +17511,7 @@ function defineServerRecordMethods(dependencies = {}, kernel = {}) {
 							itemName: lastItemMatchesWatch ? String(lastItem.itemName || "") : "",
 							itemType: lastItemMatchesWatch ? String(lastItem.itemType || "") : "",
 							seriesName: lastItemMatchesWatch ? String(lastItem.seriesName || "") : "",
+							posterUrl: lastItemMatchesWatch ? kernel.buildServerRecordPosterUrl(env, summary.nodeName, lastItem) : "",
 							posterSearch: {
 								itemId: lastItemMatchesWatch ? String(lastItem.itemId || "") : "",
 								mediaType: lastItemMatchesWatch ? inferServerRecordPosterMediaKind(lastItem.itemType, lastItem.seriesName) : "",
@@ -22037,6 +22272,7 @@ function definePlaybackAggregationRewriteMethods(dependencies = {}, kernel = {})
 			const bodyText = bodyResult.text;
 			try {
 				const parsedPayload = JSON.parse(bodyText);
+				kernel.observeServerRecordPlaybackInfoPayload(execution, parsedPayload);
 				if (!rewriteEnabled) {
 					const sanitizedResult = kernel.sanitizePlaybackInfoMediaSourcesPayload(parsedPayload);
 					if (sanitizedResult.rewriteState !== "applied") {
@@ -22514,6 +22750,9 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			execution.playbackInfoRewrite = String(cacheEntry?.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim();
 			execution.mediaAggregationDiagnostic = cacheEntry?.mediaAggregationDiagnostic && typeof cacheEntry.mediaAggregationDiagnostic === "object" ? cacheEntry.mediaAggregationDiagnostic : execution.mediaAggregationDiagnostic;
 			kernel.recordServerRecordPlaybackInfoIntent(execution, transport, Number(cacheEntry.status) || 200);
+			try {
+				kernel.observeServerRecordPlaybackInfoPayload(execution, JSON.parse(String(cacheEntry.bodyText || "{}")));
+			} catch {}
 			const cachedResponse = new Response(execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
 				status: Number(cacheEntry.status) || 200,
 				statusText: String(cacheEntry.statusText || ""),
@@ -22685,7 +22924,8 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 				itemType,
 				seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || pickTopLevel(["SeriesName"]) || "").trim().slice(0, 256),
 				originalTitle: String(posterSearch?.originalTitle || ""),
-				year: posterSearch?.productionYear ?? null
+				year: posterSearch?.productionYear ?? null,
+				imageTag: readServerRecordPrimaryImageTag(item)
 			};
 		},
 		resolveServerRecordPlaybackContextKeys(execution, transport = null) {
@@ -22758,27 +22998,27 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 			});
 		},
 		buildServerRecordPlaybackContextMedia(payload, expectedItemId = "") {
-			const item = normalizeCaseInsensitiveObject(isPlainObject(payload) ? payload : {});
-			const itemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
-			const expected = String(expectedItemId || "").trim().slice(0, 256);
-			if (!itemId || itemId !== expected) return null;
-			const posterSearch = buildServerRecordPosterMetadata(item);
-			return {
-				itemId,
-				itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim().slice(0, 256),
-				itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim().slice(0, 64),
-				seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim().slice(0, 256),
-				originalTitle: String(posterSearch?.originalTitle || ""),
-				year: posterSearch?.productionYear ?? null
-			};
+			return buildServerRecordMediaMetadata(payload, expectedItemId);
 		},
-		recordServerRecordPlaybackItemDetails(execution, media = {}) {
+		buildServerRecordPlaybackInfoMedia(payload, expectedItemId = "") {
+			return buildServerRecordMediaMetadata(payload, expectedItemId, { allowMissingItemId: true });
+		},
+		observeServerRecordPlaybackInfoPayload(execution, payload = {}) {
+			if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+			const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim().slice(0, 256);
+			const media = kernel.buildServerRecordPlaybackInfoMedia(payload, itemId);
+			return !!media?.itemName && kernel.recordServerRecordPlaybackItemDetails(execution, media, "playback_info");
+		},
+		recordServerRecordPlaybackItemDetails(execution, media = {}, source = "item_details") {
 			const itemId = String(media?.itemId || "").trim().slice(0, 256);
 			if (!itemId || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
+			const normalizedSource = source === "playback_info" ? "playback_info" : "item_details";
 			return kernel.updateServerRecordPlaybackContexts(execution, null, (existing, now) => {
-				const details = {
+				const existingDetails = existing?.details && String(existing.details.itemId || "") === itemId ? existing.details : null;
+				const details = existingDetails?.source === "item_details" && normalizedSource === "playback_info" ? existingDetails : {
 					itemId,
 					media: { ...media },
+					source: normalizedSource,
 					observedAt: now
 				};
 				const intent = existing?.intent && String(existing.intent.itemId || "") === itemId ? existing.intent : null;
@@ -22847,7 +23087,7 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 					return false;
 				}
 				const media = kernel.buildServerRecordPlaybackContextMedia(payload, itemId);
-				if (!media || !kernel.recordServerRecordPlaybackItemDetails(execution, media)) return false;
+				if (!media || !kernel.recordServerRecordPlaybackItemDetails(execution, media, "item_details")) return false;
 				const verifiedMedia = kernel.getServerRecordPlaybackContextMedia(execution, null, itemId);
 				return verifiedMedia ? await kernel.persistObservedServerRecordPosterMetadata(execution, verifiedMedia) : false;
 			}).catch(() => false);
@@ -22882,7 +23122,8 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 				itemType: pick("itemType"),
 				seriesName: pick("seriesName"),
 				originalTitle: pick("originalTitle"),
-				year: normalizeServerRecordPosterYear(current.year ?? previous.year)
+				year: normalizeServerRecordPosterYear(current.year ?? previous.year),
+				imageTag: pick("imageTag")
 			};
 		},
 		cleanupServerRecordWatchSessions(now = nowMs()) {
@@ -28100,6 +28341,7 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 			const seriesName = String(normalizedMedia.seriesName || "").trim().slice(0, 256);
 			const originalTitle = String(normalizedMedia.originalTitle || "").trim().slice(0, 256);
 			const year = normalizeServerRecordPosterYear(normalizedMedia.year ?? normalizedMedia.productionYear);
+			const imageTag = String(normalizedMedia.imageTag || "").trim().slice(0, 256);
 			const posterSearchReady = await kernel.hasServerRecordPosterSearchSchema(db);
 			const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
 			const posterValues = posterSearchReady ? ", ?, ?" : "";
@@ -28119,16 +28361,17 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
               ELSE ${kernel.SERVER_LAST_WATCH_TABLE}.updated_at
             END`).bind(normalizedName, watchedAt, updatedAt);
 			const snapshotStatement = db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-            node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-            last_item_watched_at, updated_at${posterColumns}
-          ) VALUES (?, ?, ?, ?, ?, ?, ?${posterValues})
+				node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
+				last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?${posterValues})
           ON CONFLICT(node_name) DO UPDATE SET
             last_item_id = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_id ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_id END,
             last_item_name = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_name ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_name END,
-            last_item_type = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_type ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_type END,
-            last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END${posterUpdates},
-            last_item_watched_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_watched_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at END,
-            updated_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.updated_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`).bind(normalizedName, itemId, itemName, itemType, seriesName, watchedAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : []);
+				last_item_type = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_type ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_type END,
+				last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END${posterUpdates},
+				last_item_image_tag = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_image_tag ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_image_tag END,
+				last_item_watched_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_watched_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at END,
+				updated_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.updated_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`).bind(normalizedName, itemId, itemName, itemType, seriesName, imageTag, watchedAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : []);
 			await db.batch([lastWatchStatement, snapshotStatement]);
 			return true;
 		},
@@ -28189,6 +28432,7 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 			const seriesName = String(media.seriesName || "").trim().slice(0, 256);
 			const originalTitle = String(media.originalTitle || "").trim().slice(0, 256);
 			const year = normalizeServerRecordPosterYear(media.year ?? media.productionYear);
+			const imageTag = String(media.imageTag || "").trim().slice(0, 256);
 			const posterSearchReady = await kernel.hasServerRecordPosterSearchSchema(db);
 			const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
 			const posterValues = posterSearchReady ? ", ?, ?" : "";
@@ -28220,9 +28464,9 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
               ))
             )`).bind(nodeName, eventAt, sessionFingerprint, sessionStrength, phase, updatedAt, phase, phase, sessionStrength, sessionStrength, sessionStrength, terminalCutoff, abandonedCutoff);
 			const snapshotStatement = db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-            node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-            last_item_watched_at, updated_at${posterColumns}
-          ) SELECT ?, ?, ?, ?, ?, ?, ?${posterValues}
+				node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
+				last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
+			) SELECT ?, ?, ?, ?, ?, ?, ?, ?${posterValues}
           WHERE changes() > 0 AND EXISTS (
             SELECT 1 FROM ${kernel.SERVER_LAST_WATCH_TABLE}
             WHERE node_name = ? AND last_watched_at = ?
@@ -28231,10 +28475,11 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
           ON CONFLICT(node_name) DO UPDATE SET
             last_item_id = excluded.last_item_id,
             last_item_name = excluded.last_item_name,
-            last_item_type = excluded.last_item_type,
-            last_item_series_name = excluded.last_item_series_name${posterUpdates},
-            last_item_watched_at = excluded.last_item_watched_at,
-            updated_at = excluded.updated_at`).bind(nodeName, itemId, itemName, itemType, seriesName, eventAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : [], nodeName, eventAt, sessionFingerprint, phase);
+				last_item_type = excluded.last_item_type,
+				last_item_series_name = excluded.last_item_series_name${posterUpdates},
+				last_item_image_tag = excluded.last_item_image_tag,
+				last_item_watched_at = excluded.last_item_watched_at,
+				updated_at = excluded.updated_at`).bind(nodeName, itemId, itemName, itemType, seriesName, imageTag, eventAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : [], nodeName, eventAt, sessionFingerprint, phase);
 			const results = await db.batch([lastWatchStatement, snapshotStatement]);
 			const changes = Number(results?.[0]?.meta?.changes ?? results?.[0]?.changes ?? 0) || 0;
 			return {
@@ -28327,14 +28572,16 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 			const seriesName = String(media?.seriesName || "").trim().slice(0, 256);
 			const originalTitle = String(media?.originalTitle || "").trim().slice(0, 256);
 			const year = normalizeServerRecordPosterYear(media?.year ?? media?.productionYear);
+			const imageTag = String(media?.imageTag || "").trim().slice(0, 256);
 			const result = await db.prepare(`UPDATE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} SET
             last_item_name = CASE WHEN ? != '' THEN ? ELSE last_item_name END,
             last_item_type = CASE WHEN ? != '' THEN ? ELSE last_item_type END,
             last_item_series_name = CASE WHEN ? != '' THEN ? ELSE last_item_series_name END,
-            last_item_original_title = CASE WHEN ? != '' THEN ? ELSE last_item_original_title END,
-            last_item_year = COALESCE(?, last_item_year),
-            updated_at = ?
-            WHERE node_name = ? AND last_item_id = ? AND last_item_watched_at = ?`).bind(itemName, itemName, itemType, itemType, seriesName, seriesName, originalTitle, originalTitle, year, (/* @__PURE__ */ new Date()).toISOString(), nodeName, itemId, watchedAt).run();
+			last_item_original_title = CASE WHEN ? != '' THEN ? ELSE last_item_original_title END,
+			last_item_year = COALESCE(?, last_item_year),
+			last_item_image_tag = CASE WHEN ? != '' THEN ? ELSE last_item_image_tag END,
+			updated_at = ?
+			WHERE node_name = ? AND last_item_id = ? AND last_item_watched_at = ?`).bind(itemName, itemName, itemType, itemType, seriesName, seriesName, originalTitle, originalTitle, year, imageTag, imageTag, (/* @__PURE__ */ new Date()).toISOString(), nodeName, itemId, watchedAt).run();
 			return (Number(result?.meta?.changes ?? result?.changes) || 0) > 0;
 		},
 		async getServerRecordSnapshots(db, nodeNames = []) {
@@ -28348,9 +28595,9 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 				const chunk = names.slice(offset, offset + 90);
 				const placeholders = chunk.map(() => "?").join(", ");
 				const rows = await db.prepare(`SELECT
-              node_name, movie_count, series_count, episode_count, counts_state,
-              counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-              last_item_type, last_item_series_name${posterSearchColumns},
+				node_name, movie_count, series_count, episode_count, counts_state,
+				counts_errors_json, stats_checked_at, last_item_id, last_item_name,
+				last_item_type, last_item_series_name, last_item_image_tag${posterSearchColumns},
               last_item_watched_at, updated_at
               FROM ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}
               WHERE node_name IN (${placeholders})`).bind(...chunk).all();
@@ -28376,8 +28623,9 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 						lastItem: {
 							itemId: String(row?.last_item_id || "").trim(),
 							itemName: String(row?.last_item_name || "").trim(),
-							itemType: String(row?.last_item_type || "").trim(),
-							seriesName: String(row?.last_item_series_name || "").trim(),
+						itemType: String(row?.last_item_type || "").trim(),
+						seriesName: String(row?.last_item_series_name || "").trim(),
+						imageTag: String(row?.last_item_image_tag || "").trim(),
 							originalTitle: posterSearchReady ? String(row?.last_item_original_title || "").trim() : "",
 							year: posterSearchReady ? normalizeServerRecordPosterYear(row?.last_item_year) : null,
 							watchedAt: String(row?.last_item_watched_at || "").trim()
@@ -28431,7 +28679,7 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
               WHERE node_name IN (${placeholders})`).bind(...names).all(), db.prepare(`SELECT
               node_name, movie_count, series_count, episode_count, counts_state,
               counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-              last_item_type, last_item_series_name,
+			  last_item_type, last_item_series_name, last_item_image_tag,
               ${posterSearchSchemaReady ? "last_item_original_title, last_item_year," : "'' AS last_item_original_title, NULL AS last_item_year,"}
               last_item_watched_at, updated_at
               FROM ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}
@@ -28494,6 +28742,7 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 					last_item_name: String(newestMedia?.last_item_name || "").trim(),
 					last_item_type: String(newestMedia?.last_item_type || "").trim(),
 					last_item_series_name: String(newestMedia?.last_item_series_name || "").trim(),
+					last_item_image_tag: String(newestMedia?.last_item_image_tag || "").trim(),
 					last_item_original_title: String(newestMedia?.last_item_original_title || "").trim(),
 					last_item_year: normalizeServerRecordPosterYear(newestMedia?.last_item_year),
 					last_item_watched_at: String(newestMedia?.last_item_watched_at || "").trim(),
@@ -28522,8 +28771,8 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 				statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
               node_name, movie_count, series_count, episode_count, counts_state,
               counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-              last_item_type, last_item_series_name, last_item_watched_at, updated_at${posterColumns}
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(String(row?.node_name || "").trim().toLowerCase(), row?.movie_count ?? null, row?.series_count ?? null, row?.episode_count ?? null, String(row?.counts_state || "unavailable").trim() || "unavailable", String(row?.counts_errors_json || "{}").trim() || "{}", String(row?.stats_checked_at || "").trim(), String(row?.last_item_id || "").trim(), String(row?.last_item_name || "").trim(), String(row?.last_item_type || "").trim(), String(row?.last_item_series_name || "").trim(), String(row?.last_item_watched_at || "").trim(), String(row?.updated_at || "").trim(), ...before?.posterSearchSchemaReady === true ? [String(row?.last_item_original_title || "").trim(), normalizeServerRecordPosterYear(row?.last_item_year)] : []));
+			  last_item_type, last_item_series_name, last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(String(row?.node_name || "").trim().toLowerCase(), row?.movie_count ?? null, row?.series_count ?? null, row?.episode_count ?? null, String(row?.counts_state || "unavailable").trim() || "unavailable", String(row?.counts_errors_json || "{}").trim() || "{}", String(row?.stats_checked_at || "").trim(), String(row?.last_item_id || "").trim(), String(row?.last_item_name || "").trim(), String(row?.last_item_type || "").trim(), String(row?.last_item_series_name || "").trim(), String(row?.last_item_image_tag || "").trim(), String(row?.last_item_watched_at || "").trim(), String(row?.updated_at || "").trim(), ...before?.posterSearchSchemaReady === true ? [String(row?.last_item_original_title || "").trim(), normalizeServerRecordPosterYear(row?.last_item_year)] : []));
 			}
 			return statements;
 		},
@@ -28547,8 +28796,8 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 					statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
                 node_name, movie_count, series_count, episode_count, counts_state,
                 counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-                last_item_type, last_item_series_name, last_item_watched_at, updated_at${posterColumns}
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(merged.snapshot.node_name, merged.snapshot.movie_count, merged.snapshot.series_count, merged.snapshot.episode_count, merged.snapshot.counts_state, merged.snapshot.counts_errors_json, merged.snapshot.stats_checked_at, merged.snapshot.last_item_id, merged.snapshot.last_item_name, merged.snapshot.last_item_type, merged.snapshot.last_item_series_name, merged.snapshot.last_item_watched_at, merged.snapshot.updated_at, ...before.posterSearchSchemaReady === true ? [merged.snapshot.last_item_original_title, merged.snapshot.last_item_year] : []));
+				last_item_type, last_item_series_name, last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
+			  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(merged.snapshot.node_name, merged.snapshot.movie_count, merged.snapshot.series_count, merged.snapshot.episode_count, merged.snapshot.counts_state, merged.snapshot.counts_errors_json, merged.snapshot.stats_checked_at, merged.snapshot.last_item_id, merged.snapshot.last_item_name, merged.snapshot.last_item_type, merged.snapshot.last_item_series_name, merged.snapshot.last_item_image_tag, merged.snapshot.last_item_watched_at, merged.snapshot.updated_at, ...before.posterSearchSchemaReady === true ? [merged.snapshot.last_item_original_title, merged.snapshot.last_item_year] : []));
 				}
 			}
 			await db.batch(statements);

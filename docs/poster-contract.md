@@ -2,24 +2,22 @@
 
 ## 状态
 
-本文是已实现的服务器记录海报契约。当前运行时、migration 和回归均以本文为海报边界的单一真相源。
-
-本文是服务器记录海报重构的单一真相源。管理台布局与动作入口见 [管理台契约](admin-console.md)，实施和发布门禁见 [开发与验证](development.md)。
+本文是已实现的服务器记录海报契约，也是该边界的单一真相源。管理台布局与动作入口见 [管理台契约](admin-console.md)，实施和发布门禁见 [开发与验证](development.md)。
 
 ## 范围与边界
 
 - 只覆盖“服务器记录”卡片中的最近观看海报，不扩展到其他管理台页面或 Emby `/web`。
-- 节点代理透传不干预海报。播放写入、scheduled、普通服务器记录读取和普通刷新都不解析、获取或预取海报。
-- 播放透传只被动记录请求或已有响应中可确认的 `ItemId`、媒体类型、系列名或电影名、原始名称、年份和观看时间；不得为海报额外请求 Emby。
-- 剧集使用系列名称，电影使用电影名称。`ItemId` 可以保存和参与浏览器缓存身份，但不参与供应商搜索或候选匹配。
-- 缺少名称或媒体类型时不使用 `ItemId` 主动补读，直接进入占位图状态。年份缺失时允许按唯一名称和类型精确匹配。
+- 播放透传优先被动解析同节点 Item 详情 JSON 响应中的 `Id`、`Name`、`Type`、`SeriesName`、`OriginalTitle`、`ProductionYear` 与 `ImageTags.Primary`；PlaybackInfo JSON 响应中的同名顶层字段作为次级证据。两类证据必须与节点、ItemId 和播放身份匹配后才能参与最近观看写入。
+- 用户显式执行单卡或全部刷新时，Worker 可以只为当前 ID-only 最近媒体补读一次同节点元数据：优先调用 HAR 已验证的用户 Item 详情接口，失败或缺少 `Name` 时回退 `/Items/<ItemId>/PlaybackInfo`。普通进入页面、scheduled 和普通读取仍不访问 Emby。
+- 卡片标题严格使用最终选定 JSON 响应中的 `Name` 原文，例如 `摩登家庭 - S01E01` 必须原样展示；`SeriesName` 只参与供应商海报搜索，不再与 `Name` 拼接成展示标题。
+- `ItemId` 只允许牵引同节点 Item 详情、PlaybackInfo、Primary 海报和缓存身份，不参与 TMDB/豆瓣搜索或候选匹配。年份缺失时允许按唯一名称和类型精确匹配。
 
 ## Worker 与浏览器职责
 
-- `getServerRecordsSnapshot` 的海报输入为 `posterSearch`：`itemId`、`mediaType`、`title`、`originalTitle`、`year`、`watchedAt`。响应不包含 `posterUrl` 或供应商 ID。
+- `getServerRecordsSnapshot` 返回同源 `posterUrl` 以及供应商兜底输入 `posterSearch`：`itemId`、`mediaType`、`title`、`originalTitle`、`year`、`watchedAt`。响应不包含上游 URL、认证信息或供应商 ID。
 - 只有已登录的浏览器在海报卡片进入可视区域后才开始解析。前端使用原生 `IntersectionObserver`，同时最多处理 16 张海报。
 - 搜索请求与图片请求各自最长 8 秒。卡片移除、离开服务器记录页面或退出登录时取消未完成请求。
-- Worker 不搜索供应商、不获取图片、不转发图片字节。浏览器通过 CORS 直接请求供应商 API 和图片，并在本地校验后创建 Blob URL。
+- 浏览器先通过已认证的同源 `posterUrl` 请求当前 D1 指针对应节点的 `/Items/<ItemId>/Images/Primary`；Worker 只转发通过大小、MIME 与签名门禁的图片，不泄露上游地址或凭据。同源海报失败后，浏览器才通过 CORS 直连 TMDB/豆瓣并创建 Blob URL。
 - 新增已登录动作 `getPosterBrowserConfig`。该响应使用 `Cache-Control: no-store`，只在首次需要解析海报时返回浏览器专用配置。
 
 ## 浏览器凭据
@@ -55,10 +53,10 @@
 
 ## 网络与图片校验
 
-- TMDB API 与图片只允许官方 HTTPS origin；豆瓣只允许配置的 `DOUBAN_BROWSER_ORIGIN`。所有请求使用 `redirect: "error"`。
+- 同源 Emby 海报路由只接受已登录的 `GET/HEAD`，每次从 D1 重读节点、ItemId 与观看时间并拒绝过期指针；上游请求只使用该节点活动线路和服务器记录凭据，禁止重定向。TMDB API 与图片只允许官方 HTTPS origin；豆瓣只允许配置的 `DOUBAN_BROWSER_ORIGIN`。所有图片请求使用 `redirect: "error"`。
 - 图片上限为 5 MiB，只接受 JPEG、PNG、WebP、AVIF 和 GIF；必须同时校验响应 MIME 与文件签名。
 - 校验通过后才创建 Blob URL。海报替换、卡片移除、离开页面或退出登录时立即调用 `URL.revokeObjectURL()`。
-- 无结果、歧义、认证失败、CORS、限流、超时、重定向、响应超限、MIME 或签名错误都不能回退 Emby 图片。
+- 同源 Emby、TMDB 和豆瓣均失败，或出现无结果、歧义、认证失败、CORS、限流、超时、重定向、响应超限、MIME 或签名错误时，进入固定占位图，不再尝试其他图片来源。
 
 ## 浏览器缓存
 
@@ -67,18 +65,18 @@
 - 单条缓存可保存 `ItemId`、搜索指纹、供应商、TMDB `poster_path` 或豆瓣 subject ID、成功或失败状态、过期时间和最近访问时间；不得保存任何凭据。
 - 最多保留 256 项，按最近访问时间淘汰。成功结果缓存 7 天，最终失败结果缓存 30 分钟。
 - 普通加载复用成功和失败缓存。手动单卡或全部刷新绕过失败缓存，但仍复用未过期的成功缓存；刷新本身不预取不可见卡片。
-- 缓存的 TMDB 路径或豆瓣 subject 取图失败时，本次请求将其视为供应商失败并继续回退；不得在同一次解析中重复请求同一失败资源。
+- 同源 Emby 海报使用私有 5 分钟 HTTP 缓存，不写入浏览器供应商缓存。缓存的 TMDB 路径或豆瓣 subject 取图失败时，本次请求将其视为供应商失败并继续回退；不得在同一次解析中重复请求同一失败资源。
 
 ## 展示与诊断
 
-- 卡片进入可视区后先显示加载占位，成功后替换为 `2:3` 海报；失败显示固定占位图。
+- 卡片进入可视区后先显示加载占位，按同源 Emby → TMDB → 豆瓣解析，成功后替换为 `2:3` 海报；全部失败显示固定占位图。
 - 占位图区域显示供应商和简短错误原因，浏览器控制台输出同一份脱敏结构。不得显示凭据、请求头、完整 URL 或响应正文。
 - 错误状态固定区分：缺少元数据、未配置凭据、认证失败、CORS、超时、限流、无结果、歧义、重定向、响应超限、MIME 错误和签名错误。
 - 失败缓存仍有效时，重新进入页面不重复输出同一错误。加载与失败状态必须提供可访问名称和礼貌状态播报。
 
-## 删除旧 Worker 与存储契约
+## 存储契约
 
-- 删除 Worker 海报解析、供应商调用、D1 海报缓存和图片转发路径。旧前端请求已删除的同源海报路由时返回普通 `404`，不提供兼容转发。
+- Worker 不恢复供应商搜索、供应商 ID 或 D1 海报缓存；只恢复受认证、受当前 D1 指针约束的同源 Emby 图片转发。`server_record_snapshots.last_item_image_tag` 保存被动取得的 `ImageTags.Primary` 并用于海报版本身份，不新增表或 migration。
 - 删除账号设置中的旧 TMDB API Key 输入、预览和保存流程，并删除兼容动作 `savePosterMetadataSettings`。现有 KV `tmdbApiKey` 在配置保存或 KV 整理时直接清除，不进入备份。
 - 节点改名、删除、KV/D1 整理和 scheduled 不再维护海报缓存记录。
 - 历史 `0006_server_record_poster_cache.sql` 和 `0008_server_record_poster_douban.sql` 作为已发布 migration 账本保留；新增 `0009_drop_server_record_poster_cache.sql`，执行 `DROP TABLE IF EXISTS server_record_poster_cache`，目标 D1 schema 为 v11。
@@ -97,7 +95,7 @@
 - 7 天成功缓存、30 分钟失败缓存、256 项淘汰、SHA-256 键、手动刷新和旧缓存清理。
 - 管理台 Token 只保存在 KV 与按需下发后的页面内存，bootstrap、快照、导出和诊断不泄露敏感内容。
 - Blob URL 释放、加载与错误可访问状态、占位图和供应商错误详情。
-- Worker 海报路由、解析器、旧设置动作及 D1 读写删除。
+- 同源 Emby 海报路由的鉴权、指针新鲜度、节点隔离、凭据脱敏、图片大小/MIME/签名门禁及 TMDB/豆瓣回退。
 - 0009 在新库、v10 旧库、重复初始化和 D1 整理中幂等删除表，bookmark 失败时零写入。
 
 修改该链路后至少运行 [开发与验证](development.md#验证) 规定的统一检查、Worker 聚焦回归和正式前端构建。

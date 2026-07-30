@@ -1103,7 +1103,8 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
         itemName: "Latest movie",
         itemType: "Movie",
         originalTitle: "Latest Original",
-        year: 2026
+        year: 2026,
+        imageTag: "latest-image-tag"
       })
     ]);
     const lastWatch = await kernel.getServerLastWatch(d1, ["server-a", "server-b"]);
@@ -1135,6 +1136,7 @@ test("runtime D1 SQL executes against the fresh v11 schema", async () => {
       itemName: "Latest movie",
       itemType: "Movie",
       seriesName: "",
+      imageTag: "latest-image-tag",
       originalTitle: "Latest Original",
       year: 2026,
       watchedAt: new Date(now + 3000).toISOString()
@@ -1401,7 +1403,8 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       itemId: "beta-item",
       itemName: "Beta item",
       itemType: "Episode",
-      seriesName: "Beta series"
+      seriesName: "Beta series",
+      imageTag: "beta-image-tag"
     });
     await kernel.persistServerRecordProbeSnapshots(d1, [{
       nodeName: "beta",
@@ -1437,6 +1440,7 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
       itemName: "Beta item",
       itemType: "Episode",
       seriesName: "Beta series",
+      imageTag: "beta-image-tag",
       originalTitle: "",
       year: null,
       watchedAt: "2026-07-25T02:00:00.000Z"
@@ -1446,8 +1450,10 @@ test("server-record D1 rows move with node renames, merge by freshness, and are 
     assert.equal(nodeValues.has(`${kernel.PREFIX}alpha`), true);
     assert.equal(nodeValues.has(`${kernel.PREFIX}beta`), false);
     const restoredWatch = await kernel.getServerLastWatch(d1, ["alpha", "beta"]);
+    const restoredSnapshots = await kernel.getServerRecordSnapshots(d1, ["alpha", "beta"]);
     assert.equal(restoredWatch.get("alpha")?.lastWatchedAt, "2026-07-25T01:00:00.000Z");
     assert.equal(restoredWatch.get("beta")?.lastWatchedAt, "2026-07-25T02:00:00.000Z");
+    assert.equal(restoredSnapshots.get("beta")?.lastItem.imageTag, "beta-image-tag");
 
     await kernel.applyPreparedNodeMutation({
       previousName: "alpha",

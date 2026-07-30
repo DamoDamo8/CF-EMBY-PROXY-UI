@@ -339,9 +339,10 @@ test('server record cards use Worker expiry results and expose the compact statu
       lastWatchedAt: '2026-07-01T00:00:00.000Z',
       state: 'ok',
       itemId: 'episode-1',
-      itemName: '第一集',
+      itemName: '摩登家庭 - S01E01',
       itemType: 'Episode',
-      seriesName: '测试剧集',
+      seriesName: '摩登家庭',
+      posterUrl: '/admin/__server-record-poster/alpha?v=har-primary-tag',
       posterSearch: {
         itemId: 'episode-1', mediaType: 'tv', title: '测试剧集', originalTitle: 'Test Series', year: 2026,
         watchedAt: '2026-07-01T00:00:00.000Z'
@@ -362,15 +363,17 @@ test('server record cards use Worker expiry results and expose the compact statu
   const card = buildServerRecordCard(record);
   assert.match(card, /data-server-record-poster="alpha"/);
   assert.match(card, /data-server-record-poster-placeholder data-state="idle"/);
-  assert.match(card, /<img alt="测试剧集 · 第一集 海报"[^>]* hidden>/);
-  assert.match(card, /测试剧集 · 第一集/);
+  assert.match(card, /<img alt="摩登家庭 - S01E01 海报"[^>]* hidden>/);
+  assert.match(card, /摩登家庭 - S01E01/);
+  assert.equal(record.watch.posterUrl, '/admin/__server-record-poster/alpha?v=har-primary-tag');
   assert.match(card, /已保存的媒体统计/);
   assert.match(card, /server-record-split/);
   assert.match(card, /server-record-info/);
   assert.match(card, /server-record-card-head[\s\S]*?server-record-card-identity[\s\S]*?server-record-card-refresh/);
   assert.match(card, /server-record-split[\s\S]*?server-record-watch-poster[\s\S]*?server-record-info[\s\S]*?server-record-watch[\s\S]*?server-record-metrics/);
   assert.doesNotMatch(card, /server-record-transition/);
-  assert.equal('posterUrl' in normalizeServerRecord({ nodeName: 'external', watch: { posterUrl: 'https://evil.example/poster.jpg' } }).watch, false);
+  assert.equal(normalizeServerRecord({ nodeName: 'external', watch: { posterUrl: 'https://evil.example/poster.jpg' } }).watch.posterUrl, '');
+  assert.equal(normalizeServerRecord({ nodeName: 'relative', watch: { posterUrl: '/admin/__server-record-poster/relative' } }).watch.posterUrl, '/admin/__server-record-poster/relative');
   assert.match(
     buildServerRecordCard(normalizeServerRecord({
       nodeName: 'incomplete',
@@ -430,14 +433,98 @@ test('server record cards use Worker expiry results and expose the compact statu
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_STYLE, /server-record-watch-poster(?:::|:)\w+\{[^}]*gradient/);
 });
 
-test('server record posters are visible-only browser jobs with bounded native concurrency', () => {
+test('server record posters prefer the authenticated same-origin route with bounded native concurrency', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /POSTER_MAX_CONCURRENCY = 16/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /new window\.IntersectionObserver/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\?\.\('getPosterBrowserConfig'\)/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /POSTER_REQUEST_TIMEOUT_MS = 8000/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /redirect: 'error'/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /clearPosterBrowserSession\(true\)/);
-  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /__server-record-poster|posterUrl/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /__server-record-poster|posterUrl/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /credentials: 'same-origin'/);
+});
+
+test('same-origin Emby posters bypass provider config and failures continue to TMDB fallback', async () => {
+  const createElement = () => {
+    const placeholder = { dataset: {}, hidden: false, innerHTML: '' };
+    const image = { hidden: true, src: '' };
+    return {
+      element: {
+        isConnected: true,
+        dataset: { serverRecordPoster: 'alpha' },
+        querySelector(selector) { return selector === 'img' ? image : placeholder; }
+      },
+      image,
+      placeholder
+    };
+  };
+  class PosterTestURL extends URL {
+    static createObjectURL() { return 'blob:poster-test'; }
+    static revokeObjectURL() {}
+  }
+
+  let configCalls = 0;
+  const direct = createElement();
+  const directHooks = loadEnhancementTestHooks({}, {
+    URL: PosterTestURL,
+    fetch: async (url, options) => {
+      assert.equal(url, '/admin/__server-record-poster/alpha');
+      assert.equal(options.credentials, 'same-origin');
+      return new Response(new Uint8Array([255, 216, 255]), { headers: { 'Content-Type': 'image/jpeg' } });
+    }
+  });
+  await directHooks.runPosterJob({
+    element: direct.element,
+    search: {},
+    posterUrl: '/admin/__server-record-poster/alpha',
+    app: { async apiCall() { configCalls += 1; return {}; } },
+    bypassFailure: false,
+    refreshToken: 0,
+    controller: new AbortController()
+  });
+  assert.equal(configCalls, 0);
+  assert.equal(direct.image.src, 'blob:poster-test');
+  assert.equal(direct.image.hidden, false);
+  assert.equal(direct.placeholder.dataset.state, 'success');
+
+  const fallbackRequests = [];
+  const fallback = createElement();
+  const fallbackHooks = loadEnhancementTestHooks({}, {
+    URL: PosterTestURL,
+    localStorage: createMemoryStorage(),
+    fetch: async (url) => {
+      fallbackRequests.push(String(url));
+      if (String(url).startsWith('/admin/')) return new Response(null, { status: 404 });
+      const parsed = new URL(url);
+      if (parsed.origin === 'https://api.themoviedb.org') {
+        return Response.json({ results: [{ title: '测试电影', poster_path: '/fallback.jpg' }] });
+      }
+      if (parsed.origin === 'https://image.tmdb.org') {
+        return new Response(new Uint8Array([255, 216, 255]), { headers: { 'Content-Type': 'image/jpeg' } });
+      }
+      throw new Error('unexpected poster request');
+    }
+  });
+  await fallbackHooks.runPosterJob({
+    element: fallback.element,
+    search: { itemId: 'movie-1', mediaType: 'movie', title: '测试电影', originalTitle: '', year: null },
+    posterUrl: '/admin/__server-record-poster/alpha',
+    app: {
+      async apiCall(action) {
+        configCalls += 1;
+        assert.equal(action, 'getPosterBrowserConfig');
+        return { tmdb: { configured: true, token: 'tmdb-token' }, douban: { configured: false } };
+      }
+    },
+    bypassFailure: false,
+    refreshToken: 0,
+    controller: new AbortController()
+  });
+  assert.equal(configCalls, 1);
+  assert.ok(fallbackRequests[0].startsWith('/admin/__server-record-poster/alpha'));
+  assert.ok(fallbackRequests.some((url) => url.startsWith('https://api.themoviedb.org/')));
+  assert.ok(fallbackRequests.some((url) => url.startsWith('https://image.tmdb.org/')));
+  assert.equal(fallback.placeholder.dataset.state, 'success');
 });
 
 test('TMDB uses Chinese then original title and accepts only one exact top-three match', async () => {

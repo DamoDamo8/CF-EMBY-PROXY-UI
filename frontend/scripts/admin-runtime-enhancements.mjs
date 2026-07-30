@@ -1602,12 +1602,34 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   async function runPosterJob(job) {
-    const { element, search, app, bypassFailure, refreshToken, controller } = job;
+    const { element, search, posterUrl, app, bypassFailure, refreshToken, controller } = job;
     if (!element?.isConnected || controller.signal.aborted) return;
     setPosterPlaceholder(element, 'loading');
     let cacheKey = '';
     try {
-      if (!isUsablePosterSearch(search)) throw createPosterError('browser', 'MISSING_METADATA');
+      let embyFailure = null;
+      if (posterUrl) {
+        try {
+          const response = await fetchPosterResource(posterUrl, {
+            credentials: 'same-origin',
+            headers: { Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif' }
+          }, 'emby', controller.signal);
+          const blob = await readValidatedPosterBlob(response, 'emby');
+          if (controller.signal.aborted || !element.isConnected) return;
+          const objectUrl = URL.createObjectURL(blob);
+          const previousUrl = posterBrowserState.objectUrls.get(element);
+          if (previousUrl) URL.revokeObjectURL(previousUrl);
+          posterBrowserState.objectUrls.set(element, objectUrl);
+          const image = element.querySelector('img');
+          if (image) { image.src = objectUrl; image.hidden = false; }
+          setPosterPlaceholder(element, 'success');
+          return;
+        } catch (error) {
+          if (error?.code === 'CANCELED') throw error;
+          embyFailure = error;
+        }
+      }
+      if (!isUsablePosterSearch(search)) throw embyFailure || createPosterError('browser', 'MISSING_METADATA');
       cacheKey = await hashPosterSearchIdentity(search);
       const cached = readPosterCacheEntry(cacheKey, { bypassFailure });
       if (cached?.status === 'failure') {
@@ -1672,6 +1694,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     posterBrowserState.queue.push({
       element,
       search: normalizePosterSearch(record.watch.posterSearch),
+      posterUrl: String(record.watch.posterUrl || '').trim().startsWith('/') ? String(record.watch.posterUrl).trim() : '',
       app,
       bypassFailure: refreshToken > 0,
       refreshToken,
@@ -1762,6 +1785,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         itemName: String(watch.itemName || '').trim().slice(0, 256),
         itemType: String(watch.itemType || '').trim().slice(0, 64),
         seriesName: String(watch.seriesName || '').trim().slice(0, 256),
+        posterUrl: String(watch.posterUrl || '').trim().startsWith('/') ? String(watch.posterUrl).trim() : '',
         posterSearch: normalizePosterSearch(watch.posterSearch)
       },
       expiry: {
@@ -2089,7 +2113,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
           : record.counts.state === 'unavailable' ? '尚未手动刷新或媒体统计不可用' : '';
     const lastWatchedText = record.watch.state === 'ok' ? formatServerRecordDateTime(record.watch.lastWatchedAt) : '数据不可用';
     const watchTitle = record.watch.itemName
-      ? (record.watch.seriesName && record.watch.seriesName !== record.watch.itemName ? record.watch.seriesName + ' · ' + record.watch.itemName : record.watch.itemName)
+      ? record.watch.itemName
       : (record.watch.itemId ? '媒体 #' + record.watch.itemId : '尚未记录媒体');
     const watchPoster = '<div class="server-record-watch-poster" data-server-record-poster="' + escapeServerRecordHtml(record.nodeName) + '"><span class="server-record-watch-placeholder" data-server-record-poster-placeholder data-state="idle" role="status" aria-live="polite" aria-atomic="true"><i data-lucide="image" aria-hidden="true"></i><span>等待加载</span></span><img alt="' + escapeServerRecordHtml(watchTitle + ' 海报') + '" decoding="async" referrerpolicy="no-referrer" hidden></div>';
     const watchSection = '<div class="server-record-watch"><span class="server-record-watch-label">上次观看</span><strong class="server-record-watch-title" title="' + escapeServerRecordHtml(watchTitle) + '">' + escapeServerRecordHtml(watchTitle) + '</strong><span class="server-record-watch-time">' + escapeServerRecordHtml(lastWatchedText) + '</span></div>';
