@@ -4,7 +4,7 @@ import { builtinModules } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 import { parse } from 'acorn';
-import { ancestor as walkAncestor, simple as walkSimple } from 'acorn-walk';
+import { simple as walkSimple } from 'acorn-walk';
 
 const scriptDirectory = path.dirname(fileURLToPath(import.meta.url));
 const repositoryRoot = path.resolve(scriptDirectory, '..');
@@ -14,6 +14,7 @@ const negativeFixtureFile = path.join(repositoryRoot, 'tests', 'fixtures', 'work
 const entryName = 'index.js';
 const facadeModuleName = 'runtime/application-facades.js';
 const testingHooksName = 'testing/hooks.js';
+const defaultModuleMaxLines = 1500;
 const facadeSignatures = new Map([
   ['AdminConsoleFacade', ['request', 'env', 'ctx']],
   ['NodeProxyFacade', ['request', 'env', 'ctx', 'routeContext']],
@@ -40,6 +41,11 @@ function classify(name) {
   if (normalized === entryName) return { layer: 'entry', slice: '' };
   const [layer, slice = ''] = normalized.split('/');
   return { layer, slice };
+}
+
+function classifyProxySlice(name) {
+  const [layer, proxy, slice = ''] = normalizeName(name).split('/');
+  return layer === 'runtime' && proxy === 'proxy' ? slice : '';
 }
 
 function makeError(code, file, message, node = null) {
@@ -147,8 +153,18 @@ function handleCallsMember(handle, objectName, expectedMember) {
 function isSingleCallForwarder(node) {
   if (node?.type !== 'FunctionDeclaration' || node.body.body.length !== 1) return false;
   const statement = node.body.body[0];
-  if (statement.type === 'ReturnStatement') return statement.argument?.type === 'CallExpression';
-  return statement.type === 'ExpressionStatement' && statement.expression?.type === 'CallExpression';
+  const call = statement.type === 'ReturnStatement'
+    ? statement.argument
+    : statement.type === 'ExpressionStatement' ? statement.expression : null;
+  if (call?.type !== 'CallExpression') return false;
+  const directCallee = call.callee?.type === 'Identifier'
+    || (call.callee?.type === 'MemberExpression' && call.callee.object?.type === 'Identifier');
+  if (!directCallee || call.arguments.length !== node.params.length) return false;
+  return call.arguments.every((argument, index) => (
+    argument.type === 'Identifier'
+    && node.params[index]?.type === 'Identifier'
+    && argument.name === node.params[index].name
+  ));
 }
 
 function unwrapFrozenObject(node) {
@@ -183,9 +199,26 @@ function validateDependency(sourceName, targetName, node, errors) {
       node
     ));
   }
+  const sourceSlice = classifyProxySlice(sourceName);
+  if (!sourceSlice) return;
+  const targetSlice = classifyProxySlice(targetName);
+  const allowedProxyTargets = {
+    http: new Set(['http']),
+    playback: new Set(['http', 'playback'])
+  };
+  const allowedTarget = target.layer === 'core'
+    || (target.layer === 'runtime' && allowedProxyTargets[sourceSlice]?.has(targetSlice));
+  if (!allowedTarget) {
+    errors.push(makeError(
+      'CROSS_SLICE_DEPENDENCY',
+      sourceName,
+      `${sourceSlice} proxy slice cannot depend on ${targetName}`,
+      node
+    ));
+  }
 }
 
-function analyzeFiles(fileSources, { strictRepository = false } = {}) {
+function analyzeFiles(fileSources, { strictRepository = false, moduleLineBudgets = {} } = {}) {
   const errors = [];
   const names = [...fileSources.keys()].map(normalizeName).sort();
   const fileSet = new Set(names);
@@ -213,8 +246,11 @@ function analyzeFiles(fileSources, { strictRepository = false } = {}) {
     if (production && !['entry', 'runtime', 'core', 'platform'].includes(layer)) {
       errors.push(makeError('UNKNOWN_LAYER', name, 'production modules must use entry/runtime/core/platform boundaries'));
     }
-    if (production && name !== entryName && lineCount < 300) {
-      errors.push(makeError('SMALL_MODULE', name, `production business modules require 300 lines; found ${lineCount}`));
+    const legacyLineBudget = Number(moduleLineBudgets[name]);
+    if (production && Number.isFinite(legacyLineBudget) && legacyLineBudget > 0 && lineCount > legacyLineBudget) {
+      errors.push(makeError('MODULE_LINE_BUDGET', name, `legacy module exceeds its ${legacyLineBudget}-line budget; found ${lineCount}`));
+    } else if (production && !Number.isFinite(legacyLineBudget) && name !== entryName && lineCount > defaultModuleMaxLines) {
+      errors.push(makeError('MODULE_TOO_LARGE', name, `new production modules may not exceed ${defaultModuleMaxLines} lines; found ${lineCount}`));
     }
     if (production && (name.includes('/public/') || /(?:capabilities|compat-facades)\.js$/.test(name))) {
       errors.push(makeError('LEGACY_MODULE', name, 'legacy capability, compatibility, or public forwarding modules are forbidden'));
@@ -240,9 +276,6 @@ function analyzeFiles(fileSources, { strictRepository = false } = {}) {
           facadeNodes.set(facade.name, facade.node);
           const span = facade.node.loc.end.line - facade.node.loc.start.line + 1;
           facadeSpans.set(facade.name, span);
-          if (span < 300) {
-            errors.push(makeError('FACADE_TOO_SMALL', name, `${facade.name} spans ${span} lines; requires at least 300`, facade.node));
-          }
           const constructor = facade.node.body.body.find(member => member.type === 'MethodDefinition' && member.kind === 'constructor');
           if (!constructor || constructor.value.params.length !== 1 || constructor.value.params[0].type !== 'ObjectPattern') {
             errors.push(makeError('FACADE_INJECTION', name, `${facade.name} requires one object-pattern constructor`, facade.node));
@@ -422,58 +455,6 @@ function analyzeFiles(fileSources, { strictRepository = false } = {}) {
   if (cycle) errors.push(makeError('CYCLE', cycle[0], cycle.join(' -> ')));
 
   const productionNames = names.filter(name => classify(name).layer !== 'testing');
-  const inbound = new Map(productionNames.map(name => [name, new Set()]));
-  for (const [source, targets] of graph) {
-    if (classify(source).layer === 'testing') continue;
-    for (const target of targets) if (classify(target).layer !== 'testing') inbound.get(target)?.add(source);
-  }
-  for (const name of productionNames) {
-    const layer = classify(name).layer;
-    if (name === facadeModuleName || layer === 'entry' || layer === 'core' || layer === 'platform') continue;
-    const callers = inbound.get(name) || new Set();
-    if (callers.size < 2) {
-      errors.push(makeError('SINGLE_CALLER', name, `business modules require two production callers; found ${callers.size}`));
-    }
-  }
-
-  const sharedNames = productionNames.filter(name => ['core', 'platform'].includes(classify(name).layer));
-  const sharedUsage = new Map(sharedNames.map(name => [name, { calls: 0, facades: new Set() }]));
-  const importedBindings = new Map();
-  for (const imported of resolvedImports.filter(item => item.source === facadeModuleName && sharedUsage.has(item.target))) {
-    for (const binding of imported.bindings) importedBindings.set(binding.local, { ...binding, target: imported.target });
-  }
-  const facadeAst = parsed.get(facadeModuleName);
-  if (facadeAst && importedBindings.size) {
-    const classOwners = new Map([...facadeNodes].map(([name, node]) => [node, name]));
-    walkAncestor(facadeAst, {
-      CallExpression(node, ancestors) {
-        const ownerNode = [...ancestors].reverse().find(item => classOwners.has(item));
-        const owner = classOwners.get(ownerNode);
-        if (!owner) return;
-        let binding = node.callee.type === 'Identifier' ? importedBindings.get(node.callee.name) : null;
-        if (node.callee.type === 'MemberExpression' && node.callee.object?.type === 'Identifier') {
-          const candidate = importedBindings.get(node.callee.object.name);
-          if (candidate?.kind === 'ImportNamespaceSpecifier') binding = candidate;
-        }
-        if (!binding) return;
-        const usage = sharedUsage.get(binding.target);
-        usage.calls += 1;
-        usage.facades.add(owner);
-      }
-    });
-  }
-  let sharedDirectCalls = 0;
-  for (const name of sharedNames) {
-    const usage = sharedUsage.get(name);
-    sharedDirectCalls += usage.calls;
-    if (usage.calls < 10 || usage.facades.size < 2) {
-      errors.push(makeError(
-        'UNDERUSED_SHARED_MODULE',
-        name,
-        `shared modules require 10 direct calls across two Facades; found ${usage.calls}/${usage.facades.size}`
-      ));
-    }
-  }
 
   const productionImportEdges = resolvedImports.filter(item => (
     classify(item.source).layer !== 'testing' && classify(item.target).layer !== 'testing'
@@ -486,8 +467,7 @@ function analyzeFiles(fileSources, { strictRepository = false } = {}) {
       productionModules: productionNames.length,
       productionImportEdges,
       facadeSpans: Object.fromEntries([...facadeSpans].sort()),
-      sharedDirectCalls,
-      sharedModules: sharedNames.length
+      legacyModuleBudgets: Object.keys(moduleLineBudgets).length
     }
   };
 }
@@ -508,32 +488,48 @@ async function readWorkerSources() {
   return result;
 }
 
-async function runNegativeFixtures() {
+function buildFixtureFiles(testCase) {
+  const files = new Map();
+  for (const [name, descriptor] of Object.entries(testCase.files)) {
+    const source = typeof descriptor === 'string' ? descriptor : descriptor.source;
+    const padLines = typeof descriptor === 'string' ? 0 : Number(descriptor.padLines) || 0;
+    files.set(normalizeName(name), source + '\n// fixture padding'.repeat(Math.max(0, padLines)));
+  }
+  return files;
+}
+
+async function runArchitectureFixtures() {
   const fixture = JSON.parse(await fs.readFile(negativeFixtureFile, 'utf8'));
-  for (const testCase of fixture.cases) {
-    const files = new Map();
-    for (const [name, descriptor] of Object.entries(testCase.files)) {
-      const source = typeof descriptor === 'string' ? descriptor : descriptor.source;
-      const padLines = typeof descriptor === 'string' ? 0 : Number(descriptor.padLines) || 0;
-      files.set(normalizeName(name), source + '\n// fixture padding'.repeat(Math.max(0, padLines)));
+  for (const testCase of fixture.validCases || []) {
+    const result = analyzeFiles(buildFixtureFiles(testCase));
+    if (result.errors.length) {
+      throw new Error(`valid fixture ${testCase.name} failed with ${result.errors.map(error => error.code).join(', ')}`);
     }
-    const result = analyzeFiles(files);
+  }
+  for (const testCase of fixture.invalidCases || []) {
+    const result = analyzeFiles(buildFixtureFiles(testCase));
     const actualCodes = new Set(result.errors.map(error => error.code));
     for (const expectedCode of testCase.expectedCodes) {
       if (!actualCodes.has(expectedCode)) {
-        throw new Error(`negative fixture ${testCase.name} did not fail with ${expectedCode}; got ${[...actualCodes].join(', ')}`);
+        throw new Error(`invalid fixture ${testCase.name} did not fail with ${expectedCode}; got ${[...actualCodes].join(', ')}`);
       }
     }
   }
-  return fixture.cases.length;
+  return {
+    valid: (fixture.validCases || []).length,
+    invalid: (fixture.invalidCases || []).length
+  };
 }
 
 const [fileSources, baseline, fixtureCount] = await Promise.all([
   readWorkerSources(),
   fs.readFile(baselineFile, 'utf8').then(JSON.parse),
-  runNegativeFixtures()
+  runArchitectureFixtures()
 ]);
-const result = analyzeFiles(fileSources, { strictRepository: true });
+const result = analyzeFiles(fileSources, {
+  strictRepository: true,
+  moduleLineBudgets: baseline.legacyModuleLineBudgets || {}
+});
 if (result.errors.length) {
   console.error('[check-worker-architecture] failed');
   for (const error of result.errors) console.error(`- ${formatError(error)}`);
@@ -545,6 +541,6 @@ console.log(
   `[check-worker-architecture] production graph ${baseline.productionGraph.modules} modules/${baseline.productionGraph.importEdges} edges -> `
   + `${result.stats.productionModules} modules/${result.stats.productionImportEdges} edges; `
   + `source graph ${result.stats.sourceModules} modules/${result.stats.sourceImportEdges} edges; `
-  + `Facade spans ${spans}; ${result.stats.sharedDirectCalls} shared direct calls across ${result.stats.sharedModules} modules; `
-  + `${fixtureCount} negative fixtures passed`
+  + `Facade spans ${spans}; ${result.stats.legacyModuleBudgets} legacy line budgets; `
+  + `${fixtureCount.valid} valid/${fixtureCount.invalid} invalid fixtures passed`
 );

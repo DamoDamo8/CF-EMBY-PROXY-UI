@@ -4054,6 +4054,221 @@ test("isolate cache defaults preserve bounded proxy headroom", () => {
   assert.ok(Config.Defaults.OpsStatusReadCacheTtlMs <= 15 * 1000);
 });
 
+test("API MIME guard replaces an upstream frontend document with structured JSON", async () => {
+  const upstreamState = {
+    response: new Response("<!doctype html><title>Frontend</title>", {
+      status: 200,
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Length": "42",
+        "Content-Encoding": "gzip",
+        "ETag": "frontend-shell"
+      }
+    })
+  };
+  const result = await proxyService.guardApiResponseMime({
+    request: new Request("https://worker.test/alpha/System/Info", {
+      headers: { Accept: "application/json" }
+    }),
+    requestMethod: "GET",
+    requestTraits: { isApiRequest: true }
+  }, upstreamState);
+
+  assert.notEqual(result, upstreamState);
+  assert.equal(result.response.status, 502);
+  assert.equal(result.response.headers.get("Content-Type"), "application/json; charset=utf-8");
+  assert.equal(result.response.headers.get("Cache-Control"), "no-store");
+  assert.equal(result.response.headers.get("X-Proxy-Mime-Guard"), "html-document");
+  assert.equal(result.response.headers.get("Content-Length"), null);
+  assert.equal(result.response.headers.get("Content-Encoding"), null);
+  assert.equal(result.response.headers.get("ETag"), null);
+  assert.deepEqual(await result.response.json(), {
+    error: "Bad Gateway",
+    code: 502,
+    message: "Upstream API returned an HTML document instead of API data.",
+    details: {
+      upstreamStatus: 200,
+      contentType: "text/html"
+    }
+  });
+});
+
+test("API MIME guard preserves explicit root navigation and legitimate non-HTML API responses", async () => {
+  const htmlState = {
+    response: new Response("<!doctype html><title>Emby</title>", {
+      headers: { "Content-Type": "text/html" }
+    })
+  };
+  const documentExecution = {
+    request: new Request("https://worker.test/alpha/", {
+      headers: { Accept: "text/html,application/xhtml+xml" }
+    }),
+    requestMethod: "GET",
+    proxyPath: "/",
+    requestTraits: { isApiRequest: true }
+  };
+  assert.equal(await proxyService.guardApiResponseMime(documentExecution, htmlState), htmlState);
+
+  const textState = {
+    response: new Response("Emby Server", { headers: { "Content-Type": "text/plain" } })
+  };
+  const apiExecution = {
+    request: new Request("https://worker.test/alpha/System/Ping", {
+      headers: { Accept: "application/json" }
+    }),
+    requestMethod: "GET",
+    requestTraits: { isApiRequest: true }
+  };
+  assert.equal(await proxyService.guardApiResponseMime(apiExecution, textState), textState);
+
+  const staticState = {
+    response: new Response("<!doctype html><title>Asset</title>", {
+      headers: { "Content-Type": "text/html" }
+    })
+  };
+  assert.equal(await proxyService.guardApiResponseMime({
+    ...apiExecution,
+    requestTraits: { isApiRequest: false, isStaticFile: true }
+  }, staticState), staticState);
+});
+
+test("API MIME guard does not sniff generic bodies and does not treat q=0 as document acceptance", async () => {
+  for (const contentType of ["text/plain", "application/octet-stream", ""]) {
+    const headers = contentType ? { "Content-Type": contentType } : {};
+    const body = "\uFEFF<!-- edge fallback --><!doctype html><html><body>Frontend</body></html>";
+    const upstreamState = {
+      response: new Response(contentType ? body : new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(body));
+          controller.close();
+        }
+      }), { headers })
+    };
+    const result = await proxyService.guardApiResponseMime({
+      request: new Request("https://worker.test/alpha/", {
+        headers: { Accept: "application/json" }
+      }),
+      requestMethod: "GET",
+      proxyPath: "/",
+      requestTraits: { isApiRequest: true }
+    }, upstreamState);
+    assert.equal(result, upstreamState);
+    assert.equal((await result.response.text()).replace(/^\uFEFF/, ""), body.replace(/^\uFEFF/, ""));
+  }
+
+  for (const contentType of ["text/html", "application/xhtml+xml"]) {
+    const result = await proxyService.guardApiResponseMime({
+      request: new Request("https://worker.test/alpha/", {
+        headers: { Accept: "application/json, text/html;q=0, application/xhtml+xml;q=0" }
+      }),
+      requestMethod: "GET",
+      proxyPath: "/",
+      requestTraits: { isApiRequest: true }
+    }, {
+      response: new Response("<html><body>Frontend</body></html>", {
+        headers: { "Content-Type": contentType }
+      })
+    });
+    assert.equal(result.response.status, 502);
+    assert.equal(result.response.headers.get("X-Proxy-Mime-Guard"), "html-document");
+    assert.equal((await result.response.json()).details.contentType, contentType);
+  }
+});
+
+test("PlaybackInfo contract preserves HEAD and no-content responses", async () => {
+  for (const [requestMethod, status] of [["HEAD", 200], ["POST", 204], ["POST", 205]]) {
+    const upstreamState = {
+      response: new Response(null, { status, headers: { "Content-Type": "text/plain" } })
+    };
+    const result = await proxyService.guardPlaybackInfoResponseContract({
+      requestMethod,
+      requestTraits: { isPlaybackInfoRequest: true }
+    }, upstreamState);
+    assert.equal(result, upstreamState);
+  }
+});
+
+test("production PlaybackInfo stages stop after contract rejection", async () => {
+  const execution = {
+    request: new Request("https://worker.test/alpha/Items/1/PlaybackInfo", {
+      method: "POST",
+      headers: { Accept: "application/json" }
+    }),
+    requestMethod: "POST",
+    requestUrl: new URL("https://worker.test/alpha/Items/1/PlaybackInfo"),
+    rawRequestUrl: new URL("https://worker.test/alpha/Items/1/PlaybackInfo"),
+    proxyPath: "/Items/1/PlaybackInfo",
+    requestTraits: {
+      isApiRequest: true,
+      isPlaybackInfoRequest: true,
+      isPlaybackCriticalRequest: true
+    },
+    effectivePlaybackInfoMode: "rewrite",
+    playbackInfoRewrite: "",
+    playbackInfoCacheEnabled: false,
+    playbackInfoCacheState: "skip",
+    playbackInfoCacheTtlSec: 0,
+    playbackAbsoluteFallbackEligible: false,
+    dynamicCors: {},
+    finalOrigin: "*",
+    nodeName: "alpha",
+    nodeKey: "",
+    nodeDerivedCacheRevision: "rev-1",
+    targetHotCacheState: "miss",
+    routingDecisionMode: "default"
+  };
+  const upstreamState = {
+    response: new Response(JSON.stringify("frontend-shell"), {
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    }),
+    finalUrl: new URL("https://origin.test/Items/1/PlaybackInfo"),
+    activeTargetBase: new URL("https://origin.test")
+  };
+  const originalRewrite = proxyService.maybeRewritePlaybackInfoResponse;
+  const originalRecordAccessLog = proxyService.recordAccessLog;
+  let rewriteCalled = false;
+  let accessLogPayload = null;
+  proxyService.maybeRewritePlaybackInfoResponse = async (...args) => {
+    rewriteCalled = true;
+    return originalRewrite(...args);
+  };
+  proxyService.recordAccessLog = (_execution, payload) => {
+    accessLogPayload = payload;
+  };
+  try {
+    const response = await proxyService.buildSuccessResponse(execution, {}, upstreamState);
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get("X-Proxy-Contract-Guard"), "playback-info");
+    assert.equal((await response.json()).details.reason, "invalid_root_object");
+  } finally {
+    proxyService.maybeRewritePlaybackInfoResponse = originalRewrite;
+    proxyService.recordAccessLog = originalRecordAccessLog;
+  }
+
+  assert.equal(rewriteCalled, false);
+  assert.equal(execution.playbackInfoRewrite, "rejected");
+  assert.equal(accessLogPayload?.detailJson?.playbackInfoRewrite, "rejected");
+  assert.match(proxyService.buildPlaybackInfoCacheDiagnosticDetail(execution), /PlaybackInfoRewrite=rejected/);
+});
+
+test("local firewall, rate-limit, and invalid-target errors remain text responses", async () => {
+  const firewallResponse = proxyService.evaluateFirewall({ ipBlacklist: "198.51.100.41" }, "198.51.100.41", "US", "*");
+  assert.equal(firewallResponse.status, 403);
+  assert.equal(await firewallResponse.text(), "Forbidden by IP Firewall");
+
+  const rateLimitConfig = { rateLimitRpm: 1 };
+  const requestTraits = { isPlaybackCriticalRequest: false };
+  assert.equal(proxyService.applyRateLimit(rateLimitConfig, "198.51.100.42", requestTraits, 1000, "*"), null);
+  const rateLimitResponse = proxyService.applyRateLimit(rateLimitConfig, "198.51.100.42", requestTraits, 1000, "*");
+  assert.equal(rateLimitResponse.status, 429);
+  assert.equal(await rateLimitResponse.text(), "Rate Limit Exceeded");
+
+  const { invalidResponse } = proxyService.parseTargetRecords({ target: "" }, "*");
+  assert.equal(invalidResponse.status, 502);
+  assert.equal(await invalidResponse.text(), "Invalid Node Target");
+});
+
 test("oversized PlaybackInfo responses are not retained in isolate memory", async () => {
   isolateState.PlaybackInfoResponseCache.clear();
   const execution = {
@@ -4072,8 +4287,8 @@ test("oversized PlaybackInfo responses are not retained in isolate memory", asyn
   assert.equal(isolateState.PlaybackInfoResponseCache.size, 0);
 });
 
-test("oversized PlaybackInfo rewrite bypasses without blocking its original stream", { timeout: 2000 }, async () => {
-  const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
+test("oversized PlaybackInfo objects are rejected by the contract guard", { timeout: 2000 }, async () => {
+  const oversizedBody = JSON.stringify({ padding: "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1) });
   const response = new Response(oversizedBody, {
     headers: { "Content-Type": "application/json" }
   });
@@ -4085,9 +4300,10 @@ test("oversized PlaybackInfo rewrite bypasses without blocking its original stre
     playbackInfoRewrite: ""
   };
   const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
-  assert.equal(result, upstreamState);
-  assert.equal(execution.playbackInfoRewrite, "not_needed");
-  assert.equal((await response.text()).length, oversizedBody.length);
+  assert.equal(result.response.status, 502);
+  assert.equal(execution.playbackInfoRewrite, "rejected");
+  assert.equal(result.response.headers.get("X-Proxy-Contract-Guard"), "playback-info");
+  assert.equal((await result.response.json()).details.reason, "body_too_large");
 });
 
 test("PlaybackInfo passthrough decodes nested object fields and removes invalid entries", async () => {
@@ -4188,14 +4404,17 @@ test("valid PlaybackInfo passthrough keeps the original response unchanged", asy
   };
 
   const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
-  assert.equal(result, upstreamState);
+  assert.notEqual(result, upstreamState);
   assert.equal(result.response, upstreamState.response);
+  assert.equal(result.playbackInfoRepresentation.contract, "playback-info");
+  assert.equal(result.playbackInfoRepresentation.response, upstreamState.response);
+  assert.equal(Object.isFrozen(result.playbackInfoRepresentation), true);
   assert.equal(execution.playbackInfoRewrite, "passthrough");
   assert.equal(result.response.headers.get("ETag"), "preserved-etag");
   assert.equal(await result.response.text(), bodyText);
 });
 
-test("non-JSON and oversized PlaybackInfo passthrough responses remain untouched", async () => {
+test("PlaybackInfo rejects unsupported MIME and oversized responses as structured JSON", async () => {
   const makeExecution = () => ({
     requestTraits: { isPlaybackInfoRequest: true },
     effectivePlaybackInfoMode: "passthrough",
@@ -4206,18 +4425,139 @@ test("non-JSON and oversized PlaybackInfo passthrough responses remain untouched
     response: new Response("upstream text", { headers: { "Content-Type": "text/plain" } })
   };
   const textExecution = makeExecution();
-  assert.equal(await proxyService.maybeRewritePlaybackInfoResponse(textExecution, textState), textState);
-  assert.equal(textExecution.playbackInfoRewrite, "passthrough");
-  assert.equal(await textState.response.text(), "upstream text");
+  const textResult = await proxyService.maybeRewritePlaybackInfoResponse(textExecution, textState);
+  assert.equal(textResult.response.status, 502);
+  assert.equal(textExecution.playbackInfoRewrite, "rejected");
+  assert.equal(textResult.response.headers.get("X-Proxy-Contract-Guard"), "playback-info");
+  assert.equal(textResult.response.headers.get("X-Proxy-Mime-Guard"), null);
+  assert.equal((await textResult.response.json()).details.reason, "unsupported_content_type");
 
   const oversizedBody = "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes + 1);
   const oversizedState = {
     response: new Response(oversizedBody, { headers: { "Content-Type": "application/json" } })
   };
   const oversizedExecution = makeExecution();
-  assert.equal(await proxyService.maybeRewritePlaybackInfoResponse(oversizedExecution, oversizedState), oversizedState);
-  assert.equal(oversizedExecution.playbackInfoRewrite, "passthrough");
-  assert.equal((await oversizedState.response.text()).length, oversizedBody.length);
+  const oversizedResult = await proxyService.maybeRewritePlaybackInfoResponse(oversizedExecution, oversizedState);
+  assert.equal(oversizedResult.response.status, 502);
+  assert.equal(oversizedExecution.playbackInfoRewrite, "rejected");
+  assert.equal((await oversizedResult.response.json()).details.reason, "body_too_large");
+});
+
+test("PlaybackInfo rejects double-encoded and text/plain JSON objects", async () => {
+  const makeExecution = () => ({
+    requestTraits: { isPlaybackInfoRequest: true },
+    effectivePlaybackInfoMode: "passthrough",
+    requestMethod: "POST",
+    playbackInfoRewrite: ""
+  });
+  const payload = { PlaySessionId: "session-1", MediaSources: [] };
+  for (const [body, contentType, reason] of [
+    [JSON.stringify(JSON.stringify(payload)), "application/json", "invalid_root_object"],
+    [JSON.stringify(payload), "text/plain", "unsupported_content_type"]
+  ]) {
+    const result = await proxyService.maybeRewritePlaybackInfoResponse(makeExecution(), {
+      response: new Response(body, {
+        headers: { "Content-Type": contentType, "Content-Length": String(body.length), ETag: "stale" }
+      })
+    });
+    assert.equal(result.response.status, 502);
+    assert.equal(result.response.headers.get("Content-Type"), "application/json; charset=utf-8");
+    assert.equal(result.response.headers.get("Content-Length"), null);
+    assert.equal(result.response.headers.get("ETag"), null);
+    assert.equal(result.response.headers.get("X-Proxy-Contract-Guard"), "playback-info");
+    assert.equal((await result.response.json()).details.reason, reason);
+  }
+});
+
+test("PlaybackInfo rejects arrays, scalars, null, malformed JSON, and JSONP media types", async () => {
+  const cases = [
+    { body: JSON.stringify("frontend"), contentType: "application/json", reason: "invalid_root_object" },
+    { body: JSON.stringify([]), contentType: "text/json", reason: "invalid_root_object" },
+    { body: JSON.stringify(42), contentType: "application/problem+json", reason: "invalid_root_object" },
+    { body: "null", contentType: "application/json", reason: "invalid_root_object" },
+    { body: "{broken", contentType: "application/json", reason: "invalid_root_object" },
+    { body: "{}", contentType: "application/json,text/html", reason: "unsupported_content_type" },
+    { body: "callback({})", contentType: "application/jsonp", reason: "unsupported_content_type" }
+  ];
+  for (const fixture of cases) {
+    const execution = {
+      requestTraits: { isPlaybackInfoRequest: true },
+      effectivePlaybackInfoMode: "passthrough",
+      requestMethod: "POST",
+      playbackInfoRewrite: ""
+    };
+    const result = await proxyService.maybeRewritePlaybackInfoResponse(execution, {
+      response: new Response(fixture.body, { headers: { "Content-Type": fixture.contentType } })
+    });
+    assert.equal(result.response.status, 502);
+    assert.equal(result.response.headers.get("Content-Type"), "application/json; charset=utf-8");
+    assert.equal(execution.playbackInfoRewrite, "rejected");
+    assert.equal((await result.response.json()).details.reason, fixture.reason);
+  }
+});
+
+test("PlaybackInfo cache store rejects responses without a valid representation", async () => {
+  isolateState.PlaybackInfoResponseCache.clear();
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    playbackInfoCacheKey: "playback-info:scalar",
+    requestMethod: "POST",
+    playbackInfoCacheTtlSec: 60,
+    nodeName: "alpha",
+    nodeDerivedCacheRevision: "rev-1"
+  };
+  const response = new Response(JSON.stringify({ MediaSources: [] }), {
+    headers: { "Content-Type": "application/json" }
+  });
+  const forgedRepresentation = Object.freeze({
+    contract: "playback-info",
+    response,
+    bodyText: JSON.stringify({ MediaSources: [] }),
+    bodyBytes: 19,
+    payload: { MediaSources: [] }
+  });
+  assert.equal(await proxyService.storePlaybackInfoResponseCache(execution, response), false);
+  assert.equal(await proxyService.storePlaybackInfoResponseCache(execution, response, null, forgedRepresentation), false);
+  assert.equal(isolateState.PlaybackInfoResponseCache.size, 0);
+});
+
+test("PlaybackInfo cache evicts legacy invalid entries before delivery", async () => {
+  isolateState.PlaybackInfoResponseCache.clear();
+  const execution = {
+    requestTraits: { isPlaybackInfoRequest: true },
+    playbackInfoCacheEnabled: true,
+    playbackInfoCacheTtlSec: 60,
+    requestMethod: "GET",
+    nodeName: "alpha",
+    nodeDerivedCacheRevision: "rev-1",
+    effectivePlaybackInfoMode: "passthrough",
+    playbackInfoRewriteUrlMode: "relative",
+    proxyPath: "/Items/1/PlaybackInfo",
+    requestUrl: new URL("https://worker.test/alpha/Items/1/PlaybackInfo"),
+    request: new Request("https://worker.test/alpha/Items/1/PlaybackInfo"),
+    dynamicCors: {},
+    finalOrigin: "*"
+  };
+  const cacheKey = proxyService.buildPlaybackInfoCacheKey(execution);
+  for (const fixture of [
+    { contentType: "application/json", bodyText: JSON.stringify("frontend") },
+    { contentType: "application/json", bodyText: "{broken" },
+    { contentType: "text/plain", bodyText: "{}" },
+    { contentType: "application/json", bodyText: JSON.stringify({ padding: "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes) }) }
+  ]) {
+    isolateState.PlaybackInfoResponseCache.set(cacheKey, {
+      status: 200,
+      statusText: "OK",
+      headers: [["Content-Type", fixture.contentType]],
+      bodyText: fixture.bodyText,
+      bodyBytes: 1,
+      expiresAt: Date.now() + 60000
+    });
+
+    assert.equal(await proxyService.tryServePlaybackInfoResponseCache(execution), null);
+    assert.equal(execution.playbackInfoCacheState, "miss");
+    assert.equal(isolateState.PlaybackInfoResponseCache.has(cacheKey), false);
+  }
 });
 
 test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching", async () => {
@@ -4256,15 +4596,27 @@ test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching"
       finalUrl: new URL("https://origin.test/Items/1/PlaybackInfo")
     };
 
-    const rewrittenState = await proxyService.maybeRewritePlaybackInfoResponse(execution, upstreamState);
+    const guardedState = await proxyService.guardPlaybackInfoResponseContract(execution, upstreamState);
+    const sourcePayload = guardedState.playbackInfoRepresentation.payload;
+    const sourcePayloadSnapshot = JSON.stringify(sourcePayload);
+    const rewrittenState = await proxyService.maybeRewritePlaybackInfoResponse(execution, guardedState);
     assert.equal(cloneCount, 1);
-    assert.equal(execution.playbackInfoCacheBodyResolved, true);
-    assert.ok(execution.playbackInfoCacheBody?.bytes > 0);
+    assert.equal(JSON.stringify(sourcePayload), sourcePayloadSnapshot, "rewrite must not mutate the inspected payload");
+    assert.notEqual(rewrittenState.playbackInfoRepresentation.payload, sourcePayload);
+    assert.ok(rewrittenState.playbackInfoRepresentation.bodyBytes > 0);
 
-    const stored = await proxyService.storePlaybackInfoResponseCache(execution, rewrittenState.response);
+    const stored = await proxyService.storePlaybackInfoResponseCache(
+      execution,
+      rewrittenState.response,
+      null,
+      rewrittenState.playbackInfoRepresentation
+    );
     assert.equal(stored, true);
     assert.equal(cloneCount, 1, "cache storage must reuse the rewrite snapshot");
-    assert.equal(isolateState.PlaybackInfoResponseCache.get("playback-info:single-read")?.bodyText, execution.playbackInfoCacheBody.text);
+    assert.equal(
+      isolateState.PlaybackInfoResponseCache.get("playback-info:single-read")?.bodyText,
+      rewrittenState.playbackInfoRepresentation.bodyText
+    );
   } finally {
     Object.defineProperty(Response.prototype, "clone", originalCloneDescriptor);
     isolateState.PlaybackInfoResponseCache.clear();
@@ -4273,12 +4625,16 @@ test("PlaybackInfo rewrite reuses its bounded body snapshot for isolate caching"
 
 test("PlaybackInfo cache evicts oldest entries at its total byte budget", () => {
   isolateState.PlaybackInfoResponseCache.clear();
-  const entryBytes = Config.Defaults.PlaybackInfoCacheEntryMaxBytes;
+  const bodyText = JSON.stringify({ padding: "x".repeat(Config.Defaults.PlaybackInfoCacheEntryMaxBytes - 32) });
+  const entryBytes = new TextEncoder().encode(bodyText).byteLength;
   const entryCount = Math.floor(Config.Defaults.PlaybackInfoCacheTotalMaxBytes / entryBytes) + 1;
   for (let index = 0; index < entryCount; index += 1) {
     isolateState.PlaybackInfoResponseCache.set(`entry-${index}`, {
-      bodyText: "",
-      bodyBytes: entryBytes,
+      status: 200,
+      statusText: "OK",
+      headers: [["Content-Type", "application/json"]],
+      bodyText,
+      bodyBytes: 1,
       expiresAt: Date.now() + 60000
     });
   }

@@ -1,3 +1,31 @@
+import {
+	decodeBufferedBodyText,
+	parseContentLengthHeader,
+	readResponseBytesWithLimit,
+	readResponseTextWithLimit
+} from "../core/http-body.js";
+import { guardApiResponseMime as guardApiResponseMimeRepresentation } from "./proxy/http/api-mime-guard.js";
+import {
+	isJsonHttpMediaType,
+	normalizeHttpMediaType
+} from "./proxy/http/media-types.js";
+import { buildProxyErrorState } from "./proxy/http/proxy-error-response.js";
+import {
+	inspectPlaybackInfoResponse,
+	isPlaybackInfoRepresentation,
+	parsePlaybackInfoRootObject
+} from "./proxy/playback/contract.js";
+import { createPlaybackInfoCacheKey, PlaybackInfoCacheStore } from "./proxy/playback/cache.js";
+import {
+	decodePlaybackInfoJsonValue,
+	normalizePlaybackInfoObjectArray,
+	rewritePlaybackInfoPayload as rewritePlaybackInfoPayloadRepresentation,
+	rewritePlaybackInfoRepresentation,
+	sanitizePlaybackInfoMediaSource,
+	sanitizePlaybackInfoMediaSourcesPayload,
+	sanitizePlaybackInfoSerializedResponseHeaders
+} from "./proxy/playback/rewrite.js";
+
 //#region worker/features/admin/api.js
 
 //#endregion
@@ -3480,92 +3508,6 @@ function fetchRequest(input, init) {
 }
 //#endregion
 //#region worker/core/http-body.js
-function parseContentLengthHeader(value) {
-	const raw = String(value || "").trim();
-	if (!/^\d+$/.test(raw)) return null;
-	const parsed = Number(raw);
-	return Number.isFinite(parsed) ? parsed : null;
-}
-function decodeBufferedBodyText(buffer) {
-	if (buffer === null || buffer === void 0) return "";
-	try {
-		if (buffer instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(buffer));
-		if (ArrayBuffer.isView(buffer)) return new TextDecoder().decode(buffer);
-		return String(buffer || "");
-	} catch {
-		return "";
-	}
-}
-async function readResponseBytesWithLimit(response, maxBytes) {
-	const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
-	const declaredBytes = parseContentLengthHeader(response?.headers?.get?.("Content-Length"));
-	if (Number.isFinite(declaredBytes) && declaredBytes > limit) {
-		try {
-			Promise.resolve(response?.body?.cancel?.()).catch(() => {});
-		} catch {}
-		return {
-			bodyBytes: /* @__PURE__ */ new Uint8Array(0),
-			bytes: declaredBytes,
-			exceeded: true
-		};
-	}
-	if (!response?.body) return {
-		bodyBytes: /* @__PURE__ */ new Uint8Array(0),
-		bytes: 0,
-		exceeded: false
-	};
-	const reader = response.body.getReader();
-	const chunks = [];
-	let totalBytes = 0;
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
-			if (totalBytes + chunk.byteLength > limit) {
-				try {
-					Promise.resolve(reader.cancel()).catch(() => {});
-				} catch {}
-				return {
-					bodyBytes: /* @__PURE__ */ new Uint8Array(0),
-					bytes: totalBytes + chunk.byteLength,
-					exceeded: true
-				};
-			}
-			chunks.push(chunk);
-			totalBytes += chunk.byteLength;
-		}
-	} catch {
-		return {
-			bodyBytes: /* @__PURE__ */ new Uint8Array(0),
-			bytes: totalBytes,
-			exceeded: true
-		};
-	} finally {
-		try {
-			reader.releaseLock();
-		} catch {}
-	}
-	const bodyBytes = new Uint8Array(totalBytes);
-	let offset = 0;
-	for (const chunk of chunks) {
-		bodyBytes.set(chunk, offset);
-		offset += chunk.byteLength;
-	}
-	return {
-		bodyBytes,
-		bytes: totalBytes,
-		exceeded: false
-	};
-}
-async function readResponseTextWithLimit(response, maxBytes) {
-	const result = await readResponseBytesWithLimit(response, maxBytes);
-	return {
-		text: result.exceeded ? "" : new TextDecoder().decode(result.bodyBytes),
-		bytes: result.bytes,
-		exceeded: result.exceeded
-	};
-}
 function normalizeCaseInsensitiveObject(input = {}) {
 	const normalized = {};
 	if (!input || typeof input !== "object" || Array.isArray(input)) return normalized;
@@ -17589,7 +17531,13 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 			};
 		},
 		async buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport = null) {
-			let finalUpstreamState = execution?.requestTraits?.isPlaybackInfoRequest === true ? await kernel.maybeRewritePlaybackInfoResponse(execution, upstreamState) : upstreamState;
+			let finalUpstreamState = await kernel.guardApiResponseMime(execution, upstreamState);
+			if (execution?.requestTraits?.isPlaybackInfoRequest === true) {
+				finalUpstreamState = await kernel.guardPlaybackInfoResponseContract(execution, finalUpstreamState);
+				if (isPlaybackInfoRepresentation(finalUpstreamState.playbackInfoRepresentation)) {
+					finalUpstreamState = await kernel.maybeRewritePlaybackInfoResponse(execution, finalUpstreamState);
+				}
+			}
 			const redirectTerminalMode = String(finalUpstreamState.redirectTrace?.terminalMode || execution?.redirectTrace?.terminalMode || "");
 			const shouldPlaybackFallbackRedirect = execution?.playbackAbsoluteFallbackEligible === true && !finalUpstreamState.directRedirectUrl && redirectTerminalMode !== "web_proxy_disabled" && Number(finalUpstreamState.response.status) === 404;
 			if (shouldPlaybackFallbackRedirect) execution.playbackFallback = "relative_307";
@@ -17671,7 +17619,9 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 					proxiedExternalRedirect: finalUpstreamState.proxiedExternalRedirect === true
 				}));
 			}
-			if (execution.requestTraits.isPlaybackInfoRequest === true) await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
+			if (execution.requestTraits.isPlaybackInfoRequest === true) {
+				await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response, null, finalUpstreamState.playbackInfoRepresentation);
+			}
 			await kernel.maybePrewarmMetadataResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
 				proxyPath: execution.proxyPath,
 				prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
@@ -18205,6 +18155,13 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 	const { Logger } = dependencies;
 	return {
+		buildProxyErrorState,
+		async guardApiResponseMime(execution, upstreamState) {
+			return guardApiResponseMimeRepresentation(execution, upstreamState, {
+				sanitizePath: sanitizeProxyPath,
+				buildErrorState: buildProxyErrorState
+			});
+		},
 		buildMetadataCacheStorageResponse(response, requestTraits, options = {}) {
 			const cacheHeaders = new Headers(response.headers);
 			cacheHeaders.delete("Set-Cookie");
@@ -18273,7 +18230,7 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 			if (requestTraits.isPlaybackInfoRequest === true) return;
 			if (requestTraits.isImage || requestTraits.isSubtitle || requestTraits.isManifest || requestTraits.isSegment || requestTraits.isBigStream) return;
 			if (!(response.status >= 200 && response.status < 300)) return;
-			if (!String(response.headers.get("Content-Type") || "").toLowerCase().includes("json")) return;
+			if (!isJsonHttpMediaType(response.headers.get("Content-Type"))) return;
 			const bodyResult = await readResponseTextWithLimit(response.clone(), METADATA_PREWARM_RESPONSE_MAX_BYTES);
 			if (bodyResult.exceeded) return;
 			let payload;
@@ -18879,6 +18836,13 @@ function defineProxyObservabilityMethods(dependencies = {}, kernel = {}) {
 //#region worker/features/proxy/playback/execution-cache-methods.js
 function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager } = dependencies;
+	const playbackInfoCacheStore = new PlaybackInfoCacheStore({
+		entries: cacheState.PlaybackInfoResponseCache,
+		now: nowMs,
+		maxEntries: Config.Defaults.PlaybackInfoCacheMax,
+		maxEntryBytes: DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES,
+		maxTotalBytes: DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES
+	});
 	return {
 		async prepareExecutionContext(request, node, path, name, key, env, ctx, options = {}) {
 			const startTime = Date.now();
@@ -19086,32 +19050,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			};
 		},
 		cleanupPlaybackInfoResponseCache(now = nowMs()) {
-			const cache = cacheState.PlaybackInfoResponseCache;
-			if (!(cache instanceof Map) || cache.size <= 0) return;
-			for (const [cacheKey, entry] of cache) {
-				const expiresAt = Number(entry?.expiresAt) || 0;
-				if (expiresAt > 0 && expiresAt <= now) cache.delete(cacheKey);
-			}
-			const maxEntries = Math.max(1, Number(Config.Defaults.PlaybackInfoCacheMax) || 1);
-			while (cache.size > maxEntries) {
-				const oldestKey = cache.keys().next().value;
-				if (!oldestKey) break;
-				cache.delete(oldestKey);
-			}
-			const maxTotalBytes = Math.max(1, Number(DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES) || 1);
-			let totalBytes = 0;
-			for (const entry of cache.values()) {
-				const bodyBytes = Number(entry?.bodyBytes);
-				totalBytes += Number.isFinite(bodyBytes) && bodyBytes >= 0 ? bodyBytes : new TextEncoder().encode(String(entry?.bodyText || "")).byteLength;
-			}
-			while (cache.size > 0 && totalBytes > maxTotalBytes) {
-				const oldestKey = cache.keys().next().value;
-				if (!oldestKey) break;
-				const oldestEntry = cache.get(oldestKey);
-				const oldestBodyBytes = Number(oldestEntry?.bodyBytes);
-				totalBytes -= Number.isFinite(oldestBodyBytes) && oldestBodyBytes >= 0 ? oldestBodyBytes : new TextEncoder().encode(String(oldestEntry?.bodyText || "")).byteLength;
-				cache.delete(oldestKey);
-			}
+			playbackInfoCacheStore.cleanup(now);
 		},
 		buildPlaybackInfoAuthSignature(execution, transport = null) {
 			const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
@@ -19128,7 +19067,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				cookie: cookieHeader ? hashStableText(cookieHeader) : ""
 			}));
 		},
-				buildPlaybackInfoCacheKey(execution, transport = null) {
+		buildPlaybackInfoCacheKey(execution, transport = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
 			if (execution.playbackInfoCacheEnabled !== true || Number(execution.playbackInfoCacheTtlSec) <= 0) {
 				execution.playbackInfoCacheState = "skip";
@@ -19142,84 +19081,50 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				return "";
 			}
 			const bodyText = transport?.preparedBodyMode === "buffered" ? String(transport?.preparedBodyText || decodeBufferedBodyText(transport?.preparedBody)) : "";
-			const cacheKey = `playback-info:${hashStableText(serializeConfigValue({
+			const cacheKey = createPlaybackInfoCacheKey({
 				nodeName: String(execution?.nodeName || "").trim(),
 				nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
-								requestMethod,
+				requestMethod,
 				proxyPath: String(execution?.proxyPath || "").trim(),
 				query: String(execution?.requestUrl?.search || "").trim(),
 				bodyHash: bodyText ? hashStableText(bodyText) : "",
 				authHash: kernel.buildPlaybackInfoAuthSignature(execution, transport),
 				playbackInfoMode: normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode),
-				playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative"),
-															}))}`;
+				playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative")
+			}, {
+				hash: hashStableText,
+				serialize: serializeConfigValue
+			});
 			execution.playbackInfoCacheKey = cacheKey;
 			return cacheKey;
 		},
-		async storePlaybackInfoResponseCache(execution, response, transport = null) {
+		async storePlaybackInfoResponseCache(execution, response, transport = null, representation = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return false;
 			const cacheKey = execution.playbackInfoCacheKey || kernel.buildPlaybackInfoCacheKey(execution, transport);
 			if (!cacheKey) return false;
-			if (!response || !(response.status >= 200 && response.status < 300)) return false;
-			if (!String(response.headers.get("Content-Type") || "").toLowerCase().includes("json")) return false;
-			const bodyResult = execution.requestMethod === "HEAD" ? {
-				text: "",
-				bytes: 0,
-				exceeded: false
-			} : execution.playbackInfoCacheBodyResolved === true ? {
-				text: String(execution.playbackInfoCacheBody?.text || ""),
-				bytes: Math.max(0, Number(execution.playbackInfoCacheBody?.bytes) || 0),
-				exceeded: !execution.playbackInfoCacheBody
-			} : await readResponseTextWithLimit(response.clone(), DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES);
-			if (bodyResult.exceeded) return false;
-			const bodyText = bodyResult.text;
-			const responseHeaders = kernel.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
-			responseHeaders.delete("Set-Cookie");
-			const now = nowMs();
-			const ttlMs = Math.max(0, Number(execution?.playbackInfoCacheTtlSec) || 0) * 1e3;
-			if (ttlMs <= 0) return false;
-			const cache = cacheState.PlaybackInfoResponseCache;
-			cache.delete(cacheKey);
-			cache.set(cacheKey, {
+			if (!isPlaybackInfoRepresentation(representation) || representation.response !== response) return false;
+			return playbackInfoCacheStore.set(cacheKey, representation, {
 				nodeName: String(execution?.nodeName || "").trim().toLowerCase(),
 				nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
 				playbackInfoRewrite: String(execution?.playbackInfoRewrite || "").trim(),
-								status: response.status,
-				statusText: response.statusText,
-				headers: [...responseHeaders.entries()],
-				bodyText,
-				bodyBytes: bodyResult.bytes,
-				storedAt: now,
-				expiresAt: now + ttlMs
+				ttlMs: Math.max(0, Number(execution?.playbackInfoCacheTtlSec) || 0) * 1e3
 			});
-			kernel.cleanupPlaybackInfoResponseCache(now);
-			return true;
 		},
 		async tryServePlaybackInfoResponseCache(execution, transport = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return null;
 			const cacheKey = kernel.buildPlaybackInfoCacheKey(execution, transport);
 			if (!cacheKey) return null;
-			const cache = cacheState.PlaybackInfoResponseCache;
-			kernel.cleanupPlaybackInfoResponseCache();
-			const cacheEntry = cache.get(cacheKey);
-			if (!cacheEntry) {
+			const cachedResult = playbackInfoCacheStore.get(cacheKey);
+			if (!cachedResult) {
 				execution.playbackInfoCacheState = execution.playbackInfoCacheState === "skip" ? "skip" : "miss";
 				return null;
 			}
-			if ((Number(cacheEntry.expiresAt) || 0) <= nowMs()) {
-				cache.delete(cacheKey);
-				execution.playbackInfoCacheState = "miss";
-				return null;
-			}
-			cache.delete(cacheKey);
-			cache.set(cacheKey, cacheEntry);
+			const cacheEntry = cachedResult.metadata;
+			const cachedRepresentation = cachedResult.representation;
+			const cachedResponse = cachedRepresentation.response;
+			const cachedBodyText = cachedRepresentation.bodyText;
 			execution.playbackInfoCacheState = "hit";
 			execution.playbackInfoRewrite = String(cacheEntry?.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim();
-			const cachedResponse = new Response(execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
-				status: Number(cacheEntry.status) || 200,
-				statusText: String(cacheEntry.statusText || ""),
-				headers: new Headers(Array.isArray(cacheEntry.headers) ? cacheEntry.headers : [])
-			});
 			const modifiedHeaders = kernel.buildProxyResponseHeaders(cachedResponse, execution.request, execution.dynamicCors, execution.finalOrigin, execution.requestTraits, {
 				enableH3: execution.enableH3,
 				forceH1: execution.forceH1,
@@ -19240,7 +19145,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				}),
 				outboundColo: ""
 			});
-			return new Response(execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
+			return new Response(execution.requestMethod === "HEAD" ? null : cachedBodyText, {
 				status: cachedResponse.status,
 				statusText: cachedResponse.statusText,
 				headers: modifiedHeaders
@@ -20566,7 +20471,7 @@ function defineProxyRoutingMethods(dependencies = {}, kernel = {}) {
 }
 //#endregion
 //#region worker/features/proxy/transport/methods.js
-function defineProxyTransportMethods(dependencies = {}) {
+function defineProxyTransportMethods(dependencies = {}, kernel = {}) {
 	const {} = dependencies;
 	const methods = {
 		async buildProxyRequestState(request, node, proxyPath, requestUrl, clientIp, requestTraits, forceH1, targetRecords, options = {}) {
@@ -20763,207 +20668,78 @@ function defineProxyTransportMethods(dependencies = {}) {
 				hash: relayProxyUrl.hash || ""
 			});
 		},
-		sanitizePlaybackInfoSerializedResponseHeaders(headers) {
-			const sanitizedHeaders = headers instanceof Headers ? new Headers(headers) : new Headers(headers || {});
-			[
-				"Content-Encoding",
-				"Content-Length",
-				"Content-MD5",
-				"Digest",
-				"ETag",
-				"Transfer-Encoding"
-			].forEach((header) => sanitizedHeaders.delete(header));
-			return sanitizedHeaders;
-		},
-		decodePlaybackInfoJsonValue(value) {
-			if (typeof value !== "string") return value;
-			const candidate = value.trim();
-			if (!candidate || !candidate.startsWith("{") && !candidate.startsWith("[")) return value;
-			try {
-				return JSON.parse(candidate);
-			} catch {
-				return value;
-			}
-		},
-		normalizePlaybackInfoObjectArray(value) {
-			const decodedArray = methods.decodePlaybackInfoJsonValue(value);
-			if (!Array.isArray(decodedArray)) return {
-				items: [],
-				changed: true
-			};
-			let changed = decodedArray !== value;
-			const items = [];
-			for (const rawItem of decodedArray) {
-				const item = methods.decodePlaybackInfoJsonValue(rawItem);
-				if (!isPlainObject(item)) {
-					changed = true;
-					continue;
+		sanitizePlaybackInfoSerializedResponseHeaders,
+		parsePlaybackInfoRootObject,
+		buildPlaybackInfoContractErrorState(execution, upstreamState, reason = "invalid_payload", details = null) {
+			const response = upstreamState?.response;
+			execution.playbackInfoRewrite = "rejected";
+			return kernel.buildProxyErrorState(execution, upstreamState, {
+				message: "Upstream PlaybackInfo response must be a JSON object.",
+				guardHeader: "X-Proxy-Contract-Guard",
+				guardValue: "playback-info",
+				details: isPlainObject(details) ? details : {
+					reason: String(reason || "invalid_payload"),
+					upstreamStatus: Number(response?.status) || 0,
+					contentType: normalizeHttpMediaType(response?.headers?.get?.("Content-Type")) || "missing"
 				}
-				if (item !== rawItem) changed = true;
-				items.push(item);
-			}
-			return {
-				items,
-				changed
-			};
-		},
-		sanitizePlaybackInfoMediaSource(mediaSource) {
-			let nextMediaSource = mediaSource;
-			let changed = false;
-			const applyField = (field, value) => {
-				if (nextMediaSource === mediaSource) nextMediaSource = { ...mediaSource };
-				nextMediaSource[field] = value;
-				changed = true;
-			};
-			for (const field of ["MediaStreams", "MediaAttachments"]) {
-				if (!Object.prototype.hasOwnProperty.call(mediaSource, field)) continue;
-				const normalized = methods.normalizePlaybackInfoObjectArray(mediaSource[field]);
-				if (normalized.changed) applyField(field, normalized.items);
-			}
-			if (Object.prototype.hasOwnProperty.call(mediaSource, "RequiredHttpHeaders")) {
-				const decodedHeaders = methods.decodePlaybackInfoJsonValue(mediaSource.RequiredHttpHeaders);
-				if (!isPlainObject(decodedHeaders)) applyField("RequiredHttpHeaders", {});
-				else if (decodedHeaders !== mediaSource.RequiredHttpHeaders) applyField("RequiredHttpHeaders", decodedHeaders);
-			}
-			return {
-				mediaSource: nextMediaSource,
-				changed
-			};
-		},
-		sanitizePlaybackInfoMediaSourcesPayload(payload) {
-			if (!isPlainObject(payload) || !Object.prototype.hasOwnProperty.call(payload, "MediaSources")) return {
-				payload,
-				rewriteState: "not_needed"
-			};
-			const normalizedSources = methods.normalizePlaybackInfoObjectArray(payload.MediaSources);
-			let changed = normalizedSources.changed;
-			const mediaSources = normalizedSources.items.map((mediaSource) => {
-				const sanitized = methods.sanitizePlaybackInfoMediaSource(mediaSource);
-				if (sanitized.changed) changed = true;
-				return sanitized.mediaSource;
 			});
-			if (!changed) return {
-				payload,
-				rewriteState: "not_needed"
-			};
-			return {
-				payload: {
-					...payload,
-					MediaSources: mediaSources
-				},
-				rewriteState: "applied"
-			};
 		},
+		async guardPlaybackInfoResponseContract(execution, upstreamState) {
+			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
+			if (isPlaybackInfoRepresentation(upstreamState?.playbackInfoRepresentation)
+				&& upstreamState.playbackInfoRepresentation.response === upstreamState?.response) return upstreamState;
+			const inspection = await inspectPlaybackInfoResponse(upstreamState?.response, {
+				requestMethod: execution.requestMethod,
+				maxBytes: DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
+			});
+			if (inspection.kind === "skip") return upstreamState;
+			if (inspection.kind === "invalid") {
+				return methods.buildPlaybackInfoContractErrorState(execution, upstreamState, inspection.reason, inspection.details);
+			}
+			return { ...upstreamState, playbackInfoRepresentation: inspection.representation };
+		},
+		decodePlaybackInfoJsonValue,
+		normalizePlaybackInfoObjectArray,
+		sanitizePlaybackInfoMediaSource,
+		sanitizePlaybackInfoMediaSourcesPayload,
 		rewritePlaybackInfoPayload(execution, payload, activeTargetBase, responseBaseUrl) {
-			const sanitizedResult = methods.sanitizePlaybackInfoMediaSourcesPayload(payload);
-			const sanitizedPayload = sanitizedResult.payload;
-			if (!isPlainObject(sanitizedPayload) || !Array.isArray(sanitizedPayload.MediaSources)) return {
-				payload,
-				rewriteState: "not_needed"
-			};
-			let changed = sanitizedResult.rewriteState === "applied";
-			const nextMediaSources = sanitizedPayload.MediaSources.map((mediaSource) => {
-				let nextMediaSource = mediaSource;
-				const applyField = (fieldKey, nextValue, options = {}) => {
-					const hasOwnField = Object.prototype.hasOwnProperty.call(nextMediaSource, fieldKey);
-					if (options.onlyIfPresent === true && !hasOwnField) return;
-					if (nextMediaSource[fieldKey] === nextValue && !(options.ensurePresent === true && !hasOwnField)) return;
-					if (nextMediaSource === mediaSource) nextMediaSource = { ...mediaSource };
-					nextMediaSource[fieldKey] = nextValue;
-					changed = true;
-				};
-				const rawDirectStreamUrl = String(mediaSource.DirectStreamUrl || "").trim();
-				const rawPath = String(mediaSource.Path || "").trim();
-				const playbackCandidateUrl = rawDirectStreamUrl || rawPath;
-				const rewrittenPlaybackUrl = playbackCandidateUrl ? methods.buildPlaybackInfoProxyUrl(execution, playbackCandidateUrl, activeTargetBase, responseBaseUrl) : "";
-				if (rewrittenPlaybackUrl) {
-					applyField("DirectStreamUrl", rewrittenPlaybackUrl, { ensurePresent: true });
-					applyField("Path", rewrittenPlaybackUrl, { ensurePresent: true });
-				} else applyField("Path", "", { ensurePresent: true });
-				applyField("IsRemote", false, { ensurePresent: true });
-				applyField("Protocol", "Http", { ensurePresent: true });
-				applyField("SupportsTranscoding", false, { ensurePresent: true });
-				applyField("TranscodingUrl", "", { ensurePresent: true });
-				applyField("TranscodingSubProtocol", "", { onlyIfPresent: true });
-				applyField("TranscodingContainer", "", { onlyIfPresent: true });
-				applyField("TranscodingType", "", { onlyIfPresent: true });
-				return nextMediaSource;
+			return rewritePlaybackInfoPayloadRepresentation(payload, {
+				buildProxyUrl: (candidateUrl) => methods.buildPlaybackInfoProxyUrl(execution, candidateUrl, activeTargetBase, responseBaseUrl)
 			});
-			if (!changed) return {
-				payload,
-				rewriteState: "not_needed"
-			};
-			return {
-				payload: {
-					...sanitizedPayload,
-					MediaSources: nextMediaSources
-				},
-				rewriteState: "applied"
-			};
 		},
 		async maybeRewritePlaybackInfoResponse(execution, upstreamState) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
 			const rewriteEnabled = normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) === "rewrite";
 			const bypassState = rewriteEnabled ? "not_needed" : "passthrough";
 			const response = upstreamState?.response;
-			if (!response || !(response.status >= 200 && response.status < 300) || execution.requestMethod === "HEAD") {
-				execution.playbackInfoRewrite = bypassState;
+			if (!response || !(response.status >= 200 && response.status < 300) || execution.requestMethod === "HEAD" || response.status === 204 || response.status === 205 || !response.body) {
+				if (execution.playbackInfoRewrite !== "rejected") execution.playbackInfoRewrite = bypassState;
 				return upstreamState;
 			}
-			if (!String(response.headers.get("Content-Type") || "").toLowerCase().includes("json")) {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			const declaredBodyBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
-			if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES) {
-				execution.playbackInfoCacheBodyResolved = true;
-				execution.playbackInfoCacheBody = null;
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			const bodyResult = await readResponseTextWithLimit(response.clone(), DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES);
-			execution.playbackInfoCacheBodyResolved = true;
-			execution.playbackInfoCacheBody = null;
-			if (bodyResult.exceeded) {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
+			if (!isPlaybackInfoRepresentation(upstreamState?.playbackInfoRepresentation)
+				|| upstreamState.playbackInfoRepresentation.response !== response) {
+				upstreamState = await methods.guardPlaybackInfoResponseContract(execution, upstreamState);
+				if (!isPlaybackInfoRepresentation(upstreamState?.playbackInfoRepresentation)) return upstreamState;
 			}
 			try {
-				const parsedPayload = JSON.parse(bodyResult.text);
-				const rewriteResult = rewriteEnabled
-					? methods.rewritePlaybackInfoPayload(
+				const rewriteResult = rewritePlaybackInfoRepresentation(upstreamState.playbackInfoRepresentation, {
+					rewriteEnabled,
+					buildProxyUrl: (candidateUrl) => methods.buildPlaybackInfoProxyUrl(
 						execution,
-						parsedPayload,
+						candidateUrl,
 						upstreamState?.activeTargetBase,
 						upstreamState?.finalUrl || new URL(String(execution?.requestUrl || execution?.rawRequestUrl || ""))
 					)
-					: methods.sanitizePlaybackInfoMediaSourcesPayload(parsedPayload);
-				if (rewriteResult.rewriteState !== "applied") {
-					execution.playbackInfoRewrite = bypassState;
-					execution.playbackInfoCacheBody = { text: bodyResult.text, bytes: bodyResult.bytes };
-					return upstreamState;
-				}
-				const serializedBodyText = JSON.stringify(rewriteResult.payload);
-				const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
-				execution.playbackInfoRewrite = "applied";
-				execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
-					? { text: serializedBodyText, bytes: serializedBodyBytes }
-					: null;
-				const responseHeaders = methods.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
-				try {
-					Promise.resolve(response.body?.cancel?.()).catch(() => {});
-				} catch {}
+				});
+				if (rewriteResult.kind !== "valid") return methods.buildPlaybackInfoContractErrorState(execution, upstreamState, rewriteResult.reason || "normalization_failed");
+				execution.playbackInfoRewrite = rewriteResult.rewriteState;
 				return {
 					...upstreamState,
-					response: new Response(serializedBodyText, {
-						status: response.status,
-						statusText: response.statusText,
-						headers: responseHeaders
-					})
+					response: rewriteResult.representation.response,
+					playbackInfoRepresentation: rewriteResult.representation
 				};
 			} catch {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
+				return methods.buildPlaybackInfoContractErrorState(execution, upstreamState, "normalization_failed");
 			}
 		}
 	};
@@ -20985,7 +20761,7 @@ function defineNodeProxyKernel({ configReader, nodeRepository, logger, cachePort
 		defineProxyObservabilityMethods(dependencies, internals),
 		defineProxyLifecycleMethods(dependencies, internals),
 		defineProxyRoutingMethods(dependencies, internals),
-		defineProxyTransportMethods(dependencies)
+		defineProxyTransportMethods(dependencies, internals)
 	];
 	for (const group of methodGroups) {
 		for (const [name, value] of Object.entries(group)) internals[name] = value;
