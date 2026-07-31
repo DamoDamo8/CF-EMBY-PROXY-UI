@@ -25,7 +25,6 @@ const ADMIN_APP_ROOT_HTML = '<div id="app" v-cloak></div>';
 const PRIMARY_VIEWS = Object.freeze([
   'dashboard',
   'nodes',
-  'server-records',
   'logs',
   'dns',
   'settings'
@@ -139,11 +138,6 @@ function materializeFrontendIndex(templateHtml = '') {
 
 function composeAdminRuntimeEnhancements(outputHtml = '') {
   const output = String(outputHtml || '')
-    .replace('tgAlertCooldownMinutes\",\"jwtExpiryDays', 'tgAlertCooldownMinutes\",\"tgServerExpiryWarningEnabled\",\"tgServerExpiryWarningDays\",\"serverRecordExpiryDays\",\"jwtExpiryDays')
-    .replace('tgAlertCooldownMinutes:{fallback:30,min:1,max:1440}', 'tgAlertCooldownMinutes:{fallback:30,min:1,max:1440},serverRecordExpiryDays:{fallback:30,min:1,max:3650}')
-    .replace('sourceDirectNodes:"nodeNameList"},integerFields', 'sourceDirectNodes:"nodeNameList",tgServerExpiryWarningDays:"expiryWarningDays"},integerFields')
-    .replace('"tgAlertD1UsageEnabled","tgDailyReportEnabled"', '"tgAlertD1UsageEnabled","tgServerExpiryWarningEnabled","tgDailyReportEnabled"')
-    .replace('tgAlertCooldownMinutes",id:"cfg-tg-alert-cooldown-minutes",kind:"int-finite",defaultValue:UI_DEFAULTS.tgAlertCooldownMinutes', 'tgAlertCooldownMinutes",id:"cfg-tg-alert-cooldown-minutes",kind:"int-finite",defaultValue:UI_DEFAULTS.tgAlertCooldownMinutes},{key:"serverRecordExpiryDays",id:"cfg-server-record-expiry-days",kind:"int-finite",defaultValue:30},{key:"tgServerExpiryWarningEnabled",id:"cfg-tg-server-expiry-enabled",kind:"checkbox",checkboxMode:"strictTrue"},{key:"tgServerExpiryWarningDays",id:"cfg-server-expiry-days-list",kind:"array",defaultValue:[7,3,1,0]')
     .replace(
     '},syncSettingsFormFromRuntimeConfig',
     "},syncReleaseSourcePreviewInSettingsForm(){const r=this.settingsForm&&typeof this.settingsForm==='object'?this.settingsForm:{};const o=String(r.githubRepo||r.releaseRepo||r.repo||'').trim();if(o&&r.githubRepo!==o)r.githubRepo=o;return o},syncSettingsFormFromRuntimeConfig"

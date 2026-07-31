@@ -12,15 +12,8 @@ var cacheState = {
 	NodesRevisionCache: null,
 	NodesIndexCache: null,
 	PlaybackInfoResponseCache: /* @__PURE__ */ new Map(),
-	MediaAggregationAuthCache: /* @__PURE__ */ new Map(),
-	MediaAggregationInstanceMap: /* @__PURE__ */ new Map(),
-	ServerRecordAuthCache: /* @__PURE__ */ new Map(),
-	ServerRecordProbeBackoff: /* @__PURE__ */ new Map(),
-	PlaybackProgressRelay: /* @__PURE__ */ new Map(),
-	ServerRecordWatchSessions: /* @__PURE__ */ new Map(),
-	ServerRecordPlaybackContexts: /* @__PURE__ */ new Map(),
-	ServerRecordsSnapshotCache: /* @__PURE__ */ new Map(),
-	DashboardMonthlyTrafficCache: /* @__PURE__ */ new Map(),
+					PlaybackProgressRelay: /* @__PURE__ */ new Map(),
+				DashboardMonthlyTrafficCache: /* @__PURE__ */ new Map(),
 	SingleFlightTasks: /* @__PURE__ */ new Map(),
 	RuntimeConfigCacheGeneration: 0,
 	NodesRevisionCacheGeneration: 0,
@@ -43,8 +36,7 @@ var runtimeState = {
 			rate: null,
 			log: null,
 			playbackInfo: null,
-			mediaAggregationInstance: null,
-			failover: null,
+						failover: null,
 			progress: null,
 			monthlyTraffic: null
 		}
@@ -67,8 +59,6 @@ var databaseReadinessState = {
 	D1DatabaseInitReady: /* @__PURE__ */ new WeakMap(),
 	LogsBaseDbReady: /* @__PURE__ */ new WeakMap(),
 	StatsHourlyDbReady: /* @__PURE__ */ new WeakMap(),
-	ServerLastWatchDbReady: /* @__PURE__ */ new WeakMap(),
-	ServerRecordSnapshotDbReady: /* @__PURE__ */ new WeakMap(),
 	DnsIpWorkspaceDbReady: /* @__PURE__ */ new WeakMap(),
 	OpsStatusDbReady: /* @__PURE__ */ new WeakMap(),
 	OpsStatusShadowCache: /* @__PURE__ */ new WeakMap(),
@@ -334,7 +324,7 @@ function hashStableText(input = "") {
 	}
 	return (hash >>> 0).toString(36);
 }
-function hashServerWatchFingerprint(input = "") {
+function hashPlaybackSessionFingerprint(input = "") {
 	const bytes = new TextEncoder().encode(String(input || ""));
 	let hash = 14695981039346656037n;
 	const prime = 1099511628211n;
@@ -371,22 +361,10 @@ var CACHE_DEFAULTS = Object.freeze({
 	PlaybackInfoCacheMax: 64,
 	PlaybackInfoCacheEntryMaxBytes: 256 * 1024,
 	PlaybackInfoCacheTotalMaxBytes: 4 * 1024 * 1024,
-	MediaAggregationAuthTtlMs: 600 * 1e3,
-	MediaAggregationAuthCacheMax: 32,
-	MediaAggregationInstanceMapTtlMs: 300 * 1e3,
-	MediaAggregationInstanceMapMax: 64,
-	ServerRecordAuthCacheMax: 32,
-	ServerRecordProbeBackoffMax: 512,
-	ServerRecordProbeBackoffBaseMs: 1e3,
-	ServerRecordProbeBackoffMaxMs: 60 * 1e3,
-	MediaAggregationBackupMax: 8,
-	MediaAggregationResponseMaxBytes: 256 * 1024,
-	VideoProgressForwardIntervalSec: 3,
+											VideoProgressForwardIntervalSec: 3,
 	VideoProgressForwardSessionMax: 128,
 	VideoProgressSnapshotMaxBytes: 32 * 1024,
-	ServerRecordsSnapshotTtlMs: 60 * 1e3,
-	ServerRecordsSnapshotMax: 512,
-	RateLimitCacheMax: 4096,
+		RateLimitCacheMax: 4096,
 	D1SchemaReadyTtlMs: 600 * 1e3,
 	OpsStatusReadCacheTtlMs: 15 * 1e3,
 	AdminShellStatusStableWriteIntervalMs: 300 * 1e3,
@@ -425,14 +403,6 @@ var LOG_DEFAULTS = Object.freeze({
 	TgAlertKvUsageThresholdPercent: 80,
 	TgAlertD1UsageEnabled: false,
 	TgAlertD1UsageThresholdPercent: 80,
-	TgServerExpiryWarningEnabled: false,
-	TgServerExpiryWarningDays: [
-		7,
-		3,
-		1,
-		0
-	],
-	ServerRecordExpiryDays: 30,
 	LogQueueMax: 512,
 	LogQueueOverflowDropCount: 256,
 	LogDedupeMax: 2048,
@@ -469,10 +439,7 @@ var PROXY_DEFAULTS = Object.freeze({
 	DefaultPlaybackInfoMode: "passthrough",
 	DefaultRealClientIpMode: "forward",
 	DefaultMediaAuthMode: "auto",
-	MediaAggregationMatchMode: "title_year",
-	MediaAggregationFirstResultTimeoutMs: 1500,
-	MediaAggregationGracePeriodMs: 800
-});
+			});
 var DNS_DEFAULTS = Object.freeze({
 	ConfigSnapshotLimit: 5,
 	DnsHistoryLimit: 5,
@@ -753,88 +720,6 @@ function normalizeNodeTags(tags = [], legacyTag = "") {
 		if (normalized.length >= 20) break;
 	}
 	return normalized;
-}
-function normalizeServerRecordExpiry(value = "") {
-	const text = String(value || "").trim();
-	if (!text) return null;
-	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
-	if (!match) return null;
-	const year = Number(match[1]);
-	const month = Number(match[2]);
-	const day = Number(match[3]);
-	const date = new Date(Date.UTC(year, month - 1, day));
-	return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day ? text : null;
-}
-function normalizeServerRecordExpiryMode(value = "", expiresAt = null) {
-	const mode = String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
-	if ([
-		"rolling",
-		"days",
-		"last_watched"
-	].includes(mode)) return "rolling";
-	if ([
-		"fixed",
-		"date",
-		"manual"
-	].includes(mode)) return "fixed";
-	return expiresAt ? "fixed" : "rolling";
-}
-function normalizeServerRecordSettings(value = {}, options = {}) {
-	const source = isPlainObject(value) ? value : {};
-	const normalizedExpiresAt = normalizeServerRecordExpiry(source.expiresAt);
-	const expiryEnabled = typeof source.expiryEnabled === "boolean" ? source.expiryEnabled : Boolean(normalizedExpiresAt);
-	const expiryMode = normalizeServerRecordExpiryMode(source.expiryMode, normalizedExpiresAt);
-	const expiryDays = clampIntegerConfig(source.expiryDays, clampIntegerConfig(options?.defaultExpiryDays, Config.Defaults.ServerRecordExpiryDays, 1, 3650), 1, 3650);
-	return {
-		enabled: source.enabled === true,
-		expiryEnabled,
-		expiryMode,
-		expiresAt: expiryMode === "fixed" ? normalizedExpiresAt : null,
-		expiryDays
-	};
-}
-function buildServerRecordExpiry(record = {}, lastWatchedAt = "", config = {}, now = /* @__PURE__ */ new Date()) {
-	const settings = normalizeServerRecordSettings(record, { defaultExpiryDays: config?.serverRecordExpiryDays });
-	const watched = String(lastWatchedAt || "").trim();
-	const utcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(config?.scheduleUtcOffsetMinutes);
-	if (!settings.expiryEnabled) return {
-		enabled: false,
-		state: "disabled",
-		daysRemaining: null,
-		expiresAt: "",
-		source: "disabled",
-		mode: settings.expiryMode,
-		expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
-	};
-	let expiresAt = settings.expiryMode === "fixed" ? settings.expiresAt : null;
-	let source = expiresAt ? "fixed" : "unset";
-	if (settings.expiryMode === "rolling" && watched) {
-		const watchedDate = new Date(watched);
-		if (!Number.isNaN(watchedDate.getTime())) {
-			expiresAt = buildOffsetClockParts(new Date(watchedDate.getTime() + settings.expiryDays * 864e5), utcOffsetMinutes).dateKey;
-			source = "last_watched";
-		}
-	}
-	if (!expiresAt) return {
-		enabled: true,
-		state: "unset",
-		daysRemaining: null,
-		expiresAt: "",
-		source,
-		mode: settings.expiryMode,
-		expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
-	};
-	const todayKey = buildOffsetClockParts(now, utcOffsetMinutes).dateKey;
-	const daysRemaining = Math.round((Date.parse(`${expiresAt}T00:00:00Z`) - Date.parse(`${todayKey}T00:00:00Z`)) / 864e5);
-	return {
-		enabled: true,
-		state: daysRemaining < 0 ? "expired" : daysRemaining <= 7 ? "expiring" : "valid",
-		daysRemaining,
-		expiresAt,
-		source,
-		mode: settings.expiryMode,
-		expiryDays: settings.expiryMode === "rolling" ? settings.expiryDays : null
-	};
 }
 //#endregion
 //#region worker/features/dns/pool-model.js
@@ -1948,42 +1833,31 @@ PROXY_DEFAULTS.DefaultPlaybackInfoMode;
 var DEFAULT_PLAYBACK_INFO_CACHE_TTL_SEC = CACHE_DEFAULTS.PlaybackInfoCacheTtlSec;
 var DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheEntryMaxBytes;
 var DEFAULT_PLAYBACK_INFO_CACHE_TOTAL_MAX_BYTES = CACHE_DEFAULTS.PlaybackInfoCacheTotalMaxBytes;
-var MEDIA_AGGREGATION_AUTH_TTL_MS = CACHE_DEFAULTS.MediaAggregationAuthTtlMs;
-var MEDIA_AGGREGATION_AUTH_CACHE_MAX = CACHE_DEFAULTS.MediaAggregationAuthCacheMax;
-var MEDIA_AGGREGATION_INSTANCE_MAP_TTL_MS = CACHE_DEFAULTS.MediaAggregationInstanceMapTtlMs;
-var MEDIA_AGGREGATION_INSTANCE_MAP_MAX = CACHE_DEFAULTS.MediaAggregationInstanceMapMax;
-var SERVER_RECORD_AUTH_CACHE_MAX = CACHE_DEFAULTS.ServerRecordAuthCacheMax;
-var SERVER_RECORD_PROBE_BACKOFF_MAX = CACHE_DEFAULTS.ServerRecordProbeBackoffMax;
-var SERVER_RECORD_PROBE_BACKOFF_BASE_MS = CACHE_DEFAULTS.ServerRecordProbeBackoffBaseMs;
-var SERVER_RECORD_PROBE_BACKOFF_MAX_MS = CACHE_DEFAULTS.ServerRecordProbeBackoffMaxMs;
-var MEDIA_AGGREGATION_BACKUP_MAX = CACHE_DEFAULTS.MediaAggregationBackupMax;
-var MEDIA_AGGREGATION_RESPONSE_MAX_BYTES = CACHE_DEFAULTS.MediaAggregationResponseMaxBytes;
+
+
+
+
+
+
+
+
+
+
 var DEFAULT_VIDEO_PROGRESS_FORWARD_INTERVAL_SEC = CACHE_DEFAULTS.VideoProgressForwardIntervalSec;
 var DEFAULT_VIDEO_PROGRESS_SNAPSHOT_MAX_BYTES = CACHE_DEFAULTS.VideoProgressSnapshotMaxBytes;
-var DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS = CACHE_DEFAULTS.ServerRecordsSnapshotTtlMs;
-var SERVER_RECORD_WATCH_TERMINAL_TTL_MS = 600 * 1e3;
-var SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS = 720 * 60 * 1e3;
-var SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS = 120 * 1e3;
-var SERVER_RECORD_POSTER_MAX_BYTES = 5 * 1024 * 1024;
-var SERVER_RECORD_POSTER_CONTENT_TYPES = /* @__PURE__ */ new Set([
-	"image/jpeg",
-	"image/png",
-	"image/webp",
-	"image/avif",
-	"image/gif"
-]);
+
+
+
+
+
+
 var DEFAULT_IMAGE_CACHE_TTL_DAYS = CACHE_DEFAULTS.CacheTtlImagesDays;
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCacheTtlMs;
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
 var ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
 var ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES = ADMIN_JSON_REQUEST_MAX_BYTES - 64 * 1024;
 var METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
-function areServerRecordWatchTimesCompatible(snapshotWatchedAt = "", lastWatchedAt = "") {
-	const snapshotTimeMs = Date.parse(String(snapshotWatchedAt || "").trim());
-	const lastWatchTimeMs = Date.parse(String(lastWatchedAt || "").trim());
-	const lagMs = lastWatchTimeMs - snapshotTimeMs;
-	return Number.isFinite(snapshotTimeMs) && Number.isFinite(lastWatchTimeMs) && lagMs >= 0 && lagMs <= 3e5;
-}
+
 var IMAGE_FILE_EXTENSION_REGEX = /\.(?:jpg|jpeg|gif|png|svg|ico|webp)$/i;
 var STATIC_ASSET_EXTENSION_REGEX = /\.(?:js|css|woff2?|ttf|otf|map|webmanifest)$/i;
 var SUBTITLE_EXTENSION_REGEX = /\.(?:srt|ass|vtt|sub)$/i;
@@ -2370,7 +2244,7 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 	const ADMIN_RELEASE_PROXY_PATH_SEGMENT = "__release";
 	const ADMIN_RELEASE_VENDOR_PATH_SEGMENT = "vendor";
 	const ADMIN_WARM_PATH_SEGMENT = "__warm";
-	const ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT = "__server-record-poster";
+
 	const ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN = "https://admin-release-vendor-cache.invalid";
 	const ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN = "https://admin-release-vendor-manifest.invalid";
 	const ADMIN_RELEASE_VENDOR_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -2776,7 +2650,7 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
           setGateStatus("正在上传并校验 index.html...", "");
           let redirecting = false;
           try {
-            const response = await fetchRequest(ADMIN_INDEX_GATE_RUNTIME.adminPath || "/admin", {
+            const response = await fetch(ADMIN_INDEX_GATE_RUNTIME.adminPath || "/admin", {
               method: "POST",
               credentials: "same-origin",
               headers: { "Content-Type": "application/json", "Accept": "application/json" },
@@ -2926,7 +2800,6 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 		ADMIN_RELEASE_PROXY_PATH_SEGMENT,
 		ADMIN_RELEASE_VENDOR_PATH_SEGMENT,
 		ADMIN_WARM_PATH_SEGMENT,
-		ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT,
 		ADMIN_RELEASE_VENDOR_CACHE_KEY_ORIGIN,
 		ADMIN_RELEASE_VENDOR_MANIFEST_CACHE_KEY_ORIGIN,
 		ADMIN_RELEASE_VENDOR_CACHE_CONTROL,
@@ -3941,20 +3814,7 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
 		return (sanitizeProxyPath(pathname || "/").replace(/\/+$/, "") || "/").toLowerCase() === `${normalizedAdminPath}/${shell.ADMIN_WARM_PATH_SEGMENT}`.toLowerCase();
 	}
-	function resolveAdminServerRecordPosterRouteMatch(pathname = "", adminPath = "/admin") {
-		const normalizedAdminPath = sanitizeProxyPath(adminPath || "/admin").replace(/\/+$/, "") || "/admin";
-		const normalizedPathname = sanitizeProxyPath(pathname || "/");
-		const prefix = `${normalizedAdminPath}/${shell.ADMIN_SERVER_RECORD_POSTER_PATH_SEGMENT}/`;
-		if (!normalizedPathname.toLowerCase().startsWith(prefix.toLowerCase())) return null;
-		const rawNodeName = normalizedPathname.slice(prefix.length);
-		if (!rawNodeName || rawNodeName.includes("/")) return null;
-		try {
-			const nodeName = decodeURIComponent(rawNodeName).trim().toLowerCase();
-			return nodeName && nodeName.length <= 128 && !nodeName.includes("/") ? { nodeName } : null;
-		} catch {
-			return null;
-		}
-	}
+
 	function getAdminRemoteShellCachedAt(response) {
 		const cachedAt = Number.parseInt(String(response?.headers?.get?.(shell.ADMIN_REMOTE_SHELL_CACHED_AT_HEADER) || ""), 10);
 		return Number.isFinite(cachedAt) && cachedAt > 0 ? cachedAt : 0;
@@ -4150,7 +4010,6 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		resolveAdminReleaseVendorManifestEntry,
 		resolveAdminReleaseVendorRouteMatch,
 		isAdminWarmRoute,
-		resolveAdminServerRecordPosterRouteMatch,
 		getAdminRemoteShellCachedAt,
 		shouldRevalidateAdminRemoteShell,
 		validateAdminShellHtmlSource,
@@ -4921,16 +4780,6 @@ var AdminConsoleFacade = class {
 				const isConfiguredHostSubdomain = !!(hostPrefixProxyActive && requestHost !== configuredHost && requestHost.endsWith(`.${configuredHost}`));
 				if (hostPrefixMatch || isConfiguredHostSubdomain) return null;
 				if (requestMethod === "GET" && routeContext.normalizedPathname === "/") return this.#renderLandingPage(env, routeContext.initHealth);
-				const serverRecordPosterRoute = isGetOrHead ? this.#resolveServerRecordPosterRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
-				if (serverRecordPosterRoute) {
-					if (!await this.#verifyRequest(request, env)) return this.#buildServerRecordPosterErrorResponse(401);
-					try {
-						return await this.repository.getServerRecordPosterResponse(env, serverRecordPosterRoute.nodeName, requestMethod) || this.#buildServerRecordPosterErrorResponse(404);
-					} catch (error) {
-						console.error("server record poster route failed", error);
-						return this.#buildServerRecordPosterErrorResponse(502);
-					}
-				}
 				const adminReleaseVendorRoute = isGetOrHead ? this.#resolveVendorRoute(routeContext.normalizedPathname, routeContext.adminPath) : null;
 				if (adminReleaseVendorRoute) {
 					if (!await this.#verifyRequest(request, env)) return this.#buildVendorErrorResponse("Unauthorized", 401);
@@ -5208,20 +5057,6 @@ var AdminConsoleFacade = class {
 		return this.shellService.resolveAdminReleaseVendorRouteMatch(pathname, adminPath);
 	}
 
-	#resolveServerRecordPosterRoute(pathname, adminPath) {
-		return this.shellService.resolveAdminServerRecordPosterRouteMatch(pathname, adminPath);
-	}
-
-	#buildServerRecordPosterErrorResponse(status = 404) {
-		return new Response(null, {
-			status,
-			headers: {
-				"Cache-Control": "no-store, max-age=0",
-				"X-Content-Type-Options": "nosniff"
-			}
-		});
-	}
-
 	#isWarmRoute(pathname, adminPath) {
 		return this.shellService.isAdminWarmRoute(pathname, adminPath);
 	}
@@ -5235,472 +5070,6 @@ var AdminConsoleFacade = class {
 	}
 
 };
-//#endregion
-//#region worker/features/proxy/playback/identity.js
-var MEDIA_AGGREGATION_SOURCE_ID_PREFIX = "AGG2";
-var MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX = "AGG1";
-var MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS = Object.freeze(["tmdb", "imdb"]);
-var MEDIA_AGGREGATION_SUPPORTED_TYPES = /* @__PURE__ */ new Set([
-	"movie",
-	"series",
-	"episode"
-]);
-function normalizeMediaAggregationMatchMode(value = "") {
-	return String(value || "").trim().toLowerCase() === "strict" ? "strict" : "title_year";
-}
-function readMediaAggregationCredentialPair(source = {}) {
-	const username = String(source?.mediaAggregationEmbyUsername ?? "").trim();
-	const password = String(source?.mediaAggregationEmbyPassword ?? "");
-	return {
-		username,
-		password,
-		configured: Boolean(username),
-		partial: Boolean(!username && password.length > 0)
-	};
-}
-function resolveMediaAggregationCredentials(node = {}, runtimeConfig = {}) {
-	const nodeCredentials = readMediaAggregationCredentialPair(node);
-	if (nodeCredentials.configured) return {
-		...nodeCredentials,
-		source: "node"
-	};
-	const globalCredentials = readMediaAggregationCredentialPair(runtimeConfig);
-	if (globalCredentials.configured) return {
-		...globalCredentials,
-		source: "global"
-	};
-	return {
-		username: "",
-		password: "",
-		configured: false,
-		partial: false,
-		source: "none"
-	};
-}
-function hasConfiguredMediaAggregationNodeCredentials(node = {}) {
-	return readMediaAggregationCredentialPair(node).configured || node?.mediaAggregationEmbyCredentialsConfigured === true;
-}
-function readServerRecordCredentialPair(source = {}) {
-	const username = String(source?.serverRecordEmbyUsername ?? "").trim();
-	const password = String(source?.serverRecordEmbyPassword ?? "");
-	return {
-		username,
-		password,
-		configured: Boolean(username),
-		partial: Boolean(!username && password.length > 0)
-	};
-}
-function resolveServerRecordCredentials(node = {}) {
-	const recordCredentials = readServerRecordCredentialPair(node);
-	if (recordCredentials.configured) return {
-		...recordCredentials,
-		source: "record"
-	};
-	const nodeCredentials = readMediaAggregationCredentialPair(node);
-	if (nodeCredentials.username) return {
-		...nodeCredentials,
-		configured: true,
-		partial: false,
-		source: "node"
-	};
-	return {
-		username: "",
-		password: "",
-		configured: false,
-		partial: false,
-		source: "none"
-	};
-}
-function hasConfiguredServerRecordCredentials(node = {}) {
-	return resolveServerRecordCredentials(node).configured || node?.serverRecordEmbyCredentialsConfigured === true;
-}
-function getServerRecordCredentialValidationError(node = {}) {
-	if (!readServerRecordCredentialPair(node).partial) return null;
-	return {
-		code: "SERVER_RECORD_CREDENTIALS_INCOMPLETE",
-		message: "填写服务器记录 EMBY 密码时必须同时填写账号"
-	};
-}
-function getMediaAggregationNodeCredentialValidationError(node = {}) {
-	if (!readMediaAggregationCredentialPair(node).partial) return null;
-	return {
-		code: "MEDIA_AGGREGATION_NODE_CREDENTIALS_INCOMPLETE",
-		message: "填写节点聚合密码时必须同时填写账号；密码可以留空"
-	};
-}
-function buildMediaAggregationSourceId(nodeName = "", itemId = "", mediaSourceId = "") {
-	const normalizedNodeName = String(nodeName || "").trim().toLowerCase();
-	const normalizedItemId = String(itemId || "").trim();
-	const normalizedMediaSourceId = String(mediaSourceId || "").trim();
-	if (!normalizedNodeName || !normalizedItemId || !normalizedMediaSourceId) return "";
-	return [
-		MEDIA_AGGREGATION_LEGACY_SOURCE_ID_PREFIX,
-		encodeBase64UrlUtf8(normalizedNodeName),
-		encodeBase64UrlUtf8(normalizedItemId),
-		encodeBase64UrlUtf8(normalizedMediaSourceId)
-	].join("*");
-}
-async function buildMediaAggregationSourceIdV2(secret = "", nodeName = "", itemId = "", mediaSourceId = "", identityHash = "") {
-	const normalizedSecret = String(secret || "");
-	const normalizedNodeName = String(nodeName || "").trim().toLowerCase();
-	const normalizedItemId = String(itemId || "").trim();
-	const normalizedMediaSourceId = String(mediaSourceId || "").trim();
-	const normalizedIdentityHash = String(identityHash || "").trim();
-	if (!normalizedSecret || !normalizedNodeName || !normalizedItemId || !normalizedMediaSourceId || !normalizedIdentityHash) return "";
-	const unsigned = [
-		MEDIA_AGGREGATION_SOURCE_ID_PREFIX,
-		encodeBase64UrlUtf8(normalizedNodeName),
-		encodeBase64UrlUtf8(normalizedItemId),
-		encodeBase64UrlUtf8(normalizedMediaSourceId),
-		normalizedIdentityHash
-	].join("*");
-	return `${unsigned}*${await signHmac(normalizedSecret, unsigned)}`;
-}
-function parseMediaAggregationSourceId(value = "") {
-	const parts = String(value || "").trim().split("*");
-	const isLegacy = parts.length === 4 && parts[0] === "AGG1";
-	const isSigned = parts.length === 6 && parts[0] === "AGG2";
-	if (!isLegacy && !isSigned) return null;
-	try {
-		const nodeName = decodeBase64UrlUtf8(parts[1]).trim().toLowerCase();
-		const itemId = decodeBase64UrlUtf8(parts[2]).trim();
-		const mediaSourceId = decodeBase64UrlUtf8(parts[3]).trim();
-		if (!nodeName || !itemId || !mediaSourceId) return null;
-		if (nodeName.length > 128 || itemId.length > 512 || mediaSourceId.length > 1024) return null;
-		if (isSigned) {
-			const identityHash = String(parts[4] || "").trim();
-			const signature = String(parts[5] || "").trim();
-			if (!/^[a-zA-Z0-9_-]{16,128}$/.test(identityHash) || !/^[a-zA-Z0-9_-]{32,128}$/.test(signature)) return null;
-			return {
-				version: "AGG2",
-				nodeName,
-				itemId,
-				mediaSourceId,
-				identityHash,
-				signature,
-				signedPayload: parts.slice(0, 5).join("*")
-			};
-		}
-		return {
-			nodeName,
-			itemId,
-			mediaSourceId
-		};
-	} catch {
-		return null;
-	}
-}
-function normalizeMediaAggregationProviderIds(providerIds = {}) {
-	const normalized = {};
-	if (!isPlainObject(providerIds)) return normalized;
-	for (const [rawKey, rawValue] of Object.entries(providerIds)) {
-		const key = String(rawKey || "").trim().toLowerCase();
-		if (key !== "tmdb" && key !== "imdb") continue;
-		const value = String(rawValue || "").trim().toLowerCase();
-		if (value) normalized[key] = value;
-	}
-	return normalized;
-}
-function mediaAggregationProviderIdsMatch(primaryProviderIds = {}, candidateProviderIds = {}) {
-	const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
-	const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
-	let matched = false;
-	for (const key of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
-		if (!primary[key] || !candidate[key]) continue;
-		if (primary[key] !== candidate[key]) return false;
-		matched = true;
-	}
-	return matched;
-}
-function normalizeMediaAggregationTitle(value = "") {
-	return String(value || "").normalize("NFKC").toLowerCase().replace(/[\p{P}\p{S}\s]+/gu, "").trim();
-}
-function normalizeMediaAggregationYear(value) {
-	const year = Number.parseInt(String(value ?? ""), 10);
-	return Number.isInteger(year) && year >= 1800 && year <= 3e3 ? year : null;
-}
-function normalizeMediaAggregationIndex(value) {
-	if (value === null || value === void 0 || value === "") return null;
-	const index = Number(value);
-	return Number.isInteger(index) && index >= 0 ? index : null;
-}
-function buildMediaAggregationIdentity(item = {}, seriesItem = {}) {
-	const type = String(item?.Type || item?.type || "").trim().toLowerCase();
-	const series = isPlainObject(seriesItem) ? seriesItem : {};
-	return {
-		itemId: String(item?.Id || item?.id || "").trim(),
-		type,
-		providerIds: normalizeMediaAggregationProviderIds(item?.ProviderIds || item?.providerIds),
-		searchName: String(item?.Name || item?.name || item?.OriginalTitle || item?.originalTitle || "").trim(),
-		name: normalizeMediaAggregationTitle(item?.Name || item?.name),
-		originalTitle: normalizeMediaAggregationTitle(item?.OriginalTitle || item?.originalTitle),
-		productionYear: normalizeMediaAggregationYear(item?.ProductionYear || item?.productionYear),
-		seriesId: String(item?.SeriesId || item?.seriesId || series?.Id || series?.id || "").trim(),
-		seriesProviderIds: normalizeMediaAggregationProviderIds(series?.ProviderIds || series?.providerIds || item?.SeriesProviderIds || item?.seriesProviderIds),
-		seriesSearchName: String(series?.Name || series?.name || item?.SeriesName || item?.seriesName || "").trim(),
-		seriesName: normalizeMediaAggregationTitle(series?.Name || series?.name || item?.SeriesName || item?.seriesName),
-		seriesOriginalTitle: normalizeMediaAggregationTitle(series?.OriginalTitle || series?.originalTitle),
-		seriesProductionYear: normalizeMediaAggregationYear(series?.ProductionYear || series?.productionYear || item?.SeriesProductionYear || item?.seriesProductionYear),
-		parentIndexNumber: normalizeMediaAggregationIndex(item?.ParentIndexNumber ?? item?.parentIndexNumber),
-		indexNumber: normalizeMediaAggregationIndex(item?.IndexNumber ?? item?.indexNumber),
-		indexNumberEnd: normalizeMediaAggregationIndex(item?.IndexNumberEnd ?? item?.indexNumberEnd)
-	};
-}
-function getMediaAggregationTitleCandidates(identity = {}, series = false) {
-	const values = series ? [identity.seriesName, identity.seriesOriginalTitle] : [identity.name, identity.originalTitle];
-	return [...new Set(values.map((value) => normalizeMediaAggregationTitle(value)).filter(Boolean))];
-}
-function mediaAggregationTitlesMatch(primary = {}, candidate = {}, series = false) {
-	const primaryTitles = getMediaAggregationTitleCandidates(primary, series);
-	const candidateTitles = new Set(getMediaAggregationTitleCandidates(candidate, series));
-	return primaryTitles.some((title) => candidateTitles.has(title));
-}
-function resolveMediaAggregationProviderMatch(primaryProviderIds = {}, candidateProviderIds = {}) {
-	const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
-	const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
-	let matchedKey = "";
-	for (const key of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
-		if (!primary[key] || !candidate[key]) continue;
-		if (primary[key] !== candidate[key]) return null;
-		if (!matchedKey) matchedKey = key;
-	}
-	return matchedKey ? {
-		key: matchedKey,
-		value: primary[matchedKey]
-	} : null;
-}
-function haveMediaAggregationProviderConflict(primaryProviderIds = {}, candidateProviderIds = {}) {
-	const primary = normalizeMediaAggregationProviderIds(primaryProviderIds);
-	const candidate = normalizeMediaAggregationProviderIds(candidateProviderIds);
-	return MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS.some((key) => primary[key] && candidate[key] && primary[key] !== candidate[key]);
-}
-function matchMediaAggregationIdentities(primary = {}, candidate = {}, matchMode = "title_year") {
-	const primaryType = String(primary?.type || "").trim().toLowerCase();
-	const candidateType = String(candidate?.type || "").trim().toLowerCase();
-	if (!MEDIA_AGGREGATION_SUPPORTED_TYPES.has(primaryType) || primaryType !== candidateType) return null;
-	const normalizedMode = normalizeMediaAggregationMatchMode(matchMode);
-	if (primaryType === "episode") {
-		if (primary.parentIndexNumber !== candidate.parentIndexNumber || primary.indexNumber !== candidate.indexNumber || primary.indexNumberEnd !== candidate.indexNumberEnd || primary.parentIndexNumber === null || primary.indexNumber === null) return null;
-		if (haveMediaAggregationProviderConflict(primary.seriesProviderIds, candidate.seriesProviderIds)) return null;
-		const providerMatch = resolveMediaAggregationProviderMatch(primary.seriesProviderIds, candidate.seriesProviderIds);
-		if (providerMatch) return {
-			status: "matched_episode",
-			strategy: `series_${providerMatch.key}`,
-			fingerprint: {
-				type: primaryType,
-				provider: providerMatch,
-				season: primary.parentIndexNumber,
-				episode: primary.indexNumber,
-				episodeEnd: primary.indexNumberEnd
-			}
-		};
-		if (normalizedMode === "title_year" && primary.seriesProductionYear !== null && primary.seriesProductionYear === candidate.seriesProductionYear && mediaAggregationTitlesMatch(primary, candidate, true)) return {
-			status: "matched_episode",
-			strategy: "series_title_year",
-			fingerprint: {
-				type: primaryType,
-				title: getMediaAggregationTitleCandidates(primary, true).find((title) => getMediaAggregationTitleCandidates(candidate, true).includes(title)) || "",
-				year: primary.seriesProductionYear,
-				season: primary.parentIndexNumber,
-				episode: primary.indexNumber,
-				episodeEnd: primary.indexNumberEnd
-			}
-		};
-		return null;
-	}
-	if (haveMediaAggregationProviderConflict(primary.providerIds, candidate.providerIds)) return null;
-	const providerMatch = resolveMediaAggregationProviderMatch(primary.providerIds, candidate.providerIds);
-	if (providerMatch) return {
-		status: "matched_provider",
-		strategy: providerMatch.key,
-		fingerprint: {
-			type: primaryType,
-			provider: providerMatch
-		}
-	};
-	if (normalizedMode === "title_year" && primary.productionYear !== null && primary.productionYear === candidate.productionYear && mediaAggregationTitlesMatch(primary, candidate, false)) return {
-		status: "matched_title_year",
-		strategy: "title_year",
-		fingerprint: {
-			type: primaryType,
-			title: getMediaAggregationTitleCandidates(primary).find((title) => getMediaAggregationTitleCandidates(candidate).includes(title)) || "",
-			year: primary.productionYear
-		}
-	};
-	return null;
-}
-async function sha256Base64Url(value = "") {
-	const digest = await getCryptoSubtle().digest("SHA-256", new TextEncoder().encode(String(value || "")));
-	return btoa(String.fromCharCode(...new Uint8Array(digest))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-async function buildMediaAggregationIdentityDigest(identity = {}) {
-	return await sha256Base64Url(serializeConfigValue(identity));
-}
-async function buildMediaAggregationMatchFingerprintHash(match = {}) {
-	return await sha256Base64Url(serializeConfigValue(match?.fingerprint || {}));
-}
-async function verifyMediaAggregationSourceSignature(source, secret = "") {
-	if (!source || source.version !== "AGG2" || !secret) return false;
-	return source.signature === await signHmac(String(secret), String(source.signedPayload || ""));
-}
-//#endregion
-//#region worker/features/nodes/poster-model.js
-function normalizePosterBrowserOrigin(value = "") {
-	try {
-		const url = new URL(String(value || "").trim());
-		if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return "";
-		if (url.pathname !== "/") return "";
-		return url.origin;
-	} catch {
-		return "";
-	}
-}
-function normalizePosterBrowserToken(value = "") {
-	const token = String(value || "").trim();
-	return token && token.length <= 4096 && !/[\r\n]/.test(token) ? token : "";
-}
-function normalizeTmdbBrowserToken(value = "") {
-	const token = normalizePosterBrowserToken(value).replace(/^Bearer\s+/i, "").trim();
-	return /^[a-f0-9]{32}$/i.test(token) ? "" : normalizePosterBrowserToken(token);
-}
-function buildPosterBrowserConfig(env = {}, config = {}, includeValues = false) {
-	const savedTmdbToken = normalizeTmdbBrowserToken(config?.tmdbBrowserToken);
-	const savedDoubanOrigin = normalizePosterBrowserOrigin(config?.doubanBrowserOrigin);
-	const savedDoubanToken = normalizePosterBrowserToken(config?.doubanBrowserToken);
-	const tmdbToken = savedTmdbToken || normalizeTmdbBrowserToken(env?.TMDB_BROWSER_TOKEN);
-	const doubanOrigin = savedDoubanOrigin || normalizePosterBrowserOrigin(env?.DOUBAN_BROWSER_ORIGIN);
-	const doubanToken = savedDoubanToken || normalizePosterBrowserToken(env?.DOUBAN_BROWSER_TOKEN);
-	if (!includeValues) return {
-		tmdbTokenConfigured: Boolean(tmdbToken),
-		tmdbTokenSource: savedTmdbToken ? "admin" : tmdbToken ? "binding" : "none",
-		doubanOriginConfigured: Boolean(doubanOrigin),
-		doubanOriginSource: savedDoubanOrigin ? "admin" : doubanOrigin ? "binding" : "none",
-		doubanTokenConfigured: Boolean(doubanToken),
-		doubanTokenSource: savedDoubanToken ? "admin" : doubanToken ? "binding" : "none"
-	};
-	return {
-		tmdb: {
-			configured: Boolean(tmdbToken),
-			token: tmdbToken
-		},
-		douban: {
-			configured: Boolean(doubanOrigin && doubanToken),
-			origin: doubanOrigin,
-			token: doubanToken
-		}
-	};
-}
-function normalizeServerRecordPosterTitle(value = "") {
-	return String(value || "").normalize("NFKC").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 256);
-}
-function normalizeServerRecordPosterYear(value) {
-	return normalizeMediaAggregationYear(value);
-}
-function inferServerRecordPosterMediaKind(itemType = "", seriesName = "") {
-	const type = String(itemType || "").trim().toLowerCase();
-	if (type === "movie") return "movie";
-	if (["series", "episode"].includes(type) || normalizeServerRecordPosterTitle(seriesName)) return "tv";
-	return "";
-}
-function readServerRecordPrimaryImageTag(item = {}) {
-	if (!isPlainObject(item)) return "";
-	const normalizedItem = normalizeCaseInsensitiveObject(item);
-	const imageTags = normalizeCaseInsensitiveObject(isPlainObject(normalizedItem.imagetags) ? normalizedItem.imagetags : {});
-	return String(getCaseInsensitivePayloadValue(imageTags, ["Primary"]) || getCaseInsensitivePayloadValue(normalizedItem, ["PrimaryImageTag"]) || "").trim().slice(0, 256);
-}
-function buildServerRecordMediaMetadata(payload = {}, expectedItemId = "", options = {}) {
-	const item = normalizeCaseInsensitiveObject(isPlainObject(payload) ? payload : {});
-	const expected = String(expectedItemId || "").trim().slice(0, 256);
-	const payloadItemId = String(getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
-	const itemId = payloadItemId || (options.allowMissingItemId === true ? expected : "");
-	if (!itemId || expected && itemId !== expected) return null;
-	const posterSearch = buildServerRecordPosterMetadata(item);
-	return {
-		itemId,
-		itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || "").trim().slice(0, 256),
-		itemType: String(getCaseInsensitivePayloadValue(item, ["Type"]) || "").trim().slice(0, 64),
-		seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || "").trim().slice(0, 256),
-		originalTitle: String(posterSearch?.originalTitle || ""),
-		year: posterSearch?.productionYear ?? null,
-		imageTag: readServerRecordPrimaryImageTag(item)
-	};
-}
-function sniffServerRecordPosterMime(bytes = new Uint8Array()) {
-	const has = (...values) => values.every((value, index) => bytes[index] === value);
-	if (bytes.length >= 3 && has(255, 216, 255)) return "image/jpeg";
-	if (bytes.length >= 8 && has(137, 80, 78, 71, 13, 10, 26, 10)) return "image/png";
-	const ascii = (start, length) => String.fromCharCode(...bytes.slice(start, start + length));
-	if (bytes.length >= 6 && ["GIF87a", "GIF89a"].includes(ascii(0, 6))) return "image/gif";
-	if (bytes.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") return "image/webp";
-	if (bytes.length >= 16 && ascii(4, 4) === "ftyp") {
-		const brands = ascii(8, Math.min(bytes.length - 8, 56));
-		if (brands.includes("avif") || brands.includes("avis")) return "image/avif";
-	}
-	return "";
-}
-function buildServerRecordPosterMetadata(item = {}, seriesItem = {}) {
-	if (!isPlainObject(item)) return null;
-	const normalizedItem = normalizeCaseInsensitiveObject(item);
-	const itemType = String(getCaseInsensitivePayloadValue(normalizedItem, ["Type"]) || "").trim().toLowerCase();
-	if (![
-		"movie",
-		"series",
-		"episode"
-	].includes(itemType)) return null;
-	const normalizedSeries = isPlainObject(seriesItem) ? normalizeCaseInsensitiveObject(seriesItem) : {};
-	const isEpisode = itemType === "episode";
-	const title = normalizeServerRecordPosterTitle(isEpisode ? getCaseInsensitivePayloadValue(normalizedSeries, ["Name"]) || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesName"]) : getCaseInsensitivePayloadValue(normalizedItem, ["Name"]));
-	const originalTitle = normalizeServerRecordPosterTitle(isEpisode ? getCaseInsensitivePayloadValue(normalizedSeries, ["OriginalTitle"]) || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesOriginalTitle"]) : getCaseInsensitivePayloadValue(normalizedItem, ["OriginalTitle"]));
-	const productionYear = normalizeServerRecordPosterYear(isEpisode ? getCaseInsensitivePayloadValue(normalizedSeries, ["ProductionYear"]) || getCaseInsensitivePayloadValue(normalizedItem, ["SeriesProductionYear"]) : getCaseInsensitivePayloadValue(normalizedItem, ["ProductionYear"]));
-	return {
-		mediaKind: itemType === "movie" ? "movie" : "tv",
-		itemType,
-		title,
-		originalTitle,
-		productionYear
-	};
-}
-function extractPlaybackInfoItemPathState(proxyPath = "") {
-	const normalizedPath = sanitizeProxyPath(proxyPath);
-	const match = /^(.*?\/items\/)([^/]+)(\/playbackinfo\/?$)/i.exec(normalizedPath);
-	if (!match) return {
-		itemId: "",
-		rewritePath: () => normalizedPath
-	};
-	let itemId = String(match[2] || "").trim();
-	try {
-		itemId = decodeURIComponent(itemId);
-	} catch {}
-	return {
-		itemId,
-		rewritePath(nextItemId = "") {
-			const safeItemId = encodeURIComponent(String(nextItemId || "").trim());
-			return safeItemId ? `${match[1]}${safeItemId}${match[3]}` : normalizedPath;
-		}
-	};
-}
-function extractUserItemDetailsPathState(proxyPath = "") {
-	const normalizedPath = sanitizeProxyPath(proxyPath);
-	const match = /^(?:.*\/)?users\/([^/]+)\/items\/([^/]+)\/?$/i.exec(normalizedPath);
-	if (!match) return { userId: "", itemId: "" };
-	let userId = String(match[1] || "").trim();
-	let itemId = String(match[2] || "").trim();
-	try {
-		userId = decodeURIComponent(userId);
-	} catch {}
-	try {
-		itemId = decodeURIComponent(itemId);
-	} catch {}
-	return {
-		userId: userId.trim().slice(0, 256),
-		itemId: itemId.trim().slice(0, 256)
-	};
-}
-function resolveMediaAggregationApiPrefix(proxyPath = "") {
-	const normalizedPath = sanitizeProxyPath(proxyPath);
-	const index = normalizedPath.toLowerCase().lastIndexOf("/items/");
-	return index > 0 ? normalizedPath.slice(0, index) : "";
-}
 //#endregion
 //#region worker/features/observability/log-model.js
 function classifyLogResourceScope(requestPath = "", category = "") {
@@ -6019,16 +5388,6 @@ var CONFIG_SANITIZE_RULES = {
 		"dashboardShowD1WriteHotspot",
 		"dashboardShowKvD1Status",
 		"sourceDirectNodes",
-		"mediaAggregationNodes",
-		"mediaAggregationEmbyUsername",
-		"mediaAggregationEmbyPassword",
-		"tmdbBrowserToken",
-		"doubanBrowserOrigin",
-		"doubanBrowserToken",
-		"mediaAggregationBidirectionalProgressEnabled",
-		"mediaAggregationMatchMode",
-		"mediaAggregationFirstResultTimeoutMs",
-		"mediaAggregationGracePeriodMs",
 		"dnsDefaultFallbackCname",
 		"defaultHostPrefixCnameTarget",
 		"pingTimeout",
@@ -6084,9 +5443,6 @@ var CONFIG_SANITIZE_RULES = {
 		"tgAlertD1UsageEnabled",
 		"tgAlertD1UsageThresholdPercent",
 		"tgAlertCooldownMinutes",
-		"tgServerExpiryWarningEnabled",
-		"tgServerExpiryWarningDays",
-		"serverRecordExpiryDays",
 		"jwtExpiryDays",
 		"cfAccountId",
 		"cfZoneId",
@@ -6121,17 +5477,10 @@ var CONFIG_SANITIZE_RULES = {
 		"defaultPlaybackInfoMode",
 		"defaultRealClientIpMode",
 		"defaultMediaAuthMode",
-		"mediaAggregationEmbyUsername",
-		"mediaAggregationMatchMode",
-		"tmdbBrowserToken",
-		"doubanBrowserOrigin",
-		"doubanBrowserToken"
 	],
 	arrayNormalizers: {
 		sourceDirectNodes: "nodeNameList",
-		mediaAggregationNodes: "nodeNameList",
-		tgServerExpiryWarningDays: "expiryWarningDays"
-	},
+					},
 	integerFields: {
 		logRetentionDays: {
 			fallback: Config.Defaults.LogRetentionDays,
@@ -6193,12 +5542,7 @@ var CONFIG_SANITIZE_RULES = {
 			min: 1,
 			max: 1440
 		},
-		serverRecordExpiryDays: {
-			fallback: Config.Defaults.ServerRecordExpiryDays,
-			min: 1,
-			max: 3650
-		},
-		cacheTtlImages: {
+				cacheTtlImages: {
 			fallback: Config.Defaults.CacheTtlImagesDays,
 			min: 0,
 			max: 365
@@ -6283,17 +5627,7 @@ var CONFIG_SANITIZE_RULES = {
 			min: 0,
 			max: 60
 		},
-		mediaAggregationFirstResultTimeoutMs: {
-			fallback: Config.Defaults.MediaAggregationFirstResultTimeoutMs,
-			min: 100,
-			max: 1e4
-		},
-		mediaAggregationGracePeriodMs: {
-			fallback: Config.Defaults.MediaAggregationGracePeriodMs,
-			min: 0,
-			max: 5e3
-		},
-		scheduleUtcOffsetMinutes: {
+						scheduleUtcOffsetMinutes: {
 			fallback: Config.Defaults.ScheduleUtcOffsetMinutes,
 			min: -720,
 			max: 840
@@ -6321,7 +5655,6 @@ var CONFIG_SANITIZE_RULES = {
 		"tgAlertOnScheduledFailure",
 		"tgAlertKvUsageEnabled",
 		"tgAlertD1UsageEnabled",
-		"tgServerExpiryWarningEnabled",
 		"tgDailyReportEnabled",
 		"tgDailyReportSummaryEnabled",
 		"tgDailyReportKvEnabled",
@@ -6335,8 +5668,7 @@ var CONFIG_SANITIZE_RULES = {
 		"hedgeFailoverEnabled",
 		"disablePrewarmPrefetch",
 		"logWriteImagePoster",
-		"logWriteMediaMetadata",
-		"mediaAggregationBidirectionalProgressEnabled"
+		"logWriteMediaMetadata"
 	]
 };
 function applyConfigRuleAliases(config = {}, rules = {}) {
@@ -6370,8 +5702,7 @@ function sanitizeConfigWithRules(input = {}, rules = CONFIG_SANITIZE_RULES, help
 	}
 	for (const [key, normalizerName] of Object.entries(rules.arrayNormalizers || {})) {
 		if (!Array.isArray(config[key])) continue;
-		if (normalizerName === "expiryWarningDays") config[key] = [...new Set((Array.isArray(config[key]) ? config[key] : String(config[key] || "").split(/[,\s]+/)).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0 && value <= 365))].sort((left, right) => right - left);
-		else if (normalizerName === "nodeNameList" && typeof helpers.normalizeNodeNameList === "function") config[key] = helpers.normalizeNodeNameList(config[key]);
+		if (normalizerName === "nodeNameList" && typeof helpers.normalizeNodeNameList === "function") config[key] = helpers.normalizeNodeNameList(config[key]);
 	}
 	for (const [key, rule] of Object.entries(rules.integerFields || {})) config[key] = clampIntegerConfig(config[key], rule.fallback, rule.min, rule.max);
 	for (const [key, rule] of Object.entries(rules.numberFields || {})) config[key] = clampNumberConfig(config[key], rule.fallback, rule.min, rule.max);
@@ -6504,10 +5835,6 @@ function sanitizeMigratedRuntimeConfig(migratedRawConfig = {}) {
 	sanitized.defaultPlaybackInfoMode = normalizeDefaultPlaybackInfoMode(sanitized.defaultPlaybackInfoMode);
 	sanitized.defaultRealClientIpMode = normalizeDefaultRealClientIpMode(sanitized.defaultRealClientIpMode);
 	sanitized.defaultMediaAuthMode = normalizeDefaultMediaAuthMode(sanitized.defaultMediaAuthMode);
-	sanitized.mediaAggregationMatchMode = normalizeMediaAggregationMatchMode(sanitized.mediaAggregationMatchMode);
-	sanitized.tmdbBrowserToken = normalizeTmdbBrowserToken(sanitized.tmdbBrowserToken);
-	sanitized.doubanBrowserOrigin = normalizePosterBrowserOrigin(sanitized.doubanBrowserOrigin);
-	sanitized.doubanBrowserToken = normalizePosterBrowserToken(sanitized.doubanBrowserToken);
 	sanitized.scheduleUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(sanitized.scheduleUtcOffsetMinutes);
 	sanitized.tgDailyReportClockTimes = normalizeScheduleClockTimeList(sanitized.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
 	const localIndexRevision = parseAdminLocalIndexSourceUrl(sanitized.indexUrl);
@@ -6517,43 +5844,15 @@ function sanitizeMigratedRuntimeConfig(migratedRawConfig = {}) {
 }
 var CONFIG_SECRET_FIELDS = [
 	"cfApiToken",
-	"tgBotToken",
-	"tmdbBrowserToken",
-	"doubanBrowserToken",
-	"mediaAggregationEmbyUsername",
-	"mediaAggregationEmbyPassword"
-];
-var FULL_BACKUP_REDACTED_SECRET_FIELDS = [
-	"cfApiToken",
-	"tgBotToken",
-	"tmdbBrowserToken",
-	"doubanBrowserToken"
+	"tgBotToken"
 ];
 function redactRuntimeConfigSecrets(input = {}) {
 	const config = sanitizeRuntimeConfig(input);
 	for (const field of CONFIG_SECRET_FIELDS) delete config[field];
 	return config;
 }
-function redactFullBackupServiceSecrets(input = {}) {
-	const config = sanitizeRuntimeConfig(input);
-	for (const field of FULL_BACKUP_REDACTED_SECRET_FIELDS) delete config[field];
-	return config;
-}
 function redactAdminRuntimeConfig(input = {}) {
 	const redacted = sanitizeRuntimeConfig(input);
-	delete redacted.tmdbBrowserToken;
-	delete redacted.doubanBrowserToken;
-	return redacted;
-}
-function redactNodeEmbyCredentials(node = {}) {
-	if (!isPlainObject(node)) return node;
-	const redacted = { ...node };
-	delete redacted.mediaAggregationEmbyUsername;
-	delete redacted.mediaAggregationEmbyPassword;
-	delete redacted.mediaAggregationEmbyCredentialsConfigured;
-	delete redacted.serverRecordEmbyUsername;
-	delete redacted.serverRecordEmbyPassword;
-	delete redacted.serverRecordEmbyCredentialsConfigured;
 	return redacted;
 }
 function preserveRuntimeConfigSecrets(input = {}, currentConfig = {}) {
@@ -7263,7 +6562,7 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
           if (submitButton) submitButton.disabled = true;
           updateStatus("正在验证密码并建立 Cookie 会话...", "");
           try {
-            const response = await fetchRequest(ADMIN_LOGIN_RUNTIME.loginPath, {
+            const response = await fetch(ADMIN_LOGIN_RUNTIME.loginPath, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -7275,7 +6574,7 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
             const payload = await response.json().catch(() => ({}));
             if (response.ok && payload && payload.ok === true) {
               updateStatus("登录成功，正在进入控制台...", "success");
-              void fetchRequest((ADMIN_LOGIN_RUNTIME.adminPath || "/admin").replace(/\\/+$/, "") + "/__warm", {
+              void fetch((ADMIN_LOGIN_RUNTIME.adminPath || "/admin").replace(/\\/+$/, "") + "/__warm", {
                 method: "HEAD",
                 credentials: "same-origin",
                 cache: "no-store",
@@ -9043,8 +8342,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 					nodes,
 					configSnapshots,
 					shell: buildAdminShellState(env, initHealth, config),
-					posterBrowserBindings: buildPosterBrowserConfig(env, config),
-					runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object" ? runtimeStatusPayload.status : withAdminShellRuntimeStatus({}, env, config, initHealth),
+										runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object" ? runtimeStatusPayload.status : withAdminShellRuntimeStatus({}, env, config, initHealth),
 					revisions,
 					generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 				});
@@ -9106,8 +8404,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				contract: buildAdminUiContract(),
 				nodes,
 				configSnapshots,
-				posterBrowserBindings: buildPosterBrowserConfig(env, config),
-				runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
+								runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
 				revisions,
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
@@ -9214,46 +8511,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				return jsonError("WORKER_PLACEMENT_SAVE_FAILED", normalizeCloudflareWorkerPlacementErrorMessage(error, requestedMode === "default" ? "default" : "write"), normalizeErrorStatus(error?.status, requestedMode === "default" ? 409 : 400), isPlainObject(error?.details) ? error.details : null);
 			}
 		},
-		async getPosterBrowserConfig(data, { env }) {
-			return jsonResponse(buildPosterBrowserConfig(env, await getRuntimeConfigStrict(env), true), 200, { "Cache-Control": "no-store, max-age=0" });
-		},
-		async savePosterBrowserSettings(data, { env, ctx, kv }) {
-			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-			const nextConfig = { ...await getRuntimeConfigStrict(env) };
-			const tmdbToken = normalizeTmdbBrowserToken(data?.tmdbToken);
-			const doubanOrigin = normalizePosterBrowserOrigin(data?.doubanOrigin);
-			const doubanToken = normalizePosterBrowserToken(data?.doubanToken);
-			if (String(data?.tmdbToken || "").trim() && !tmdbToken) return jsonError("POSTER_TMDB_TOKEN_INVALID", "请填写 TMDB 设置页上方的 API 读取访问令牌，不要填写下方的 32 位 API 密钥", 400);
-			if (String(data?.doubanOrigin || "").trim() && !doubanOrigin) return jsonError("POSTER_DOUBAN_ORIGIN_INVALID", "豆瓣服务地址必须是 HTTPS 根 Origin", 400);
-			if (String(data?.doubanToken || "").trim() && !doubanToken) return jsonError("POSTER_DOUBAN_TOKEN_INVALID", "豆瓣 Browser Token 格式无效", 400);
-			if (data?.clearTmdbToken === true) delete nextConfig.tmdbBrowserToken;
-			else if (tmdbToken) nextConfig.tmdbBrowserToken = tmdbToken;
-			if (Object.prototype.hasOwnProperty.call(data || {}, "doubanOrigin")) if (doubanOrigin) nextConfig.doubanBrowserOrigin = doubanOrigin;
-			else delete nextConfig.doubanBrowserOrigin;
-			if (data?.clearDoubanToken === true) delete nextConfig.doubanBrowserToken;
-			else if (doubanToken) nextConfig.doubanBrowserToken = doubanToken;
-			const savedConfig = await kernel.persistRuntimeConfig(nextConfig, {
-				env,
-				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "save_config",
-					section: "poster_browser",
-					source: "ui",
-					actor: "admin"
-				}
-			});
-			return jsonResponse({
-				success: true,
-				config: redactAdminRuntimeConfig(savedConfig),
-				posterBrowserBindings: buildPosterBrowserConfig(env, savedConfig),
-				revisions: await kernel.getAdminRevisions(env, {
-					ctx,
-					config: savedConfig
-				})
-			});
-		}
-	};
+					};
 }
 //#endregion
 //#region worker/features/maintenance/constants.js
@@ -9397,7 +8655,6 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 			});
 			return jsonResponse({
 				config: redactAdminRuntimeConfig(prepared.nextConfig),
-				migration: collectLegacyRuntimeConfigState(rawConfig),
 				hostPrefixDnsSyncCount: prepared.dnsPlans.length
 			});
 		},
@@ -9411,7 +8668,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 						kv,
 						maintenanceMode: normalizeTidyMaintenanceMode(data?.maintenanceMode, "manual")
 					});
-					const requiresSchemaInitialization = plan.schemaStatus?.runtimeCompatibilityReady !== true;
+					const requiresSchemaInitialization = plan.schemaStatus?.schemaReady !== true;
 					const planToken = requiresSchemaInitialization ? "" : await kernel.createD1TidyPlanToken(env, plan);
 					return jsonResponse({
 						success: true,
@@ -9565,8 +8822,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 			return jsonResponse({
 				success: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-				posterBrowserBindings: buildPosterBrowserConfig(env, savedConfig),
-				revisions: await kernel.getAdminRevisions(env, {
+								revisions: await kernel.getAdminRevisions(env, {
 					ctx,
 					config: savedConfig
 				})
@@ -9605,8 +8861,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 		async exportConfig(data, { env, ctx, request }) {
 			const kv = kernel.getKV(env);
 			const includeSecrets = data?.includeSecrets === true;
-			const includeEmbyCredentials = includeSecrets || data?.includeEmbyCredentials === true;
-			if (includeEmbyCredentials && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportConfig") return jsonError("CONFIRMATION_REQUIRED", "导出 Emby 凭据需要显式确认", 428);
+			if (includeSecrets && String(request.headers.get("X-Admin-Confirm") || "").trim() !== "exportConfig") return jsonError("CONFIRMATION_REQUIRED", "Exporting secrets requires explicit confirmation", 428);
 			const config = await getRuntimeConfigStrict(env);
 			const indexState = buildResolvedAdminIndexState(env, config);
 			const adminIndexUpload = kv && indexState.localUploadRevision ? await kernel.getAdminIndexUploadRecord(kv, indexState.localUploadRevision) : null;
@@ -9614,8 +8869,8 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 			const backupPayload = {
 				version: Config.Defaults.Version,
 				exportTime: (/* @__PURE__ */ new Date()).toISOString(),
-				nodes: includeEmbyCredentials ? storedNodes : storedNodes.map(redactNodeEmbyCredentials),
-				config: includeSecrets ? config : includeEmbyCredentials ? redactFullBackupServiceSecrets(config) : redactRuntimeConfigSecrets(config),
+				nodes: storedNodes,
+				config: includeSecrets ? config : redactRuntimeConfigSecrets(config),
 				adminIndexUpload: adminIndexUpload ? {
 					version: adminIndexUpload.version,
 					revision: adminIndexUpload.revision,
@@ -9624,8 +8879,8 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 					bytes: adminIndexUpload.bytes,
 					html: adminIndexUpload.html
 				} : null,
-				secretsRedacted: includeEmbyCredentials !== true,
-				containsSecrets: includeEmbyCredentials === true
+				secretsRedacted: includeSecrets !== true,
+				containsSecrets: includeSecrets === true
 			};
 			const importRequestBytes = new TextEncoder().encode(JSON.stringify({
 				action: "importFull",
@@ -9742,23 +8997,6 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 			if (!snapshotId) return jsonError("SNAPSHOT_ID_REQUIRED", "请提供要恢复的快照 ID");
 			const snapshot = await kernel.getConfigSnapshotById(kv, snapshotId);
 			if (!snapshot) return jsonError("SNAPSHOT_NOT_FOUND", "指定的配置快照不存在", 404);
-			if (snapshot.reason === "tidy_kv_data_pre_migration" && isPlainObject(snapshot.rollbackPayload)) {
-				const restoredConfig = await kernel.restoreTidyKvMigrationSnapshot(snapshot, {
-					env,
-					kv,
-					ctx
-				});
-				return jsonResponse({
-					success: true,
-					config: redactAdminRuntimeConfig(restoredConfig),
-					restoredSnapshotId: snapshotId,
-					restoredMigrationPayload: true,
-					revisions: await kernel.getAdminRevisions(env, {
-						ctx,
-						config: restoredConfig
-					})
-				});
-			}
 			const currentConfig = await getRuntimeConfigStrict(env);
 			const restoredSnapshotConfig = preserveRuntimeConfigSecrets(snapshot.config || {}, currentConfig);
 			const savedConfig = await kernel.persistRuntimeConfig(restoredSnapshotConfig, {
@@ -9801,64 +9039,7 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 				throw remapAdminReadKvError(error, "NODE_LIST_READ_FAILED", "节点列表读取失败：KV 读取异常", "admin.read.nodes");
 			}
 		},
-		async getServerRecordsSnapshot(data, { env, ctx, db, request }) {
-			try {
-				return jsonResponse(await kernel.getServerRecordsSnapshotPayload(env, {
-					ctx,
-					db,
-					request,
-					forceRefresh: data?.forceRefresh === true,
-					skipProbe: data?.forceRefresh !== true,
-					refreshNodeName: String(data?.nodeName || "").trim().toLowerCase()
-				}));
-			} catch (error) {
-				throw remapAdminReadKvError(error, "SERVER_RECORDS_READ_FAILED", "服务器记录读取失败：节点数据不可用", "admin.read.server_records");
-			}
-		},
-		async getServerRecordCredential(data, { env, ctx, request }) {
-			const nodeName = String(data?.nodeName || "").trim().toLowerCase();
-			const recordRevealEvent = (statusCode, outcome) => {
-				Logger.record(env, ctx, {
-					nodeName: nodeName || "unknown",
-					requestPath: `${getAdminPath(env)}/server-records/credential`,
-					requestMethod: "POST",
-					statusCode,
-					category: "auth",
-					clientIp: request?.headers?.get?.("cf-connecting-ip") || "unknown",
-					userAgent: request?.headers?.get?.("user-agent") || "",
-					errorDetail: `server_record_credential_reveal_${outcome}`,
-					detailJson: {
-						event: "server_record_credential_reveal",
-						outcome
-					}
-				});
-			};
-			if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请选择服务器节点", 400);
-			if (!env?.ADMIN_PASS) return jsonError("SERVER_MISCONFIGURED", "ADMIN_PASS 未配置", 503);
-			const adminPassword = typeof data?.adminPassword === "string" ? data.adminPassword : "";
-			if (!adminPassword) {
-				recordRevealEvent(428, "recent_auth_required");
-				return jsonError("RECENT_AUTH_REQUIRED", "显示服务器记录密码前需要重新验证管理密码", 428);
-			}
-			if (adminPassword !== env.ADMIN_PASS) {
-				recordRevealEvent(401, "recent_auth_failed");
-				return jsonError("RECENT_AUTH_FAILED", "管理密码验证失败", 401);
-			}
-			const node = await kernel.getNodeForRead(nodeName, env);
-			if (!node) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
-			const credentials = resolveServerRecordCredentials(node);
-			recordRevealEvent(200, "success");
-			return jsonResponse({
-				success: true,
-				credential: {
-					username: credentials.username,
-					password: credentials.password,
-					configured: credentials.configured,
-					source: credentials.source
-				}
-			});
-		},
-		async getDashboardD1WriteHotspot(data, { env, ctx }) {
+						async getDashboardD1WriteHotspot(data, { env, ctx }) {
 			const config = await getRuntimeConfigStrict(env);
 			return jsonResponse(await kernel.buildDashboardD1WriteHotspotPayload(env, {
 				config,
@@ -9882,102 +9063,15 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 				config
 			}) });
 		},
-		async saveServerRecordSettings(data, { env, ctx, kv, db }) {
-			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-			const nodeName = String(data?.nodeName || "").trim().toLowerCase();
-			if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请选择服务器节点", 400);
-			const rawExpiresAt = String(data?.expiresAt || "").trim();
-			const expiresAt = normalizeServerRecordExpiry(rawExpiresAt);
-			if (rawExpiresAt && !expiresAt) return jsonError("SERVER_RECORD_EXPIRY_INVALID", "预计过期日期无效", 400);
-			const expiryEnabled = typeof data?.expiryEnabled === "boolean" ? data.expiryEnabled : Boolean(expiresAt);
-			const expiryMode = normalizeServerRecordExpiryMode(data?.expiryMode, expiresAt);
-			const rawExpiryDays = String(data?.expiryDays ?? "").trim();
-			const expiryDays = Number.parseInt(rawExpiryDays, 10);
-			const storedExpiryDays = /^\d+$/.test(rawExpiryDays) && Number.isInteger(expiryDays) && expiryDays >= 1 && expiryDays <= 3650 ? expiryDays : Config.Defaults.ServerRecordExpiryDays;
-			if (expiryEnabled && expiryMode === "fixed" && !expiresAt) return jsonError("SERVER_RECORD_EXPIRY_REQUIRED", "固定日期模式必须填写预计过期日期", 400);
-			if (expiryEnabled && expiryMode === "rolling" && (!/^\d+$/.test(rawExpiryDays) || !Number.isInteger(expiryDays) || expiryDays < 1 || expiryDays > 3650)) return jsonError("SERVER_RECORD_EXPIRY_DAYS_INVALID", "滚动模式天数必须在 1 到 3650 之间", 400);
-			const tags = normalizeNodeTags(data?.tags, "");
-			return await runKvDataMutation(async () => {
-				const existingNode = await kv.get(`${kernel.PREFIX}${nodeName}`, { type: "json" });
-				if (!existingNode) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
-				const hasUsername = Object.prototype.hasOwnProperty.call(data || {}, "serverRecordEmbyUsername");
-				const hasPassword = Object.prototype.hasOwnProperty.call(data || {}, "serverRecordEmbyPassword");
-				const serverRecordEmbyUsername = hasUsername ? String(data?.serverRecordEmbyUsername || "").trim() : String(existingNode.serverRecordEmbyUsername || "").trim();
-				let serverRecordEmbyPassword = hasPassword ? String(data?.serverRecordEmbyPassword || "") : String(existingNode.serverRecordEmbyPassword || "");
-				if (hasUsername && !serverRecordEmbyUsername) serverRecordEmbyPassword = "";
-				const credentialValidationError = getServerRecordCredentialValidationError({
-					serverRecordEmbyUsername,
-					serverRecordEmbyPassword
-				});
-				if (credentialValidationError) return jsonError(credentialValidationError.code, credentialValidationError.message, 400);
-				const mutation = kernel.buildPreparedServerRecordSettingsMutation(nodeName, existingNode, {
-					tags,
-					tag: tags[0] || "",
-					serverRecordEmbyUsername,
-					serverRecordEmbyPassword,
-					serverRecord: {
-						enabled: data?.enabled === true,
-						expiryEnabled,
-						expiryMode,
-						expiresAt: expiryMode === "fixed" ? expiresAt : null,
-						expiryDays: storedExpiryDays
-					}
-				});
-				if (!mutation) return jsonError("INVALID_TARGET", "节点目标无效", 400);
-				let mutationCommitted = false;
-				try {
-					await kernel.applyPreparedNodeMutations([mutation], {
-						env,
-						kv,
-						ctx
-					});
-					mutationCommitted = mutation.nodeChanged === true;
-					const rebuilt = mutationCommitted ? await kernel.rebuildNodeIndexesFromKv(kv, {
-						ctx,
-						syncLegacyIndex: false
-					}) : null;
-					const nodes = Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : await CacheManager.getNodesListStrict(env, ctx);
-					return jsonResponse({
-						success: true,
-						node: nodes.find((item) => String(item?.name || "").trim().toLowerCase() === nodeName) || null,
-						revisions: await kernel.getAdminRevisions(env, {
-							ctx,
-							nodes
-						}),
-						watchState: db ? "ok" : "unavailable"
-					});
-				} catch (error) {
-					if (mutationCommitted) try {
-						await kernel.rollbackPreparedNodeMutations([mutation], {
-							env,
-							kv,
-							ctx,
-							rebuildIndexes: true
-						});
-					} catch (rollbackError) {
-						error.details = {
-							...isPlainObject(error?.details) ? error.details : {},
-							rollbackError: getErrorMessage(rollbackError, "rollback_failed")
-						};
-					}
-					throw error;
-				}
-			});
-		},
-		async getNode(data, { env, ctx, kv, db }) {
+				async getNode(data, { env, ctx, kv, db }) {
 			const nodeName = String(data?.name || "").trim();
 			if (!nodeName) return jsonError("NODE_NAME_REQUIRED", "请提供节点路径");
 			const node = await kernel.getNodeForRead(nodeName, env);
 			if (!node) return jsonError("NODE_NOT_FOUND", "节点不存在", 404);
-			const nodeCredentialsConfigured = readMediaAggregationCredentialPair(node).configured;
 			const adminNode = {
 				name: nodeName.toLowerCase(),
 				...node
 			};
-			delete adminNode.mediaAggregationEmbyPassword;
-			adminNode.mediaAggregationEmbyCredentialsConfigured = nodeCredentialsConfigured;
-			delete adminNode.serverRecordEmbyPassword;
-			adminNode.serverRecordEmbyCredentialsConfigured = hasConfiguredServerRecordCredentials(node);
 			return jsonResponse({
 				success: true,
 				node: adminNode,
@@ -10117,10 +9211,6 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						nextName: name
 					});
 					if (!mutation) continue;
-					const credentialValidationError = getMediaAggregationNodeCredentialValidationError(mutation.nextNode);
-					if (credentialValidationError) return jsonError(credentialValidationError.code, credentialValidationError.message, 400, { name });
-					const serverRecordCredentialValidationError = getServerRecordCredentialValidationError(mutation.nextNode);
-					if (serverRecordCredentialValidationError) return jsonError(serverRecordCredentialValidationError.code, serverRecordCredentialValidationError.message, 400, { name });
 					mutation.dnsPlan = kernel.buildHostPrefixDnsSyncPlan(mutation.previousName, mutation.previousNode, mutation.nextName, mutation.nextNode, configuredHost, {
 						config: runtimeConfig,
 						forceUpsert: true
@@ -10334,140 +9424,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 				});
 			});
 		},
-		async saveMediaAggregationPolicyShortcuts(data, { env, ctx, kv }) {
-			if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
-			return await runKvDataMutation(async () => {
-				const currentNodes = await kernel.loadAllNodeEntitiesFromKv(kv, { ctx });
-				const allowedNames = Array.isArray(currentNodes) ? currentNodes.map((node) => node?.name) : [];
-				const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], { allowedNames });
-				const selectedKeys = new Set(selectedNodeNames.map((name) => String(name || "").trim().toLowerCase()).filter(Boolean));
-				const configuredHost = resolveConfiguredHost(env);
-				const currentConfig = await getRuntimeConfigStrict(env);
-				const nextAggregationUsername = Object.prototype.hasOwnProperty.call(data || {}, "username") ? String(data.username || "").trim() : String(currentConfig.mediaAggregationEmbyUsername || "").trim();
-				const nextAggregationPassword = Object.prototype.hasOwnProperty.call(data || {}, "password") ? String(data.password || "") : String(currentConfig.mediaAggregationEmbyPassword || "");
-				const nextBidirectionalProgressEnabled = Object.prototype.hasOwnProperty.call(data || {}, "bidirectionalProgressEnabled") ? data.bidirectionalProgressEnabled === true : currentConfig.mediaAggregationBidirectionalProgressEnabled === true;
-				const nextMatchMode = Object.prototype.hasOwnProperty.call(data || {}, "matchMode") ? normalizeMediaAggregationMatchMode(data.matchMode) : normalizeMediaAggregationMatchMode(currentConfig.mediaAggregationMatchMode);
-				const nextFirstResultTimeoutMs = Object.prototype.hasOwnProperty.call(data || {}, "firstResultTimeoutMs") ? clampIntegerConfig(data.firstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 1e4) : clampIntegerConfig(currentConfig.mediaAggregationFirstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 1e4);
-				const nextGracePeriodMs = Object.prototype.hasOwnProperty.call(data || {}, "gracePeriodMs") ? clampIntegerConfig(data.gracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5e3) : clampIntegerConfig(currentConfig.mediaAggregationGracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5e3);
-				const nextAggregationConfig = {
-					...currentConfig,
-					mediaAggregationNodes: selectedNodeNames,
-					mediaAggregationEmbyUsername: nextAggregationUsername,
-					mediaAggregationEmbyPassword: nextAggregationPassword,
-					mediaAggregationBidirectionalProgressEnabled: nextBidirectionalProgressEnabled,
-					mediaAggregationMatchMode: nextMatchMode,
-					mediaAggregationFirstResultTimeoutMs: nextFirstResultTimeoutMs,
-					mediaAggregationGracePeriodMs: nextGracePeriodMs
-				};
-				const missingCredentialNames = selectedNodeNames.filter((nodeName) => {
-					return !resolveMediaAggregationCredentials((Array.isArray(currentNodes) ? currentNodes : []).find((item) => String(item?.name || "").trim().toLowerCase() === nodeName) || {}, nextAggregationConfig).configured;
-				});
-				if (missingCredentialNames.length > 0) return jsonError("MEDIA_AGGREGATION_CREDENTIALS_REQUIRED", "已勾选节点没有可用的 Emby 账号，请填写节点账号或全局账号；密码可以留空", 400, { nodeNames: missingCredentialNames });
-				const preparedMutations = [];
-				for (const rawNode of Array.isArray(currentNodes) ? currentNodes : []) {
-					if (!isPlainObject(rawNode)) continue;
-					const nodeName = String(rawNode.name || "").trim().toLowerCase();
-					if (!nodeName) continue;
-					const currentMode = normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode);
-					const managedRewrite = rawNode.mediaAggregationManagedRewrite === true;
-					const selected = selectedKeys.has(nodeName);
-					const nextMode = selected ? "rewrite" : managedRewrite && currentMode === "rewrite" ? "inherit" : currentMode;
-					const nextManagedRewrite = selected ? managedRewrite || currentMode !== "rewrite" : false;
-					if (nextMode === currentMode && nextManagedRewrite === managedRewrite) continue;
-					const { name: _ignoredName, ...nodeData } = rawNode;
-					const mutation = kernel.buildPreparedNodeMutation({
-						name: nodeName,
-						...nodeData,
-						playbackInfoMode: nextMode,
-						mediaAggregationManagedRewrite: nextManagedRewrite
-					}, rawNode, {
-						previousName: nodeName,
-						nextName: nodeName
-					});
-					if (!mutation) continue;
-					mutation.nextNode = kernel.normalizeNode(nodeName, mutation.nextNode || {}, { dropLegacyDirectRouting: true }).data;
-					mutation.dnsPlan = kernel.buildHostPrefixDnsSyncPlan(mutation.previousName, mutation.previousNode, mutation.nextName, mutation.nextNode, configuredHost, {
-						config: currentConfig,
-						forceUpsert: true
-					});
-					preparedMutations.push(mutation);
-				}
-				const shouldSyncConfig = serializeConfigValue(currentConfig) !== serializeConfigValue(sanitizeRuntimeConfig(nextAggregationConfig));
-				const configRollbackState = preparedMutations.length > 0 || shouldSyncConfig ? await kernel.captureRuntimeConfigRollbackState(env, kv) : null;
-				let savedConfig = currentConfig;
-				try {
-					if (preparedMutations.length > 0) {
-						await kernel.applyPreparedNodeMutations(preparedMutations, {
-							env,
-							kv,
-							ctx,
-							requestHost: configuredHost
-						});
-						await kernel.rebuildNodeIndexesFromKv(kv, { ctx });
-					}
-					if (shouldSyncConfig) savedConfig = await kernel.commitRuntimeConfig(nextAggregationConfig, {
-						env,
-						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "sync_media_aggregation_shortcuts",
-							section: "proxy",
-							source: "ui_shortcut",
-							actor: "admin",
-							note: selectedNodeNames.join(",")
-						}
-					});
-				} catch (error) {
-					let configRollbackError = "";
-					let nodeRollbackError = "";
-					if (configRollbackState) try {
-						await kernel.restoreCapturedRuntimeConfigState(configRollbackState, {
-							env,
-							kv,
-							ctx
-						});
-					} catch (restoreError) {
-						configRollbackError = getErrorMessage(restoreError, "config_restore_failed");
-					}
-					if (preparedMutations.length > 0) try {
-						await kernel.rollbackPreparedNodeMutations(preparedMutations, {
-							env,
-							kv,
-							ctx,
-							requestHost: configuredHost,
-							rebuildIndexes: true
-						});
-					} catch (rollbackError) {
-						nodeRollbackError = getErrorMessage(rollbackError, "rollback_failed");
-					}
-					if (error && typeof error === "object") {
-						error.code = String(error.code || "NODE_MUTATION_FAILED");
-						error.status = normalizeErrorStatus(error.status, 500);
-						error.details = {
-							...isPlainObject(error.details) ? error.details : {},
-							rollbackAttempted: true,
-							configRollbackError,
-							nodeRollbackError
-						};
-					}
-					throw error;
-				}
-				const summaryNodes = await CacheManager.getNodesList(env, ctx);
-				return jsonResponse({
-					success: true,
-					selectedNodeNames,
-					updatedNodeCount: preparedMutations.length,
-					config: redactAdminRuntimeConfig(savedConfig),
-					nodes: summaryNodes,
-					revisions: await kernel.getAdminRevisions(env, {
-						ctx,
-						config: savedConfig,
-						nodes: summaryNodes
-					})
-				});
-			});
-		},
-		async importFull(data, { env, ctx, kv }) {
+				async importFull(data, { env, ctx, kv }) {
 			const reservedNodeConflict = findReservedNodeNameConflict(data?.nodes, env);
 			if (reservedNodeConflict) return jsonError("NODE_NAME_RESERVED", "节点路径与系统保留路由冲突，请更换后重试", 409, reservedNodeConflict);
 			const hostPrefixValidationError = findHostPrefixNodeValidationError(data?.nodes, env);
@@ -10508,10 +9465,6 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						nextName: name
 					});
 					if (!mutation) continue;
-					const credentialValidationError = getMediaAggregationNodeCredentialValidationError(mutation.nextNode);
-					if (credentialValidationError) return jsonError(credentialValidationError.code, credentialValidationError.message, 400, { name });
-					const serverRecordCredentialValidationError = getServerRecordCredentialValidationError(mutation.nextNode);
-					if (serverRecordCredentialValidationError) return jsonError(serverRecordCredentialValidationError.code, serverRecordCredentialValidationError.message, 400, { name });
 					mutation.dnsPlan = kernel.buildHostPrefixDnsSyncPlan(mutation.previousName, mutation.previousNode, mutation.nextName, mutation.nextNode, configuredHost, {
 						previousConfig: currentConfig,
 						nextConfig: nodeDnsConfig,
@@ -12636,94 +11589,27 @@ function defineDatabaseActions(dependencies = {}, actions = {}) {
 				status: await kernel.getD1SchemaStatus(db)
 			});
 		},
-		async getD1TimeTravelBookmark(data, { db }) {
-			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-			return jsonResponse({
-				success: true,
-				...await kernel.getD1TimeTravelBookmark(db)
-			});
-		},
-		async initD1Schema(data, { db }) {
-			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+		async initLogsDb(data, { db }) {
+			if (!db) return jsonError("D1_NOT_CONFIGURED", "D1 database is not configured", 503);
 			const initialization = await kernel.initializeD1Database(db, { includeFts: true });
 			const status = initialization.status;
-			return jsonResponse({
-				success: status.runtimeCompatibilityReady === true,
-				runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
-				migrationReady: status.migrationReady === true,
-				schemaVersion: status.schemaVersion,
-				initialization,
-				steps: initialization.steps,
-				status
-			});
-		},
-		async initLogsDb(data, { db }) {
-			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-			const initialization = await kernel.initializeD1Database(db, {
-				includeFts: true,
-				adoptMigrations: true,
-				requireBookmark: true,
-				failOnIncompatible: true
-			});
-			const schemaStatus = initialization.status;
-			const ftsReady = schemaStatus.ftsReady === true;
-			const statsReady = schemaStatus.tables?.[kernel.STATS_HOURLY_TABLE] === true;
+			const ftsReady = status.ftsReady === true;
+			const statsReady = status.tables?.[kernel.STATS_HOURLY_TABLE] === true;
 			const logStatus = await kernel.bumpLogsRevision(db, {
-				schemaReady: schemaStatus.tables?.[kernel.LOGS_TABLE] === true,
+				schemaReady: status.schemaReady === true,
 				ftsReady,
 				statsReady,
-				schemaVersion: schemaStatus.schemaVersion,
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				migrationReady: schemaStatus.migrationReady === true,
 				categoryEnabled: true
 			});
 			return jsonResponse({
-				success: schemaStatus.runtimeCompatibilityReady === true,
-				schemaVersion: schemaStatus.schemaVersion,
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				runtimeCompatibilityReady: schemaStatus.runtimeCompatibilityReady === true,
-				migrationReady: schemaStatus.migrationReady === true,
+				success: status.schemaReady === true,
+				schemaReady: status.schemaReady === true,
 				categoryEnabled: true,
 				ftsReady,
 				statsReady,
-				recoveryBookmark: initialization.recoveryBookmark,
-				bookmarkCapturedAt: initialization.bookmarkCapturedAt,
-				adoptedMigrations: initialization.adoptedMigrations,
 				initialization,
 				steps: initialization.steps,
-				status: schemaStatus,
-				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
-			});
-		},
-		async initLogsFts(data, { db }) {
-			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
-			kernel.invalidateD1SchemaReadiness(db, "logs");
-			await kernel.ensureLogsBaseSchema(db);
-			await kernel.ensureStatsHourlySchema(db);
-			const result = await kernel.ensureLogsFtsSchema(db);
-			const schemaStatus = await kernel.getD1SchemaStatus(db);
-			const ftsReady = schemaStatus.ftsReady === true && result.rebuilt === true;
-			const statsReady = schemaStatus.tables?.[kernel.STATS_HOURLY_TABLE] === true;
-			const logStatus = await kernel.bumpLogsRevision(db, {
-				schemaReady: true,
-				ftsReady,
-				statsReady,
-				schemaVersion: schemaStatus.schemaVersion,
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				migrationReady: schemaStatus.migrationReady === true,
-				categoryEnabled: true
-			});
-			return jsonResponse({
-				success: ftsReady,
-				ftsReady,
-				statsReady,
-				schemaVersion: schemaStatus.schemaVersion,
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				migrationReady: schemaStatus.migrationReady === true,
-				migratedRows: result.migratedRows,
-				droppedTriggers: result.droppedTriggers,
-				triggerMode: "insert_only",
-				status: schemaStatus,
+				status,
 				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
 			});
 		}
@@ -13845,9 +12731,7 @@ function buildNodeDerivedCacheRevision(nodeName = "", nodeData = {}) {
 		orderedTargets: buildOrderedNodeTargetList(nodeData),
 		headers: headerEntries,
 		playbackInfoMode: String(nodeData?.playbackInfoMode || "").trim().toLowerCase(),
-		mediaAggregationManagedRewrite: nodeData?.mediaAggregationManagedRewrite === true,
-		mediaAggregationCredentialIdentity: hashStableText(`${String(nodeData?.mediaAggregationEmbyUsername || "").trim()}:${String(nodeData?.mediaAggregationEmbyPassword || "")}`),
-		mediaAuthMode: String(nodeData?.mediaAuthMode || "").trim().toLowerCase(),
+						mediaAuthMode: String(nodeData?.mediaAuthMode || "").trim().toLowerCase(),
 		realClientIpMode: String(nodeData?.realClientIpMode || "").trim().toLowerCase(),
 		routingDecisionMode: String(nodeData?.routingDecisionMode || "").trim().toLowerCase(),
 		mainVideoStreamMode: String(nodeData?.mainVideoStreamMode || nodeData?.wangpanDirectMode || nodeData?.wangpanMode || "").trim().toLowerCase()
@@ -13867,26 +12751,8 @@ function invalidatePlaybackInfoResponseCacheForNodes(nodeNames = []) {
 	const cache = cacheState.PlaybackInfoResponseCache;
 	if (cache instanceof Map) for (const [cacheKey, entry] of cache.entries()) {
 		const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-		const aggregationNodeNames = normalizeNodeNameList(entry?.mediaAggregationNodes || []);
-		if (!normalizedNames.has(entryNodeName) && !aggregationNodeNames.some((name) => normalizedNames.has(name))) continue;
+		if (!normalizedNames.has(entryNodeName)) continue;
 		cache.delete(cacheKey);
-	}
-	const instanceMap = cacheState.MediaAggregationInstanceMap;
-	if (instanceMap instanceof Map) for (const [cacheKey, entry] of instanceMap.entries()) {
-		const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-		if (entryNodeName && normalizedNames.has(entryNodeName)) instanceMap.delete(cacheKey);
-	}
-	for (const authCache of [cacheState.MediaAggregationAuthCache, cacheState.ServerRecordAuthCache]) {
-		if (!(authCache instanceof Map)) continue;
-		for (const [cacheKey, entry] of authCache.entries()) {
-			const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-			if (entryNodeName && normalizedNames.has(entryNodeName)) authCache.delete(cacheKey);
-		}
-	}
-	const probeBackoff = cacheState.ServerRecordProbeBackoff;
-	if (probeBackoff instanceof Map) for (const [cacheKey, entry] of probeBackoff.entries()) {
-		const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-		if (entryNodeName && normalizedNames.has(entryNodeName)) probeBackoff.delete(cacheKey);
 	}
 }
 function invalidatePlaybackProgressRelayForNodes(nodeNames = []) {
@@ -13898,26 +12764,6 @@ function invalidatePlaybackProgressRelayForNodes(nodeNames = []) {
 		const entryNodeName = String(entry?.nodeName || entry?.pendingSnapshot?.nodeName || "").trim().toLowerCase();
 		if (!entryNodeName || !normalizedNames.has(entryNodeName)) continue;
 		deletePlaybackProgressRelayEntry(sessionKey);
-	}
-}
-function invalidateServerRecordWatchSessionsForNodes(nodeNames = []) {
-	const normalizedNames = normalizeNodeNameSet(nodeNames);
-	if (!normalizedNames.size) return;
-	const sessions = cacheState.ServerRecordWatchSessions;
-	if (!(sessions instanceof Map) || sessions.size <= 0) return;
-	for (const [sessionKey, entry] of sessions.entries()) {
-		const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-		if (entryNodeName && normalizedNames.has(entryNodeName)) sessions.delete(sessionKey);
-	}
-}
-function invalidateServerRecordPlaybackContextsForNodes(nodeNames = []) {
-	const normalizedNames = normalizeNodeNameSet(nodeNames);
-	if (!normalizedNames.size) return;
-	const contexts = cacheState.ServerRecordPlaybackContexts;
-	if (!(contexts instanceof Map) || contexts.size <= 0) return;
-	for (const [contextKey, entry] of contexts.entries()) {
-		const entryNodeName = String(entry?.nodeName || "").trim().toLowerCase();
-		if (entryNodeName && normalizedNames.has(entryNodeName)) contexts.delete(contextKey);
 	}
 }
 function buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, proxyPath = "/", options = {}) {
@@ -14110,8 +12956,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				statsEndTs: Number(plan?.statsEndTs) || 0,
 				statsUtcOffsetMinutes: Number(plan?.statsUtcOffsetMinutes) || 0,
 				schemaStatus: {
-					runtimeCompatibilityReady: schemaStatus.runtimeCompatibilityReady === true,
-					migrationReady: schemaStatus.migrationReady === true,
+					schemaReady: schemaStatus.schemaReady === true,
 					tables: isPlainObject(schemaStatus.tables) ? schemaStatus.tables : {},
 					columns: isPlainObject(schemaStatus.columns) ? schemaStatus.columns : {},
 					indexes: isPlainObject(schemaStatus.indexes) ? schemaStatus.indexes : {},
@@ -14232,34 +13077,10 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 		async buildKvTidyPlan(env, options = {}) {
 			const kv = options.kv || kernel.getKV(env);
 			if (!kv) throw new Error("KV not configured");
-			const db = options.db || kernel.getDB(env) || null;
-			let d1Compatibility = {
-				configured: !!db,
-				runtimeCompatibilityReady: false,
-				migrationReady: false,
-				issues: db ? ["d1_status_unavailable"] : ["db_not_configured"]
-			};
-			if (db) try {
-				const status = await kernel.getD1SchemaStatus(db);
-				d1Compatibility = {
-					configured: true,
-					runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
-					migrationReady: status.migrationReady === true,
-					issues: Array.isArray(status.issues) ? status.issues : []
-				};
-			} catch (error) {
-				d1Compatibility = {
-					configured: true,
-					runtimeCompatibilityReady: false,
-					migrationReady: false,
-					issues: [String(error?.code || "d1_status_failed")]
-				};
-			}
 			const allKeys = (await kernel.listKvKeysStrict(kv)).sort();
 			const adminIndexUploadKeys = allKeys.filter((key) => key.startsWith(kernel.ADMIN_INDEX_UPLOAD_PREFIX));
 			const { rawStoredSummaryIndexText, storedSummaryIndexState, previousFullIndexBytes } = await kernel.readStoredNodesSummaryState(kv);
-			const { nodeNames, removableKeys, preservedD1LegacyKeys, untouchedOtherKeyCount, opsStatusKeyCount, dnsRecordHistoryKeyCount, dnsIpPoolSourceKeyCount, configMetaKeyCount, snapshotMetaKeyCount, nodeIndexMetaKeyCount, telegramAlertStateKeyCount, loginFailureKeyCount, dnsFetchLockKeyCount } = await kernel.classifyKvTidyKeys(kv, allKeys, { canDeleteD1OwnedLegacyKeys: d1Compatibility.runtimeCompatibilityReady === true });
-			const d1LegacyMigrations = await kernel.buildKvD1LegacyMigrationPlan(kv, removableKeys);
+			const { nodeNames, removableKeys, untouchedOtherKeyCount, opsStatusKeyCount, dnsRecordHistoryKeyCount, dnsIpPoolSourceKeyCount, configMetaKeyCount, snapshotMetaKeyCount, nodeIndexMetaKeyCount, telegramAlertStateKeyCount, loginFailureKeyCount, dnsFetchLockKeyCount } = await kernel.classifyKvTidyKeys(kv, allKeys);
 			const repairedConfig = await kernel.readRepairableRuntimeConfig(kv);
 			const currentStoredConfig = isPlainObject(repairedConfig.rawConfig) ? repairedConfig.rawConfig : {};
 			const configMigration = migrateLegacyRuntimeConfig(currentStoredConfig);
@@ -14288,36 +13109,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const { rewrittenSnapshots, rewrittenSnapshotCount, deletedLegacySnapshotFieldCount, migratedConfigKeys: snapshotMigratedConfigKeys } = kernel.rewriteKvTidySnapshots(rawSnapshots);
 			migratedConfigKeys.push(...snapshotMigratedConfigKeys);
 			const configRewriteNeeded = repairedConfig.hadMalformedValue || serializeConfigValue(currentStoredConfig) !== serializeConfigValue(nextTidyConfig);
-			const needsMigrationSnapshot = configRewriteNeeded || rewrittenSnapshotCount > 0 || rewrittenNodeCount > 0;
-			let migrationSnapshot = null;
-			if (needsMigrationSnapshot) {
-				const snapshotNoteParts = kernel.buildKvTidyNoteParts({
-					legacyKeysPresent: configMigration.legacyKeysPresent,
-					rewrittenSnapshotCount,
-					rewrittenNodeCount,
-					migratedTopLevelPortNodeCount,
-					migratedLinePortCount,
-					migratedDefaultPortNodeCount,
-					migratedDefaultPortLineCount
-				}, {
-					includeRepairSource: true,
-					repairLabel: "config_source",
-					repairedConfig
-				});
-				migrationSnapshot = kernel.createSyntheticConfigSnapshot(currentStoredConfig, {
-					reason: "tidy_kv_data_pre_migration",
-					section: "all",
-					source: "kv_tidy",
-					actor: "admin",
-					note: snapshotNoteParts.join("; ")
-				}, {
-					changedKeys: [...configMigration.legacyKeysPresent, ...rewrittenNodeCount > 0 ? ["sourceDirectNodes"] : []],
-					extraFields: { rollbackPayload: {
-						version: 1,
-						kvEntries: rollbackKvEntries
-					} }
-				});
-			}
 			const tidySnapshotNoteParts = kernel.buildKvTidyNoteParts({
 				legacyKeysPresent: configMigration.legacyKeysPresent,
 				rewrittenSnapshotCount,
@@ -14343,10 +13134,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				changedKeys: configDiffEntries.map((item) => item.key),
 				changeCount: configDiffEntries.length
 			}));
-			if (migrationSnapshot) {
-				nextSnapshots.push(migrationSnapshot);
-				nextSnapshots.push(...rewrittenSnapshots);
-			}
+			if (rewrittenSnapshots.length > 0) nextSnapshots.push(...rewrittenSnapshots);
 			const retainedSnapshots = nextSnapshots.length > 0 ? nextSnapshots : rawSnapshots;
 			const unreferencedAdminIndexUploadKeys = kernel.collectUnreferencedAdminIndexUploadKeys(nextTidyConfig, retainedSnapshots, adminIndexUploadKeys);
 			for (const key of unreferencedAdminIndexUploadKeys) removableKeys.add(key);
@@ -14402,8 +13190,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				configWasMalformed: repairedConfig.hadMalformedValue,
 				configReadSource: repairedConfig.source,
 				configRewritten: configRewriteNeeded,
-				createdMigrationSnapshot: migrationSnapshot !== null,
-				migrationSnapshotId: migrationSnapshot?.id || "",
 				migratedConfigKeys: normalizeDistinctConfigKeyList(migratedConfigKeys),
 				rewrittenSnapshotCount,
 				deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + deletedLegacySnapshotFieldCount + deletedLegacyNodeFieldCount,
@@ -14421,10 +13207,8 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				deletedDnsIpPoolSourceKeyCount: dnsIpPoolSourceKeyCount,
 				deletedOpsStatusKeyCount: opsStatusKeyCount,
 				deletedTelegramAlertStateKeyCount: telegramAlertStateKeyCount,
-				migratedD1LegacyKeyCount: d1LegacyMigrations.length,
 				deletedDnsFetchLockKeyCount: dnsFetchLockKeyCount,
 				deletedAdminIndexUploadCount: unreferencedAdminIndexUploadKeys.length,
-				preservedD1LegacyKeyCount: preservedD1LegacyKeys.length,
 				untouchedOtherKeyCount,
 				rawSnapshotCount: rawSnapshots.length,
 				previousFullIndexBytes,
@@ -14460,9 +13244,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			pushTidyPreviewGroup(deleteGroups, dnsFetchLockKeys.length > 0, "dns_fetch_lock", "旧版 DNS 抓取锁键", dnsFetchLockKeys, dnsFetchLockKeys.length, "会删除 sys:dns_ip_pool_fetch_lock:v1:*，后续只保留 D1 sys_locks。");
 			pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只删除当前配置和保留快照都不再引用的内容寻址 index.html。");
 			const rewriteGroups = [];
-			if (d1LegacyMigrations.length > 0) pushTidyPreviewGroup(rewriteGroups, true, "d1_legacy_migrations", "遗留 KV 数据迁入 D1", d1LegacyMigrations.map((item) => item.key), d1LegacyMigrations.length, "会先把仍有内容的旧运维状态、Telegram 状态和 DNS IP 池源合并到 D1；全部写入成功后才删除原 KV 键。");
 			if (configRewriteNeeded) pushTidyPreviewGroup(rewriteGroups, true, "runtime_config", "全局设置 sys:theme", [...configMigration.legacyKeysPresent, ...configDiffEntries.map((item) => item.key)], 1, "会把旧版设置字段吸收到当前 schema，并以后端 sanitizeRuntimeConfig() 结果回写。");
-			if (migrationSnapshot || rewrittenSnapshotCount > 0) pushTidyPreviewGroup(rewriteGroups, true, "config_snapshots", "配置快照 sys:config_snapshots:v1", [migrationSnapshot?.id || "", ...rewrittenSnapshotIds], rewrittenSnapshotCount + (migrationSnapshot ? 1 : 0), migrationSnapshot ? "会生成一份 tidy_kv_data_pre_migration 快照，并把旧快照迁移到当前 schema。" : "会把旧快照迁移到当前 schema。");
 			if (rewrittenNodeCount > 0) {
 				const nodeRewriteNoteParts = [];
 				if (migratedTopLevelPortNodeCount > 0) nodeRewriteNoteParts.push(`旧版顶层 node.port 节点 ${migratedTopLevelPortNodeCount} 个`);
@@ -14483,7 +13265,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				kernel.CONFIG_SNAPSHOTS_META_KEY,
 				kernel.NODES_INDEX_META_KEY
 			], preservedMetaCount, "不会删除这些 revision / meta 键。");
-			if (preservedD1LegacyKeys.length > 0) pushTidyPreviewGroup(preserveGroups, true, "d1_legacy_keys_pending", "等待 D1 兼容确认的遗留 KV 键", preservedD1LegacyKeys, preservedD1LegacyKeys.length, "D1 未通过运行时兼容检查，本次保留这些旧位置的数据；初始化 DB 成功后再次整理即可删除。");
 			const warnings = [];
 			if (repairedConfig.hadMalformedValue) warnings.push(`检测到异常 sys:theme（来源: ${repairedConfig.source}），整理时会按当前 schema 修复。`);
 			if (migratedTopLevelPortNodeCount > 0) warnings.push(`检测到 ${migratedTopLevelPortNodeCount} 个旧节点仍使用顶层 node.port；整理后会把端口并入 lines[].target。`);
@@ -14491,7 +13272,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			if (migratedDefaultPortNodeCount > 0 || migratedDefaultPortLineCount > 0) warnings.push(`检测到 ${migratedDefaultPortNodeCount} 个节点 / ${migratedDefaultPortLineCount} 条线路仍未显式写端口；整理后会按协议补齐为 :443 / :80。`);
 			if (storedSummaryIndexState?.legacyMirrorDetected === true) warnings.push(`检测到旧版 sys:nodes_index_full:v2 仍保存完整节点镜像；本次会按 node:* 重建并收敛为摘要索引（${previousFullIndexBytes} -> ${nextSummaryIndexBytes} bytes）。`);
 			if (untouchedOtherKeyCount > 0) warnings.push(`发现 ${untouchedOtherKeyCount} 个未列入整理白名单的 KV 键，本次不会自动删除。`);
-			if (preservedD1LegacyKeys.length > 0) warnings.push(`D1 兼容门禁未通过，已保留 ${preservedD1LegacyKeys.length} 个由 D1 接管的遗留 KV 键。`);
 			if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenSnapshotCount === 0 && rewrittenNodeCount === 0) warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
 			warnings.push(buildKvTidyQuotaBudgetWarning(quotaBudget));
 			if (quotaBudget.blocked === true && quotaBudget.reason) warnings.push(quotaBudget.reason);
@@ -14502,8 +13282,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				nodesIndex: rebuiltNodeIndex,
 				rebuiltNodeSummaries,
 				revisions,
-				d1Compatibility,
-				d1LegacyMigrations,
 				summary,
 				quotaBudget,
 				mutationPlan,
@@ -14524,13 +13302,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const kv = options.kv || kernel.getKV(options.env);
 			if (!kv) throw new Error("KV not configured");
 			const mutationPlan = Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : [];
-			const d1LegacyMigrations = Array.isArray(plan?.d1LegacyMigrations) ? plan.d1LegacyMigrations : [];
-			let d1MigrationResult = {
-				migratedKeyCount: 0,
-				migratedDnsIpPoolSourceCount: 0
-			};
 			try {
-				d1MigrationResult = await kernel.applyKvD1LegacyMigrations(options.db || kernel.getDB(options.env) || null, d1LegacyMigrations);
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 			} catch (error) {
 				invalidateRuntimeConfigCache();
@@ -14557,8 +13329,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			};
 			return kernel.buildTidyResult(plan, {
 				...plan?.summary || {},
-				migratedD1LegacyKeyCount: d1MigrationResult.migratedKeyCount,
-				migratedDnsIpPoolSourceCount: d1MigrationResult.migratedDnsIpPoolSourceCount
 			}, "kv", {
 				config: plan?.config || {},
 				nodesIndex: Array.isArray(plan?.nodesIndex) ? plan.nodesIndex : []
@@ -14647,7 +13417,6 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 					deletedExpiredProbeCacheCount: Math.max(0, Number(summary.deletedExpiredProbeCacheCount) || 0),
 					deletedExpiredAuthFailureCount: Math.max(0, Number(summary.deletedExpiredAuthFailureCount) || 0),
 					deletedExpiredDashboardCacheCount: Math.max(0, Number(summary.deletedExpiredDashboardCacheCount) || 0),
-					droppedLegacyServerRecordPosterCache: summary.droppedLegacyServerRecordPosterCache === true,
 					preservedLogCount: Math.max(0, Number(summary.preservedLogCount) || 0),
 					rebuiltStatsHourly: summary.rebuiltStatsHourly === true,
 					rebuiltLogsFts: summary.rebuiltLogsFts === true,
@@ -14703,9 +13472,8 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
 			const flags = D1TidyPlanner.buildFlags(kernel, context, facts, sourcePolicy);
 			const summary = D1TidyPlanner.buildSummary(context, facts, sourcePolicy, flags);
-			const posterDropOnly = context.mode === "manual" && flags.dropLegacyServerRecordPosterCache === true && schemaStatus.runtimeCompatibilityReadyIgnoringRetiredPosterCache === true && schemaStatus.migrationReady !== true && schemaStatus.migrationTableValid === true && Array.isArray(schemaStatus.missingMigrations) && schemaStatus.missingMigrations.length === 0;
-			const schemaReadyForTidy = schemaStatus.runtimeCompatibilityReady === true || posterDropOnly;
-			summary.runtimeCompatibilityReady = schemaReadyForTidy;
+			const schemaReadyForTidy = schemaStatus.schemaReady === true;
+			summary.schemaReady = schemaReadyForTidy;
 			summary.requiresSchemaInitialization = !schemaReadyForTidy;
 			const preview = D1TidyPlanner.buildPreview(context, facts, sourcePolicy, flags);
 			if (!schemaReadyForTidy) preview.warnings.unshift("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
@@ -14743,8 +13511,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
 			const compatibilityStatus = await kernel.getD1SchemaStatus(db);
-			const posterDropOnly = (String(plan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual") === "manual" && plan?.flags?.dropLegacyServerRecordPosterCache === true && compatibilityStatus.runtimeCompatibilityReadyIgnoringRetiredPosterCache === true && compatibilityStatus.migrationTableValid === true && Array.isArray(compatibilityStatus.missingMigrations) && compatibilityStatus.missingMigrations.length === 0;
-			if (compatibilityStatus.runtimeCompatibilityReady !== true && !posterDropOnly) {
+			if (compatibilityStatus.schemaReady !== true) {
 				const error = /* @__PURE__ */ new Error("D1 schema must pass runtime compatibility checks before tidy execution");
 				error.code = "D1_SCHEMA_INCOMPATIBLE";
 				error.status = 409;
@@ -14884,7 +13651,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			if (mode === "manual") {
 				const tokenPayload = await kernel.verifyD1TidyPlanToken(env, options.planToken);
 				const statusBefore = await kernel.getD1SchemaStatus(db);
-				if (statusBefore.runtimeCompatibilityReady !== true) {
+				if (statusBefore.schemaReady !== true) {
 					const error = /* @__PURE__ */ new Error("D1 schema changed after preview; initialize and preview again");
 					error.code = "TIDY_PLAN_STALE";
 					error.status = 409;
@@ -14925,31 +13692,17 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 						mode,
 						maintenanceMode: plan.maintenanceMode
 					}),
-					compatibility: {
-						runtimeCompatibilityReady: true,
-						migrationReady: statusBefore.migrationReady === true,
-						schemaVersion: statusBefore.schemaVersion,
-						status: statusBefore
-					}
+					schema: statusBefore
 				};
 			}
 			const statusBefore = await kernel.getD1SchemaStatus(db);
-			const compatibility = statusBefore.runtimeCompatibilityReady !== true ? await kernel.initializeD1Database(db, {
-				includeFts: false,
-				failOnIncompatible: true
-			}) : {
-				runtimeCompatibilityReady: true,
-				migrationReady: statusBefore.migrationReady === true,
-				schemaVersion: statusBefore.schemaVersion,
-				createdTables: [],
-				adjustedColumns: [],
-				droppedRetiredIndexes: [],
-				createdIndexes: [],
-				repairedIndexes: [],
-				ftsRebuilt: false,
-				ftsRecreated: false,
-				status: statusBefore
-			};
+			if (statusBefore.schemaReady !== true) {
+				const error = /* @__PURE__ */ new Error("D1 schema is not initialized");
+				error.code = "D1_SCHEMA_NOT_READY";
+				error.status = 409;
+				error.details = { issues: statusBefore.issues };
+				throw error;
+			}
 			const plan = options.plan || await kernel.buildD1TidyPlan(env, {
 				...options,
 				db,
@@ -14962,7 +13715,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 					db,
 					env
 				}),
-				compatibility
+				schema: statusBefore
 			};
 		},
 		shouldRunLogsOptimize(lastOptimizeAt, options = {}) {
@@ -15308,72 +14061,6 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				throw error;
 			}
 			return restoredConfig;
-		},
-		async restoreTidyKvMigrationSnapshot(snapshot, options = {}) {
-			const { env, kv } = options;
-			if (!kv) return redactRuntimeConfigSecrets(snapshot?.config || {});
-			const rollbackPayload = isPlainObject(snapshot?.rollbackPayload) ? snapshot.rollbackPayload : {};
-			const rollbackEntries = Array.isArray(rollbackPayload.kvEntries) ? rollbackPayload.kvEntries : [];
-			const prevRuntimeConfig = env ? await getRuntimeConfigStrict(env) : sanitizeRuntimeConfig(await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {});
-			if (!rollbackEntries.length) return preserveRuntimeConfigSecrets(snapshot?.config || {}, prevRuntimeConfig);
-			const rollbackConfigEntry = rollbackEntries.find((entry) => String(entry?.key || "") === kernel.CONFIG_KEY);
-			let nextRuntimeConfig = sanitizeRuntimeConfig(snapshot?.config || {});
-			if (rollbackConfigEntry?.exists && rollbackConfigEntry.value) try {
-				nextRuntimeConfig = preserveRuntimeConfigSecrets(JSON.parse(String(rollbackConfigEntry.value)), prevRuntimeConfig);
-			} catch {}
-			nextRuntimeConfig = preserveRuntimeConfigSecrets(nextRuntimeConfig, prevRuntimeConfig);
-			const diffEntries = getConfigDiffEntries(prevRuntimeConfig, nextRuntimeConfig);
-			const rollbackSnapshotsEntry = rollbackEntries.find((entry) => String(entry?.key || "") === kernel.CONFIG_SNAPSHOTS_KEY);
-			let restoredSnapshots = await kernel.getConfigSnapshotsForRead(kv, { withConfig: true });
-			if (rollbackSnapshotsEntry?.exists === true) try {
-				const parsedSnapshots = JSON.parse(String(rollbackSnapshotsEntry.value || "[]"));
-				if (Array.isArray(parsedSnapshots)) restoredSnapshots = parsedSnapshots.map((item) => redactConfigSnapshotSecrets(item));
-			} catch {}
-			const nextSnapshots = diffEntries.length ? [{
-				id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-				createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-				reason: "restore_snapshot",
-				section: "all",
-				actor: "admin",
-				source: "snapshot",
-				note: String(snapshot?.id || "").trim(),
-				changedKeys: diffEntries.map((item) => item.key),
-				changeCount: diffEntries.length,
-				config: redactRuntimeConfigSecrets(prevRuntimeConfig)
-			}, ...restoredSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit) : restoredSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
-			const mutationPlan = [{
-				type: "put",
-				key: kernel.CONFIG_SNAPSHOTS_KEY,
-				value: JSON.stringify(nextSnapshots)
-			}];
-			for (const entry of rollbackEntries) {
-				const key = String(entry?.key || "").trim();
-				if (!key) continue;
-				if (entry?.exists === true) mutationPlan.push({
-					type: "put",
-					key,
-					value: key === kernel.CONFIG_KEY ? JSON.stringify(nextRuntimeConfig) : key === kernel.CONFIG_SNAPSHOTS_KEY ? JSON.stringify(nextSnapshots.map((item) => redactConfigSnapshotSecrets(item))) : String(entry?.value ?? "")
-				});
-				else mutationPlan.push({
-					type: "delete",
-					key,
-					value: ""
-				});
-			}
-			for (const key of kernel.buildLegacyConfigCacheKeys(prevRuntimeConfig, nextRuntimeConfig)) mutationPlan.push({
-				type: "delete",
-				key,
-				value: ""
-			});
-			await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
-			invalidateRuntimeConfigCache();
-			cacheState.NodesListCache = null;
-			cacheState.NodesIndexCache = null;
-			invalidateNodesRevisionCache();
-			resetNodeCacheTokens();
-			cacheState.NodeCache.clear();
-			cacheState.PlaybackRouteHotCache.clear();
-			return env ? await getRuntimeConfig(env) : nextRuntimeConfig;
 		}
 	};
 }
@@ -15515,11 +14202,6 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 				if (env) primeRuntimeConfigCache(env, nextConfig);
 				else invalidateRuntimeConfigCache();
-				if (String(prevConfig.mediaAggregationEmbyUsername || "") !== String(nextConfig.mediaAggregationEmbyUsername || "") || String(prevConfig.mediaAggregationEmbyPassword || "") !== String(nextConfig.mediaAggregationEmbyPassword || "") || serializeConfigValue(prevConfig.mediaAggregationNodes || []) !== serializeConfigValue(nextConfig.mediaAggregationNodes || []) || String(prevConfig.mediaAggregationMatchMode || "") !== String(nextConfig.mediaAggregationMatchMode || "") || Number(prevConfig.mediaAggregationFirstResultTimeoutMs) !== Number(nextConfig.mediaAggregationFirstResultTimeoutMs) || Number(prevConfig.mediaAggregationGracePeriodMs) !== Number(nextConfig.mediaAggregationGracePeriodMs)) {
-					cacheState.MediaAggregationAuthCache.clear();
-					cacheState.MediaAggregationInstanceMap.clear();
-					cacheState.PlaybackInfoResponseCache.clear();
-				}
 				await kernel.invalidateDashboardSnapshotCacheForConfigChange(env, {
 					prevConfig,
 					nextConfig
@@ -15566,17 +14248,10 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 				removedNames: options.removedNames,
 				allowedNames: options.allowedNames
 			});
-			const currentAggregationSelection = normalizeNodeNameList(currentConfig.mediaAggregationNodes || []);
-			const nextAggregationSelection = reconcileNamedNodeSelection(currentAggregationSelection, {
-				renameMap: options.renameMap,
-				removedNames: options.removedNames,
-				allowedNames: options.allowedNames
-			});
-			if (serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection) && serializeConfigValue(currentAggregationSelection) === serializeConfigValue(nextAggregationSelection)) return currentConfig;
+			if (serializeConfigValue(currentSelection) === serializeConfigValue(nextSelection)) return currentConfig;
 			return kernel.commitRuntimeConfig({
 				...currentConfig,
-				sourceDirectNodes: nextSelection,
-				mediaAggregationNodes: nextAggregationSelection
+				sourceDirectNodes: nextSelection
 			}, {
 				env,
 				kv,
@@ -15715,87 +14390,7 @@ function defineTelegramMethods(dependencies = {}, kernel = {}) {
 				messages: sentMessages
 			};
 		},
-		async maybeSendServerExpiryWarnings(env, options = {}) {
-			const db = kernel.getDB(env);
-			const kv = kernel.getKV(env);
-			const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
-			if (!db || !kv) return {
-				sent: false,
-				reason: "storage_unavailable"
-			};
-			const snapshot = await kernel.getServerRecordsSnapshotPayload(env, {
-				db,
-				kv,
-				ctx: options?.ctx,
-				config,
-				skipProbe: true,
-				now: options?.now
-			});
-			const refreshedCount = Array.isArray(snapshot.records) ? snapshot.records.length : 0;
-			if (config.tgServerExpiryWarningEnabled !== true) return {
-				sent: false,
-				reason: "disabled",
-				refreshedCount
-			};
-			const tgBotToken = String(config.tgBotToken || "").trim();
-			const tgChatId = String(config.tgChatId || "").trim();
-			if (!tgBotToken || !tgChatId) return {
-				sent: false,
-				reason: "telegram_not_configured",
-				refreshedCount
-			};
-			const warningDays = Array.isArray(config.tgServerExpiryWarningDays) && config.tgServerExpiryWarningDays.length ? config.tgServerExpiryWarningDays : Config.Defaults.TgServerExpiryWarningDays;
-			const due = (snapshot.records || []).map((record) => {
-				const days = record?.expiry?.daysRemaining;
-				if (!Number.isInteger(days) || !warningDays.includes(days)) return null;
-				const lastWatchedAt = record?.expiry?.mode === "rolling" ? String(record?.watch?.lastWatchedAt || "").trim() : "";
-				return {
-					record,
-					days,
-					signature: `${record.nodeName}|${lastWatchedAt}|${record.expiry.expiresAt}|${days}`
-				};
-			}).filter(Boolean);
-			if (!due.length) return {
-				sent: false,
-				reason: "no_due_warnings",
-				refreshedCount
-			};
-			const state = await kernel.getOpsStatusPayloadFromDb(db, "telegram_server_expiry_warnings");
-			const sentSignatures = new Set(Array.isArray(state?.signatures) ? state.signatures : []);
-			const pending = due.filter((item) => !sentSignatures.has(item.signature));
-			if (!pending.length) return {
-				sent: false,
-				reason: "already_sent",
-				refreshedCount
-			};
-			const lines = [
-				"⚠️ Emby 服务器过期预警",
-				"",
-				...pending.map(({ record, days }) => {
-					const label = days < 0 ? `已过期 ${Math.abs(days)} 天` : days === 0 ? "今天到期" : `${days} 天后到期`;
-					return `- ${record.displayName || record.nodeName}：${label}`;
-				}),
-				"",
-				"#Emby #Expiry"
-			];
-			await kernel.sendTelegramMessage({
-				tgBotToken,
-				tgChatId,
-				text: lines.join("\n")
-			});
-			const nextSignatures = [.../* @__PURE__ */ new Set([...sentSignatures, ...pending.map((item) => item.signature)])].slice(-256);
-			await kernel.putOpsStatusPayloadToDb(db, "telegram_server_expiry_warnings", {
-				signatures: nextSignatures,
-				updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-			}, Date.now());
-			return {
-				sent: true,
-				issueCount: pending.length,
-				refreshedCount,
-				reason: "warning_sent"
-			};
-		},
-		async maybeSendRuntimeAlerts(env, scheduledState = null, options = {}) {
+				async maybeSendRuntimeAlerts(env, scheduledState = null, options = {}) {
 			const db = kernel.getDB(env);
 			if (!db) return {
 				sent: false,
@@ -16243,7 +14838,6 @@ var ScheduledMaintenanceFacade = class {
 					cleanup: {},
 					kvTidy: {},
 					tgDailyReport: {},
-					serverExpiryWarnings: {},
 					alerts: {}
 				};
 				const nowIso = () => makeScheduledIso(/* @__PURE__ */ new Date());
@@ -16325,7 +14919,7 @@ var ScheduledMaintenanceFacade = class {
 					const { tgBotToken, tgChatId } = config;
 					const previousTgDailyReportState = this.#getStatusSection(previousScheduledStatus, "tgDailyReport", "report");
 					const previousAlertsState = this.#getStatusSection(previousScheduledStatus, "alerts");
-					const previousServerExpiryState = this.#getStatusSection(previousScheduledStatus, "serverExpiryWarnings");
+
 					const tgDailyReportClockTimes = normalizeScheduleClockTimeList(config.tgDailyReportClockTimes, Config.Defaults.TgDailyReportClockTimes);
 					const dailyReportDueState = getDueScheduledClockSlots(previousTgDailyReportState, tgDailyReportClockTimes, scheduleUtcOffsetMinutes, scheduledNow);
 					const selectedDailyReportKinds = resolveDailyTelegramReportKinds(config, config);
@@ -16371,31 +14965,6 @@ var ScheduledMaintenanceFacade = class {
 							}
 						}
 					} else scheduledState.tgDailyReport = this.#buildSkippedState(baseDailyReportState, nowIso(), "disabled", { fixedQueue: dailyReportDueState.fixedQueue });
-					const expiryDueState = getDueScheduledClockSlots(previousServerExpiryState, ["00:00"], scheduleUtcOffsetMinutes, scheduledNow);
-					try {
-						if (expiryDueState.due !== true) scheduledState.serverExpiryWarnings = this.#buildSkippedState(previousServerExpiryState, nowIso(), expiryDueState.reason || "daily_refresh_not_due", { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
-						else {
-							await ensureLeaseActive();
-							const expiryWarningResult = await this.service.maybeSendServerExpiryWarnings(env, {
-								config,
-								db,
-								kv,
-								ctx,
-								now: scheduledNow
-							});
-							const stateMeta = {
-								fixedQueue: this.#appendFixedQueueSlot(this.#normalizeFixedQueueState(expiryDueState.fixedQueue), expiryDueState.context.dateKey, "00:00"),
-								refreshedCount: Number(expiryWarningResult.refreshedCount) || 0,
-								issueCount: Number(expiryWarningResult.issueCount) || 0,
-								reason: expiryWarningResult.reason || "no_due_warnings"
-							};
-							scheduledState.serverExpiryWarnings = expiryWarningResult.sent === true ? this.#buildSuccessState(previousServerExpiryState, nowIso(), stateMeta) : this.#buildSkippedState(previousServerExpiryState, nowIso(), stateMeta.reason, stateMeta);
-						}
-					} catch (expiryWarningError) {
-						scheduledState.status = this.#markPartialFailure(scheduledState.status);
-						scheduledState.serverExpiryWarnings = this.#buildFailedState(previousServerExpiryState, nowIso(), expiryWarningError?.message || String(expiryWarningError), { fixedQueue: this.#normalizeFixedQueueState(expiryDueState.fixedQueue) });
-						this.logger.error("Scheduled Server Expiry Warning Error: ", expiryWarningError);
-					}
 					try {
 						await ensureLeaseActive();
 						const alertResult = await this.service.maybeSendRuntimeAlerts(env, scheduledState);
@@ -16868,713 +15437,6 @@ function buildProxyAccessRuleProfile(currentConfig = {}) {
 	return profile;
 }
 //#endregion
-//#region worker/features/nodes/server-record-methods.js
-function defineServerRecordMethods(dependencies = {}, kernel = {}) {
-	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
-	return {
-		buildServerRecordAccessUrl(nodeName = "", node = {}, env = null, request = null) {
-			const name = String(nodeName || node?.name || "").trim().toLowerCase();
-			if (!name) return "";
-			if (isHostPrefixEntryMode(node?.entryMode)) {
-				const hostRoot = resolveConfiguredHost(env);
-				return hostRoot ? `https://${name}.${hostRoot}` : "";
-			}
-			let origin = "";
-			try {
-				origin = new URL(request?.url || "").origin;
-			} catch {}
-			if (!origin) return "";
-			const secret = String(node?.secret || "").trim();
-			return `${origin}/${encodeURIComponent(name)}${secret ? `/${encodeURIComponent(secret)}` : ""}`;
-		},
-		buildServerRecordRequestHeaders(node = {}) {
-			const headers = new Headers();
-			for (const [name, value] of normalizeLooseHeaderEntries(kernel.sanitizeHeaders(node?.headers))) {
-				const normalizedName = String(name || "").trim();
-				if (!normalizedName || DROP_REQUEST_HEADER_SET.has(normalizedName.toLowerCase())) continue;
-				headers.set(normalizedName, String(value ?? ""));
-			}
-			headers.set("Accept", "application/json");
-			return headers;
-		},
-		async fetchServerRecordEndpoint(targetRecord, path = "/", headers = new Headers(), options = {}) {
-			const controller = new AbortController();
-			const timeoutMs = Math.max(1e3, Number(options.timeoutMs) || 8e3);
-			const timeoutId = setTimeout(() => controller.abort("server_record_timeout"), timeoutMs);
-			const startedAt = nowMs();
-			try {
-				const url = buildUpstreamProxyUrl(targetRecord, path);
-				if (options.query && typeof options.query === "object") for (const [name, value] of Object.entries(options.query)) url.searchParams.set(name, String(value));
-				const response = await fetchRequest(url.toString(), {
-					method: String(options.method || "GET").toUpperCase(),
-					headers: new Headers(headers),
-					body: options.body,
-					cache: "no-store",
-					signal: controller.signal
-				});
-				let json = null;
-				let parseError = false;
-				if (options.expectJson === true && response.status !== 204) {
-					const body = await readResponseTextWithLimit(response, 512 * 1024);
-					if (body.exceeded) parseError = true;
-					else if (body.text.trim()) try {
-						json = JSON.parse(body.text);
-					} catch {
-						parseError = true;
-					}
-				} else try {
-					response.body?.cancel?.();
-				} catch {}
-				return {
-					ok: response.ok,
-					status: response.status,
-					json,
-					parseError,
-					latencyMs: Math.max(0, nowMs() - startedAt)
-				};
-			} catch (error) {
-				const timedOut = controller.signal.aborted || String(error?.name || "") === "AbortError";
-				const wrapped = /* @__PURE__ */ new Error(timedOut ? "server_record_timeout" : "server_record_network_error");
-				wrapped.code = timedOut ? "SERVER_RECORD_TIMEOUT" : "SERVER_RECORD_NETWORK_ERROR";
-				throw wrapped;
-			} finally {
-				clearTimeout(timeoutId);
-			}
-		},
-		async recoverServerRecordMediaMetadata(nodeName = "", node = {}, candidate = {}) {
-			const itemId = String(candidate?.itemId || "").trim().slice(0, 256);
-			if (!itemId) return null;
-			const baseHeaders = kernel.buildServerRecordRequestHeaders(node);
-			const credentials = resolveServerRecordCredentials(node);
-			const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
-			for (const targetRecord of targetRecords) {
-				const headers = new Headers(baseHeaders);
-				let userId = "";
-				if (credentials.configured) {
-					stripSensitiveProxyAuthHeaders(headers);
-					headers.delete("Cookie");
-					const auth = await kernel.authenticateServerRecord(nodeName, node, targetRecord, baseHeaders);
-					if (!auth?.token) continue;
-					headers.set("X-Emby-Token", auth.token);
-					userId = String(auth.userId || "").trim();
-				}
-				const detailPath = userId ? `/Users/${encodeURIComponent(userId)}/Items/${encodeURIComponent(itemId)}` : `/Items/${encodeURIComponent(itemId)}`;
-				try {
-					const detail = await kernel.fetchServerRecordEndpoint(targetRecord, detailPath, headers, {
-						expectJson: true,
-						query: {
-							EnableImageTypes: "Primary,Backdrop,Thumb,Logo",
-							ImageTypeLimit: "1",
-							Fields: "ProviderIds,ExternalUrls"
-						}
-					});
-					const media = detail.ok && !detail.parseError ? buildServerRecordMediaMetadata(detail.json, itemId) : null;
-					if (media?.itemName) return media;
-				} catch {}
-				try {
-					const playbackHeaders = new Headers(headers);
-					playbackHeaders.set("Content-Type", "application/json");
-					const playbackInfo = await kernel.fetchServerRecordEndpoint(targetRecord, `/Items/${encodeURIComponent(itemId)}/PlaybackInfo`, playbackHeaders, {
-						method: "POST",
-						body: "{}",
-						expectJson: true,
-						query: userId ? { UserId: userId } : {}
-					});
-					const media = playbackInfo.ok && !playbackInfo.parseError ? buildServerRecordMediaMetadata(playbackInfo.json, itemId, { allowMissingItemId: true }) : null;
-					if (media?.itemName) return media;
-				} catch {}
-			}
-			return null;
-		},
-		async buildServerRecordPosterImageResponse(upstream, requestMethod = "GET") {
-			const contentType = String(upstream?.headers?.get("Content-Type") || "").split(";", 1)[0].trim().toLowerCase();
-			const declaredLength = Number(upstream?.headers?.get("Content-Length"));
-			if (!upstream?.ok || !SERVER_RECORD_POSTER_CONTENT_TYPES.has(contentType) || Number.isFinite(declaredLength) && declaredLength > SERVER_RECORD_POSTER_MAX_BYTES) {
-				try {
-					await upstream?.body?.cancel?.();
-				} catch {}
-				return null;
-			}
-			if (String(requestMethod || "GET").toUpperCase() === "HEAD") return new Response(null, {
-				status: 200,
-				headers: {
-					"Content-Type": contentType,
-					"Cache-Control": "private, max-age=300, stale-while-revalidate=60",
-					"Content-Security-Policy": "default-src 'none'; sandbox",
-					"Cross-Origin-Resource-Policy": "same-origin",
-					"X-Content-Type-Options": "nosniff",
-					"Vary": "Cookie"
-				}
-			});
-			const body = await readResponseBytesWithLimit(upstream, SERVER_RECORD_POSTER_MAX_BYTES);
-			if (body.exceeded || sniffServerRecordPosterMime(body.bodyBytes) !== contentType) return null;
-			return new Response(body.bodyBytes, {
-				status: 200,
-				headers: {
-					"Content-Type": contentType,
-					"Content-Length": String(body.bodyBytes.byteLength),
-					"Cache-Control": "private, max-age=300, stale-while-revalidate=60",
-					"Content-Security-Policy": "default-src 'none'; sandbox",
-					"Cross-Origin-Resource-Policy": "same-origin",
-					"X-Content-Type-Options": "nosniff",
-					"Vary": "Cookie"
-				}
-			});
-		},
-		async getServerRecordPosterResponse(env, nodeName = "", requestMethod = "GET") {
-			const normalizedName = String(nodeName || "").trim().toLowerCase();
-			const db = kernel.getDB(env);
-			if (!db || !normalizedName) return null;
-			const [snapshots, lastWatchByNode] = await Promise.all([kernel.getServerRecordSnapshots(db, [normalizedName]), kernel.getServerLastWatch(db, [normalizedName])]);
-			const lastItem = snapshots.get(normalizedName)?.lastItem || {};
-			const itemId = String(lastItem.itemId || "").trim();
-			if (!itemId || !areServerRecordWatchTimesCompatible(lastItem.watchedAt, lastWatchByNode.get(normalizedName)?.lastWatchedAt)) return null;
-			const node = await kernel.getNodeForRead(normalizedName, env);
-			if (!node || normalizeServerRecordSettings(node?.serverRecord).enabled !== true) return null;
-			const baseHeaders = kernel.buildServerRecordRequestHeaders(node);
-			const credentials = resolveServerRecordCredentials(node);
-			for (const targetRecord of buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord)) {
-				const headers = new Headers(baseHeaders);
-				if (credentials.configured) {
-					stripSensitiveProxyAuthHeaders(headers);
-					headers.delete("Cookie");
-					const auth = await kernel.authenticateServerRecord(normalizedName, node, targetRecord, baseHeaders);
-					if (!auth?.token) continue;
-					headers.set("X-Emby-Token", auth.token);
-				}
-				headers.set("Accept", "image/avif,image/webp,image/png,image/jpeg,image/gif;q=0.8");
-				const controller = new AbortController();
-				const timeoutId = setTimeout(() => controller.abort("server_record_poster_timeout"), 8e3);
-				try {
-					const posterUrl = buildUpstreamProxyUrl(targetRecord, `/Items/${encodeURIComponent(itemId)}/Images/Primary`);
-					const imageTag = String(lastItem.imageTag || "").trim();
-					if (imageTag) posterUrl.searchParams.set("tag", imageTag);
-					const upstream = await fetchRequest(posterUrl.toString(), {
-						method: String(requestMethod || "GET").toUpperCase() === "HEAD" ? "HEAD" : "GET",
-						headers,
-						cache: "no-store",
-						redirect: "error",
-						signal: controller.signal
-					});
-					const response = await kernel.buildServerRecordPosterImageResponse(upstream, requestMethod);
-					if (response) return response;
-				} catch {} finally {
-					clearTimeout(timeoutId);
-				}
-			}
-			return null;
-		},
-		buildServerRecordPosterUrl(env, nodeName = "", snapshot = {}) {
-			const normalizedName = String(nodeName || "").trim().toLowerCase();
-			const itemId = String(snapshot?.itemId || "").trim();
-			if (!normalizedName || !itemId) return "";
-			const adminPath = getAdminPath(env).replace(/\/+$/, "") || "/admin";
-			const revision = hashStableText(`${String(snapshot?.watchedAt || "")}|${String(snapshot?.imageTag || "")}`);
-			return `${adminPath}/__server-record-poster/${encodeURIComponent(normalizedName)}?v=${encodeURIComponent(revision)}`;
-		},
-		normalizeServerRecordRuntimeError(error = null, status = 0) {
-			if (String(error?.code || "") === "SERVER_RECORD_TIMEOUT") return "timeout";
-			if (status === 401 || status === 403) return "unauthorized";
-			return "offline";
-		},
-		async authenticateServerRecord(nodeName = "", node = {}, targetRecord = null, requestHeaders = new Headers()) {
-			const credentials = resolveServerRecordCredentials(node);
-			if (!credentials.configured || !isTargetRecord(targetRecord)) return null;
-			const nodeRevision = String(node?.cacheRevision || buildNodeDerivedCacheRevision(nodeName, node)).trim();
-			const cacheKey = `server-record-auth:${hashStableText(serializeConfigValue({
-				nodeName: String(nodeName || "").trim().toLowerCase(),
-				nodeRevision,
-				target: hashStableText(serializeConfigValue(targetRecord)),
-				username: hashStableText(credentials.username),
-				password: hashStableText(credentials.password)
-			}))}`;
-			const authCache = cacheState.ServerRecordAuthCache;
-			const cached = authCache.get(cacheKey);
-			const now = nowMs();
-			if (cached && Number(cached.expiresAt) > now && cached.token) {
-				touchMapEntry(authCache, cacheKey);
-				return cached;
-			}
-			return await runSingleFlight(buildSingleFlightKey(["server-record-auth", cacheKey]), async () => {
-				const current = authCache.get(cacheKey);
-				if (current && Number(current.expiresAt) > nowMs() && current.token) {
-					touchMapEntry(authCache, cacheKey);
-					return current;
-				}
-				const headers = new Headers(requestHeaders);
-				stripSensitiveProxyAuthHeaders(headers);
-				headers.delete("Cookie");
-				headers.set("Accept", "application/json");
-				headers.set("Content-Type", "application/json");
-				headers.set("X-Emby-Authorization", "MediaBrowser Client=\"CF Emby Proxy\", Device=\"Worker\", DeviceId=\"cf-emby-proxy-server-records\", Version=\"1\"");
-				try {
-					const result = await kernel.fetchServerRecordEndpoint(targetRecord, "/Users/AuthenticateByName", headers, {
-						method: "POST",
-						body: JSON.stringify({
-							Username: credentials.username,
-							Pw: credentials.password
-						}),
-						expectJson: true
-					});
-					const token = String(result?.json?.AccessToken || result?.json?.accessToken || result?.json?.SessionInfo?.AccessToken || "").trim();
-					if (!result.ok || result.parseError || !token) return {
-						token: "",
-						userId: "",
-						error: `http_${result.status || 0}`
-					};
-					const entry = {
-						nodeName: String(nodeName || "").trim().toLowerCase(),
-						token,
-						userId: String(result?.json?.User?.Id || result?.json?.user?.Id || "").trim(),
-						expiresAt: nowMs() + MEDIA_AGGREGATION_AUTH_TTL_MS
-					};
-					setBoundedMapEntry(authCache, cacheKey, entry, SERVER_RECORD_AUTH_CACHE_MAX);
-					return entry;
-				} catch (error) {
-					return {
-						token: "",
-						userId: "",
-						error: String(error?.code || "authentication_failed").toLowerCase()
-					};
-				}
-			});
-		},
-		async probeServerRecord(nodeName = "", node = {}) {
-			const checkedAt = (/* @__PURE__ */ new Date()).toISOString();
-			const fallback = {
-				runtime: {
-					state: "offline",
-					latencyMs: null,
-					serverId: "",
-					version: "",
-					detailsLimited: false,
-					checkedAt,
-					errorCode: "upstream_unavailable"
-				},
-				counts: {
-					movies: null,
-					series: null,
-					episodes: null,
-					state: "unavailable",
-					errors: {
-						movies: "not_checked",
-						series: "not_checked",
-						episodes: "not_checked"
-					}
-				}
-			};
-			const headers = kernel.buildServerRecordRequestHeaders(node);
-			const targetRecords = buildOrderedNodeTargetList(node).map(createTargetRecord).filter(isTargetRecord);
-			if (!targetRecords.length) return fallback;
-			let selectedTarget = null;
-			let systemInfo = null;
-			let runtimeState = "offline";
-			let runtimeErrorCode = "upstream_unavailable";
-			let latencyMs = null;
-			let detailsLimited = false;
-			let unauthorizedTarget = null;
-			let unauthorizedTargetCount = 0;
-			for (const targetRecord of targetRecords) try {
-				const ping = await kernel.fetchServerRecordEndpoint(targetRecord, "/System/Ping", headers);
-				latencyMs = ping.latencyMs;
-				if (ping.ok) {
-					selectedTarget = targetRecord;
-					runtimeState = "online";
-					runtimeErrorCode = "";
-					break;
-				}
-				if (ping.status === 401 || ping.status === 403) {
-					if (!unauthorizedTarget) unauthorizedTarget = {
-						targetRecord,
-						latencyMs: ping.latencyMs,
-						status: ping.status
-					};
-					unauthorizedTargetCount += 1;
-					continue;
-				}
-				runtimeState = "offline";
-				runtimeErrorCode = `http_${ping.status || 0}`;
-			} catch (error) {
-				runtimeState = kernel.normalizeServerRecordRuntimeError(error);
-				runtimeErrorCode = String(error?.code || "upstream_unavailable").toLowerCase();
-			}
-			if (!selectedTarget && unauthorizedTarget && unauthorizedTargetCount === targetRecords.length) {
-				selectedTarget = unauthorizedTarget.targetRecord;
-				latencyMs = unauthorizedTarget.latencyMs;
-				runtimeState = "unauthorized";
-				runtimeErrorCode = `http_${unauthorizedTarget.status}`;
-				detailsLimited = true;
-			}
-			if (!selectedTarget) return {
-				...fallback,
-				runtime: {
-					...fallback.runtime,
-					state: runtimeState,
-					latencyMs,
-					checkedAt,
-					errorCode: runtimeErrorCode
-				}
-			};
-			if (runtimeState !== "online") return {
-				...fallback,
-				runtime: {
-					...fallback.runtime,
-					state: runtimeState,
-					latencyMs,
-					detailsLimited,
-					checkedAt,
-					errorCode: runtimeErrorCode
-				},
-				counts: {
-					...fallback.counts,
-					errors: {
-						movies: "unauthorized",
-						series: "unauthorized",
-						episodes: "unauthorized"
-					}
-				}
-			};
-			const detailHeaders = new Headers(headers);
-			let credentialError = "";
-			if (resolveServerRecordCredentials(node).configured) {
-				stripSensitiveProxyAuthHeaders(detailHeaders);
-				detailHeaders.delete("Cookie");
-				const auth = await kernel.authenticateServerRecord(nodeName, node, selectedTarget, headers);
-				if (auth?.token) detailHeaders.set("X-Emby-Token", auth.token);
-				else credentialError = String(auth?.error || "authentication_failed");
-			}
-			const countTypes = [
-				["movies", "Movie"],
-				["series", "Series"],
-				["episodes", "Episode"]
-			];
-			const [infoResult, countResults] = await Promise.all([kernel.fetchServerRecordEndpoint(selectedTarget, "/System/Info", detailHeaders, { expectJson: true }).catch((error) => ({
-				ok: false,
-				status: 0,
-				json: null,
-				parseError: true,
-				errorCode: String(error?.code || "upstream_unavailable").toLowerCase()
-			})), Promise.all(countTypes.map(async ([key, itemType]) => {
-				if (credentialError) return {
-					key,
-					value: null,
-					error: credentialError
-				};
-				try {
-					const result = await kernel.fetchServerRecordEndpoint(selectedTarget, "/Items", detailHeaders, {
-						expectJson: true,
-						query: {
-							IncludeItemTypes: itemType,
-							Recursive: "true",
-							Limit: "1"
-						}
-					});
-					const total = Number(result?.json?.TotalRecordCount);
-					if (!result.ok) return {
-						key,
-						value: null,
-						error: `http_${result.status || 0}`
-					};
-					if (result.parseError || !Number.isFinite(total) || total < 0) return {
-						key,
-						value: null,
-						error: "invalid_response"
-					};
-					return {
-						key,
-						value: Math.trunc(total),
-						error: ""
-					};
-				} catch (error) {
-					return {
-						key,
-						value: null,
-						error: String(error?.code || "upstream_unavailable").toLowerCase()
-					};
-				}
-			}))]);
-			if (infoResult.ok && !infoResult.parseError && isPlainObject(infoResult.json)) systemInfo = infoResult.json;
-			else detailsLimited = true;
-			const counts = {
-				movies: null,
-				series: null,
-				episodes: null
-			};
-			const errors = {};
-			let successCount = 0;
-			for (const result of countResults) {
-				counts[result.key] = result.value;
-				if (result.error) errors[result.key] = result.error;
-				else successCount += 1;
-			}
-			return {
-				runtime: {
-					state: runtimeState,
-					latencyMs,
-					serverId: String(systemInfo?.Id || "").trim(),
-					version: String(systemInfo?.Version || "").trim(),
-					detailsLimited,
-					checkedAt,
-					errorCode: runtimeErrorCode
-				},
-				counts: {
-					...counts,
-					state: successCount === countTypes.length ? "ok" : successCount > 0 ? "partial" : "unavailable",
-					errors
-				}
-			};
-		},
-		async getServerRecordProbe(nodeName = "", node = {}, options = {}) {
-			const name = String(nodeName || "").trim().toLowerCase();
-			const revision = String(node?.cacheRevision || buildNodeDerivedCacheRevision(name, node)).trim();
-			const forceRefresh = options.forceRefresh === true;
-			const now = nowMs();
-			const cached = cacheState.ServerRecordsSnapshotCache.get(name);
-			const hasCurrentCachedValue = cached && cached.revision === revision && Number(cached.expiresAt) > now;
-			if (!forceRefresh && hasCurrentCachedValue) {
-				touchMapEntry(cacheState.ServerRecordsSnapshotCache, name);
-				return {
-					...cached.value,
-					probe: {
-						source: "cache",
-						retryAt: ""
-					}
-				};
-			}
-			const backoffKey = `${name}:${revision}`;
-			const backoff = cacheState.ServerRecordProbeBackoff.get(backoffKey);
-			if (forceRefresh && hasCurrentCachedValue && backoff && Number(backoff.retryAt) > now) {
-				touchMapEntry(cacheState.ServerRecordsSnapshotCache, name);
-				touchMapEntry(cacheState.ServerRecordProbeBackoff, backoffKey);
-				return {
-					...cached.value,
-					probe: {
-						source: "backoff",
-						retryAt: new Date(Number(backoff.retryAt)).toISOString()
-					}
-				};
-			}
-			const value = await runSingleFlight(buildSingleFlightKey([
-				"server-record-probe",
-				name,
-				revision
-			]), async () => {
-				const probeValue = await kernel.probeServerRecord(name, node);
-				const errorCode = String(probeValue?.runtime?.errorCode || "").trim().toLowerCase();
-				const runtimeState = String(probeValue?.runtime?.state || "").trim().toLowerCase();
-				if (runtimeState === "timeout" && errorCode === "server_record_timeout" || runtimeState === "offline" && ["server_record_network_error", "upstream_unavailable"].includes(errorCode)) {
-					const previous = cacheState.ServerRecordProbeBackoff.get(backoffKey);
-					const failures = previous?.revision === revision ? Math.max(0, Number(previous.failures) || 0) + 1 : 1;
-					const delayMs = Math.min(SERVER_RECORD_PROBE_BACKOFF_MAX_MS, SERVER_RECORD_PROBE_BACKOFF_BASE_MS * 2 ** Math.min(failures - 1, 16));
-					setBoundedMapEntry(cacheState.ServerRecordProbeBackoff, backoffKey, {
-						nodeName: name,
-						revision,
-						failures,
-						retryAt: nowMs() + delayMs
-					}, SERVER_RECORD_PROBE_BACKOFF_MAX);
-				} else cacheState.ServerRecordProbeBackoff.delete(backoffKey);
-				setBoundedMapEntry(cacheState.ServerRecordsSnapshotCache, name, {
-					revision,
-					expiresAt: nowMs() + DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
-					value: probeValue
-				}, Config.Defaults.ServerRecordsSnapshotMax);
-				return probeValue;
-			});
-			const completedBackoff = cacheState.ServerRecordProbeBackoff.get(backoffKey);
-			return {
-				...value,
-				probe: {
-					source: "live",
-					retryAt: completedBackoff?.retryAt ? new Date(Number(completedBackoff.retryAt)).toISOString() : ""
-				}
-			};
-		},
-		async getServerRecordsSnapshotPayload(env, options = {}) {
-			const config = sanitizeRuntimeConfig(options?.config || await getRuntimeConfigStrict(env));
-			const summaries = await CacheManager.getNodesListStrict(env, options.ctx);
-			const availableNodes = (Array.isArray(summaries) ? summaries : []).map((node) => {
-				const settings = normalizeServerRecordSettings(node?.serverRecord, { defaultExpiryDays: config.serverRecordExpiryDays });
-				return {
-					nodeName: String(node?.name || "").trim().toLowerCase(),
-					displayName: String(node?.displayName || node?.name || "").trim(),
-					accessUrl: kernel.buildServerRecordAccessUrl(node?.name, node, env, options.request),
-					tags: normalizeNodeTags(node?.tags, node?.tag),
-					enabled: settings.enabled,
-					expiryEnabled: settings.expiryEnabled,
-					expiryMode: settings.expiryMode,
-					expiresAt: settings.expiresAt,
-					expiryDays: settings.expiryDays,
-					serverRecordEmbyUsername: String(node?.serverRecordEmbyUsername || "").trim(),
-					serverRecordEmbyCredentialsConfigured: hasConfiguredServerRecordCredentials(node),
-					serverRecordEmbyCredentialSource: String(node?.serverRecordEmbyCredentialSource || "none")
-				};
-			}).filter((node) => node.nodeName);
-			const enabledNodes = availableNodes.filter((node) => node.enabled);
-			const probes = /* @__PURE__ */ new Map();
-			const fullNodes = /* @__PURE__ */ new Map();
-			const refreshNodeName = String(options?.refreshNodeName || "").trim().toLowerCase();
-			const recordNodes = refreshNodeName ? enabledNodes.filter((node) => node.nodeName === refreshNodeName) : enabledNodes;
-			const probeNodes = options.skipProbe === true ? [] : recordNodes;
-			const probedNodeNames = new Set(probeNodes.map((node) => node.nodeName));
-			if (options.skipProbe !== true) {
-				await runWithConcurrency(probeNodes, 4, async (summary) => {
-					const node = await kernel.getNodeForRead(summary.nodeName, env);
-					if (node) fullNodes.set(summary.nodeName, node);
-				});
-				await runWithConcurrency(probeNodes, 4, async (summary) => {
-					const node = fullNodes.get(summary.nodeName);
-					probes.set(summary.nodeName, node ? await kernel.getServerRecordProbe(summary.nodeName, node, { forceRefresh: options.forceRefresh === true }) : await kernel.probeServerRecord(summary.nodeName, {}));
-				});
-			}
-			let recordSnapshots = /* @__PURE__ */ new Map();
-			let snapshotState = options.db ? "ok" : "unavailable";
-			if (options.db && recordNodes.length > 0) try {
-				const persistable = [...probes.entries()].map(([nodeName, probe]) => ({
-					nodeName,
-					counts: probe?.counts,
-					checkedAt: probe?.runtime?.checkedAt
-				}));
-				if (persistable.length) await kernel.persistServerRecordProbeSnapshots(options.db, persistable);
-				recordSnapshots = await kernel.getServerRecordSnapshots(options.db, recordNodes.map((node) => node.nodeName));
-			} catch (error) {
-				snapshotState = "unavailable";
-				console.error("server record snapshot persistence failed", error);
-			}
-			let lastWatchByNode = /* @__PURE__ */ new Map();
-			let watchState = options.db ? "ok" : "unavailable";
-			if (options.db && recordNodes.length > 0) try {
-				lastWatchByNode = await kernel.getServerLastWatch(options.db, recordNodes.map((node) => node.nodeName));
-			} catch (error) {
-				watchState = "unavailable";
-				console.error("server last watch read failed", error);
-			}
-			if (options.forceRefresh === true && options.db && snapshotState === "ok" && watchState === "ok") {
-				let recovered = false;
-				await runWithConcurrency(recordNodes, 4, async (summary) => {
-					const snapshot = recordSnapshots.get(summary.nodeName)?.lastItem || {};
-					const watch = lastWatchByNode.get(summary.nodeName) || {};
-					if (!String(snapshot.itemId || "").trim() || String(snapshot.itemName || "").trim() || !areServerRecordWatchTimesCompatible(snapshot.watchedAt, watch.lastWatchedAt)) return;
-					const node = fullNodes.get(summary.nodeName) || await kernel.getNodeForRead(summary.nodeName, env);
-					if (!node) return;
-					const media = await kernel.recoverServerRecordMediaMetadata(summary.nodeName, node, snapshot);
-					if (!media?.itemName) return;
-					recovered = await kernel.persistServerRecordPosterSearchMetadata(options.db, {
-						nodeName: summary.nodeName,
-						itemId: snapshot.itemId,
-						watchedAt: snapshot.watchedAt
-					}, media) || recovered;
-				});
-				if (recovered) recordSnapshots = await kernel.getServerRecordSnapshots(options.db, recordNodes.map((node) => node.nodeName));
-			}
-			return {
-				records: recordNodes.map((summary) => {
-					const probe = probes.get(summary.nodeName) || {};
-					const storedSnapshot = recordSnapshots.get(summary.nodeName) || {};
-					const liveCounts = isPlainObject(probe.counts) ? probe.counts : {};
-					const counts = [
-						liveCounts.movies,
-						liveCounts.series,
-						liveCounts.episodes
-					].some((value) => value !== null && value !== void 0 && value !== "" && Number.isFinite(Number(value)) && Number(value) >= 0) ? {
-						...liveCounts,
-						checkedAt: String(probe?.runtime?.checkedAt || ""),
-						source: "live",
-						persisted: snapshotState === "ok"
-					} : storedSnapshot?.counts ? {
-						...storedSnapshot.counts,
-						source: "persisted",
-						persisted: true,
-						refreshErrors: isPlainObject(liveCounts.errors) ? liveCounts.errors : {}
-					} : {
-						movies: null,
-						series: null,
-						episodes: null,
-						state: "unavailable",
-						errors: {},
-						checkedAt: "",
-						source: "unavailable",
-						persisted: false
-					};
-					const watch = lastWatchByNode.get(summary.nodeName) || {};
-					const lastItem = isPlainObject(storedSnapshot?.lastItem) ? storedSnapshot.lastItem : {};
-					const lastItemMatchesWatch = !!String(lastItem.itemId || "").trim() && areServerRecordWatchTimesCompatible(lastItem.watchedAt, watch.lastWatchedAt);
-					const probeRequested = probedNodeNames.has(summary.nodeName);
-					return {
-						...summary,
-						runtime: probe.runtime || {
-							state: probeRequested ? "offline" : "not_checked",
-							checkedAt: "",
-							errorCode: probeRequested ? "node_not_found" : "manual_refresh_required"
-						},
-						counts,
-						probe: probe.probe || {
-							source: probeRequested ? "live" : "not_checked",
-							retryAt: ""
-						},
-						watch: {
-							lastWatchedAt: String(watch.lastWatchedAt || ""),
-							state: watchState,
-							itemId: lastItemMatchesWatch ? String(lastItem.itemId || "") : "",
-							itemName: lastItemMatchesWatch ? String(lastItem.itemName || "") : "",
-							itemType: lastItemMatchesWatch ? String(lastItem.itemType || "") : "",
-							seriesName: lastItemMatchesWatch ? String(lastItem.seriesName || "") : "",
-							posterUrl: lastItemMatchesWatch ? kernel.buildServerRecordPosterUrl(env, summary.nodeName, lastItem) : "",
-							posterSearch: {
-								itemId: lastItemMatchesWatch ? String(lastItem.itemId || "") : "",
-								mediaType: lastItemMatchesWatch ? inferServerRecordPosterMediaKind(lastItem.itemType, lastItem.seriesName) : "",
-								title: lastItemMatchesWatch ? String((String(lastItem.itemType || "").trim().toLowerCase() === "episode" ? lastItem.seriesName : lastItem.itemName) || "").trim() : "",
-								originalTitle: lastItemMatchesWatch ? String(lastItem.originalTitle || "") : "",
-								year: lastItemMatchesWatch ? normalizeServerRecordPosterYear(lastItem.year) : null,
-								watchedAt: lastItemMatchesWatch ? String(lastItem.watchedAt || "") : ""
-							}
-						},
-						expiry: buildServerRecordExpiry(summary, watch.lastWatchedAt, config, options?.now || /* @__PURE__ */ new Date())
-					};
-				}),
-				availableNodes,
-				refreshedAt: (/* @__PURE__ */ new Date()).toISOString(),
-				cacheTtlMs: DEFAULT_SERVER_RECORDS_SNAPSHOT_TTL_MS,
-				persistence: { state: snapshotState }
-			};
-		},
-		async pingTarget(target, timeoutMs, options = {}) {
-			const controller = new AbortController();
-			const startedAt = nowMs();
-			const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-			try {
-				const resolvedTarget = String(target || "").trim();
-				if (!resolvedTarget) return 9999;
-				const targetRecord = createTargetRecord(resolvedTarget);
-				if (!targetRecord) return 9999;
-				const probeUrl = buildProbeUpstreamUrl(targetRecord, normalizeNodeLineHeadProbePath(options?.probePath, DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1));
-				if (!probeUrl) return 9999;
-				let response = await fetchRequest(probeUrl.toString(), {
-					method: "HEAD",
-					signal: controller.signal
-				});
-				if (response.status === 405 || response.status === 501) {
-					try {
-						response.body?.cancel?.();
-					} catch {}
-					response = await fetchRequest(probeUrl.toString(), {
-						method: "GET",
-						signal: controller.signal
-					});
-				}
-				const healthy = response.ok;
-				try {
-					response.body?.cancel?.();
-				} catch {}
-				return healthy ? nowMs() - startedAt : 9999;
-			} catch {
-				return 9999;
-			} finally {
-				clearTimeout(timeoutId);
-			}
-		}
-	};
-}
-//#endregion
 //#region worker/features/nodes/node-mutation-methods.js
 function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
@@ -17606,19 +15468,11 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 			if (String(n.tag || "") !== legacyTag) changed = true;
 			n.tags = normalizedTags;
 			n.tag = legacyTag;
-			const normalizedServerRecord = normalizeServerRecordSettings(n.serverRecord);
-			if (JSON.stringify(normalizedServerRecord) !== JSON.stringify(isPlainObject(n.serverRecord) ? n.serverRecord : {})) changed = true;
-			n.serverRecord = normalizedServerRecord;
-			const inheritedServerRecordCredentialFlag = n.serverRecordEmbyCredentialsConfigured === true && !Object.prototype.hasOwnProperty.call(n, "serverRecordEmbyPassword");
-			const normalizedServerRecordEmbyUsername = String(n.serverRecordEmbyUsername ?? "").trim();
-			const normalizedServerRecordEmbyPassword = String(n.serverRecordEmbyPassword ?? "");
-			const normalizedServerRecordCredentialsConfigured = Boolean(normalizedServerRecordEmbyUsername || inheritedServerRecordCredentialFlag);
-			if (String(n.serverRecordEmbyUsername ?? "") !== normalizedServerRecordEmbyUsername) changed = true;
-			if (String(n.serverRecordEmbyPassword ?? "") !== normalizedServerRecordEmbyPassword) changed = true;
-			if (n.serverRecordEmbyCredentialsConfigured !== normalizedServerRecordCredentialsConfigured) changed = true;
-			n.serverRecordEmbyUsername = normalizedServerRecordEmbyUsername;
-			n.serverRecordEmbyPassword = normalizedServerRecordEmbyPassword;
-			n.serverRecordEmbyCredentialsConfigured = normalizedServerRecordCredentialsConfigured;
+			const retiredNodeFieldPrefixes = [["server", "Record"].join(""), ["media", "Aggregation"].join("")];
+			for (const retiredField of Object.keys(n).filter((key) => retiredNodeFieldPrefixes.some((prefix) => key.startsWith(prefix)))) {
+				delete n[retiredField];
+				changed = true;
+			}
 			if (n.remark === void 0) {
 				n.remark = "";
 				changed = true;
@@ -17648,22 +15502,9 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 			const normalizedPlaybackInfoMode = normalizeNodePlaybackInfoMode(n.playbackInfoMode);
 			if (String(n.playbackInfoMode || "") !== normalizedPlaybackInfoMode) changed = true;
 			n.playbackInfoMode = normalizedPlaybackInfoMode;
-			const normalizedMediaAggregationManagedRewrite = n.mediaAggregationManagedRewrite === true;
-			if (n.mediaAggregationManagedRewrite !== normalizedMediaAggregationManagedRewrite) changed = true;
-			n.mediaAggregationManagedRewrite = normalizedMediaAggregationManagedRewrite;
 			const normalizedMediaAuthMode = normalizeNodeMediaAuthMode(n.mediaAuthMode);
 			if (String(n.mediaAuthMode || "") !== normalizedMediaAuthMode) changed = true;
 			n.mediaAuthMode = normalizedMediaAuthMode;
-			const inheritedMediaAggregationCredentialFlag = n.mediaAggregationEmbyCredentialsConfigured === true && !Object.prototype.hasOwnProperty.call(n, "mediaAggregationEmbyUsername") && !Object.prototype.hasOwnProperty.call(n, "mediaAggregationEmbyPassword");
-			const normalizedMediaAggregationEmbyUsername = String(n.mediaAggregationEmbyUsername ?? "").trim();
-			const normalizedMediaAggregationEmbyPassword = String(n.mediaAggregationEmbyPassword ?? "");
-			const normalizedMediaAggregationCredentialsConfigured = Boolean(normalizedMediaAggregationEmbyUsername || inheritedMediaAggregationCredentialFlag);
-			if (String(n.mediaAggregationEmbyUsername ?? "") !== normalizedMediaAggregationEmbyUsername) changed = true;
-			if (String(n.mediaAggregationEmbyPassword ?? "") !== normalizedMediaAggregationEmbyPassword) changed = true;
-			if (n.mediaAggregationEmbyCredentialsConfigured !== normalizedMediaAggregationCredentialsConfigured) changed = true;
-			n.mediaAggregationEmbyUsername = normalizedMediaAggregationEmbyUsername;
-			n.mediaAggregationEmbyPassword = normalizedMediaAggregationEmbyPassword;
-			n.mediaAggregationEmbyCredentialsConfigured = normalizedMediaAggregationCredentialsConfigured;
 			const normalizedRealClientIpMode = normalizeNodeRealClientIpMode(n.realClientIpMode);
 			if (String(n.realClientIpMode || "") !== normalizedRealClientIpMode) changed = true;
 			n.realClientIpMode = normalizedRealClientIpMode;
@@ -17770,18 +15611,12 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 				tag: rawNode?.tag !== void 0 ? rawNode.tag : existingNode.tag || "",
 				tags: rawNode?.tags !== void 0 ? rawNode.tags : rawNode?.tag !== void 0 ? [rawNode.tag, ...normalizeNodeTags(existingNode.tags, existingNode.tag).filter((tag) => tag.toLowerCase() !== String(existingNode.tag || "").trim().toLowerCase())] : existingNode.tags,
 				remark: rawNode?.remark !== void 0 ? rawNode.remark : existingNode.remark || "",
-				serverRecord: rawNode?.serverRecord !== void 0 ? rawNode.serverRecord : existingNode.serverRecord,
-				serverRecordEmbyUsername: rawNode?.serverRecordEmbyUsername !== void 0 ? String(rawNode.serverRecordEmbyUsername || "").trim() : String(existingNode.serverRecordEmbyUsername || "").trim(),
-				serverRecordEmbyPassword: rawNode?.serverRecordEmbyPassword !== void 0 ? String(rawNode.serverRecordEmbyPassword || "") : String(existingNode.serverRecordEmbyPassword || ""),
-				tagColor: rawNode?.tagColor !== void 0 ? String(rawNode.tagColor || "").trim() : existingNode.tagColor || "",
+																tagColor: rawNode?.tagColor !== void 0 ? String(rawNode.tagColor || "").trim() : existingNode.tagColor || "",
 				remarkColor: rawNode?.remarkColor !== void 0 ? String(rawNode.remarkColor || "").trim() : existingNode.remarkColor || "",
 				displayName: rawNode?.displayName !== void 0 ? String(rawNode.displayName || "").trim() : existingNode.displayName || "",
 				playbackInfoMode: rawNode?.playbackInfoMode !== void 0 ? normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode) : normalizeNodePlaybackInfoMode(existingNode.playbackInfoMode),
-				mediaAggregationManagedRewrite: rawNode?.mediaAggregationManagedRewrite !== void 0 ? rawNode.mediaAggregationManagedRewrite === true : rawNode?.playbackInfoMode !== void 0 ? false : existingNode.mediaAggregationManagedRewrite === true,
-				mediaAuthMode: rawNode?.mediaAuthMode !== void 0 ? normalizeNodeMediaAuthMode(rawNode.mediaAuthMode) : normalizeNodeMediaAuthMode(existingNode.mediaAuthMode),
-				mediaAggregationEmbyUsername: rawNode?.mediaAggregationEmbyUsername !== void 0 ? String(rawNode.mediaAggregationEmbyUsername || "").trim() : String(existingNode.mediaAggregationEmbyUsername || "").trim(),
-				mediaAggregationEmbyPassword: rawNode?.mediaAggregationEmbyPassword !== void 0 ? String(rawNode.mediaAggregationEmbyPassword || "") : String(existingNode.mediaAggregationEmbyPassword || ""),
-				realClientIpMode: rawNode?.realClientIpMode !== void 0 ? normalizeNodeRealClientIpMode(rawNode.realClientIpMode) : normalizeNodeRealClientIpMode(existingNode.realClientIpMode),
+								mediaAuthMode: rawNode?.mediaAuthMode !== void 0 ? normalizeNodeMediaAuthMode(rawNode.mediaAuthMode) : normalizeNodeMediaAuthMode(existingNode.mediaAuthMode),
+												realClientIpMode: rawNode?.realClientIpMode !== void 0 ? normalizeNodeRealClientIpMode(rawNode.realClientIpMode) : normalizeNodeRealClientIpMode(existingNode.realClientIpMode),
 				hedgeProbePath: rawNode?.hedgeProbePath !== void 0 ? normalizeNodeHedgeProbePath(rawNode.hedgeProbePath) : normalizeNodeHedgeProbePath(existingNode.hedgeProbePath),
 				routingDecisionMode: rawNode?.routingDecisionMode !== void 0 ? normalizeNodeRoutingDecisionMode(rawNode.routingDecisionMode) : normalizeNodeRoutingDecisionMode(existingNode.routingDecisionMode),
 				mainVideoStreamMode: rawMainVideoStreamMode !== void 0 ? normalizeNodeMainVideoStreamMode(rawMainVideoStreamMode) : readNodeMainVideoStreamMode(existingNode),
@@ -17859,34 +15694,7 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 				dnsPlan: null
 			};
 		},
-		buildPreparedServerRecordSettingsMutation(nodeName = "", existingNode = {}, settingsPatch = {}) {
-			const name = String(nodeName || "").trim().toLowerCase();
-			if (!name || !isPlainObject(existingNode) || !Object.keys(existingNode).length) return null;
-			const patch = isPlainObject(settingsPatch) ? settingsPatch : {};
-			const previousNode = { ...existingNode };
-			const nextNode = { ...existingNode };
-			if (Object.prototype.hasOwnProperty.call(patch, "tags") || Object.prototype.hasOwnProperty.call(patch, "tag")) {
-				const tags = normalizeNodeTags(patch.tags, patch.tag);
-				nextNode.tags = tags;
-				nextNode.tag = tags[0] || "";
-			}
-			if (Object.prototype.hasOwnProperty.call(patch, "serverRecordEmbyUsername")) nextNode.serverRecordEmbyUsername = String(patch.serverRecordEmbyUsername || "").trim();
-			if (Object.prototype.hasOwnProperty.call(patch, "serverRecordEmbyPassword")) nextNode.serverRecordEmbyPassword = String(patch.serverRecordEmbyPassword || "");
-			if (Object.prototype.hasOwnProperty.call(patch, "serverRecordEmbyUsername") || Object.prototype.hasOwnProperty.call(patch, "serverRecordEmbyPassword")) nextNode.serverRecordEmbyCredentialsConfigured = Boolean(String(nextNode.serverRecordEmbyUsername || "").trim());
-			if (Object.prototype.hasOwnProperty.call(patch, "serverRecord")) nextNode.serverRecord = normalizeServerRecordSettings(patch.serverRecord);
-			const isSemanticNoop = kernel.areNodePayloadsEquivalent(previousNode, nextNode);
-			return {
-				previousName: name,
-				previousNode,
-				nextName: name,
-				nextNode,
-				isRename: false,
-				nodeChanged: !isSemanticNoop,
-				isSemanticNoop,
-				dnsPlan: null
-			};
-		},
-		async upsertHostPrefixDnsRecord(hostname = "", options = {}) {
+				async upsertHostPrefixDnsRecord(hostname = "", options = {}) {
 			const host = normalizeHostnameText(hostname);
 			if (!host) return null;
 			const config = options.config || await getRuntimeConfig(options.env);
@@ -17961,26 +15769,22 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 		async applyPreparedNodeMutation(mutation = {}, options = {}) {
 			const kv = options.kv;
 			if (!kv || mutation?.nodeChanged !== true) return false;
-			const db = options.db || (options.env ? kernel.getDB(options.env) : null);
 			const previousName = String(mutation?.previousName || "").trim().toLowerCase();
 			const nextName = String(mutation?.nextName || "").trim().toLowerCase();
 			if (mutation?.nextNode) await kv.put(`${kernel.PREFIX}${nextName}`, JSON.stringify(mutation.nextNode));
 			else if (nextName) await kv.delete(`${kernel.PREFIX}${nextName}`);
 			if (previousName && nextName && previousName !== nextName) await kv.delete(`${kernel.PREFIX}${previousName}`);
-			await kernel.applyServerRecordNodeLifecycleMutation(mutation, db);
 			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
 			return true;
 		},
 		async rollbackPreparedNodeMutation(mutation = {}, options = {}) {
 			const kv = options.kv;
 			if (!kv || mutation?.nodeChanged !== true) return false;
-			const db = options.db || (options.env ? kernel.getDB(options.env) : null);
 			const previousName = String(mutation?.previousName || "").trim().toLowerCase();
 			const nextName = String(mutation?.nextName || "").trim().toLowerCase();
 			if (previousName) if (mutation?.previousNode) await kv.put(`${kernel.PREFIX}${previousName}`, JSON.stringify(mutation.previousNode));
 			else await kv.delete(`${kernel.PREFIX}${previousName}`);
 			if (nextName && nextName !== previousName) await kv.delete(`${kernel.PREFIX}${nextName}`);
-			await kernel.rollbackServerRecordNodeLifecycleMutation(mutation, db);
 			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
 			return true;
 		},
@@ -18076,6 +15880,40 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
+		async pingTarget(target, timeoutMs, options = {}) {
+			const controller = new AbortController();
+			const startedAt = nowMs();
+			const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+			try {
+				const targetRecord = createTargetRecord(String(target || "").trim());
+				if (!targetRecord) return 9999;
+				const probePath = normalizeNodeLineHeadProbePath(options?.probePath, DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1);
+				const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
+				if (!probeUrl) return 9999;
+				let response = await fetchRequest(probeUrl.toString(), {
+					method: "HEAD",
+					signal: controller.signal
+				});
+				if (response.status === 405 || response.status === 501) {
+					try {
+						response.body?.cancel?.();
+					} catch {}
+					response = await fetchRequest(probeUrl.toString(), {
+						method: "GET",
+						signal: controller.signal
+					});
+				}
+				const healthy = response.ok;
+				try {
+					response.body?.cancel?.();
+				} catch {}
+				return healthy ? nowMs() - startedAt : 9999;
+			} catch {
+				return 9999;
+			} finally {
+				clearTimeout(timeoutId);
+			}
+		},
 		async getNode(nodeName, env, ctx) {
 			nodeName = String(nodeName).toLowerCase();
 			const kv = kernel.getKV(env);
@@ -18204,8 +16042,7 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 function defineDatabaseNodeServiceMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineNodeModelMethods(dependencies, kernel),
-		...defineServerRecordMethods(dependencies, kernel),
-		...defineNodeMutationMethods(dependencies, kernel),
+				...defineNodeMutationMethods(dependencies, kernel),
 		...defineNodeRepositoryMethods(dependencies, kernel)
 	};
 }
@@ -19835,7 +17672,6 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 				}));
 			}
 			if (execution.requestTraits.isPlaybackInfoRequest === true) await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response);
-			kernel.observeServerRecordPlaybackItemDetails(execution, finalUpstreamState.response);
 			await kernel.maybePrewarmMetadataResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
 				proxyPath: execution.proxyPath,
 				prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
@@ -19883,326 +17719,6 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 				statusText: finalStatusText,
 				headers: modifiedHeaders
 			});
-		}
-	};
-}
-//#endregion
-//#region worker/features/proxy/failover/aggregation-delivery-methods.js
-function defineProxyAggregationDeliveryMethods(dependencies = {}, kernel = {}) {
-	const { nodeRepository } = dependencies;
-	return {
-		applyMediaAggregationAuthToTransport(transport, auth) {
-			if (!transport || !auth?.token) return transport;
-			const headers = new Headers(transport.newHeaders || {});
-			stripSensitiveProxyAuthHeaders(headers);
-			headers.set("X-Emby-Token", auth.token);
-			headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
-			transport.newHeaders = headers;
-			if (transport.transportTemplate) transport.transportTemplate.baseHeaderEntries = [...headers.entries()];
-			return transport;
-		},
-		buildMediaAggregationRoutedBody(transport, source) {
-			if (!transport || transport.preparedBodyMode !== "buffered") return {
-				body: null,
-				bodyText: ""
-			};
-			const contentType = String(transport.newHeaders?.get("Content-Type") || "").toLowerCase();
-			const rawBodyText = String(transport.preparedBodyText || decodeBufferedBodyText(transport.preparedBody));
-			if (!rawBodyText.trim()) return {
-				body: null,
-				bodyText: ""
-			};
-			try {
-				if (contentType.includes("application/json")) {
-					const payload = JSON.parse(rawBodyText);
-					if (!isPlainObject(payload)) return {
-						body: null,
-						bodyText: ""
-					};
-					const keys = Object.keys(payload);
-					const setField = (name, value) => {
-						const existing = keys.find((key) => key.toLowerCase() === name.toLowerCase());
-						payload[existing || name] = value;
-					};
-					setField("ItemId", source.itemId);
-					setField("MediaSourceId", source.mediaSourceId);
-					const bodyText = JSON.stringify(payload);
-					return {
-						body: new TextEncoder().encode(bodyText),
-						bodyText
-					};
-				}
-				if (contentType.includes("application/x-www-form-urlencoded")) {
-					const params = new URLSearchParams(rawBodyText);
-					params.set("ItemId", source.itemId);
-					params.set("MediaSourceId", source.mediaSourceId);
-					const bodyText = params.toString();
-					return {
-						body: new TextEncoder().encode(bodyText),
-						bodyText
-					};
-				}
-			} catch {}
-			return {
-				body: null,
-				bodyText: ""
-			};
-		},
-		clearMediaAggregationSourceSelection(execution, transport, status = "stale_source_fallback") {
-			execution?.requestUrl?.searchParams?.delete?.("MediaSourceId");
-			if (transport?.preparedBodyMode === "buffered") {
-				const contentType = String(transport.newHeaders?.get("Content-Type") || "").toLowerCase();
-				const rawBodyText = String(transport.preparedBodyText || decodeBufferedBodyText(transport.preparedBody));
-				let bodyText = rawBodyText;
-				try {
-					if (contentType.includes("application/json")) {
-						const payload = JSON.parse(rawBodyText || "{}");
-						if (isPlainObject(payload)) {
-							for (const key of Object.keys(payload)) if (key.toLowerCase() === "mediasourceid") delete payload[key];
-							bodyText = JSON.stringify(payload);
-						}
-					} else if (contentType.includes("application/x-www-form-urlencoded")) {
-						const params = new URLSearchParams(rawBodyText);
-						for (const key of [...params.keys()]) if (key.toLowerCase() === "mediasourceid") params.delete(key);
-						bodyText = params.toString();
-					}
-				} catch {}
-				if (bodyText !== rawBodyText) {
-					transport.preparedBodyText = bodyText;
-					transport.preparedBody = new TextEncoder().encode(bodyText);
-					transport.newHeaders?.set?.("Content-Length", String(transport.preparedBody.byteLength));
-					if (transport.transportTemplate) transport.transportTemplate.baseHeaderEntries = [...transport.newHeaders.entries()];
-				}
-			}
-			execution.mediaAggregationState = status;
-			execution.mediaAggregationDiagnostic = {
-				status,
-				matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
-				attemptedNodes: 0,
-				matchedNodes: 0,
-				pendingNodes: 0,
-				foregroundElapsedMs: 0,
-				nodes: []
-			};
-			execution.mediaAggregationCacheable = false;
-		},
-		async resolveMediaAggregationPrimaryRouteIdentity(execution, itemId) {
-			const { targetRecords } = kernel.parseTargetRecords(execution?.node, execution?.finalOrigin || "*");
-			for (const targetRecord of targetRecords) {
-				const identity = await kernel.resolveMediaAggregationPrimaryIdentity({
-					...execution,
-					mediaAggregationItemId: itemId
-				}, {}, { activeTargetBase: targetRecord });
-				if (MEDIA_AGGREGATION_SUPPORTED_TYPES.has(identity?.type)) return identity;
-			}
-			return null;
-		},
-		async validateMediaAggregationPlaybackSource(execution, source, primaryItemId, targetNode) {
-			const version = String(source?.version || "AGG1");
-			if (version === "AGG2" && !await verifyMediaAggregationSourceSignature(source, execution?.env?.JWT_SECRET)) return {
-				ok: false,
-				status: "stale_source_fallback"
-			};
-			execution.mediaAggregationDeadlineAt = nowMs() + 1e4;
-			const primaryIdentity = await kernel.resolveMediaAggregationPrimaryRouteIdentity(execution, primaryItemId);
-			if (!primaryIdentity) return {
-				ok: false,
-				status: "stale_source_fallback"
-			};
-			const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-			const matchMode = normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode);
-			const { targetRecords } = kernel.parseTargetRecords(targetNode, execution?.finalOrigin || "*");
-			for (const targetRecord of targetRecords) {
-				const localExecution = {
-					...execution,
-					mediaAggregationLastAuthStatus: ""
-				};
-				const auth = await kernel.getMediaAggregationAuth(localExecution, source.nodeName, targetNode, prefix, targetRecord);
-				if (!auth) continue;
-				const candidate = await kernel.fetchMediaAggregationItemIdentity(localExecution, targetNode, targetRecord, auth, prefix, source.itemId);
-				if (!candidate.ok) {
-					if (candidate.retryable) continue;
-					return {
-						ok: false,
-						status: "stale_source_fallback"
-					};
-				}
-				const match = matchMediaAggregationIdentities(primaryIdentity, candidate.identity, matchMode);
-				if (!match) return {
-					ok: false,
-					status: "stale_source_fallback"
-				};
-				const identityHash = await buildMediaAggregationMatchFingerprintHash(match);
-				if (version === "AGG2" && identityHash !== source.identityHash) return {
-					ok: false,
-					status: "stale_source_fallback"
-				};
-				const availableSources = Array.isArray(candidate.item?.MediaSources) ? candidate.item.MediaSources : [];
-				if (availableSources.length && !availableSources.some((item) => String(item?.Id || "").trim() === source.mediaSourceId)) return {
-					ok: false,
-					status: "stale_source_fallback"
-				};
-				return {
-					ok: true,
-					auth,
-					targetRecord,
-					source: {
-						...source,
-						version,
-						identityHash
-					},
-					status: version === "AGG1" ? "legacy_revalidated" : "validated"
-				};
-			}
-			return {
-				ok: false,
-				status: "stale_source_fallback"
-			};
-		},
-		async maybeScheduleMediaAggregationProgressMirror(execution, transport) {
-			if (execution?.currentConfig?.mediaAggregationBidirectionalProgressEnabled !== true) return;
-			if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true || !execution?.ctx?.waitUntil) return;
-			const parsedPayload = kernel.parsePlaybackSessionControlPayload(execution, transport);
-			if (parsedPayload.parseError) return;
-			const source = parseMediaAggregationSourceId(String(getCaseInsensitivePayloadValue(parsedPayload.query, ["MediaSourceId"]) || getCaseInsensitivePayloadValue(parsedPayload.body, ["MediaSourceId"]) || "").trim());
-			if (!source || source.version !== "AGG2" || !await verifyMediaAggregationSourceSignature(source, execution?.env?.JWT_SECRET)) return;
-			const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
-			const currentName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (!selectedNames.includes(currentName) || !selectedNames.includes(source.nodeName) || source.nodeName === currentName) return;
-			if (transport?.preparedBodyMode !== "buffered" && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") return;
-			const task = (async () => {
-				const backupNode = await nodeRepository.getNode(source.nodeName, execution.env, execution.ctx);
-				if (!backupNode) return;
-				const apiPrefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-				const { targetRecords } = kernel.parseTargetRecords(backupNode, execution.finalOrigin || "*");
-				for (const targetRecord of targetRecords) {
-					const auth = await kernel.getMediaAggregationAuth(execution, source.nodeName, backupNode, apiPrefix, targetRecord);
-					if (!auth) continue;
-					const targetUrl = buildUpstreamProxyUrl(targetRecord, execution.proxyPath || "/");
-					targetUrl.search = execution.requestUrl.search;
-					targetUrl.searchParams.set("ItemId", source.itemId);
-					targetUrl.searchParams.set("MediaSourceId", source.mediaSourceId);
-					if (auth.userId) targetUrl.searchParams.set("UserId", auth.userId);
-					const headers = kernel.buildMediaAggregationRequestHeaders(execution, backupNode, targetUrl, auth);
-					const bodyState = kernel.buildMediaAggregationRoutedBody(transport, source);
-					const fetchOptions = {
-						method: execution.requestMethod,
-						headers,
-						redirect: "manual"
-					};
-					if (bodyState.bodyText && execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD") {
-						fetchOptions.body = bodyState.bodyText;
-						headers.set("Content-Type", String(transport.newHeaders?.get("Content-Type") || "application/json"));
-					}
-					let upstream;
-					try {
-						upstream = await kernel.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
-							timeoutMs: Math.min(Math.max(1e3, Number(execution.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 1e4),
-							requestLifecycle: null
-						});
-						const status = Number(upstream.response.status) || 0;
-						try {
-							await upstream.response.body?.cancel?.();
-						} catch {}
-						if (!(status === 408 || status === 425 || status === 429 || status >= 500)) break;
-					} catch {} finally {
-						try {
-							upstream?.releaseFetchController?.();
-						} catch {}
-					}
-				}
-			})();
-			execution.ctx.waitUntil(task.catch(() => {}));
-		},
-		async resolveMediaAggregationPlaybackRoute(execution, transport) {
-			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return null;
-			if (execution?.mediaAggregationRouted === true) return null;
-			if (normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) !== "rewrite") return null;
-			const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
-			const currentName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (selectedNames.length < 2 || !selectedNames.includes(currentName)) return null;
-			const parsedPayload = kernel.parsePlaybackSessionControlPayload(execution, transport);
-			if (parsedPayload.parseError) return null;
-			const itemPathState = extractPlaybackInfoItemPathState(execution?.proxyPath || "");
-			const itemId = String(itemPathState.itemId || getCaseInsensitivePayloadValue(parsedPayload.query, ["ItemId"]) || getCaseInsensitivePayloadValue(parsedPayload.body, ["ItemId"]) || "").trim();
-			const mediaSourceId = String(getCaseInsensitivePayloadValue(parsedPayload.query, ["MediaSourceId"]) || getCaseInsensitivePayloadValue(parsedPayload.body, ["MediaSourceId"]) || "").trim();
-			const source = parseMediaAggregationSourceId(mediaSourceId);
-			if (!source) {
-				if (/^AGG[12]\*/.test(mediaSourceId)) kernel.clearMediaAggregationSourceSelection(execution, transport);
-				return null;
-			}
-			if (!itemId || source.nodeName === currentName || !selectedNames.includes(source.nodeName)) {
-				kernel.clearMediaAggregationSourceSelection(execution, transport);
-				return null;
-			}
-			if (execution.requestMethod !== "GET" && execution.requestMethod !== "HEAD" && transport?.preparedBodyMode !== "buffered") return null;
-			const targetNode = await nodeRepository.getNode(source.nodeName, execution.env, execution.ctx);
-			if (!targetNode) {
-				kernel.clearMediaAggregationSourceSelection(execution, transport);
-				return null;
-			}
-			const validation = await kernel.validateMediaAggregationPlaybackSource(execution, source, itemId, targetNode);
-			if (!validation.ok) {
-				kernel.clearMediaAggregationSourceSelection(execution, transport, validation.status);
-				return null;
-			}
-			const validatedSource = validation.source;
-			const auth = validation.auth;
-			const routedPath = itemPathState.rewritePath(validatedSource.itemId);
-			const routedUrl = new URL(execution.requestUrl.toString());
-			routedUrl.searchParams.set("ItemId", validatedSource.itemId);
-			routedUrl.searchParams.set("MediaSourceId", validatedSource.mediaSourceId);
-			if (auth.userId) routedUrl.searchParams.set("UserId", auth.userId);
-			const routedBody = kernel.buildMediaAggregationRoutedBody(transport, validatedSource);
-			const headers = new Headers(execution.request.headers);
-			headers.delete("Content-Length");
-			if (routedBody.bodyText) headers.set("Content-Length", String(new TextEncoder().encode(routedBody.bodyText).byteLength));
-			const routedRequest = new Request(routedUrl, {
-				method: execution.requestMethod,
-				headers,
-				body: execution.requestMethod === "GET" || execution.requestMethod === "HEAD" ? void 0 : routedBody.bodyText || void 0
-			});
-			const routedExecution = await kernel.prepareExecutionContext(routedRequest, targetNode, routedPath, source.nodeName, targetNode.secret || "", execution.env, execution.ctx, {
-				runtimeConfig: execution.currentConfig,
-				requestUrl: routedUrl,
-				entryMode: targetNode.entryMode,
-				targetHotCacheState: "hit"
-			});
-			if (routedExecution.invalidResponse) return null;
-			routedExecution.mediaAggregationRouted = true;
-			routedExecution.mediaAggregationItemId = validatedSource.itemId;
-			routedExecution.mediaAggregationSource = validatedSource;
-			routedExecution.mediaAggregationState = validation.status;
-			routedExecution.mediaAggregationDiagnostic = {
-				status: "routed_playback",
-				matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
-				attemptedNodes: 1,
-				matchedNodes: 1,
-				pendingNodes: 0,
-				foregroundElapsedMs: 0,
-				nodes: [{
-					nodeName: validatedSource.nodeName,
-					status: validation.status,
-					elapsedMs: 0
-				}]
-			};
-			const parsedTargets = kernel.parseTargetRecords(routedExecution.node, routedExecution.finalOrigin);
-			if (parsedTargets.invalidResponse) return null;
-			const selectedTargetIdentity = String(validation.targetRecord?.originText || validation.targetRecord?.targetUrl || "");
-			const targetRecords = parsedTargets.targetRecords.slice().sort((left, right) => {
-				const leftMatch = String(left?.originText || left?.targetUrl || "") === selectedTargetIdentity ? 1 : 0;
-				return (String(right?.originText || right?.targetUrl || "") === selectedTargetIdentity ? 1 : 0) - leftMatch;
-			});
-			const routedTransport = await kernel.buildProxyRequestState(routedExecution.request, routedExecution.node, routedExecution.proxyPath, routedExecution.requestUrl, routedExecution.clientIp, routedExecution.requestTraits, routedExecution.forceH1, targetRecords, {
-				effectiveRealClientIpMode: routedExecution.effectiveRealClientIpMode,
-				effectiveMediaAuthMode: routedExecution.effectiveMediaAuthMode
-			});
-			kernel.applyMediaAggregationAuthToTransport(routedTransport, auth);
-			return {
-				execution: routedExecution,
-				transport: routedTransport,
-				targetRecords
-			};
 		}
 	};
 }
@@ -20315,15 +17831,6 @@ function defineProxyHandlerDeliveryMethods(dependencies = {}, kernel = {}) {
 					effectiveRealClientIpMode: execution.effectiveRealClientIpMode,
 					effectiveMediaAuthMode: execution.effectiveMediaAuthMode
 				});
-				const aggregationRoute = await kernel.resolveMediaAggregationPlaybackRoute(execution, transport);
-				if (aggregationRoute) {
-					execution = aggregationRoute.execution;
-					transport = aggregationRoute.transport;
-					targetRecords = aggregationRoute.targetRecords;
-					failoverTargetRecords = kernel.prepareFailoverOverlay(execution, targetRecords);
-					transport.retryTargetRecords = failoverTargetRecords;
-				}
-				await kernel.prepareMediaAggregationPlaybackInfoCacheRevision(execution);
 				const playbackInfoCachedResponse = await kernel.tryServePlaybackInfoResponseCache(execution, transport);
 				if (playbackInfoCachedResponse) return playbackInfoCachedResponse;
 				const buildFetchOptions = kernel.createBuildFetchOptions(execution, transport);
@@ -20331,7 +17838,6 @@ function defineProxyHandlerDeliveryMethods(dependencies = {}, kernel = {}) {
 				if (entryDirectResponse) return entryDirectResponse;
 				const progressRelayResponse = await kernel.maybeHandlePlaybackProgressRelay(execution, transport, buildFetchOptions, transport.retryTargetRecords);
 				if (progressRelayResponse) return progressRelayResponse;
-				await kernel.maybeScheduleMediaAggregationProgressMirror(execution, transport);
 				execution.requestLifecycle = createProxyRequestLifecycle(execution.request?.signal);
 				const upstreamState = await kernel.executeUpstreamFlow(execution, transport, buildFetchOptions);
 				return await kernel.buildSuccessResponse(execution, buildFetchOptions, upstreamState, transport);
@@ -20347,8 +17853,7 @@ function defineProxyDeliveryMethods(dependencies = {}, kernel = {}) {
 	return {
 		...defineProxyCacheDeliveryMethods(dependencies, kernel),
 		...defineProxyUpstreamDeliveryMethods(dependencies, kernel),
-		...defineProxyAggregationDeliveryMethods(dependencies, kernel),
-		...defineProxyHandlerDeliveryMethods(dependencies, kernel)
+				...defineProxyHandlerDeliveryMethods(dependencies, kernel)
 	};
 }
 //#endregion
@@ -20505,19 +18010,9 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 			return parts.join(" | ");
 		},
 		buildRuntimeDiagnosticDetail(execution) {
-			return kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.buildTargetHotCacheDiagnosticDetail(execution), kernel.buildPlaybackInfoCacheDiagnosticDetail(execution)), kernel.buildFailoverDiagnosticDetail(execution)), kernel.buildPlaybackUrlDiagnosticDetail(execution)), kernel.buildProgressRelayDiagnosticDetail(execution)), kernel.appendLogDiagnosticDetail(kernel.buildRouteContextDiagnosticDetail(execution), kernel.buildMediaAggregationDiagnosticDetail(execution)));
+			return kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.appendLogDiagnosticDetail(kernel.buildTargetHotCacheDiagnosticDetail(execution), kernel.buildPlaybackInfoCacheDiagnosticDetail(execution)), kernel.buildFailoverDiagnosticDetail(execution)), kernel.buildPlaybackUrlDiagnosticDetail(execution)), kernel.appendLogDiagnosticDetail(kernel.buildProgressRelayDiagnosticDetail(execution), kernel.buildRouteContextDiagnosticDetail(execution)));
 		},
-		buildMediaAggregationDiagnosticDetail(execution) {
-			const diagnostic = execution?.mediaAggregationDiagnostic;
-			if (!diagnostic || typeof diagnostic !== "object") return "";
-			const parts = [`MediaAggregation=${String(diagnostic.status || execution?.mediaAggregationState || "unknown")}`];
-			parts.push(`AggregationMatch=${normalizeMediaAggregationMatchMode(diagnostic.matchMode)}`);
-			parts.push(`AggregationNodes=${Math.max(0, Number(diagnostic.matchedNodes) || 0)}/${Math.max(0, Number(diagnostic.attemptedNodes) || 0)}`);
-			if (Number(diagnostic.pendingNodes) > 0) parts.push(`AggregationPending=${Math.max(0, Number(diagnostic.pendingNodes) || 0)}`);
-			if (Number(diagnostic.foregroundElapsedMs) >= 0) parts.push(`AggregationElapsed=${Math.max(0, Math.round(Number(diagnostic.foregroundElapsedMs) || 0))}ms`);
-			return parts.join(" | ");
-		},
-		buildProgressRelayDiagnosticDetail(execution) {
+				buildProgressRelayDiagnosticDetail(execution) {
 			if (execution?.requestTraits?.isPlaybackSessionControlRequest !== true) return "";
 			const relayMode = String(execution?.progressForwardMode || "").trim();
 			if (!relayMode) return "";
@@ -20636,31 +18131,12 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 				playbackInfoCacheTtlSec: Number.isFinite(Number(options.playbackInfoCacheTtlSec)) ? Math.max(0, Math.trunc(Number(options.playbackInfoCacheTtlSec))) : Math.max(0, Math.trunc(Number(execution?.playbackInfoCacheTtlSec) || 0)),
 				playbackInfoMode: execution?.requestTraits?.isPlaybackInfoRequest === true ? normalizeDefaultPlaybackInfoMode(options.playbackInfoMode || execution?.effectivePlaybackInfoMode) : null,
 				playbackInfoRewrite: execution?.requestTraits?.isPlaybackInfoRequest === true ? String(options.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim() || null : null,
-				mediaAggregation: execution?.mediaAggregationDiagnostic && typeof execution.mediaAggregationDiagnostic === "object" ? {
-					status: String(execution.mediaAggregationDiagnostic.status || "").trim() || null,
-					matchMode: normalizeMediaAggregationMatchMode(execution.mediaAggregationDiagnostic.matchMode),
-					attemptedNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.attemptedNodes) || 0)),
-					matchedNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.matchedNodes) || 0)),
-					pendingNodes: Math.max(0, Math.trunc(Number(execution.mediaAggregationDiagnostic.pendingNodes) || 0)),
-					foregroundElapsedMs: Math.max(0, Math.round(Number(execution.mediaAggregationDiagnostic.foregroundElapsedMs) || 0)),
-					nodes: (Array.isArray(execution.mediaAggregationDiagnostic.nodes) ? execution.mediaAggregationDiagnostic.nodes : []).slice(0, MEDIA_AGGREGATION_BACKUP_MAX).map((node) => ({
-						nodeName: String(node?.nodeName || "").trim().toLowerCase(),
-						status: String(node?.status || "").trim(),
-						elapsedMs: Math.max(0, Math.round(Number(node?.elapsedMs) || 0)),
-						cacheHit: node?.cacheHit === true,
-						pending: node?.pending === true
-					}))
-				} : null,
-				playbackUrlMode: String(options.playbackUrlMode || execution?.playbackUrlMode || "").trim() || null,
+								playbackUrlMode: String(options.playbackUrlMode || execution?.playbackUrlMode || "").trim() || null,
 				playbackFallback: String(options.playbackFallback || execution?.playbackFallback || "").trim() || null,
 				playbackPathFix: String(options.playbackPathFix || execution?.playbackPathFix || "").trim() || null,
 				rewritePlaybackEntry: String(options.rewritePlaybackEntry || execution?.rewritePlaybackEntry || "").trim() || null,
 				progressRelayMode: String(options.progressRelayMode || execution?.progressForwardMode || "").trim() || null,
 				progressIntervalSec: Number.isFinite(Number(options.progressIntervalSec)) ? Math.max(0, Math.trunc(Number(options.progressIntervalSec))) : Math.max(0, Math.trunc(Number(execution?.videoProgressForwardIntervalSec) || 0)),
-				watchPhase: String(execution?.serverWatchLifecycleDiagnostic?.phase || "").trim() || null,
-				watchDecision: String(execution?.serverWatchLifecycleDiagnostic?.decision || "").trim() || null,
-				watchParseMode: String(execution?.serverWatchLifecycleDiagnostic?.parseMode || "").trim() || null,
-				watchSessionStrength: String(execution?.serverWatchLifecycleDiagnostic?.sessionStrength || "").trim() || null,
 				rangeRequest: !!String(execution?.request?.headers?.get("Range") || "").trim(),
 				upstreamHost: String(options.upstreamHost || options.upstreamUrlHost || options.finalUrl?.hostname || "").trim(),
 				upstreamStatus
@@ -21365,28 +18841,7 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 				referer: execution.request.headers.get("Referer"),
 				...payload
 			};
-			const record = () => {
-				const diagnostic = execution?.serverWatchLifecycleDiagnostic;
-				if (diagnostic && isPlainObject(logData.detailJson)) logData.detailJson = {
-					...logData.detailJson,
-					watchPhase: String(diagnostic.phase || "").trim() || null,
-					watchDecision: String(diagnostic.decision || "").trim() || null,
-					watchParseMode: String(diagnostic.parseMode || "").trim() || null,
-					watchSessionStrength: String(diagnostic.sessionStrength || "").trim() || null
-				};
-				Logger.record(execution.env, execution.ctx, logData);
-			};
-			const lifecycleTask = execution?.serverWatchLifecycleTask;
-			if (lifecycleTask) {
-				if (execution?.serverWatchAccessLogScheduled === true) return;
-				execution.serverWatchAccessLogScheduled = true;
-				if (execution?.serverWatchLifecycleDiagnostic?.finalized !== true && execution?.ctx && typeof execution.ctx.waitUntil === "function") {
-					const deferredLogTask = Promise.resolve(lifecycleTask).catch(() => {}).then(record);
-					execution.ctx.waitUntil(deferredLogTask);
-					return;
-				}
-			}
-			record();
+			Logger.record(execution.env, execution.ctx, logData);
 		},
 		async flushCriticalLogsIfNeeded(execution) {
 			const requestTraits = execution?.requestTraits || {};
@@ -21418,962 +18873,6 @@ function defineProxyObservabilityMethods(dependencies = {}, kernel = {}) {
 		...defineProxyMetadataResponseMethods(dependencies, kernel),
 		...defineProxyUpstreamFetchMethods(dependencies, kernel),
 		...defineProxyAccessLogMethods(dependencies, kernel)
-	};
-}
-//#endregion
-//#region worker/features/proxy/playback/aggregation-auth-methods.js
-function definePlaybackAggregationAuthMethods(dependencies = {}, kernel = {}) {
-	return {
-		buildMediaAggregationRequestHeaders(execution, node, targetUrl, auth = null) {
-			const headers = buildMutableHeadersFromLoose(execution?.request?.headers || {});
-			DROP_REQUEST_HEADER_SET.forEach((headerName) => headers.delete(headerName));
-			let customCookie = null;
-			for (const [rawName, rawValue] of Object.entries(node?.headers || {})) {
-				const name = String(rawName || "").trim();
-				const lowerName = name.toLowerCase();
-				if (!name || DROP_REQUEST_HEADER_SET.has(lowerName)) continue;
-				if (lowerName === "cookie") customCookie = String(rawValue || "");
-				else headers.set(name, String(rawValue ?? ""));
-			}
-			const mergedCookie = mergeAndSanitizeCookieHeaders(headers.get("Cookie"), customCookie, ["auth_token", ...INTERNAL_PROXY_COOKIE_NAMES]);
-			if (mergedCookie) headers.set("Cookie", mergedCookie);
-			else headers.delete("Cookie");
-			normalizeMediaAuthHeaders(headers, node?.mediaAuthMode);
-			if (targetUrl instanceof URL) {
-				headers.set("X-Forwarded-Host", execution?.requestUrl?.host || targetUrl.host);
-				headers.set("X-Forwarded-Proto", execution?.requestUrl?.protocol?.replace(":", "") || "https");
-			}
-			if (auth?.token) {
-				stripSensitiveProxyAuthHeaders(headers);
-				headers.set("X-Emby-Token", auth.token);
-				headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
-			}
-			return headers;
-		},
-		async fetchMediaAggregationJson(execution, node, proxyPath, search = "", options = {}) {
-			const { targetRecords } = kernel.parseTargetRecords(node, execution?.finalOrigin || "*");
-			const targetRecord = options.targetRecord || targetRecords[0];
-			if (!targetRecord) return {
-				ok: false,
-				status: "network_error",
-				retryable: false,
-				statusCode: 0
-			};
-			const targetUrl = buildUpstreamProxyUrl(targetRecord, proxyPath);
-			targetUrl.search = String(search || "");
-			const headers = kernel.buildMediaAggregationRequestHeaders(execution, node, targetUrl, options.auth || null);
-			const method = String(options.method || "GET").toUpperCase();
-			const body = options.body === void 0 ? null : options.body;
-			const fetchOptions = {
-				method,
-				headers,
-				redirect: "manual"
-			};
-			if (body !== null && body !== void 0) {
-				fetchOptions.body = body;
-				headers.set("Content-Type", "application/json");
-			}
-			let upstream;
-			try {
-				const deadlineAt = Number(options.deadlineAt || execution?.mediaAggregationDeadlineAt) || 0;
-				const remainingMs = deadlineAt > 0 ? deadlineAt - nowMs() : 1e4;
-				if (remainingMs <= 0) return {
-					ok: false,
-					status: "timeout",
-					retryable: false,
-					statusCode: 0,
-					targetRecord
-				};
-				upstream = await kernel.performFetchWithTimeout(targetUrl, async () => fetchOptions, {
-					timeoutMs: Math.min(Math.max(1e3, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 1e4, Math.max(1, remainingMs)),
-					requestLifecycle: null
-				});
-				const response = upstream.response;
-				if (!response.ok) {
-					try {
-						await response.body?.cancel?.();
-					} catch {}
-					const statusCode = Number(response.status) || 0;
-					return {
-						ok: false,
-						status: statusCode === 401 || statusCode === 403 ? "auth_failed" : statusCode === 400 || statusCode === 422 ? "query_unsupported" : statusCode === 408 ? "timeout" : "network_error",
-						retryable: statusCode === 408 || statusCode === 425 || statusCode === 429 || statusCode >= 500,
-						statusCode,
-						targetRecord,
-						finalUrl: upstream.finalUrl
-					};
-				}
-				const bodyResult = await readResponseTextWithLimit(response, MEDIA_AGGREGATION_RESPONSE_MAX_BYTES);
-				if (bodyResult.exceeded) return {
-					ok: false,
-					status: "response_too_large",
-					retryable: false,
-					statusCode: response.status,
-					targetRecord,
-					finalUrl: upstream.finalUrl
-				};
-				let payload = null;
-				try {
-					payload = JSON.parse(bodyResult.text || "");
-				} catch {
-					return {
-						ok: false,
-						status: "invalid_json",
-						retryable: false,
-						statusCode: response.status,
-						targetRecord,
-						finalUrl: upstream.finalUrl
-					};
-				}
-				return {
-					ok: true,
-					payload,
-					targetRecord,
-					finalUrl: upstream.finalUrl,
-					statusCode: response.status
-				};
-			} catch (error) {
-				return {
-					ok: false,
-					status: String(error?.code || "").toUpperCase() === "UPSTREAM_TIMEOUT" ? "timeout" : "network_error",
-					retryable: true,
-					statusCode: 0,
-					targetRecord
-				};
-			} finally {
-				try {
-					upstream?.releaseFetchController?.();
-				} catch {}
-			}
-		},
-		async getMediaAggregationAuth(execution, nodeName, node, apiPrefix = "", preferredTargetRecord = null) {
-			const credentials = resolveMediaAggregationCredentials(node, execution?.currentConfig || {});
-			const username = credentials.username;
-			const password = credentials.password;
-			if (!credentials.configured || !nodeName || !node) return null;
-			const nodeRevision = buildNodeDerivedCacheRevision(nodeName, node);
-			const { targetRecords } = kernel.parseTargetRecords(node, "*");
-			const targetRecord = preferredTargetRecord || targetRecords[0];
-			if (!targetRecord) return null;
-			const targetIdentity = String(targetRecord?.originText || targetRecord?.targetUrl || "");
-			const cacheKey = `media-aggregation-auth:${hashStableText(serializeConfigValue({
-				nodeName,
-				nodeRevision,
-				apiPrefix: String(apiPrefix || ""),
-				targetIdentity,
-				credentialSource: credentials.source,
-				username: hashStableText(username),
-				password: hashStableText(password)
-			}))}`;
-			const now = nowMs();
-			const cached = cacheState.MediaAggregationAuthCache.get(cacheKey);
-			if (cached && Number(cached.expiresAt) > now && cached.token) {
-				touchMapEntry(cacheState.MediaAggregationAuthCache, cacheKey);
-				return cached;
-			}
-			return await runSingleFlight(buildSingleFlightKey(["media-aggregation-auth", cacheKey]), async () => {
-				const current = cacheState.MediaAggregationAuthCache.get(cacheKey);
-				if (current && Number(current.expiresAt) > nowMs() && current.token) {
-					touchMapEntry(cacheState.MediaAggregationAuthCache, cacheKey);
-					return current;
-				}
-				const loginUrl = buildUpstreamProxyUrl(targetRecord, `${String(apiPrefix || "")}/Users/AuthenticateByName`);
-				const headers = kernel.buildMediaAggregationRequestHeaders(execution, node, loginUrl, null);
-				stripSensitiveProxyAuthHeaders(headers);
-				headers.delete("Cookie");
-				headers.set("Content-Type", "application/json");
-				headers.set("X-Emby-Authorization", `MediaBrowser Client="CF Emby Proxy", Device="Worker", DeviceId="cf-emby-proxy", Version="1"`);
-				let upstream;
-				try {
-					const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
-					const remainingMs = deadlineAt > 0 ? deadlineAt - nowMs() : 1e4;
-					if (remainingMs <= 0) {
-						execution.mediaAggregationLastAuthStatus = "timeout";
-						return null;
-					}
-					upstream = await kernel.performFetchWithTimeout(loginUrl, async () => ({
-						method: "POST",
-						headers,
-						body: JSON.stringify({
-							Username: username,
-							Pw: password
-						}),
-						redirect: "manual"
-					}), {
-						timeoutMs: Math.min(Math.max(1e3, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 1e4, Math.max(1, remainingMs)),
-						requestLifecycle: null
-					});
-					const bodyResult = await readResponseTextWithLimit(upstream.response, 64 * 1024);
-					if (!upstream.response.ok || bodyResult.exceeded) {
-						execution.mediaAggregationLastAuthStatus = bodyResult.exceeded ? "response_too_large" : upstream.response.status === 408 ? "timeout" : [425, 429].includes(upstream.response.status) || upstream.response.status >= 500 ? "network_error" : "auth_failed";
-						return null;
-					}
-					let payload;
-					try {
-						payload = JSON.parse(bodyResult.text || "{}");
-					} catch {
-						execution.mediaAggregationLastAuthStatus = "invalid_json";
-						return null;
-					}
-					const token = String(payload?.AccessToken || payload?.accessToken || payload?.SessionInfo?.AccessToken || "").trim();
-					if (!token) {
-						execution.mediaAggregationLastAuthStatus = "auth_failed";
-						return null;
-					}
-					const entry = {
-						nodeName,
-						nodeRevision,
-						token,
-						userId: String(payload?.User?.Id || payload?.user?.Id || "").trim(),
-						targetRecord,
-						expiresAt: nowMs() + MEDIA_AGGREGATION_AUTH_TTL_MS
-					};
-					setBoundedMapEntry(cacheState.MediaAggregationAuthCache, cacheKey, entry, MEDIA_AGGREGATION_AUTH_CACHE_MAX);
-					return entry;
-				} catch (error) {
-					execution.mediaAggregationLastAuthStatus = String(error?.code || "").toUpperCase() === "UPSTREAM_TIMEOUT" ? "timeout" : "network_error";
-					return null;
-				} finally {
-					try {
-						upstream?.releaseFetchController?.();
-					} catch {}
-				}
-			});
-		},
-		async resolveMediaAggregationPrimaryIdentity(execution, payload, upstreamState) {
-			const itemPathState = extractPlaybackInfoItemPathState(execution?.proxyPath || "");
-			const itemId = String(execution?.mediaAggregationItemId || itemPathState.itemId || "").trim();
-			let item = isPlainObject(payload) ? payload : {};
-			if (!itemId) return buildMediaAggregationIdentity(item);
-			const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-			const itemPath = `${prefix}/Items/${encodeURIComponent(itemId)}`;
-			const metadataParams = new URLSearchParams();
-			for (const [key, value] of execution?.requestUrl?.searchParams?.entries?.() || []) if (MEDIA_REDIRECT_AUTH_QUERY_KEYS.has(normalizeWorkerCacheParamName(key))) metadataParams.set(key, value);
-			metadataParams.set("Fields", "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd");
-			metadataParams.set("UserData", "false");
-			const activeTargetBase = upstreamState?.activeTargetBase;
-			const targetBase = activeTargetBase instanceof URL || isTargetRecord(activeTargetBase) ? activeTargetBase : null;
-			if (!targetBase) return buildMediaAggregationIdentity(item);
-			const itemUrl = buildUpstreamProxyUrl(targetBase, itemPath);
-			itemUrl.search = metadataParams.toString();
-			const fetchOptions = {
-				method: "GET",
-				headers: kernel.buildMediaAggregationRequestHeaders(execution, execution.node, itemUrl, null),
-				redirect: "manual"
-			};
-			try {
-				const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
-				const remainingMs = deadlineAt > 0 ? Math.max(1, deadlineAt - nowMs()) : 1e4;
-				const response = await kernel.performFetchWithTimeout(itemUrl, async () => fetchOptions, {
-					timeoutMs: Math.min(Math.max(1e3, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 1e4, remainingMs),
-					requestLifecycle: null
-				});
-				const bodyResult = await readResponseTextWithLimit(response.response, 64 * 1024);
-				const parsed = bodyResult.exceeded ? null : JSON.parse(bodyResult.text || "{}");
-				try {
-					response.response.body?.cancel?.();
-				} catch {}
-				const parsedItem = parsed?.Items?.[0] || parsed;
-				if (isPlainObject(parsedItem)) item = {
-					...parsedItem,
-					...item,
-					ProviderIds: item?.ProviderIds || parsedItem?.ProviderIds
-				};
-			} catch {}
-			let seriesItem = {};
-			const initialIdentity = buildMediaAggregationIdentity(item);
-			if (initialIdentity.type === "episode" && initialIdentity.seriesId) {
-				const seriesUrl = buildUpstreamProxyUrl(targetBase, `${prefix}/Items/${encodeURIComponent(initialIdentity.seriesId)}`);
-				seriesUrl.search = new URLSearchParams({
-					Fields: "ProviderIds,Name,OriginalTitle,ProductionYear",
-					UserData: "false"
-				}).toString();
-				let seriesResponse;
-				try {
-					const deadlineAt = Number(execution?.mediaAggregationDeadlineAt) || 0;
-					const remainingMs = deadlineAt > 0 ? Math.max(1, deadlineAt - nowMs()) : 1e4;
-					seriesResponse = await kernel.performFetchWithTimeout(seriesUrl, async () => ({
-						method: "GET",
-						headers: kernel.buildMediaAggregationRequestHeaders(execution, execution.node, seriesUrl, null),
-						redirect: "manual"
-					}), {
-						timeoutMs: Math.min(Math.max(1e3, Number(execution?.upstreamTimeoutMs) || DEFAULT_UPSTREAM_TIMEOUT_MS), 1e4, remainingMs),
-						requestLifecycle: null
-					});
-					const bodyResult = await readResponseTextWithLimit(seriesResponse.response, 64 * 1024);
-					if (!bodyResult.exceeded) seriesItem = JSON.parse(bodyResult.text || "{}");
-				} catch {
-					seriesItem = {};
-				} finally {
-					try {
-						seriesResponse?.releaseFetchController?.();
-					} catch {}
-				}
-			}
-			return buildMediaAggregationIdentity(item, seriesItem);
-		},
-		buildMediaAggregationInstanceMapKey(primaryDigest = "", nodeName = "", nodeRevision = "") {
-			return `media-aggregation-instance:${hashStableText(`${String(primaryDigest)}:${String(nodeName).toLowerCase()}:${String(nodeRevision)}`)}`;
-		},
-		readMediaAggregationInstance(primaryDigest = "", nodeName = "", nodeRevision = "") {
-			const key = kernel.buildMediaAggregationInstanceMapKey(primaryDigest, nodeName, nodeRevision);
-			const entry = cacheState.MediaAggregationInstanceMap.get(key);
-			if (!entry || Number(entry.expiresAt) <= nowMs()) {
-				if (entry) cacheState.MediaAggregationInstanceMap.delete(key);
-				return null;
-			}
-			touchMapEntry(cacheState.MediaAggregationInstanceMap, key);
-			return entry;
-		},
-		cacheMediaAggregationInstance(primaryDigest = "", nodeName = "", nodeRevision = "", itemId = "", identityHash = "", status = "") {
-			if (!primaryDigest || !nodeName || !nodeRevision || !itemId || !identityHash) return;
-			const key = kernel.buildMediaAggregationInstanceMapKey(primaryDigest, nodeName, nodeRevision);
-			setBoundedMapEntry(cacheState.MediaAggregationInstanceMap, key, {
-				nodeName: String(nodeName).trim().toLowerCase(),
-				itemId: String(itemId).trim(),
-				identityHash: String(identityHash).trim(),
-				status: String(status || "").trim(),
-				expiresAt: nowMs() + MEDIA_AGGREGATION_INSTANCE_MAP_TTL_MS
-			}, MEDIA_AGGREGATION_INSTANCE_MAP_MAX);
-		},
-		async fetchMediaAggregationItemIdentity(execution, node, targetRecord, auth, prefix, itemId) {
-			const itemResult = await kernel.fetchMediaAggregationJson(execution, node, `${prefix}/Items/${encodeURIComponent(String(itemId || ""))}`, new URLSearchParams({
-				Fields: "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd,MediaSources",
-				UserData: "false"
-			}).toString(), {
-				auth,
-				targetRecord,
-				deadlineAt: execution?.mediaAggregationDeadlineAt
-			});
-			if (!itemResult || itemResult.ok === false) return {
-				ok: false,
-				status: itemResult?.status || "network_error",
-				retryable: itemResult?.retryable === true
-			};
-			const item = itemResult?.payload?.Items?.[0] || itemResult?.payload;
-			if (!isPlainObject(item) || !String(item?.Id || itemId || "").trim()) return {
-				ok: false,
-				status: "no_match",
-				retryable: false
-			};
-			let seriesItem = {};
-			const partialIdentity = buildMediaAggregationIdentity(item);
-			if (partialIdentity.type === "episode" && partialIdentity.seriesId) {
-				const seriesResult = await kernel.fetchMediaAggregationJson(execution, node, `${prefix}/Items/${encodeURIComponent(partialIdentity.seriesId)}`, new URLSearchParams({
-					Fields: "ProviderIds,Name,OriginalTitle,ProductionYear",
-					UserData: "false"
-				}).toString(), {
-					auth,
-					targetRecord,
-					deadlineAt: execution?.mediaAggregationDeadlineAt
-				});
-				if (!seriesResult || seriesResult.ok === false) return {
-					ok: false,
-					status: seriesResult?.status || "network_error",
-					retryable: seriesResult?.retryable === true
-				};
-				seriesItem = seriesResult?.payload?.Items?.[0] || seriesResult?.payload || {};
-			}
-			return {
-				ok: true,
-				item,
-				seriesItem,
-				identity: buildMediaAggregationIdentity(item, seriesItem),
-				targetRecord,
-				finalUrl: itemResult.finalUrl
-			};
-		},
-		async queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, params) {
-			const result = await kernel.fetchMediaAggregationJson(execution, node, `${prefix}/Items`, params.toString(), {
-				auth,
-				targetRecord,
-				deadlineAt: execution?.mediaAggregationDeadlineAt
-			});
-			if (!result || result.ok === false) return {
-				ok: false,
-				status: result?.status || "network_error",
-				retryable: result?.retryable === true,
-				items: [],
-				result
-			};
-			return {
-				ok: true,
-				status: "ok",
-				retryable: false,
-				items: Array.isArray(result?.payload?.Items) ? result.payload.Items : [],
-				result
-			};
-		}
-	};
-}
-//#endregion
-//#region worker/features/proxy/playback/aggregation-rewrite-methods.js
-function definePlaybackAggregationRewriteMethods(dependencies = {}, kernel = {}) {
-	const { nodeRepository } = dependencies;
-	return {
-		async findMediaAggregationCandidate(execution, node, targetRecord, auth, prefix, primaryIdentity, matchMode) {
-			const fields = "ProviderIds,Name,OriginalTitle,ProductionYear,SeriesId,SeriesName,ParentIndexNumber,IndexNumber,IndexNumberEnd,MediaSources";
-			const queryByProviderOrTitle = async (identity, itemType, seriesSearch = false) => {
-				const providerIds = seriesSearch ? identity.seriesProviderIds : identity.providerIds;
-				let unsupported = false;
-				const collectedItems = [];
-				let lastResult = null;
-				for (const providerKey of MEDIA_AGGREGATION_STRONG_PROVIDER_KEYS) {
-					if (!providerIds?.[providerKey]) continue;
-					const params = new URLSearchParams({
-						Recursive: "true",
-						IncludeItemTypes: itemType,
-						Fields: fields,
-						AnyProviderIdEquals: `${providerKey}.${providerIds[providerKey]}`,
-						Limit: "10",
-						UserData: "false"
-					});
-					const queried = await kernel.queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, params);
-					if (!queried.ok) {
-						if (queried.status === "query_unsupported") {
-							unsupported = true;
-							break;
-						}
-						return queried;
-					}
-					collectedItems.push(...queried.items);
-					lastResult = queried.result || lastResult;
-				}
-				if (normalizeMediaAggregationMatchMode(matchMode) !== "title_year" && !unsupported) return {
-					ok: true,
-					status: collectedItems.length ? "ok" : "no_match",
-					retryable: false,
-					items: collectedItems,
-					result: lastResult
-				};
-				const searchTerm = String(seriesSearch ? identity.seriesSearchName : identity.searchName).trim();
-				if (!searchTerm) return {
-					ok: true,
-					status: collectedItems.length ? "ok" : unsupported ? "query_unsupported" : "no_match",
-					retryable: false,
-					items: collectedItems,
-					result: lastResult
-				};
-				const titleParams = new URLSearchParams({
-					Recursive: "true",
-					IncludeItemTypes: itemType,
-					Fields: fields,
-					SearchTerm: searchTerm,
-					Limit: "20",
-					UserData: "false"
-				});
-				const titleResult = await kernel.queryMediaAggregationItems(execution, node, targetRecord, auth, prefix, titleParams);
-				if (!titleResult.ok) {
-					if (collectedItems.length) return {
-						ok: true,
-						status: "ok",
-						retryable: false,
-						items: collectedItems,
-						result: lastResult
-					};
-					return titleResult;
-				}
-				return {
-					ok: true,
-					status: collectedItems.length || titleResult.items.length ? "ok" : unsupported ? "query_unsupported" : "no_match",
-					retryable: false,
-					items: [...collectedItems, ...titleResult.items],
-					result: titleResult.result || lastResult
-				};
-			};
-			if (primaryIdentity.type === "episode") {
-				const seriesCandidates = await queryByProviderOrTitle(primaryIdentity, "Series", true);
-				if (!seriesCandidates.ok) return seriesCandidates;
-				for (const seriesItem of seriesCandidates.items) {
-					if (!matchMediaAggregationIdentities(primaryIdentity, buildMediaAggregationIdentity({
-						Type: "Episode",
-						ParentIndexNumber: primaryIdentity.parentIndexNumber,
-						IndexNumber: primaryIdentity.indexNumber,
-						IndexNumberEnd: primaryIdentity.indexNumberEnd,
-						SeriesId: seriesItem?.Id,
-						SeriesName: seriesItem?.Name
-					}, seriesItem), matchMode)) continue;
-					const episodeParams = new URLSearchParams({
-						Season: String(primaryIdentity.parentIndexNumber),
-						Fields: fields,
-						UserData: "false"
-					});
-					const episodesResult = await kernel.fetchMediaAggregationJson(execution, node, `${prefix}/Shows/${encodeURIComponent(String(seriesItem?.Id || ""))}/Episodes`, episodeParams.toString(), {
-						auth,
-						targetRecord,
-						deadlineAt: execution?.mediaAggregationDeadlineAt
-					});
-					if (!episodesResult || episodesResult.ok === false) return {
-						ok: false,
-						status: episodesResult?.status || "network_error",
-						retryable: episodesResult?.retryable === true,
-						items: []
-					};
-					for (const episodeItem of Array.isArray(episodesResult?.payload?.Items) ? episodesResult.payload.Items : []) {
-						const identity = buildMediaAggregationIdentity(episodeItem, seriesItem);
-						const match = matchMediaAggregationIdentities(primaryIdentity, identity, matchMode);
-						if (match) return {
-							ok: true,
-							status: match.status,
-							item: episodeItem,
-							identity,
-							match,
-							queryResult: episodesResult
-						};
-					}
-				}
-				return {
-					ok: true,
-					status: "no_match",
-					retryable: false
-				};
-			}
-			const candidates = await queryByProviderOrTitle(primaryIdentity, primaryIdentity.type === "movie" ? "Movie" : "Series", false);
-			if (!candidates.ok) return candidates;
-			for (const item of candidates.items) {
-				const identity = buildMediaAggregationIdentity(item);
-				const match = matchMediaAggregationIdentities(primaryIdentity, identity, matchMode);
-				if (match) return {
-					ok: true,
-					status: match.status,
-					item,
-					identity,
-					match,
-					queryResult: candidates.result
-				};
-			}
-			return {
-				ok: true,
-				status: candidates.status === "query_unsupported" ? "query_unsupported" : "no_match",
-				retryable: false
-			};
-		},
-		async buildMediaAggregationInjectedSources(execution, backupName, backupNode, targetRecord, auth, prefix, candidate, primaryIdentity) {
-			let sourcePayload = candidate.item;
-			if (!Array.isArray(sourcePayload?.MediaSources) || !sourcePayload.MediaSources.length) {
-				const playbackQuery = new URLSearchParams({
-					UserId: auth.userId || "",
-					AutoOpenLiveStream: "false"
-				}).toString();
-				const playbackResult = await kernel.fetchMediaAggregationJson(execution, backupNode, `${prefix}/Items/${encodeURIComponent(String(candidate.item?.Id || ""))}/PlaybackInfo`, playbackQuery, {
-					auth,
-					targetRecord,
-					deadlineAt: execution?.mediaAggregationDeadlineAt
-				});
-				if (!playbackResult || playbackResult.ok === false) return {
-					ok: false,
-					status: playbackResult?.status || "network_error",
-					retryable: playbackResult?.retryable === true
-				};
-				sourcePayload = playbackResult.payload || sourcePayload;
-				candidate.queryResult = playbackResult;
-			}
-			const sources = Array.isArray(sourcePayload?.MediaSources) ? sourcePayload.MediaSources : [];
-			if (!sources.length) return {
-				ok: true,
-				status: "no_match",
-				sources: []
-			};
-			const identityHash = await buildMediaAggregationMatchFingerprintHash(candidate.match);
-			const backupTargetBase = targetRecord?.targetUrl || candidate.queryResult?.targetRecord?.targetUrl || null;
-			const backupExecution = {
-				...execution,
-				node: backupNode,
-				nodeName: backupName,
-				nodeKey: backupNode.secret || "",
-				entryMode: normalizeNodeEntryMode(backupNode.entryMode),
-				proxyPath: `${prefix}/Items/${encodeURIComponent(String(candidate.item.Id))}/PlaybackInfo`,
-				playbackInfoRewriteUrlMode: "relative",
-				requestUrl: new URL(execution.requestUrl.toString()),
-				rawRequestUrl: new URL(execution.rawRequestUrl?.toString?.() || execution.requestUrl.toString())
-			};
-			const rewritten = kernel.rewritePlaybackInfoPayload(backupExecution, { MediaSources: sources }, backupTargetBase, candidate.queryResult?.finalUrl || backupTargetBase).payload;
-			const injected = [];
-			for (const [index, source] of (Array.isArray(rewritten?.MediaSources) ? rewritten.MediaSources : sources).entries()) {
-				if (!isPlainObject(source)) continue;
-				const sourceId = String(sources[index]?.Id || source?.Id || "").trim();
-				const magicId = await buildMediaAggregationSourceIdV2(execution?.env?.JWT_SECRET, backupName, String(candidate.item.Id), sourceId, identityHash);
-				if (!magicId) continue;
-				injected.push({
-					...source,
-					Id: magicId,
-					Name: `${String(backupNode.displayName || backupName).trim() || backupName} · ${String(source.Name || "版本").trim() || "版本"}`
-				});
-			}
-			return {
-				ok: true,
-				status: candidate.match.status,
-				sources: injected,
-				identityHash
-			};
-		},
-		async aggregateMediaAggregationNode(execution, backupName, primaryIdentity, primaryDigest, prefix, matchMode) {
-			const startedAt = nowMs();
-			const backupNode = await nodeRepository.getNode(backupName, execution.env, execution.ctx);
-			if (!backupNode) return {
-				nodeName: backupName,
-				status: "no_match",
-				sources: [],
-				elapsedMs: nowMs() - startedAt
-			};
-			const nodeRevision = buildNodeDerivedCacheRevision(backupName, backupNode);
-			const mapped = kernel.readMediaAggregationInstance(primaryDigest, backupName, nodeRevision);
-			const { targetRecords } = kernel.parseTargetRecords(backupNode, execution?.finalOrigin || "*");
-			let lastStatus = "network_error";
-			for (const targetRecord of targetRecords) {
-				const nodeExecution = {
-					...execution,
-					mediaAggregationLastAuthStatus: ""
-				};
-				const auth = await kernel.getMediaAggregationAuth(nodeExecution, backupName, backupNode, prefix, targetRecord);
-				if (!auth) {
-					lastStatus = nodeExecution.mediaAggregationLastAuthStatus || "auth_failed";
-					continue;
-				}
-				let candidate = null;
-				if (mapped?.itemId) {
-					const mappedItem = await kernel.fetchMediaAggregationItemIdentity(nodeExecution, backupNode, targetRecord, auth, prefix, mapped.itemId);
-					if (mappedItem.ok) {
-						const match = matchMediaAggregationIdentities(primaryIdentity, mappedItem.identity, matchMode);
-						if (match) candidate = {
-							item: mappedItem.item,
-							identity: mappedItem.identity,
-							match,
-							queryResult: mappedItem
-						};
-						else cacheState.MediaAggregationInstanceMap.delete(kernel.buildMediaAggregationInstanceMapKey(primaryDigest, backupName, nodeRevision));
-					} else if (mappedItem.retryable) {
-						lastStatus = mappedItem.status;
-						continue;
-					} else cacheState.MediaAggregationInstanceMap.delete(kernel.buildMediaAggregationInstanceMapKey(primaryDigest, backupName, nodeRevision));
-				}
-				if (!candidate) {
-					const found = await kernel.findMediaAggregationCandidate(nodeExecution, backupNode, targetRecord, auth, prefix, primaryIdentity, matchMode);
-					if (!found.ok) {
-						lastStatus = found.status || "network_error";
-						if (found.retryable) continue;
-						return {
-							nodeName: backupName,
-							status: lastStatus,
-							sources: [],
-							elapsedMs: nowMs() - startedAt
-						};
-					}
-					if (!found.item || !found.match) return {
-						nodeName: backupName,
-						status: found.status || "no_match",
-						sources: [],
-						elapsedMs: nowMs() - startedAt
-					};
-					candidate = found;
-				}
-				const built = await kernel.buildMediaAggregationInjectedSources(nodeExecution, backupName, backupNode, targetRecord, auth, prefix, candidate, primaryIdentity);
-				if (!built.ok) {
-					lastStatus = built.status || "network_error";
-					if (built.retryable) continue;
-					return {
-						nodeName: backupName,
-						status: lastStatus,
-						sources: [],
-						elapsedMs: nowMs() - startedAt
-					};
-				}
-				if (!built.sources.length) return {
-					nodeName: backupName,
-					status: "no_match",
-					sources: [],
-					elapsedMs: nowMs() - startedAt
-				};
-				kernel.cacheMediaAggregationInstance(primaryDigest, backupName, nodeRevision, candidate.item.Id, built.identityHash, built.status);
-				return {
-					nodeName: backupName,
-					status: built.status,
-					itemId: String(candidate.item.Id),
-					identityHash: built.identityHash,
-					sources: built.sources,
-					elapsedMs: nowMs() - startedAt,
-					cacheHit: !!mapped
-				};
-			}
-			return {
-				nodeName: backupName,
-				status: lastStatus,
-				sources: [],
-				elapsedMs: nowMs() - startedAt
-			};
-		},
-		async collectMediaAggregationResults(tasks, options = {}) {
-			const settled = [];
-			let resolveFirstMatch;
-			const firstMatch = new Promise((resolve) => {
-				resolveFirstMatch = resolve;
-			});
-			const wrapped = tasks.map((task, index) => Promise.resolve().then(task).catch(() => ({
-				nodeName: String(options.nodeNames?.[index] || ""),
-				status: "network_error",
-				sources: []
-			})).then((result) => {
-				settled.push(result);
-				if (Array.isArray(result?.sources) && result.sources.length) resolveFirstMatch(result);
-				return result;
-			}));
-			const all = Promise.all(wrapped);
-			const raceWithTimeout = async (promises, timeoutMs) => {
-				let timeoutId;
-				try {
-					return await Promise.race([...promises, new Promise((resolve) => {
-						timeoutId = setTimeout(resolve, Math.max(0, Number(timeoutMs) || 0), "timeout");
-					})]);
-				} finally {
-					if (timeoutId !== void 0) clearTimeout(timeoutId);
-				}
-			};
-			if (await raceWithTimeout([firstMatch.then(() => "matched"), all.then(() => "all")], options.firstResultTimeoutMs) === "matched" && settled.length < wrapped.length && Number(options.gracePeriodMs) > 0) await raceWithTimeout([all], options.gracePeriodMs);
-			const foregroundResults = settled.slice();
-			const pendingCount = Math.max(0, wrapped.length - foregroundResults.length);
-			if (pendingCount > 0 && options.ctx?.waitUntil) {
-				const remainingMs = Math.max(0, Number(options.hardDeadlineAt) - nowMs());
-				options.ctx.waitUntil(raceWithTimeout([all], remainingMs).catch(() => {}));
-			}
-			return {
-				foregroundResults,
-				pendingCount
-			};
-		},
-		async aggregateMediaSources(execution, payload, upstreamState) {
-			const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
-			const currentName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (selectedNames.length < 2 || !selectedNames.includes(currentName)) return {
-				payload,
-				state: "disabled"
-			};
-			const foregroundStartedAt = nowMs();
-			const matchMode = normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode);
-			const primaryIdentity = await kernel.resolveMediaAggregationPrimaryIdentity(execution, payload, upstreamState);
-			const hasStrongIdentity = primaryIdentity.type === "episode" ? Object.keys(primaryIdentity.seriesProviderIds || {}).length > 0 : Object.keys(primaryIdentity.providerIds || {}).length > 0;
-			const hasTitleIdentity = primaryIdentity.type === "episode" ? !!(primaryIdentity.seriesName && primaryIdentity.seriesProductionYear !== null) : !!(primaryIdentity.name && primaryIdentity.productionYear !== null);
-			if (!MEDIA_AGGREGATION_SUPPORTED_TYPES.has(primaryIdentity.type) || !hasStrongIdentity && !(matchMode === "title_year" && hasTitleIdentity)) {
-				execution.mediaAggregationDiagnostic = {
-					status: "primary_identity_missing",
-					matchMode,
-					attemptedNodes: 0,
-					matchedNodes: 0,
-					pendingNodes: 0,
-					foregroundElapsedMs: nowMs() - foregroundStartedAt,
-					nodes: []
-				};
-				execution.mediaAggregationCacheable = false;
-				return {
-					payload,
-					state: "primary_identity_missing"
-				};
-			}
-			const backupNames = selectedNames.filter((name) => name !== currentName).slice(0, MEDIA_AGGREGATION_BACKUP_MAX);
-			const prefix = resolveMediaAggregationApiPrefix(execution?.proxyPath || "");
-			const primaryDigest = await buildMediaAggregationIdentityDigest(primaryIdentity);
-			const hardDeadlineAt = nowMs() + 1e4;
-			execution.mediaAggregationDeadlineAt = hardDeadlineAt;
-			const firstResultTimeoutMs = clampIntegerConfig(execution?.currentConfig?.mediaAggregationFirstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 1e4);
-			const gracePeriodMs = clampIntegerConfig(execution?.currentConfig?.mediaAggregationGracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5e3);
-			const collected = await kernel.collectMediaAggregationResults(backupNames.map((backupName) => () => kernel.aggregateMediaAggregationNode(execution, backupName, primaryIdentity, primaryDigest, prefix, matchMode)), {
-				nodeNames: backupNames,
-				firstResultTimeoutMs,
-				gracePeriodMs,
-				hardDeadlineAt,
-				ctx: execution?.ctx
-			});
-			const resultByNode = new Map(collected.foregroundResults.map((result) => [String(result?.nodeName || "").toLowerCase(), result]));
-			const nodeDiagnostics = backupNames.map((nodeName) => {
-				const result = resultByNode.get(nodeName);
-				return result ? {
-					nodeName,
-					status: String(result.status || "no_match"),
-					elapsedMs: Math.max(0, Math.round(Number(result.elapsedMs) || 0)),
-					cacheHit: result.cacheHit === true
-				} : {
-					nodeName,
-					status: "timeout",
-					elapsedMs: nowMs() - foregroundStartedAt,
-					pending: true
-				};
-			});
-			const injectedSources = [];
-			const dedupe = /* @__PURE__ */ new Set();
-			for (const result of collected.foregroundResults) for (const source of Array.isArray(result?.sources) ? result.sources : []) {
-				const parsed = parseMediaAggregationSourceId(source?.Id);
-				const key = `${parsed?.nodeName || result.nodeName}:${parsed?.itemId || result.itemId}:${parsed?.mediaSourceId || source?.Id || ""}`;
-				if (dedupe.has(key)) continue;
-				dedupe.add(key);
-				injectedSources.push(source);
-			}
-			const failureStatuses = /* @__PURE__ */ new Set([
-				"auth_failed",
-				"query_unsupported",
-				"response_too_large",
-				"timeout",
-				"network_error",
-				"invalid_json"
-			]);
-			const hasFailure = nodeDiagnostics.some((node) => failureStatuses.has(node.status));
-			const overallStatus = injectedSources.length ? collected.pendingCount > 0 || hasFailure ? "applied_partial" : "applied_complete" : collected.pendingCount > 0 ? "background_pending" : hasFailure ? "all_failed" : "no_match";
-			execution.mediaAggregationDiagnostic = {
-				status: overallStatus,
-				matchMode,
-				attemptedNodes: backupNames.length,
-				matchedNodes: collected.foregroundResults.filter((result) => Array.isArray(result?.sources) && result.sources.length).length,
-				pendingNodes: collected.pendingCount,
-				foregroundElapsedMs: nowMs() - foregroundStartedAt,
-				firstResultTimeoutMs,
-				gracePeriodMs,
-				nodes: nodeDiagnostics
-			};
-			execution.mediaAggregationCacheable = collected.pendingCount === 0 && !hasFailure;
-			if (!injectedSources.length) return {
-				payload,
-				state: overallStatus === "no_match" ? "no_backup_match" : overallStatus
-			};
-			return {
-				payload: {
-					...payload,
-					MediaSources: [...Array.isArray(payload.MediaSources) ? payload.MediaSources : [], ...injectedSources]
-				},
-				state: "applied",
-				count: injectedSources.length
-			};
-		},
-		async maybeRewritePlaybackInfoResponse(execution, upstreamState) {
-			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
-			const rewriteEnabled = normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) === "rewrite";
-			const bypassState = rewriteEnabled ? "not_needed" : "passthrough";
-			const response = upstreamState?.response;
-			kernel.recordServerRecordPlaybackInfoIntent(execution, null, Number(response?.status) || 0);
-			if (!response || !(response.status >= 200 && response.status < 300)) {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			if (execution.requestMethod === "HEAD") {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			if (!String(response.headers.get("Content-Type") || "").toLowerCase().includes("json")) {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			const declaredBodyBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
-			if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES) {
-				execution.playbackInfoCacheBodyResolved = true;
-				execution.playbackInfoCacheBody = null;
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			const bodyResult = await readResponseTextWithLimit(response.clone(), DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES);
-			execution.playbackInfoCacheBodyResolved = true;
-			execution.playbackInfoCacheBody = null;
-			if (bodyResult.exceeded) {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-			const bodyText = bodyResult.text;
-			try {
-				const parsedPayload = JSON.parse(bodyText);
-				kernel.observeServerRecordPlaybackInfoPayload(execution, parsedPayload);
-				if (!rewriteEnabled) {
-					const sanitizedResult = kernel.sanitizePlaybackInfoMediaSourcesPayload(parsedPayload);
-					if (sanitizedResult.rewriteState !== "applied") {
-						execution.playbackInfoRewrite = "passthrough";
-						execution.playbackInfoCacheBody = {
-							text: bodyText,
-							bytes: bodyResult.bytes
-						};
-						return upstreamState;
-					}
-					const serializedBodyText = JSON.stringify(sanitizedResult.payload);
-					const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
-					execution.playbackInfoRewrite = "applied";
-					execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES ? {
-						text: serializedBodyText,
-						bytes: serializedBodyBytes
-					} : null;
-					const responseHeaders = kernel.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
-					try {
-						Promise.resolve(response.body?.cancel?.()).catch(() => {});
-					} catch {}
-					return {
-						...upstreamState,
-						response: new Response(serializedBodyText, {
-							status: response.status,
-							statusText: response.statusText,
-							headers: responseHeaders
-						})
-					};
-				}
-				const responseBaseUrl = upstreamState?.finalUrl || (() => {
-					const fallbackUrl = upstreamState?.activeTargetBase instanceof URL ? buildUpstreamProxyUrl(upstreamState.activeTargetBase, execution?.proxyPath || "/") : null;
-					if (fallbackUrl) fallbackUrl.search = String(execution?.requestUrl?.search || "");
-					return fallbackUrl;
-				})() || new URL(String(execution?.requestUrl || execution?.rawRequestUrl || ""));
-				const rewriteResult = kernel.rewritePlaybackInfoPayload(execution, parsedPayload, upstreamState?.activeTargetBase, responseBaseUrl);
-				let routedPayload = rewriteResult.payload;
-				if (execution?.mediaAggregationRouted === true && execution?.mediaAggregationSource && Array.isArray(routedPayload?.MediaSources)) {
-					const routedSource = execution.mediaAggregationSource;
-					routedPayload = {
-						...routedPayload,
-						MediaSources: await Promise.all(routedPayload.MediaSources.map(async (source) => {
-							if (!isPlainObject(source)) return source;
-							const rawId = String(source.Id || "").trim();
-							const sourceId = parseMediaAggregationSourceId(rawId)?.mediaSourceId || rawId;
-							const magicId = await buildMediaAggregationSourceIdV2(execution?.env?.JWT_SECRET, routedSource.nodeName, routedSource.itemId, sourceId, routedSource.identityHash);
-							return magicId ? {
-								...source,
-								Id: magicId
-							} : source;
-						}))
-					};
-				}
-				const aggregationResult = execution?.mediaAggregationRouted === true ? {
-					payload: routedPayload,
-					state: "routed_playback"
-				} : await kernel.aggregateMediaSources(execution, routedPayload, upstreamState);
-				execution.mediaAggregationState = aggregationResult.state;
-				execution.playbackInfoRewrite = rewriteResult.rewriteState === "applied" || aggregationResult.state === "applied" ? "applied" : rewriteResult.rewriteState;
-				if (execution.playbackInfoRewrite !== "applied") {
-					execution.playbackInfoCacheBody = {
-						text: bodyText,
-						bytes: bodyResult.bytes
-					};
-					return upstreamState;
-				}
-				const serializedBodyText = JSON.stringify(aggregationResult.payload);
-				const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
-				execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES ? {
-					text: serializedBodyText,
-					bytes: serializedBodyBytes
-				} : null;
-				const responseHeaders = kernel.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
-				try {
-					Promise.resolve(response.body?.cancel?.()).catch(() => {});
-				} catch {}
-				return {
-					...upstreamState,
-					response: new Response(serializedBodyText, {
-						status: response.status,
-						statusText: response.statusText,
-						headers: responseHeaders
-					})
-				};
-			} catch {
-				execution.playbackInfoRewrite = bypassState;
-				return upstreamState;
-			}
-		}
-	};
-}
-//#endregion
-//#region worker/features/proxy/playback/aggregation-methods.js
-function defineProxyPlaybackMethods(dependencies = {}, kernel = {}) {
-	return {
-		...definePlaybackAggregationAuthMethods(dependencies, kernel),
-		...definePlaybackAggregationRewriteMethods(dependencies, kernel)
 	};
 }
 //#endregion
@@ -22629,34 +19128,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				cookie: cookieHeader ? hashStableText(cookieHeader) : ""
 			}));
 		},
-		async prepareMediaAggregationPlaybackInfoCacheRevision(execution) {
-			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
-			const selectedNames = normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []);
-			const currentName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (selectedNames.length < 2 || !selectedNames.includes(currentName)) {
-				execution.mediaAggregationPoolRevision = "disabled";
-				return execution.mediaAggregationPoolRevision;
-			}
-			let summaries = [];
-			try {
-				summaries = await CacheManager.getNodesList(execution.env, execution.ctx);
-			} catch {
-				summaries = [];
-			}
-			const summaryByName = new Map((Array.isArray(summaries) ? summaries : []).map((summary) => [String(summary?.name || "").trim().toLowerCase(), summary]));
-			execution.mediaAggregationPoolRevision = hashStableText(serializeConfigValue({
-				revision: "media-aggregation-v2",
-				matchMode: normalizeMediaAggregationMatchMode(execution?.currentConfig?.mediaAggregationMatchMode),
-				firstResultTimeoutMs: clampIntegerConfig(execution?.currentConfig?.mediaAggregationFirstResultTimeoutMs, Config.Defaults.MediaAggregationFirstResultTimeoutMs, 100, 1e4),
-				gracePeriodMs: clampIntegerConfig(execution?.currentConfig?.mediaAggregationGracePeriodMs, Config.Defaults.MediaAggregationGracePeriodMs, 0, 5e3),
-				nodes: selectedNames.map((name) => ({
-					name,
-					cacheRevision: String(summaryByName.get(name)?.cacheRevision || "missing")
-				}))
-			}));
-			return execution.mediaAggregationPoolRevision;
-		},
-		buildPlaybackInfoCacheKey(execution, transport = null) {
+				buildPlaybackInfoCacheKey(execution, transport = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
 			if (execution.playbackInfoCacheEnabled !== true || Number(execution.playbackInfoCacheTtlSec) <= 0) {
 				execution.playbackInfoCacheState = "skip";
@@ -22673,27 +19145,19 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			const cacheKey = `playback-info:${hashStableText(serializeConfigValue({
 				nodeName: String(execution?.nodeName || "").trim(),
 				nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
-				mediaAggregationNodes: normalizeNodeNameList(execution?.currentConfig?.mediaAggregationNodes || []),
-				requestMethod,
+								requestMethod,
 				proxyPath: String(execution?.proxyPath || "").trim(),
 				query: String(execution?.requestUrl?.search || "").trim(),
 				bodyHash: bodyText ? hashStableText(bodyText) : "",
 				authHash: kernel.buildPlaybackInfoAuthSignature(execution, transport),
 				playbackInfoMode: normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode),
 				playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative"),
-				mediaAggregationAuthIdentity: hashStableText(`${String(execution?.currentConfig?.mediaAggregationEmbyUsername || "")}:${String(execution?.currentConfig?.mediaAggregationEmbyPassword || "")}`),
-				mediaAggregationPoolRevision: String(execution?.mediaAggregationPoolRevision || "unprepared"),
-				mediaAggregationRouted: execution?.mediaAggregationRouted === true
-			}))}`;
+															}))}`;
 			execution.playbackInfoCacheKey = cacheKey;
 			return cacheKey;
 		},
 		async storePlaybackInfoResponseCache(execution, response, transport = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return false;
-			if (execution?.mediaAggregationCacheable === false) {
-				execution.playbackInfoCacheState = "skip_partial_aggregation";
-				return false;
-			}
 			const cacheKey = execution.playbackInfoCacheKey || kernel.buildPlaybackInfoCacheKey(execution, transport);
 			if (!cacheKey) return false;
 			if (!response || !(response.status >= 200 && response.status < 300)) return false;
@@ -22720,8 +19184,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				nodeName: String(execution?.nodeName || "").trim().toLowerCase(),
 				nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
 				playbackInfoRewrite: String(execution?.playbackInfoRewrite || "").trim(),
-				mediaAggregationDiagnostic: execution?.mediaAggregationDiagnostic && typeof execution.mediaAggregationDiagnostic === "object" ? execution.mediaAggregationDiagnostic : null,
-				status: response.status,
+								status: response.status,
 				statusText: response.statusText,
 				headers: [...responseHeaders.entries()],
 				bodyText,
@@ -22752,11 +19215,6 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			cache.set(cacheKey, cacheEntry);
 			execution.playbackInfoCacheState = "hit";
 			execution.playbackInfoRewrite = String(cacheEntry?.playbackInfoRewrite || execution?.playbackInfoRewrite || "").trim();
-			execution.mediaAggregationDiagnostic = cacheEntry?.mediaAggregationDiagnostic && typeof cacheEntry.mediaAggregationDiagnostic === "object" ? cacheEntry.mediaAggregationDiagnostic : execution.mediaAggregationDiagnostic;
-			kernel.recordServerRecordPlaybackInfoIntent(execution, transport, Number(cacheEntry.status) || 200);
-			try {
-				kernel.observeServerRecordPlaybackInfoPayload(execution, JSON.parse(String(cacheEntry.bodyText || "{}")));
-			} catch {}
 			const cachedResponse = new Response(execution.requestMethod === "HEAD" ? null : String(cacheEntry.bodyText || ""), {
 				status: Number(cacheEntry.status) || 200,
 				statusText: String(cacheEntry.statusText || ""),
@@ -22791,9 +19249,8 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 	};
 }
 //#endregion
-//#region worker/features/proxy/playback/watch-lifecycle-methods.js
-function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
-	const { CacheManager, watchRepository } = dependencies;
+//#region worker/features/proxy/playback/session-control-methods.js
+function definePlaybackSessionControlMethods(dependencies = {}, kernel = {}) {
 	return {
 		parsePlaybackSessionControlPayload(execution, transport = null) {
 			if (execution?.playbackSessionControlPayload) return execution.playbackSessionControlPayload;
@@ -22886,7 +19343,7 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 				sessionIdentity = `device:${deviceId}`;
 			} else {
 				const requestHeaders = execution?.request?.headers;
-				sessionKey = `fallback:${hashServerWatchFingerprint([
+				sessionKey = `fallback:${hashPlaybackSessionFingerprint([
 					requestHeaders?.get?.("Authorization"),
 					requestHeaders?.get?.("X-Emby-Token"),
 					requestHeaders?.get?.("X-MediaBrowser-Token"),
@@ -22897,376 +19354,16 @@ function definePlaybackWatchLifecycleMethods(dependencies = {}, kernel = {}) {
 				].map((value) => String(value || "").trim()).join("|"))}`;
 				sessionIdentity = sessionKey;
 			}
-			const sessionIdentityFingerprint = hashServerWatchFingerprint(`${nodeName}|${sessionIdentity}`);
+			const sessionIdentityFingerprint = hashPlaybackSessionFingerprint(`${nodeName}|${sessionIdentity}`);
 			return {
 				sessionKey: `${nodeName}|${sessionKey}`,
 				sessionIdentityFingerprint,
-				sessionFingerprint: hashServerWatchFingerprint(`${sessionIdentityFingerprint}|${itemId}`),
+				sessionFingerprint: hashPlaybackSessionFingerprint(`${sessionIdentityFingerprint}|${itemId}`),
 				sessionStrength,
 				itemId,
 				parseError: parsedPayload.parseError === true
 			};
 		},
-		resolveServerLastWatchMedia(execution, transport = null) {
-			const parsedPayload = kernel.parsePlaybackSessionControlPayload(execution, transport);
-			const rawItem = getCaseInsensitivePayloadValue(parsedPayload.body, ["Item"]);
-			const item = normalizeCaseInsensitiveObject(isPlainObject(rawItem) ? rawItem : {});
-			const pickTopLevel = (names) => {
-				const fromQuery = getCaseInsensitivePayloadValue(parsedPayload.query, names);
-				if (String(fromQuery || "").trim()) return fromQuery;
-				return getCaseInsensitivePayloadValue(parsedPayload.body, names);
-			};
-			const itemId = String(pickTopLevel(["ItemId"]) || getCaseInsensitivePayloadValue(item, ["Id"]) || "").trim().slice(0, 256);
-			const itemType = String(getCaseInsensitivePayloadValue(item, ["Type"]) || pickTopLevel(["ItemType"]) || "").trim().slice(0, 64);
-			const posterSearch = buildServerRecordPosterMetadata({
-				...item,
-				Type: itemType
-			});
-			return {
-				itemId,
-				itemName: String(getCaseInsensitivePayloadValue(item, ["Name"]) || pickTopLevel(["ItemName", "Name"]) || "").trim().slice(0, 256),
-				itemType,
-				seriesName: String(getCaseInsensitivePayloadValue(item, ["SeriesName"]) || pickTopLevel(["SeriesName"]) || "").trim().slice(0, 256),
-				originalTitle: String(posterSearch?.originalTitle || ""),
-				year: posterSearch?.productionYear ?? null,
-				imageTag: readServerRecordPrimaryImageTag(item)
-			};
-		},
-		resolveServerRecordPlaybackContextKeys(execution, transport = null) {
-			const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (!nodeName) return [];
-			const parsedPayload = kernel.parsePlaybackSessionControlPayload(execution, transport);
-			const pick = (names) => {
-				const fromQuery = getCaseInsensitivePayloadValue(parsedPayload.query, names);
-				if (String(fromQuery || "").trim()) return String(fromQuery).trim();
-				const fromBody = getCaseInsensitivePayloadValue(parsedPayload.body, names);
-				return String(fromBody || "").trim();
-			};
-			const requestHeaders = execution?.request?.headers;
-			const deviceId = pick(["DeviceId"]) || String(requestHeaders?.get?.("X-Emby-Device-Id") || requestHeaders?.get?.("X-Emby-DeviceId") || "").trim();
-			const identities = [
-				["session", pick(["SessionId"])],
-				["play", pick(["PlaySessionId", "CurrentPlaySessionId"])],
-				["device", deviceId]
-			];
-			const keys = /* @__PURE__ */ new Set();
-			for (const [kind, value] of identities) {
-				if (!value) continue;
-				keys.add(`${nodeName}|${kind}:${hashServerWatchFingerprint(value)}`);
-			}
-			return [...keys];
-		},
-		cleanupServerRecordPlaybackContexts(now = nowMs()) {
-			const contexts = cacheState.ServerRecordPlaybackContexts;
-			if (!(contexts instanceof Map)) return;
-			for (const [contextKey, entry] of contexts.entries()) if ((Number(entry?.expiresAt) || 0) <= now) contexts.delete(contextKey);
-		},
-		updateServerRecordPlaybackContexts(execution, transport, update) {
-			const contextKeys = kernel.resolveServerRecordPlaybackContextKeys(execution, transport);
-			if (!contextKeys.length || typeof update !== "function") return false;
-			const contexts = cacheState.ServerRecordPlaybackContexts;
-			if (!(contexts instanceof Map)) return false;
-			const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
-			const now = nowMs();
-			kernel.cleanupServerRecordPlaybackContexts(now);
-			const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
-			for (const contextKey of contextKeys) {
-				const existing = contexts.get(contextKey);
-				const next = update(existing && Number(existing.expiresAt) > now ? existing : null, now, nodeName);
-				if (!next || typeof next !== "object") continue;
-				setBoundedMapEntry(contexts, contextKey, {
-					...next,
-					nodeName,
-					lastSeenAt: now,
-					expiresAt: now + SERVER_RECORD_PLAYBACK_CONTEXT_TTL_MS
-				}, maxEntries);
-			}
-			return true;
-		},
-		recordServerRecordPlaybackInfoIntent(execution, transport = null, responseStatus = 200) {
-			const status = Number(responseStatus) || 0;
-			if (execution?.requestTraits?.isPlaybackInfoRequest !== true || String(execution?.requestMethod || "").toUpperCase() !== "POST" || status < 200 || status >= 300 || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
-			const isPlayback = [...execution?.requestUrl?.searchParams?.entries?.() || []].some(([key, value]) => String(key || "").trim().toLowerCase() === "isplayback" && String(value || "").trim().toLowerCase() === "true");
-			if (!isPlayback || !String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim()) return false;
-			execution.serverRecordPlaybackInfoIntent = {
-				observedAt: nowMs()
-			};
-			return kernel.updateServerRecordPlaybackContexts(execution, transport, (existing, now) => {
-				const details = existing?.details || null;
-				return {
-					intent: {
-						observedAt: now
-					},
-					details,
-					verifiedMedia: details?.media || null
-				};
-			});
-		},
-		buildServerRecordPlaybackContextMedia(payload, expectedItemId = "") {
-			return buildServerRecordMediaMetadata(payload, expectedItemId);
-		},
-		buildServerRecordPlaybackInfoMedia(payload, expectedItemId = "") {
-			return buildServerRecordMediaMetadata(payload, expectedItemId, { allowMissingItemId: true });
-		},
-		observeServerRecordPlaybackInfoPayload(execution, payload = {}) {
-			if (!execution?.serverRecordPlaybackInfoIntent || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
-			const itemId = String(extractPlaybackInfoItemPathState(execution?.proxyPath || "").itemId || "").trim().slice(0, 256);
-			const media = kernel.buildServerRecordPlaybackInfoMedia(payload, itemId);
-			if (!media?.itemName || !kernel.recordServerRecordPlaybackItemDetails(execution, media, "playback_info")) return false;
-			const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
-			if (verification?.source !== "playback_info") return false;
-			return kernel.scheduleObservedServerRecordWatch(execution, verification.media, "playback_info");
-		},
-		recordServerRecordPlaybackItemDetails(execution, media = {}, source = "item_details") {
-			const itemId = String(media?.itemId || "").trim().slice(0, 256);
-			if (!itemId || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
-			const normalizedSource = source === "playback_info" ? "playback_info" : "item_details";
-			return kernel.updateServerRecordPlaybackContexts(execution, null, (existing, now) => {
-				const existingDetails = existing?.details && String(existing.details.itemId || "") === itemId ? existing.details : null;
-				const details = existingDetails?.source === "item_details" && normalizedSource === "playback_info" ? existingDetails : {
-					itemId,
-					media: { ...media },
-					source: normalizedSource,
-					observedAt: now
-				};
-				const intent = existing?.intent || null;
-				return {
-					intent,
-					details,
-					verifiedMedia: normalizedSource === "item_details" || intent ? details.media : null
-				};
-			});
-		},
-		getServerRecordPlaybackContextVerification(execution, expectedItemId = "") {
-			const contexts = cacheState.ServerRecordPlaybackContexts;
-			if (!(contexts instanceof Map)) return null;
-			const now = nowMs();
-			kernel.cleanupServerRecordPlaybackContexts(now);
-			const expected = String(expectedItemId || "").trim();
-			for (const contextKey of kernel.resolveServerRecordPlaybackContextKeys(execution, null)) {
-				const context = contexts.get(contextKey);
-				const media = context?.verifiedMedia;
-				const intentObservedAt = Number(context?.intent?.observedAt) || 0;
-				const source = String(context?.details?.source || "").trim();
-				if (!media || source === "playback_info" && !intentObservedAt || expected && String(media.itemId || "") !== expected) continue;
-				touchMapEntry(contexts, contextKey);
-				return {
-					media: { ...media },
-					intentObservedAt,
-					source
-				};
-			}
-			return null;
-		},
-		async persistObservedServerRecordWatch(execution, media = {}, source = "item_details") {
-			const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
-			const itemId = String(media?.itemId || "").trim().slice(0, 256);
-			const db = watchRepository.getDB(execution?.env);
-			if (!db || !nodeName || !itemId) return false;
-			const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
-			if (!verification || verification.source !== source) return false;
-			const requestStartedAt = Number(execution?.startTime);
-			const watchedAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
-			return await watchRepository.upsertServerLastWatch(db, nodeName, new Date(watchedAtMs).toISOString(), media);
-		},
-		scheduleObservedServerRecordWatch(execution, media = {}, source = "item_details") {
-			if (!execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
-			const task = kernel.persistObservedServerRecordWatch(execution, media, source).catch((error) => {
-				console.error("server record observed media write failed", error);
-				return false;
-			});
-			execution.ctx.waitUntil(task);
-			return true;
-		},
-		observeServerRecordPlaybackItemDetails(execution, response) {
-			if (String(execution?.requestMethod || "").toUpperCase() !== "GET" || normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true || !(Number(response?.status) >= 200 && Number(response?.status) < 300) || !String(response?.headers?.get?.("Content-Type") || "").toLowerCase().includes("json") || !execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
-			const pathState = extractUserItemDetailsPathState(execution?.proxyPath || "");
-			const itemId = String(pathState.itemId || "").trim();
-			const requestUrl = execution?.requestUrl instanceof URL ? execution.requestUrl : null;
-			const queryValue = (name) => {
-				for (const [key, value] of requestUrl?.searchParams?.entries?.() || []) if (String(key || "").trim().toLowerCase() === name.toLowerCase()) return String(value || "").trim();
-				return "";
-			};
-			const listHas = (value, required) => new Set(String(value || "").split(",").map((part) => part.trim().toLowerCase()).filter(Boolean)).has(required.toLowerCase());
-			const requestHeaders = execution?.request?.headers;
-			const hasAuthorization = ["Authorization", "X-Emby-Token", "X-MediaBrowser-Token"].some((name) => String(requestHeaders?.get?.(name) || "").trim());
-			const hasExpectedQuery = listHas(queryValue("EnableImageTypes"), "Primary") && queryValue("ImageTypeLimit") === "1" && listHas(queryValue("Fields"), "ProviderIds") && listHas(queryValue("Fields"), "ExternalUrls");
-			if (!pathState.userId || !itemId || !hasAuthorization || !hasExpectedQuery || !kernel.resolveServerRecordPlaybackContextKeys(execution).length) return false;
-			let responseCopy;
-			try {
-				responseCopy = response.clone();
-			} catch {
-				return false;
-			}
-			const task = readResponseTextWithLimit(responseCopy, DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES).then(async (body) => {
-				if (body.exceeded || !body.text.trim()) return false;
-				let payload;
-				try {
-					payload = JSON.parse(body.text);
-				} catch {
-					return false;
-				}
-				const media = kernel.buildServerRecordPlaybackContextMedia(payload, itemId);
-				if (!media || !kernel.recordServerRecordPlaybackItemDetails(execution, media, "item_details")) return false;
-				const verification = kernel.getServerRecordPlaybackContextVerification(execution, itemId);
-				return verification?.source === "item_details" ? await kernel.persistObservedServerRecordWatch(execution, verification.media, "item_details") : false;
-			}).catch(() => false);
-			execution.ctx.waitUntil(task);
-			return true;
-		},
-		getServerRecordPlaybackContextMedia(execution, transport = null, expectedItemId = "") {
-			if (!transport) return kernel.getServerRecordPlaybackContextVerification(execution, expectedItemId)?.media || null;
-			const contexts = cacheState.ServerRecordPlaybackContexts;
-			if (!(contexts instanceof Map)) return null;
-			const now = nowMs();
-			kernel.cleanupServerRecordPlaybackContexts(now);
-			const expected = String(expectedItemId || "").trim();
-			for (const contextKey of kernel.resolveServerRecordPlaybackContextKeys(execution, transport)) {
-				const media = contexts.get(contextKey)?.verifiedMedia;
-				if (!media || expected && String(media.itemId || "") !== expected) continue;
-				touchMapEntry(contexts, contextKey);
-				return { ...media };
-			}
-			return null;
-		},
-		mergeServerWatchMedia(primary = {}, fallback = {}) {
-			const current = isPlainObject(primary) ? primary : {};
-			const previous = isPlainObject(fallback) ? fallback : {};
-			const currentItemId = String(current.itemId || "").trim();
-			const previousItemId = String(previous.itemId || "").trim();
-			if (currentItemId && previousItemId && currentItemId !== previousItemId) return { ...current };
-			const pick = (key) => String(current[key] || previous[key] || "").trim();
-			return {
-				itemId: pick("itemId"),
-				itemName: pick("itemName"),
-				itemType: pick("itemType"),
-				seriesName: pick("seriesName"),
-				originalTitle: pick("originalTitle"),
-				year: normalizeServerRecordPosterYear(current.year ?? previous.year),
-				imageTag: pick("imageTag")
-			};
-		},
-		cleanupServerRecordWatchSessions(now = nowMs()) {
-			const sessions = cacheState.ServerRecordWatchSessions;
-			if (!(sessions instanceof Map)) return;
-			for (const [sessionKey, entry] of sessions.entries()) {
-				const terminalUntil = Number(entry?.terminalUntil) || 0;
-				const lastSeenAt = Number(entry?.lastSeenAt || entry?.firstSeenAt) || 0;
-				if (terminalUntil > 0 && terminalUntil < now || terminalUntil <= 0 && lastSeenAt > 0 && lastSeenAt + 18e5 <= now) sessions.delete(sessionKey);
-			}
-			const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
-			while (sessions.size > maxEntries) sessions.delete(sessions.keys().next().value);
-		},
-		scheduleServerWatchLifecycle(execution, transport = null) {
-			const traits = execution?.requestTraits || {};
-			const phase = traits.isPlaybackStoppedRequest === true ? "stopped" : traits.isPlaybackStartedRequest === true ? "started" : traits.isPlaybackProgressRequest === true ? "progress" : "";
-			if (!phase) return false;
-			if (String(execution?.requestMethod || "").toUpperCase() !== "POST") return false;
-			if (normalizeServerRecordSettings(execution?.node?.serverRecord).enabled !== true) return false;
-			const db = watchRepository.getDB(execution?.env);
-			const parsedPayload = kernel.parsePlaybackSessionControlPayload(execution, transport);
-			const sessionInfo = kernel.resolvePlaybackProgressSessionKey(execution, transport);
-			let media = kernel.resolveServerLastWatchMedia(execution, transport);
-			const directItemId = String(media.itemId || "").trim();
-			const contextMedia = phase === "stopped" ? null : kernel.getServerRecordPlaybackContextMedia(execution, transport, directItemId);
-			const usedPlaybackContext = !directItemId && !!contextMedia;
-			if (contextMedia) media = directItemId ? kernel.mergeServerWatchMedia(media, contextMedia) : contextMedia;
-			const diagnostic = {
-				phase,
-				decision: "",
-				parseMode: String(parsedPayload.parseMode || "query_only"),
-				sessionStrength: String(sessionInfo.sessionStrength || "weak"),
-				finalized: false
-			};
-			execution.serverWatchLifecycleDiagnostic = diagnostic;
-			if (!db) {
-				diagnostic.decision = "d1_unavailable";
-				diagnostic.finalized = true;
-				return false;
-			}
-			if (!execution?.ctx || typeof execution.ctx.waitUntil !== "function") return false;
-			const nodeName = String(execution?.nodeName || "").trim().toLowerCase();
-			if (!nodeName) return false;
-			const requestStartedAt = Number(execution?.startTime);
-			const eventAtMs = Number.isFinite(requestStartedAt) && requestStartedAt > 0 ? requestStartedAt : nowMs();
-			const sessions = cacheState.ServerRecordWatchSessions;
-			kernel.cleanupServerRecordWatchSessions(eventAtMs);
-			const identityKey = String(sessionInfo.sessionIdentityFingerprint || "");
-			let entry = identityKey ? sessions.get(identityKey) : null;
-			if (phase === "stopped" && entry) media = kernel.mergeServerWatchMedia(media, entry.media);
-			const itemId = String(media.itemId || "").trim().slice(0, 256);
-			if (itemId !== String(media.itemId || "")) media = {
-				...media,
-				itemId
-			};
-			if (phase !== "stopped" && !itemId) {
-				diagnostic.decision = parsedPayload.parseErrorReason === "unbuffered_body" ? "skipped_unbuffered" : "skipped_no_item";
-				diagnostic.finalized = true;
-				return false;
-			}
-			const sessionFingerprint = itemId ? hashServerWatchFingerprint(`${identityKey}|${itemId}`) : String(entry?.sessionFingerprint || sessionInfo.sessionFingerprint || "");
-			if (phase === "progress" && entry) {
-				entry.lastSeenAt = eventAtMs;
-				if (Number(entry.terminalUntil) >= eventAtMs && String(entry.sessionFingerprint || "") === sessionFingerprint) {
-					diagnostic.decision = "late_progress_after_stop";
-					diagnostic.finalized = true;
-					touchMapEntry(sessions, identityKey);
-					return false;
-				}
-				if (String(entry.itemId || "") === itemId && String(entry.writeState || "") !== "failed") {
-					diagnostic.decision = "deduped";
-					diagnostic.finalized = true;
-					touchMapEntry(sessions, identityKey);
-					return false;
-				}
-			}
-			if (phase === "started" && entry && sessionInfo.sessionStrength === "strong" && String(entry.itemId || "") === itemId && Number(entry.terminalUntil || 0) <= 0 && String(entry.writeState || "") !== "failed") {
-				entry.lastSeenAt = eventAtMs;
-				diagnostic.decision = "deduped";
-				diagnostic.finalized = true;
-				touchMapEntry(sessions, identityKey);
-				return false;
-			}
-			entry = {
-				nodeName,
-				sessionFingerprint,
-				sessionStrength: sessionInfo.sessionStrength,
-				itemId,
-				media: { ...media },
-				writeState: "pending",
-				firstSeenAt: phase === "started" || !entry || String(entry.sessionFingerprint || "") !== sessionFingerprint ? eventAtMs : Number(entry.firstSeenAt) || eventAtMs,
-				lastSeenAt: eventAtMs,
-				terminalAt: phase === "stopped" ? eventAtMs : 0,
-				terminalUntil: phase === "stopped" ? eventAtMs + SERVER_RECORD_WATCH_TERMINAL_TTL_MS : 0
-			};
-			if (identityKey) setBoundedMapEntry(sessions, identityKey, entry, Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1));
-			diagnostic.decision = usedPlaybackContext ? "fallback_playback_context" : phase === "progress" ? "fallback_progress" : "scheduled";
-			const task = watchRepository.upsertServerWatchLifecycle(db, {
-				nodeName,
-				eventAt: new Date(eventAtMs).toISOString(),
-				phase,
-				sessionFingerprint,
-				sessionStrength: sessionInfo.sessionStrength,
-				media
-			}).then((result) => {
-				entry.writeState = "written";
-				if (Number(result?.schemaVersion) === 8) diagnostic.decision = "schema_v8_fallback";
-				else if (result?.admitted === false) diagnostic.decision = "deduped";
-				return result;
-			}).catch((error) => {
-				entry.writeState = "failed";
-				diagnostic.decision = "d1_unavailable";
-				console.error("server watch lifecycle write failed", error);
-			}).finally(() => {
-				diagnostic.finalized = true;
-			});
-			execution.serverWatchLifecycleTask = task;
-			execution.ctx.waitUntil(task);
-			return true;
-		},
-		scheduleServerLastWatch(execution, transport = null) {
-			return kernel.scheduleServerWatchLifecycle(execution, transport);
-		}
 	};
 }
 //#endregion
@@ -23552,7 +19649,7 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 function defineProxyLifecycleMethods(dependencies = {}, kernel = {}) {
 	return {
 		...definePlaybackExecutionCacheMethods(dependencies, kernel),
-		...definePlaybackWatchLifecycleMethods(dependencies, kernel),
+		...definePlaybackSessionControlMethods(dependencies, kernel),
 		...definePlaybackProgressRelayMethods(dependencies, kernel)
 	};
 }
@@ -24803,26 +20900,89 @@ function defineProxyTransportMethods(dependencies = {}) {
 				},
 				rewriteState: "applied"
 			};
+		},
+		async maybeRewritePlaybackInfoResponse(execution, upstreamState) {
+			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return upstreamState;
+			const rewriteEnabled = normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode) === "rewrite";
+			const bypassState = rewriteEnabled ? "not_needed" : "passthrough";
+			const response = upstreamState?.response;
+			if (!response || !(response.status >= 200 && response.status < 300) || execution.requestMethod === "HEAD") {
+				execution.playbackInfoRewrite = bypassState;
+				return upstreamState;
+			}
+			if (!String(response.headers.get("Content-Type") || "").toLowerCase().includes("json")) {
+				execution.playbackInfoRewrite = bypassState;
+				return upstreamState;
+			}
+			const declaredBodyBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
+			if (Number.isFinite(declaredBodyBytes) && declaredBodyBytes > DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES) {
+				execution.playbackInfoCacheBodyResolved = true;
+				execution.playbackInfoCacheBody = null;
+				execution.playbackInfoRewrite = bypassState;
+				return upstreamState;
+			}
+			const bodyResult = await readResponseTextWithLimit(response.clone(), DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES);
+			execution.playbackInfoCacheBodyResolved = true;
+			execution.playbackInfoCacheBody = null;
+			if (bodyResult.exceeded) {
+				execution.playbackInfoRewrite = bypassState;
+				return upstreamState;
+			}
+			try {
+				const parsedPayload = JSON.parse(bodyResult.text);
+				const rewriteResult = rewriteEnabled
+					? methods.rewritePlaybackInfoPayload(
+						execution,
+						parsedPayload,
+						upstreamState?.activeTargetBase,
+						upstreamState?.finalUrl || new URL(String(execution?.requestUrl || execution?.rawRequestUrl || ""))
+					)
+					: methods.sanitizePlaybackInfoMediaSourcesPayload(parsedPayload);
+				if (rewriteResult.rewriteState !== "applied") {
+					execution.playbackInfoRewrite = bypassState;
+					execution.playbackInfoCacheBody = { text: bodyResult.text, bytes: bodyResult.bytes };
+					return upstreamState;
+				}
+				const serializedBodyText = JSON.stringify(rewriteResult.payload);
+				const serializedBodyBytes = new TextEncoder().encode(serializedBodyText).byteLength;
+				execution.playbackInfoRewrite = "applied";
+				execution.playbackInfoCacheBody = serializedBodyBytes <= DEFAULT_PLAYBACK_INFO_CACHE_ENTRY_MAX_BYTES
+					? { text: serializedBodyText, bytes: serializedBodyBytes }
+					: null;
+				const responseHeaders = methods.sanitizePlaybackInfoSerializedResponseHeaders(response.headers);
+				try {
+					Promise.resolve(response.body?.cancel?.()).catch(() => {});
+				} catch {}
+				return {
+					...upstreamState,
+					response: new Response(serializedBodyText, {
+						status: response.status,
+						statusText: response.statusText,
+						headers: responseHeaders
+					})
+				};
+			} catch {
+				execution.playbackInfoRewrite = bypassState;
+				return upstreamState;
+			}
 		}
 	};
 	return methods;
 }
 //#endregion
 //#region worker/features/proxy/api.js
-function defineNodeProxyKernel({ configReader, nodeRepository, watchRepository, logger, cachePort, fetchPort }) {
+function defineNodeProxyKernel({ configReader, nodeRepository, logger, cachePort, fetchPort }) {
 	const internals = {};
 	const dependencies = {
 		CacheManager: cachePort,
 		Logger: logger,
 		configReader,
 		fetchPort,
-		nodeRepository,
-		watchRepository
+		nodeRepository
 	};
 	const methodGroups = [
 		defineProxyDeliveryMethods(dependencies, internals),
 		defineProxyObservabilityMethods(dependencies, internals),
-		defineProxyPlaybackMethods(dependencies, internals),
 		defineProxyLifecycleMethods(dependencies, internals),
 		defineProxyRoutingMethods(dependencies, internals),
 		defineProxyTransportMethods(dependencies)
@@ -24832,11 +20992,10 @@ function defineNodeProxyKernel({ configReader, nodeRepository, watchRepository, 
 	}
 	return internals;
 }
-function buildNodeProxyWorkflow({ configReader, nodeRepository, watchRepository, logger, cachePort, fetchPort }) {
+function buildNodeProxyWorkflow({ configReader, nodeRepository, logger, cachePort, fetchPort }) {
 	const internals = defineNodeProxyKernel({
 		configReader,
 		nodeRepository,
-		watchRepository,
 		logger,
 		cachePort,
 		fetchPort
@@ -25060,21 +21219,31 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 				rebuilt: false,
 				recreated: false
 			};
-			let forceRecreate = options.forceRecreate === true;
+			const forceRecreate = options.forceRecreate === true;
 			await kernel.ensureLogsBaseSchema(db);
+			const readiness = await kernel.getLogsFtsReadiness(db);
+			if (readiness.ready && !forceRecreate) return {
+				migratedRows: 0,
+				droppedTriggers: 0,
+				rebuilt: false,
+				recreated: false
+			};
+			if (readiness.tableReady && !forceRecreate) {
+				const error = /* @__PURE__ */ new Error("Existing FTS schema does not match the current contract");
+				error.code = "D1_SCHEMA_INCOMPATIBLE";
+				error.status = 409;
+				error.details = { phase: "fts_preflight" };
+				throw error;
+			}
 			let recreated = false;
 			let droppedTriggers = 0;
-			if (!forceRecreate && await kernel.hasLogsFtsTable(db)) {
-				const readiness = await kernel.getLogsFtsReadiness(db);
-				if (!readiness.virtualTableReady || !readiness.columnsReady) forceRecreate = true;
-			}
 			if (forceRecreate) {
 				droppedTriggers = await kernel.dropLogsFtsSyncTriggers(db);
 				await db.prepare(`DROP TABLE IF EXISTS ${kernel.LOGS_FTS_TABLE}`).run();
 				recreated = true;
 			}
 			await db.prepare(`CREATE VIRTUAL TABLE IF NOT EXISTS ${kernel.LOGS_FTS_TABLE} USING fts5(node_name, request_path, user_agent, error_detail, detail_json, content='${kernel.LOGS_TABLE}', content_rowid='id', tokenize='unicode61')`).run();
-			droppedTriggers += await kernel.dropLogsFtsSyncTriggers(db);
+			if (forceRecreate) droppedTriggers += await kernel.dropLogsFtsSyncTriggers(db);
 			await db.prepare(`CREATE TRIGGER IF NOT EXISTS ${kernel.LOGS_FTS_INSERT_TRIGGER} AFTER INSERT ON ${kernel.LOGS_TABLE} BEGIN
             INSERT INTO ${kernel.LOGS_FTS_TABLE}(rowid, node_name, request_path, user_agent, error_detail, detail_json)
             VALUES (new.id, new.node_name, new.request_path, COALESCE(new.user_agent, ''), COALESCE(new.error_detail, ''), COALESCE(new.detail_json, ''));
@@ -25112,7 +21281,6 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
               )`).run();
-					if (!(await kernel.getTableColumns(db, kernel.DNS_IP_POOL_ITEMS_TABLE)).has("line_label")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_ITEMS_TABLE} ADD COLUMN line_label TEXT NOT NULL DEFAULT ''`).run();
 					await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_updated_ip ON ${kernel.DNS_IP_POOL_ITEMS_TABLE} (updated_at DESC, ip ASC)`).run();
 					await db.prepare(`CREATE TABLE IF NOT EXISTS ${kernel.DNS_IP_POOL_SOURCES_TABLE} (
                 id TEXT PRIMARY KEY,
@@ -25132,13 +21300,6 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
               )`).run();
-					const sourceColumns = await kernel.getTableColumns(db, kernel.DNS_IP_POOL_SOURCES_TABLE);
-					if (!sourceColumns.has("source_type")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_type TEXT NOT NULL DEFAULT 'url'`).run();
-					if (!sourceColumns.has("domain")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN domain TEXT`).run();
-					if (!sourceColumns.has("source_kind")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'custom'`).run();
-					if (!sourceColumns.has("preset_id")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN preset_id TEXT NOT NULL DEFAULT ''`).run();
-					if (!sourceColumns.has("builtin_id")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN builtin_id TEXT NOT NULL DEFAULT ''`).run();
-					if (!sourceColumns.has("ip_limit")) await db.prepare(`ALTER TABLE ${kernel.DNS_IP_POOL_SOURCES_TABLE} ADD COLUMN ip_limit INTEGER NOT NULL DEFAULT 5`).run();
 					await db.prepare(`CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_sources_sort ON ${kernel.DNS_IP_POOL_SOURCES_TABLE} (sort_order ASC, updated_at ASC)`).run();
 					await db.prepare(`CREATE TABLE IF NOT EXISTS ${kernel.DNS_IP_POOL_FETCH_CACHE_TABLE} (
                 signature TEXT PRIMARY KEY,
@@ -27051,30 +23212,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					playback_info_count: "INTEGER NOT NULL DEFAULT 0",
 					updated_at: "TEXT NOT NULL DEFAULT ''"
 				},
-				[kernel.SERVER_LAST_WATCH_TABLE]: {
-					last_watched_at: "TEXT NOT NULL DEFAULT ''",
-					playback_session_fingerprint: "TEXT NOT NULL DEFAULT ''",
-					playback_session_strength: "TEXT NOT NULL DEFAULT ''",
-					playback_event_phase: "TEXT NOT NULL DEFAULT 'stopped'",
-					updated_at: "TEXT NOT NULL DEFAULT ''"
-				},
-				[kernel.SERVER_RECORD_SNAPSHOT_TABLE]: {
-					movie_count: "INTEGER",
-					series_count: "INTEGER",
-					episode_count: "INTEGER",
-					counts_state: "TEXT NOT NULL DEFAULT 'unavailable'",
-					counts_errors_json: "TEXT NOT NULL DEFAULT '{}'",
-					stats_checked_at: "TEXT NOT NULL DEFAULT ''",
-					last_item_id: "TEXT NOT NULL DEFAULT ''",
-					last_item_name: "TEXT NOT NULL DEFAULT ''",
-					last_item_type: "TEXT NOT NULL DEFAULT ''",
-					last_item_series_name: "TEXT NOT NULL DEFAULT ''",
-					last_item_image_tag: "TEXT NOT NULL DEFAULT ''",
-					last_item_original_title: "TEXT NOT NULL DEFAULT ''",
-					last_item_year: "INTEGER",
-					last_item_watched_at: "TEXT NOT NULL DEFAULT ''",
-					updated_at: "TEXT NOT NULL DEFAULT ''"
-				}
+
 			};
 		},
 		getD1RequiredPrimaryKeyContract() {
@@ -27090,25 +23228,8 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				[kernel.DNS_IP_PROBE_CACHE_TABLE]: ["ip", "entry_colo"],
 				[kernel.LOGS_TABLE]: ["id"],
 				[kernel.STATS_HOURLY_TABLE]: ["bucket_date", "bucket_hour"],
-				[kernel.SERVER_LAST_WATCH_TABLE]: ["node_name"],
-				[kernel.SERVER_RECORD_SNAPSHOT_TABLE]: ["node_name"]
+
 			};
-		},
-		getD1RetiredIndexNames() {
-			return [
-				"idx_proxy_logs_client_ip",
-				"idx_proxy_logs_inbound_colo",
-				"idx_proxy_logs_outbound_colo",
-				"idx_proxy_logs_timestamp_id",
-				"idx_proxy_logs_node_time",
-				"idx_proxy_logs_category",
-				"idx_proxy_stats_hourly_date",
-				"idx_dns_ip_pool_items_updated_at",
-				"idx_dns_ip_pool_items_ip_type",
-				"idx_sys_status_updated_at",
-				"idx_cf_dashboard_cache_zone_bucket",
-				"idx_cf_runtime_cache_group_resource"
-			];
 		},
 		getD1SchemaReadyState(db) {
 			if (!db || typeof db.prepare !== "function") return null;
@@ -27485,646 +23606,170 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				throw error;
 			}
 		},
-		normalizeD1MigrationName(name = "") {
-			return String(name || "").trim().replace(/\.sql$/i, "");
-		},
-		async getD1TimeTravelBookmark(db) {
-			if (!db || typeof db.withSession !== "function") {
-				const error = /* @__PURE__ */ new Error("D1 Time Travel bookmark is unavailable on this binding");
-				error.code = "D1_TIME_TRAVEL_UNAVAILABLE";
-				error.status = 409;
-				error.details = { reason: "sessions_api_unavailable" };
-				throw error;
-			}
-			try {
-				const session = db.withSession("first-primary");
-				if (!session || typeof session.prepare !== "function" || typeof session.getBookmark !== "function") throw new Error("invalid_d1_session");
-				await session.prepare("SELECT 1 AS bookmark_probe").run();
-				const bookmark = String(session.getBookmark() || "").trim();
-				if (!bookmark) throw new Error("empty_bookmark");
-				return {
-					bookmark,
-					consistency: "first-primary",
-					capturedAt: (/* @__PURE__ */ new Date()).toISOString()
-				};
-			} catch (cause) {
-				if (String(cause?.code || "") === "D1_TIME_TRAVEL_UNAVAILABLE") throw cause;
-				const error = /* @__PURE__ */ new Error("Unable to capture a D1 Time Travel bookmark");
-				error.code = "D1_TIME_TRAVEL_BOOKMARK_FAILED";
-				error.status = 503;
-				error.details = { cause: getErrorMessage(cause, "bookmark_failed") };
-				throw error;
-			}
-		},
-		async readD1AppliedMigrations(db, tableNames = null) {
-			if (!(tableNames instanceof Set ? tableNames : new Set((await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all())?.results?.map((row) => String(row?.name || "")) || [])).has(kernel.D1_MIGRATIONS_TABLE)) return {
-				tablePresent: false,
-				tableValid: false,
-				appliedMigrations: []
-			};
-			const definitions = await kernel.getTableColumnDefinitions(db, kernel.D1_MIGRATIONS_TABLE);
-			const columns = new Set(definitions.map((column) => column.name));
-			const primaryKey = definitions.filter((column) => column.primaryKeyOrder > 0).sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder).map((column) => column.name);
-			const idColumn = definitions.find((column) => column.name === "id");
-			let nameUnique = false;
-			for (const index of (await kernel.getTableIndexDefinitions(db, kernel.D1_MIGRATIONS_TABLE)).filter((item) => item.unique && !item.partial)) if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["name"])) {
-				nameUnique = true;
-				break;
-			}
-			if (!([
-				"id",
-				"name",
-				"applied_at"
-			].every((name) => columns.has(name)) && serializeConfigValue(primaryKey) === serializeConfigValue(["id"]) && idColumn?.type === "INTEGER" && nameUnique)) return {
-				tablePresent: true,
-				tableValid: false,
-				appliedMigrations: []
-			};
-			const rows = await db.prepare(`SELECT name FROM ${quoteSqlIdentifier(kernel.D1_MIGRATIONS_TABLE)} ORDER BY name ASC`).all();
-			return {
-				tablePresent: true,
-				tableValid: true,
-				appliedMigrations: [...new Set((rows?.results || []).map((row) => kernel.normalizeD1MigrationName(row?.name)).filter(Boolean))]
-			};
-		},
-		async adoptVerifiedD1Migrations(db, migrationState = null) {
-			let currentState = migrationState || await kernel.readD1AppliedMigrations(db);
-			if (currentState.tablePresent && !currentState.tableValid) {
-				const error = /* @__PURE__ */ new Error("Existing d1_migrations table does not match the managed migration contract");
-				error.code = "D1_MIGRATION_TABLE_INVALID";
-				error.status = 409;
-				error.details = { tableName: kernel.D1_MIGRATIONS_TABLE };
-				throw error;
-			}
-			let migrationTableCreated = false;
-			if (!currentState.tablePresent) {
-				await db.prepare(`CREATE TABLE IF NOT EXISTS ${quoteSqlIdentifier(kernel.D1_MIGRATIONS_TABLE)} (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              name TEXT UNIQUE NOT NULL,
-              applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )`).run();
-				migrationTableCreated = true;
-				currentState = await kernel.readD1AppliedMigrations(db);
-			}
-			if (!currentState.tableValid) {
-				const error = /* @__PURE__ */ new Error("Managed d1_migrations table could not be verified");
-				error.code = "D1_MIGRATION_TABLE_INVALID";
-				error.status = 409;
-				error.details = {
-					tableName: kernel.D1_MIGRATIONS_TABLE,
-					migrationTableCreated
-				};
-				throw error;
-			}
-			const applied = new Set(currentState.appliedMigrations);
-			const adoptedMigrations = kernel.D1_REQUIRED_MIGRATIONS.filter((name) => !applied.has(name));
-			if (adoptedMigrations.length) {
-				const statements = adoptedMigrations.map((name) => db.prepare(`INSERT OR IGNORE INTO ${quoteSqlIdentifier(kernel.D1_MIGRATIONS_TABLE)} (name) VALUES (?)`).bind(`${name}.sql`));
-				if (typeof db.batch === "function") await db.batch(statements);
-				else for (const statement of statements) await statement.run();
-			}
-			const finalState = await kernel.readD1AppliedMigrations(db);
-			const finalApplied = new Set(finalState.appliedMigrations);
-			const missingMigrations = kernel.D1_REQUIRED_MIGRATIONS.filter((name) => !finalApplied.has(name));
-			if (!finalState.tableValid || missingMigrations.length) {
-				const error = /* @__PURE__ */ new Error("Verified D1 migration baseline could not be recorded");
-				error.code = "D1_MIGRATION_ADOPTION_FAILED";
-				error.status = 503;
-				error.details = {
-					missingMigrations,
-					migrationTableCreated,
-					adoptedMigrations
-				};
-				throw error;
-			}
-			return {
-				migrationTableCreated,
-				adoptedMigrations
-			};
-		},
-		async getD1SchemaStatus(db) {
-			if (!db) return {
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				runtimeCompatibilityReady: false,
-				appliedMigrations: [],
-				latestRequiredMigration: kernel.D1_REQUIRED_MIGRATIONS.at(-1) || "",
-				migrationReady: false,
-				schemaVersion: null,
-				tables: {},
-				indexes: {},
-				ftsReady: false,
-				issues: ["db_not_configured"]
-			};
-			const [tableRows, indexRows] = await Promise.all([db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all()]);
-			const tableNames = new Set((tableRows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
-			const indexOwners = new Map((indexRows?.results || []).map((row) => [String(row?.name || ""), String(row?.tbl_name || "")]).filter(([name]) => name));
-			const requiredTables = [
-				kernel.SYS_STATUS_TABLE,
-				kernel.SCHEDULED_LOCKS_TABLE,
-				kernel.AUTH_FAILURES_TABLE,
-				kernel.CF_DASH_CACHE_TABLE,
-				kernel.CF_RUNTIME_CACHE_TABLE,
-				kernel.DNS_IP_POOL_ITEMS_TABLE,
-				kernel.DNS_IP_POOL_SOURCES_TABLE,
-				kernel.DNS_IP_POOL_FETCH_CACHE_TABLE,
-				kernel.DNS_IP_PROBE_CACHE_TABLE,
-				kernel.LOGS_TABLE,
-				kernel.STATS_HOURLY_TABLE,
-				kernel.SERVER_LAST_WATCH_TABLE,
-				kernel.SERVER_RECORD_SNAPSHOT_TABLE
-			];
-			const requiredIndexes = kernel.getD1RuntimeIndexContract();
-			const requiredColumns = {
-				[kernel.SYS_STATUS_TABLE]: [
-					"scope",
-					"payload",
-					"updated_at"
-				],
-				[kernel.SCHEDULED_LOCKS_TABLE]: [
-					"scope",
-					"token",
-					"owner",
-					"acquired_at",
-					"renewed_at",
-					"expires_at"
-				],
-				[kernel.AUTH_FAILURES_TABLE]: [
-					"ip",
-					"fail_count",
-					"expires_at",
-					"updated_at"
-				],
-				[kernel.CF_DASH_CACHE_TABLE]: [
-					"cache_key",
-					"zone_id",
-					"bucket_date",
-					"payload",
-					"version",
-					"cached_at",
-					"expires_at",
-					"updated_at"
-				],
-				[kernel.CF_RUNTIME_CACHE_TABLE]: [
-					"cache_key",
-					"cache_group",
-					"resource_id",
-					"payload",
-					"cached_at",
-					"expires_at",
-					"updated_at"
-				],
-				[kernel.DNS_IP_POOL_ITEMS_TABLE]: [
-					"id",
-					"ip",
-					"ip_type",
-					"source_kind",
-					"source_label",
-					"line_label",
-					"remark",
-					"created_at",
-					"updated_at"
-				],
-				[kernel.DNS_IP_POOL_SOURCES_TABLE]: [
-					"id",
-					"name",
-					"url",
-					"source_type",
-					"domain",
-					"source_kind",
-					"preset_id",
-					"builtin_id",
-					"enabled",
-					"sort_order",
-					"ip_limit",
-					"last_fetch_at",
-					"last_fetch_status",
-					"last_fetch_count",
-					"created_at",
-					"updated_at"
-				],
-				[kernel.DNS_IP_POOL_FETCH_CACHE_TABLE]: [
-					"signature",
-					"items_json",
-					"source_results_json",
-					"imported_count",
-					"enabled_source_count",
-					"cached_at",
-					"expires_at",
-					"created_at",
-					"updated_at"
-				],
-				[kernel.DNS_IP_PROBE_CACHE_TABLE]: [
-					"ip",
-					"entry_colo",
-					"probe_status",
-					"latency_ms",
-					"cf_ray",
-					"colo_code",
-					"city_name",
-					"country_code",
-					"country_name",
-					"probed_at",
-					"expires_at"
-				],
-				[kernel.LOGS_TABLE]: [
-					"id",
-					"timestamp",
-					"node_name",
-					"request_path",
-					"request_method",
-					"status_code",
-					"response_time",
-					"client_ip",
-					"inbound_colo",
-					"outbound_colo",
-					"user_agent",
-					"referer",
-					"category",
-					"error_detail",
-					"detail_json",
-					"created_at",
-					"inbound_ip",
-					"outbound_ip"
-				],
-				[kernel.STATS_HOURLY_TABLE]: [
-					"bucket_date",
-					"bucket_hour",
-					"request_count",
-					"play_count",
-					"playback_info_count",
-					"updated_at"
-				],
-				[kernel.SERVER_LAST_WATCH_TABLE]: [
-					"node_name",
-					"last_watched_at",
-					"playback_session_fingerprint",
-					"playback_session_strength",
-					"playback_event_phase",
-					"updated_at"
-				],
-				[kernel.SERVER_RECORD_SNAPSHOT_TABLE]: [
-					"node_name",
-					"movie_count",
-					"series_count",
-					"episode_count",
-					"counts_state",
-					"counts_errors_json",
-					"stats_checked_at",
-					"last_item_id",
-					"last_item_name",
-					"last_item_type",
-					"last_item_series_name",
-					"last_item_image_tag",
-					"last_item_original_title",
-					"last_item_year",
-					"last_item_watched_at",
-					"updated_at"
-				]
-			};
-			const requiredPrimaryKeys = kernel.getD1RequiredPrimaryKeyContract();
-			const issues = [];
-			const retiredPosterCacheAbsent = !tableNames.has(kernel.SERVER_RECORD_POSTER_CACHE_TABLE);
-			if (!retiredPosterCacheAbsent) issues.push(`retired_table_present:${kernel.SERVER_RECORD_POSTER_CACHE_TABLE}`);
-			const tableStatus = Object.fromEntries(requiredTables.map((name) => [name, tableNames.has(name)]));
-			for (const [name, ready] of Object.entries(tableStatus)) if (!ready) issues.push(`missing_table:${name}`);
-			const columnStatus = {};
-			const primaryKeyStatus = {};
-			for (const [tableName, columnNames] of Object.entries(requiredColumns)) {
-				const definitions = tableNames.has(tableName) ? await kernel.getTableColumnDefinitions(db, tableName) : [];
-				const columns = new Set(definitions.map((column) => column.name));
-				columnStatus[tableName] = Object.fromEntries(columnNames.map((name) => [name, columns.has(name)]));
-				if (tableNames.has(tableName)) {
-					for (const [name, ready] of Object.entries(columnStatus[tableName])) if (!ready) issues.push(`missing_column:${tableName}.${name}`);
-					const actualPrimaryKey = definitions.filter((column) => column.primaryKeyOrder > 0).sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder).map((column) => column.name);
-					const expectedPrimaryKey = requiredPrimaryKeys[tableName] || [];
-					const idColumn = tableName === kernel.LOGS_TABLE ? definitions.find((column) => column.name === "id") : null;
-					primaryKeyStatus[tableName] = serializeConfigValue(actualPrimaryKey) === serializeConfigValue(expectedPrimaryKey) && (!idColumn || idColumn.type === "INTEGER");
-					if (!primaryKeyStatus[tableName]) issues.push(`invalid_primary_key:${tableName}`);
-				} else primaryKeyStatus[tableName] = false;
-			}
-			const indexStatus = {};
-			const tableIndexDefinitions = /* @__PURE__ */ new Map();
-			for (const [indexName, definition] of Object.entries(requiredIndexes)) {
-				const owner = indexOwners.get(indexName);
-				if (!owner) {
-					indexStatus[indexName] = false;
-					issues.push(`missing_index:${indexName}`);
-					continue;
-				}
-				if (!tableIndexDefinitions.has(definition.table)) tableIndexDefinitions.set(definition.table, await kernel.getTableIndexDefinitions(db, definition.table));
-				const listedIndex = tableIndexDefinitions.get(definition.table).find((index) => index.name === indexName);
-				const actualColumns = await kernel.getIndexKeyColumns(db, indexName);
-				indexStatus[indexName] = owner === definition.table && listedIndex?.unique === false && listedIndex?.partial === false && serializeConfigValue(actualColumns) === serializeConfigValue(definition.columns);
-				if (!indexStatus[indexName]) issues.push(`invalid_index:${indexName}`);
-			}
-			let dnsIpUniqueReady = false;
-			if (tableNames.has(kernel.DNS_IP_POOL_ITEMS_TABLE)) {
-				const tableIndexes = await kernel.getTableIndexDefinitions(db, kernel.DNS_IP_POOL_ITEMS_TABLE);
-				for (const index of tableIndexes.filter((item) => item.unique && !item.partial)) if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["ip"])) {
-					dnsIpUniqueReady = true;
-					break;
-				}
-				if (!dnsIpUniqueReady) issues.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
-			}
-			const constraintStatus = {
-				primaryKeys: primaryKeyStatus,
-				uniqueKeys: { [`${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`]: dnsIpUniqueReady }
-			};
-			const fts = await kernel.getLogsFtsReadiness(db);
-			if (fts.tableReady && !fts.virtualTableReady) issues.push("fts_virtual_table_invalid");
-			if (fts.tableReady && !fts.columnsReady) issues.push("fts_columns_incomplete");
-			if (fts.tableReady && !fts.triggerReady) issues.push(`missing_trigger:${kernel.LOGS_FTS_INSERT_TRIGGER}`);
-			const migrationState = await kernel.readD1AppliedMigrations(db, tableNames);
-			const appliedMigrationSet = new Set(migrationState.appliedMigrations);
-			const missingMigrations = kernel.D1_REQUIRED_MIGRATIONS.filter((name) => !appliedMigrationSet.has(name));
-			if (!migrationState.tablePresent) issues.push("migration_table_missing");
-			else if (!migrationState.tableValid) issues.push("migration_table_invalid");
-			for (const name of missingMigrations) issues.push(`missing_migration:${name}`);
-			const runtimeCompatibilityReadyIgnoringRetiredPosterCache = Object.values(tableStatus).every(Boolean) && Object.values(indexStatus).every(Boolean) && Object.values(columnStatus).every((table) => Object.values(table).every(Boolean)) && Object.values(primaryKeyStatus).every(Boolean) && dnsIpUniqueReady;
-			const runtimeCompatibilityReady = runtimeCompatibilityReadyIgnoringRetiredPosterCache && retiredPosterCacheAbsent;
-			const migrationReady = runtimeCompatibilityReady && migrationState.tableValid && missingMigrations.length === 0;
-			return {
-				runtimeCompatibilityVersion: kernel.D1_SCHEMA_VERSION,
-				runtimeCompatibilityReady,
-				runtimeCompatibilityReadyIgnoringRetiredPosterCache,
-				appliedMigrations: migrationState.appliedMigrations,
-				latestRequiredMigration: kernel.D1_REQUIRED_MIGRATIONS.at(-1) || "",
-				missingMigrations,
-				migrationTablePresent: migrationState.tablePresent,
-				migrationTableValid: migrationState.tableValid,
-				migrationReady,
-				schemaVersion: migrationReady ? kernel.D1_SCHEMA_VERSION : null,
-				tables: tableStatus,
-				retiredTables: { [kernel.SERVER_RECORD_POSTER_CACHE_TABLE]: retiredPosterCacheAbsent },
-				columns: columnStatus,
-				indexes: indexStatus,
-				constraints: constraintStatus,
-				ftsReady: fts.ready,
-				fts,
-				autoRepairPolicy: {
-					createMissingTables: true,
-					addKnownColumns: true,
-					repairNamedIndexes: true,
-					rebuildDerivedFts: true,
-					rebuildPrimaryOrUniqueConstraints: false,
-					deleteUnknownObjects: false,
-					dropRetiredPosterCache: true
-				},
-				issues
-			};
-		},
 		async getD1TableNameSet(db) {
-			if (!db) return /* @__PURE__ */ new Set();
+			if (!db) return new Set();
 			const rows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
 			return new Set((rows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
 		},
-		async assertD1RepairableTableShapes(db, tableNames = null) {
-			const knownTables = tableNames instanceof Set ? tableNames : await kernel.getD1TableNameSet(db);
+		getD1CurrentSchemaContract() {
+			const primaryKeys = kernel.getD1RequiredPrimaryKeyContract();
+			const primaryKeyTypes = {
+				[kernel.SYS_STATUS_TABLE]: { scope: "TEXT" },
+				[kernel.SCHEDULED_LOCKS_TABLE]: { scope: "TEXT" },
+				[kernel.AUTH_FAILURES_TABLE]: { ip: "TEXT" },
+				[kernel.CF_DASH_CACHE_TABLE]: { cache_key: "TEXT" },
+				[kernel.CF_RUNTIME_CACHE_TABLE]: { cache_key: "TEXT" },
+				[kernel.DNS_IP_POOL_ITEMS_TABLE]: { id: "TEXT", ip: "TEXT" },
+				[kernel.DNS_IP_POOL_SOURCES_TABLE]: { id: "TEXT" },
+				[kernel.DNS_IP_POOL_FETCH_CACHE_TABLE]: { signature: "TEXT" },
+				[kernel.DNS_IP_PROBE_CACHE_TABLE]: { ip: "TEXT", entry_colo: "TEXT" },
+				[kernel.LOGS_TABLE]: { id: "INTEGER" },
+				[kernel.STATS_HOURLY_TABLE]: { bucket_date: "TEXT", bucket_hour: "INTEGER" }
+			};
+			const columnTypes = Object.fromEntries(Object.entries(kernel.getD1RuntimeColumnAdditions()).map(([tableName, definitions]) => {
+				const runtimeTypes = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => [
+					name,
+					String(definition || "").trim().split(/\s+/, 1)[0].toUpperCase()
+				]));
+				return [tableName, { ...primaryKeyTypes[tableName], ...runtimeTypes }];
+			}));
+			const columns = Object.fromEntries(Object.entries(columnTypes).map(([tableName, definitions]) => [tableName, Object.keys(definitions)]));
+			return { columns, columnTypes, primaryKeys, indexes: kernel.getD1RuntimeIndexContract() };
+		},
+		async getD1SchemaStatus(db) {
+			if (!db) return { tables: {}, columns: {}, indexes: {}, constraints: { primaryKeys: {}, uniqueKeys: {} }, ftsReady: false, fts: {}, schemaReady: false, issues: ["db_not_configured"] };
+			const contract = kernel.getD1CurrentSchemaContract();
+			const [tableRows, indexRows] = await Promise.all([
+				db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
+				db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all()
+			]);
+			const tableNames = new Set((tableRows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
+			const indexOwners = new Map((indexRows?.results || []).map((row) => [String(row?.name || ""), String(row?.tbl_name || "")]).filter(([name]) => name));
+			const tables = Object.fromEntries(Object.keys(contract.columns).map((name) => [name, tableNames.has(name)]));
+			const columns = {};
+			const primaryKeys = {};
 			const issues = [];
-			for (const [tableName, expectedPrimaryKey] of Object.entries(kernel.getD1RequiredPrimaryKeyContract())) {
-				if (!knownTables.has(tableName)) continue;
+			for (const [tableName, requiredColumns] of Object.entries(contract.columns)) {
+				if (!tableNames.has(tableName)) {
+					columns[tableName] = Object.fromEntries(requiredColumns.map((name) => [name, false]));
+					primaryKeys[tableName] = false;
+					issues.push(`missing_table:${tableName}`);
+					continue;
+				}
 				const definitions = await kernel.getTableColumnDefinitions(db, tableName);
+				const actualColumns = new Map(definitions.map((column) => [column.name, column]));
+				columns[tableName] = Object.fromEntries(requiredColumns.map((name) => {
+					const actual = actualColumns.get(name);
+					const expectedType = String(contract.columnTypes?.[tableName]?.[name] || "").toUpperCase();
+					return [name, !!actual && (!expectedType || actual.type === expectedType)];
+				}));
+				for (const [name, ready] of Object.entries(columns[tableName])) if (!ready) {
+					const actual = actualColumns.get(name);
+					issues.push(actual ? `invalid_column_type:${tableName}.${name}` : `missing_column:${tableName}.${name}`);
+				}
 				const actualPrimaryKey = definitions.filter((column) => column.primaryKeyOrder > 0).sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder).map((column) => column.name);
 				const idColumn = tableName === kernel.LOGS_TABLE ? definitions.find((column) => column.name === "id") : null;
-				if (serializeConfigValue(actualPrimaryKey) !== serializeConfigValue(expectedPrimaryKey) || idColumn && idColumn.type !== "INTEGER") issues.push(`invalid_primary_key:${tableName}`);
+				primaryKeys[tableName] = serializeConfigValue(actualPrimaryKey) === serializeConfigValue(contract.primaryKeys[tableName] || []) && (!idColumn || idColumn.type === "INTEGER");
+				if (!primaryKeys[tableName]) issues.push(`invalid_primary_key:${tableName}`);
 			}
-			if (knownTables.has(kernel.DNS_IP_POOL_ITEMS_TABLE)) {
-				let uniqueIpReady = false;
-				const tableIndexes = await kernel.getTableIndexDefinitions(db, kernel.DNS_IP_POOL_ITEMS_TABLE);
-				for (const index of tableIndexes.filter((item) => item.unique && !item.partial)) if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["ip"])) {
-					uniqueIpReady = true;
-					break;
+			let dnsIpUniqueReady = false;
+			if (tableNames.has(kernel.DNS_IP_POOL_ITEMS_TABLE)) {
+				for (const index of (await kernel.getTableIndexDefinitions(db, kernel.DNS_IP_POOL_ITEMS_TABLE)).filter((item) => item.unique && !item.partial)) {
+					if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["ip"])) { dnsIpUniqueReady = true; break; }
 				}
-				if (!uniqueIpReady) issues.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
+				if (!dnsIpUniqueReady) issues.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
 			}
-			if (issues.length) {
-				const error = /* @__PURE__ */ new Error("D1 schema contains key constraints that cannot be repaired automatically");
+			const indexes = {};
+			for (const [indexName, definition] of Object.entries(contract.indexes)) {
+				const owner = indexOwners.get(indexName);
+				if (!owner) { indexes[indexName] = false; issues.push(`missing_index:${indexName}`); continue; }
+				const listed = (await kernel.getTableIndexDefinitions(db, definition.table)).find((item) => item.name === indexName);
+				indexes[indexName] = owner === definition.table && listed?.unique === false && listed?.partial === false && serializeConfigValue(await kernel.getIndexKeyColumns(db, indexName)) === serializeConfigValue(definition.columns);
+				if (!indexes[indexName]) issues.push(`invalid_index:${indexName}`);
+			}
+			const fts = await kernel.getLogsFtsReadiness(db);
+			if (!fts.ready) issues.push(fts.tableReady ? "fts_contract_invalid" : `missing_table:${kernel.LOGS_FTS_TABLE}`);
+			const schemaReady = Object.values(tables).every(Boolean) && Object.values(columns).every((entry) => Object.values(entry).every(Boolean)) && Object.values(primaryKeys).every(Boolean) && dnsIpUniqueReady && Object.values(indexes).every(Boolean) && fts.ready;
+			return {
+				tables,
+				columns,
+				indexes,
+				constraints: { primaryKeys, uniqueKeys: { [`${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`]: dnsIpUniqueReady } },
+				ftsReady: fts.ready,
+				fts,
+				schemaReady,
+				issues
+			};
+		},
+		async assertD1CurrentSchema(db, status = null) {
+			const current = status || await kernel.getD1SchemaStatus(db);
+			const contract = kernel.getD1CurrentSchemaContract();
+			const incompatible = [];
+			for (const [tableName, exists] of Object.entries(current.tables || {})) {
+				if (!exists) continue;
+				for (const [columnName, ready] of Object.entries(current.columns?.[tableName] || {})) if (!ready) {
+					const suffix = `${tableName}.${columnName}`;
+					incompatible.push((current.issues || []).find((issue) => String(issue).endsWith(suffix)) || `missing_column:${suffix}`);
+				}
+				if (current.constraints?.primaryKeys?.[tableName] !== true) incompatible.push(`invalid_primary_key:${tableName}`);
+			}
+			if (current.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && current.constraints?.uniqueKeys?.[`${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`] !== true) incompatible.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
+			for (const [indexName, ready] of Object.entries(current.indexes || {})) if (!ready) {
+				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
+				if (owner) incompatible.push(`invalid_index:${indexName}`);
+			}
+			if (current.fts?.tableReady && current.ftsReady !== true) incompatible.push("fts_contract_invalid");
+			if (incompatible.length) {
+				const error = new Error("Existing D1 schema does not match the current contract");
 				error.code = "D1_SCHEMA_INCOMPATIBLE";
 				error.status = 409;
-				error.details = {
-					issues,
-					phase: "preflight"
-				};
+				error.details = { phase: "preflight", issues: [...new Set(incompatible)] };
 				throw error;
 			}
 			return true;
 		},
-		async ensureD1KnownColumns(db) {
-			const tableNames = await kernel.getD1TableNameSet(db);
-			const adjustedColumns = [];
-			for (const [tableName, additions] of Object.entries(kernel.getD1RuntimeColumnAdditions())) {
-				if (!tableNames.has(tableName)) continue;
-				const columns = await kernel.getTableColumns(db, tableName);
-				for (const [columnName, definition] of Object.entries(additions)) {
-					if (columns.has(columnName)) continue;
-					await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
-					columns.add(columnName);
-					adjustedColumns.push(`${tableName}.${columnName}`);
-				}
-			}
-			return adjustedColumns;
-		},
-		async repairD1RuntimeIndexes(db) {
-			const tableNames = await kernel.getD1TableNameSet(db);
-			const indexRows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all();
-			const existingIndexNames = new Set((indexRows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
-			const droppedRetiredIndexes = [];
-			const createdIndexes = [];
-			const repairedIndexes = [];
-			for (const indexName of kernel.getD1RetiredIndexNames()) {
-				if (!existingIndexNames.has(indexName)) continue;
-				await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
-				existingIndexNames.delete(indexName);
-				droppedRetiredIndexes.push(indexName);
-			}
-			for (const [indexName, definition] of Object.entries(kernel.getD1RuntimeIndexContract())) {
-				if (!tableNames.has(definition.table)) continue;
-				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
-				let valid = false;
-				if (owner) {
-					const listedIndex = (await kernel.getTableIndexDefinitions(db, definition.table)).find((index) => index.name === indexName);
-					const actualColumns = await kernel.getIndexKeyColumns(db, indexName);
-					valid = String(owner?.tbl_name || "") === definition.table && listedIndex?.unique === false && listedIndex?.partial === false && serializeConfigValue(actualColumns) === serializeConfigValue(definition.columns);
-				}
-				if (valid) continue;
-				if (owner) {
-					await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
-					repairedIndexes.push(indexName);
-				} else createdIndexes.push(indexName);
-				await db.prepare(definition.createSql).run();
-			}
-			return {
-				droppedRetiredIndexes,
-				createdIndexes,
-				repairedIndexes
-			};
-		},
 		async initializeD1Database(db, options = {}) {
-			if (!db) {
-				const error = /* @__PURE__ */ new Error("D1 not configured");
-				error.code = "D1_NOT_CONFIGURED";
-				error.status = 503;
-				throw error;
-			}
-			const profile = options.includeFts === true ? "logs-fts" : "logs-core";
-			const operationKey = `${profile}:${options.adoptMigrations === true ? "adopt" : "compat"}:${options.requireBookmark === true ? "bookmark" : "no-bookmark"}`;
+			if (!db) { const error = new Error("D1 not configured"); error.code = "D1_NOT_CONFIGURED"; error.status = 503; throw error; }
+			const profile = options.includeFts === false ? "logs-core" : "logs-fts";
 			let state = databaseReadinessState.D1DatabaseInitReady.get(db);
-			if (!state || !(state.inFlight instanceof Map)) {
-				state = {
-					tail: Promise.resolve(),
-					inFlight: /* @__PURE__ */ new Map()
-				};
-				databaseReadinessState.D1DatabaseInitReady.set(db, state);
-			}
-			let initTask = state.inFlight.get(operationKey);
+			if (!state || !(state.inFlight instanceof Map)) { state = { tail: Promise.resolve(), inFlight: new Map() }; databaseReadinessState.D1DatabaseInitReady.set(db, state); }
+			let initTask = state.inFlight.get(profile);
 			if (!initTask) {
-				initTask = Promise.resolve(state.tail).catch(() => {}).then(() => kernel.runD1DatabaseInitialization(db, {
-					...options,
-					profile,
-					failOnIncompatible: false
-				}));
+				initTask = Promise.resolve(state.tail).catch(() => {}).then(() => kernel.runD1DatabaseInitialization(db, { ...options, profile }));
 				state.tail = initTask.catch(() => {});
-				state.inFlight.set(operationKey, initTask);
+				state.inFlight.set(profile, initTask);
 			}
-			try {
-				const result = await initTask;
-				if (options.failOnIncompatible === true && result?.runtimeCompatibilityReady !== true) {
-					const error = /* @__PURE__ */ new Error("D1 schema remains incompatible after automatic repair");
-					error.code = "D1_SCHEMA_INCOMPATIBLE";
-					error.status = 409;
-					error.details = {
-						phase: String(result?.blockedPhase || "final_status"),
-						issues: result?.status?.issues,
-						autoRepairPolicy: result?.status?.autoRepairPolicy,
-						result
-					};
-					throw error;
-				}
-				return result;
-			} finally {
-				if (state.inFlight.get(operationKey) === initTask) state.inFlight.delete(operationKey);
-			}
+			try { return await initTask; }
+			finally { if (state.inFlight.get(profile) === initTask) state.inFlight.delete(profile); }
 		},
 		async runD1DatabaseInitialization(db, options = {}) {
-			const profile = options.includeFts === true ? "logs-fts" : "logs-core";
-			const adoptMigrations = options.adoptMigrations === true;
-			const requireBookmark = options.requireBookmark === true || adoptMigrations;
+			const profile = options.profile || (options.includeFts === false ? "logs-core" : "logs-fts");
 			kernel.invalidateD1SchemaReadiness(db, "all");
 			const tablesBefore = await kernel.getD1TableNameSet(db);
+			const statusBefore = await kernel.getD1SchemaStatus(db);
+			await kernel.assertD1CurrentSchema(db, statusBefore);
 			try {
-				await kernel.assertD1RepairableTableShapes(db, tablesBefore);
-			} catch (error) {
-				if (String(error?.code || "") !== "D1_SCHEMA_INCOMPATIBLE") throw error;
-				const status = await kernel.getD1SchemaStatus(db);
-				const result = {
-					profile,
-					runtimeCompatibilityReady: false,
-					migrationReady: status.migrationReady === true,
-					schemaVersion: status.schemaVersion,
-					createdTables: [],
-					adjustedColumns: [],
-					droppedRetiredIndexes: [],
-					createdIndexes: [],
-					repairedIndexes: [],
-					ftsRebuilt: false,
-					ftsRecreated: false,
-					blockedPhase: "preflight",
-					steps: [],
-					status
-				};
-				if (options.failOnIncompatible === true) {
-					error.details = {
-						...isPlainObject(error?.details) ? error.details : {},
-						issues: status.issues,
-						autoRepairPolicy: status.autoRepairPolicy,
-						result
-					};
-					throw error;
-				}
-				return result;
-			}
-			let migrationStateBefore = null;
-			if (adoptMigrations) {
-				migrationStateBefore = await kernel.readD1AppliedMigrations(db, tablesBefore);
-				if (migrationStateBefore.tablePresent && !migrationStateBefore.tableValid) {
-					const error = /* @__PURE__ */ new Error("Existing d1_migrations table does not match the managed migration contract");
-					error.code = "D1_MIGRATION_TABLE_INVALID";
-					error.status = 409;
-					error.details = {
-						tableName: kernel.D1_MIGRATIONS_TABLE,
-						phase: "preflight"
-					};
-					throw error;
-				}
-			}
-			const bookmarkState = requireBookmark ? await kernel.getD1TimeTravelBookmark(db) : null;
-			try {
-				const adjustedColumns = await kernel.ensureD1KnownColumns(db);
-				const droppedRetiredTables = [];
-				if (adoptMigrations && tablesBefore.has(kernel.SERVER_RECORD_POSTER_CACHE_TABLE)) {
-					await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(kernel.SERVER_RECORD_POSTER_CACHE_TABLE)}`).run();
-					droppedRetiredTables.push(kernel.SERVER_RECORD_POSTER_CACHE_TABLE);
-				}
 				const bootstrap = await kernel.bootstrapD1Schema(db, profile);
-				const adjustedAfterCreate = await kernel.ensureD1KnownColumns(db);
-				const indexChanges = await kernel.repairD1RuntimeIndexes(db);
-				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => !tablesBefore.has(name));
-				cacheState.LogsReadinessProbeCache.delete(db);
-				let status = await kernel.getD1SchemaStatus(db);
-				let migrationAdoption = {
-					migrationTableCreated: false,
-					adoptedMigrations: []
-				};
-				if (adoptMigrations && status.runtimeCompatibilityReady === true) {
-					migrationAdoption = await kernel.adoptVerifiedD1Migrations(db, migrationStateBefore);
-					status = await kernel.getD1SchemaStatus(db);
+				kernel.invalidateD1SchemaReadiness(db, "all");
+				const status = await kernel.getD1SchemaStatus(db);
+				if (!status.schemaReady) {
+					const error = new Error("D1 schema initialization did not produce the current contract");
+					error.code = "D1_SCHEMA_INCOMPATIBLE";
+					error.status = 409;
+					error.details = { phase: "final_status", issues: status.issues };
+					throw error;
 				}
-				const result = {
+				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => !tablesBefore.has(name));
+				return {
 					profile,
-					runtimeCompatibilityReady: status.runtimeCompatibilityReady === true,
-					migrationReady: status.migrationReady === true,
-					schemaVersion: status.schemaVersion,
-					recoveryBookmark: String(bookmarkState?.bookmark || ""),
-					bookmarkCapturedAt: String(bookmarkState?.capturedAt || ""),
-					migrationTableCreated: migrationAdoption.migrationTableCreated === true,
-					adoptedMigrations: migrationAdoption.adoptedMigrations,
+					schemaReady: true,
 					createdTables,
-					droppedRetiredTables,
-					adjustedColumns: [.../* @__PURE__ */ new Set([...adjustedColumns, ...adjustedAfterCreate])],
-					...indexChanges,
 					ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
 					ftsRecreated: bootstrap.ftsResult?.recreated === true,
 					steps: bootstrap.steps,
 					status
 				};
-				if (options.failOnIncompatible === true && result.runtimeCompatibilityReady !== true) {
-					const error = /* @__PURE__ */ new Error("D1 schema remains incompatible after automatic repair");
-					error.code = "D1_SCHEMA_INCOMPATIBLE";
-					error.status = 409;
-					error.details = {
-						issues: status.issues,
-						autoRepairPolicy: status.autoRepairPolicy,
-						result
-					};
-					throw error;
-				}
-				if (adoptMigrations && result.migrationReady !== true) {
-					const error = /* @__PURE__ */ new Error("D1 migration baseline remains incomplete after managed initialization");
-					error.code = "D1_MIGRATION_ADOPTION_FAILED";
-					error.status = 503;
-					error.details = {
-						issues: status.issues,
-						result
-					};
-					throw error;
-				}
-				return result;
 			} catch (error) {
-				if (bookmarkState?.bookmark && error && typeof error === "object") error.details = {
-					...isPlainObject(error.details) ? error.details : {},
-					recoveryBookmark: bookmarkState.bookmark,
-					bookmarkCapturedAt: bookmarkState.capturedAt
-				};
 				throw error;
 			}
 		},
@@ -28189,40 +23834,6 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 			if (!initTask) {
 				initTask = (async () => {
 					await db.prepare(`CREATE TABLE IF NOT EXISTS ${kernel.LOGS_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, inbound_colo TEXT, outbound_colo TEXT, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL, inbound_ip TEXT, outbound_ip TEXT)`).run();
-					const existingColumns = await kernel.getTableColumns(db, kernel.LOGS_TABLE);
-					if (!existingColumns.has("inbound_colo")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN inbound_colo TEXT`).run();
-						existingColumns.add("inbound_colo");
-					}
-					if (!existingColumns.has("outbound_colo")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN outbound_colo TEXT`).run();
-						existingColumns.add("outbound_colo");
-					}
-					if (!existingColumns.has("inbound_ip")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN inbound_ip TEXT`).run();
-						existingColumns.add("inbound_ip");
-					}
-					if (!existingColumns.has("outbound_ip")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN outbound_ip TEXT`).run();
-						existingColumns.add("outbound_ip");
-					}
-					if (!existingColumns.has("category")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN category TEXT DEFAULT 'api'`).run();
-						existingColumns.add("category");
-					}
-					if (!existingColumns.has("error_detail")) await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN error_detail TEXT`).run();
-					if (!existingColumns.has("detail_json")) {
-						await db.prepare(`ALTER TABLE ${kernel.LOGS_TABLE} ADD COLUMN detail_json TEXT`).run();
-						existingColumns.add("detail_json");
-					}
-					if (existingColumns.has("inbound_ip")) await db.prepare(`UPDATE ${kernel.LOGS_TABLE}
-                  SET inbound_colo = COALESCE(NULLIF(inbound_colo, ''), NULLIF(inbound_ip, ''))
-                  WHERE COALESCE(NULLIF(inbound_colo, ''), '') = ''
-                    AND COALESCE(NULLIF(inbound_ip, ''), '') != ''`).run();
-					if (existingColumns.has("outbound_ip")) await db.prepare(`UPDATE ${kernel.LOGS_TABLE}
-                  SET outbound_colo = COALESCE(NULLIF(outbound_colo, ''), NULLIF(outbound_ip, ''))
-                  WHERE COALESCE(NULLIF(outbound_colo, ''), '') = ''
-                    AND COALESCE(NULLIF(outbound_ip, ''), '') != ''`).run();
 					await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_timestamp ON ${kernel.LOGS_TABLE} (timestamp)`).run();
 					await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_client_time ON ${kernel.LOGS_TABLE} (client_ip, timestamp DESC)`).run();
 					await db.prepare(`CREATE INDEX IF NOT EXISTS idx_proxy_logs_status_time ON ${kernel.LOGS_TABLE} (status_code, timestamp)`).run();
@@ -28273,569 +23884,6 @@ function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 				if (databaseReadinessState.StatsHourlyDbReady.get(db) === initTask) databaseReadinessState.StatsHourlyDbReady.delete(db);
 			}
 		},
-		async ensureServerLastWatchSchema(db) {
-			if (!db) return false;
-			if (kernel.isD1SchemaReadyCached(db, "serverLastWatchSchema")) return true;
-			let initTask = databaseReadinessState.ServerLastWatchDbReady.get(db);
-			if (!initTask) {
-				initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${kernel.SERVER_LAST_WATCH_TABLE} (
-              node_name TEXT PRIMARY KEY,
-              last_watched_at TEXT NOT NULL,
-              playback_session_fingerprint TEXT NOT NULL DEFAULT '',
-              playback_session_strength TEXT NOT NULL DEFAULT '',
-              playback_event_phase TEXT NOT NULL DEFAULT 'stopped',
-              updated_at TEXT NOT NULL
-            )`).run().then(() => {
-					kernel.markD1SchemaReady(db, "serverLastWatchSchema");
-					return true;
-				}).catch((error) => {
-					databaseReadinessState.ServerLastWatchDbReady.delete(db);
-					throw error;
-				});
-				databaseReadinessState.ServerLastWatchDbReady.set(db, initTask);
-			}
-			try {
-				return await initTask;
-			} finally {
-				if (databaseReadinessState.ServerLastWatchDbReady.get(db) === initTask) databaseReadinessState.ServerLastWatchDbReady.delete(db);
-			}
-		},
-		async ensureServerRecordSnapshotSchema(db) {
-			if (!db) return false;
-			if (kernel.isD1SchemaReadyCached(db, "serverRecordSnapshotSchema")) return true;
-			let initTask = databaseReadinessState.ServerRecordSnapshotDbReady.get(db);
-			if (!initTask) {
-				initTask = db.prepare(`CREATE TABLE IF NOT EXISTS ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-              node_name TEXT PRIMARY KEY,
-              movie_count INTEGER,
-              series_count INTEGER,
-              episode_count INTEGER,
-              counts_state TEXT NOT NULL DEFAULT 'unavailable',
-              counts_errors_json TEXT NOT NULL DEFAULT '{}',
-              stats_checked_at TEXT NOT NULL DEFAULT '',
-              last_item_id TEXT NOT NULL DEFAULT '',
-              last_item_name TEXT NOT NULL DEFAULT '',
-              last_item_type TEXT NOT NULL DEFAULT '',
-              last_item_series_name TEXT NOT NULL DEFAULT '',
-              last_item_image_tag TEXT NOT NULL DEFAULT '',
-              last_item_original_title TEXT NOT NULL DEFAULT '',
-              last_item_year INTEGER,
-              last_item_watched_at TEXT NOT NULL DEFAULT '',
-              updated_at TEXT NOT NULL
-            )`).run().then(() => {
-					kernel.markD1SchemaReady(db, "serverRecordSnapshotSchema");
-					return true;
-				}).catch((error) => {
-					databaseReadinessState.ServerRecordSnapshotDbReady.delete(db);
-					throw error;
-				});
-				databaseReadinessState.ServerRecordSnapshotDbReady.set(db, initTask);
-			}
-			try {
-				return await initTask;
-			} finally {
-				if (databaseReadinessState.ServerRecordSnapshotDbReady.get(db) === initTask) databaseReadinessState.ServerRecordSnapshotDbReady.delete(db);
-			}
-		},
-		async hasServerRecordPosterSearchSchema(db) {
-			if (!db) return false;
-			if (kernel.isD1SchemaReadyCached(db, "serverRecordPosterSearchSchema")) return true;
-			const columns = await kernel.getTableColumns(db, kernel.SERVER_RECORD_SNAPSHOT_TABLE);
-			const ready = columns.has("last_item_original_title") && columns.has("last_item_year");
-			if (ready) kernel.markD1SchemaReady(db, "serverRecordPosterSearchSchema");
-			return ready;
-		},
-		async upsertServerLastWatch(db, nodeName = "", lastWatchedAt = "", media = {}) {
-			const normalizedName = String(nodeName || "").trim().toLowerCase();
-			if (!db || !normalizedName) return false;
-			const watchedAtMs = Date.parse(String(lastWatchedAt || "").trim());
-			if (!Number.isFinite(watchedAtMs)) return false;
-			const watchedAt = new Date(watchedAtMs).toISOString();
-			await kernel.ensureServerLastWatchSchema(db);
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-			const normalizedMedia = isPlainObject(media) ? media : {};
-			const itemId = String(normalizedMedia.itemId || "").trim().slice(0, 256);
-			const itemName = String(normalizedMedia.itemName || "").trim().slice(0, 256);
-			const itemType = String(normalizedMedia.itemType || "").trim().slice(0, 64);
-			const seriesName = String(normalizedMedia.seriesName || "").trim().slice(0, 256);
-			const originalTitle = String(normalizedMedia.originalTitle || "").trim().slice(0, 256);
-			const year = normalizeServerRecordPosterYear(normalizedMedia.year ?? normalizedMedia.productionYear);
-			const imageTag = String(normalizedMedia.imageTag || "").trim().slice(0, 256);
-			const posterSearchReady = await kernel.hasServerRecordPosterSearchSchema(db);
-			const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
-			const posterValues = posterSearchReady ? ", ?, ?" : "";
-			const posterUpdates = posterSearchReady ? `,
-            last_item_original_title = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_original_title ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_original_title END,
-            last_item_year = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_year ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_year END` : "";
-			const lastWatchStatement = db.prepare(`INSERT INTO ${kernel.SERVER_LAST_WATCH_TABLE} (
-            node_name, last_watched_at, updated_at
-          ) VALUES (?, ?, ?)
-          ON CONFLICT(node_name) DO UPDATE SET
-            last_watched_at = CASE
-              WHEN excluded.last_watched_at > ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at THEN excluded.last_watched_at
-              ELSE ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at
-            END,
-            updated_at = CASE
-              WHEN excluded.last_watched_at > ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at THEN excluded.updated_at
-              ELSE ${kernel.SERVER_LAST_WATCH_TABLE}.updated_at
-            END`).bind(normalizedName, watchedAt, updatedAt);
-			const snapshotStatement = db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-				node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-				last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?${posterValues})
-          ON CONFLICT(node_name) DO UPDATE SET
-            last_item_id = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_id ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_id END,
-            last_item_name = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_name ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_name END,
-				last_item_type = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_type ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_type END,
-				last_item_series_name = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_series_name ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_series_name END${posterUpdates},
-				last_item_image_tag = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_image_tag ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_image_tag END,
-				last_item_watched_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.last_item_watched_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at END,
-				updated_at = CASE WHEN excluded.last_item_watched_at > ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.last_item_watched_at THEN excluded.updated_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`).bind(normalizedName, itemId, itemName, itemType, seriesName, imageTag, watchedAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : []);
-			await db.batch([lastWatchStatement, snapshotStatement]);
-			return true;
-		},
-		async hasServerWatchLifecycleSchema(db) {
-			if (!db) return false;
-			if (kernel.isD1SchemaReadyCached(db, "serverWatchLifecycleSchema")) return true;
-			const columns = await kernel.getTableColumns(db, kernel.SERVER_LAST_WATCH_TABLE);
-			const ready = [
-				"playback_session_fingerprint",
-				"playback_session_strength",
-				"playback_event_phase"
-			].every((name) => columns.has(name));
-			if (ready) kernel.markD1SchemaReady(db, "serverWatchLifecycleSchema");
-			return ready;
-		},
-		async upsertServerWatchLifecycle(db, event = {}) {
-			const nodeName = String(event?.nodeName || "").trim().toLowerCase();
-			const eventAtMs = Date.parse(String(event?.eventAt || "").trim());
-			const phaseValue = String(event?.phase || "").trim().toLowerCase();
-			const phase = [
-				"started",
-				"progress",
-				"stopped"
-			].includes(phaseValue) ? phaseValue : "";
-			const sessionFingerprint = String(event?.sessionFingerprint || "").trim().slice(0, 128);
-			const sessionStrength = String(event?.sessionStrength || "").trim().toLowerCase() === "strong" ? "strong" : "weak";
-			const media = isPlainObject(event?.media) ? event.media : {};
-			const itemId = String(media.itemId || "").trim().slice(0, 256);
-			if (!db || !nodeName || !phase || !Number.isFinite(eventAtMs)) return {
-				admitted: false,
-				schemaVersion: null,
-				reason: "invalid_event"
-			};
-			if (phase !== "stopped" && !itemId) return {
-				admitted: false,
-				schemaVersion: null,
-				reason: "item_id_missing"
-			};
-			const eventAt = new Date(eventAtMs).toISOString();
-			await kernel.ensureServerLastWatchSchema(db);
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			if (!await kernel.hasServerWatchLifecycleSchema(db)) {
-				if (phase === "progress") return {
-					admitted: false,
-					schemaVersion: 8,
-					reason: "schema_v8_progress_disabled"
-				};
-				await kernel.upsertServerLastWatch(db, nodeName, eventAt, media);
-				return {
-					admitted: true,
-					schemaVersion: 8,
-					reason: "schema_v8_fallback"
-				};
-			}
-			const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-			const itemName = String(media.itemName || "").trim().slice(0, 256);
-			const itemType = String(media.itemType || "").trim().slice(0, 64);
-			const seriesName = String(media.seriesName || "").trim().slice(0, 256);
-			const originalTitle = String(media.originalTitle || "").trim().slice(0, 256);
-			const year = normalizeServerRecordPosterYear(media.year ?? media.productionYear);
-			const imageTag = String(media.imageTag || "").trim().slice(0, 256);
-			const posterSearchReady = await kernel.hasServerRecordPosterSearchSchema(db);
-			const posterColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
-			const posterValues = posterSearchReady ? ", ?, ?" : "";
-			const posterUpdates = posterSearchReady ? ",\n      last_item_original_title = excluded.last_item_original_title,\n      last_item_year = excluded.last_item_year" : "";
-			const terminalCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_TERMINAL_TTL_MS).toISOString();
-			const abandonedCutoff = new Date(eventAtMs - SERVER_RECORD_WATCH_WEAK_ABANDONED_TTL_MS).toISOString();
-			const lastWatchStatement = db.prepare(`INSERT INTO ${kernel.SERVER_LAST_WATCH_TABLE} (
-            node_name, last_watched_at, playback_session_fingerprint,
-            playback_session_strength, playback_event_phase, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(node_name) DO UPDATE SET
-            last_watched_at = excluded.last_watched_at,
-            playback_session_fingerprint = excluded.playback_session_fingerprint,
-            playback_session_strength = excluded.playback_session_strength,
-            playback_event_phase = excluded.playback_event_phase,
-            updated_at = excluded.updated_at
-          WHERE excluded.last_watched_at > ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at
-            AND (
-              ? = 'stopped'
-              OR (? = 'started' AND (
-                ? = 'weak'
-                OR excluded.playback_session_fingerprint != ${kernel.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint
-              ))
-              OR (? = 'strong' AND excluded.playback_session_fingerprint != ${kernel.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint)
-              OR (? = 'weak' AND (
-                excluded.playback_session_fingerprint != ${kernel.SERVER_LAST_WATCH_TABLE}.playback_session_fingerprint
-                OR (${kernel.SERVER_LAST_WATCH_TABLE}.playback_event_phase = 'stopped' AND ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at < ?)
-                OR (${kernel.SERVER_LAST_WATCH_TABLE}.playback_event_phase != 'stopped' AND ${kernel.SERVER_LAST_WATCH_TABLE}.last_watched_at < ?)
-              ))
-            )`).bind(nodeName, eventAt, sessionFingerprint, sessionStrength, phase, updatedAt, phase, phase, sessionStrength, sessionStrength, sessionStrength, terminalCutoff, abandonedCutoff);
-			const snapshotStatement = db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-				node_name, last_item_id, last_item_name, last_item_type, last_item_series_name,
-				last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
-			) SELECT ?, ?, ?, ?, ?, ?, ?, ?${posterValues}
-          WHERE changes() > 0 AND EXISTS (
-            SELECT 1 FROM ${kernel.SERVER_LAST_WATCH_TABLE}
-            WHERE node_name = ? AND last_watched_at = ?
-              AND playback_session_fingerprint = ? AND playback_event_phase = ?
-          )
-          ON CONFLICT(node_name) DO UPDATE SET
-            last_item_id = excluded.last_item_id,
-            last_item_name = excluded.last_item_name,
-				last_item_type = excluded.last_item_type,
-				last_item_series_name = excluded.last_item_series_name${posterUpdates},
-				last_item_image_tag = excluded.last_item_image_tag,
-				last_item_watched_at = excluded.last_item_watched_at,
-				updated_at = excluded.updated_at`).bind(nodeName, itemId, itemName, itemType, seriesName, imageTag, eventAt, updatedAt, ...posterSearchReady ? [originalTitle, year] : [], nodeName, eventAt, sessionFingerprint, phase);
-			const results = await db.batch([lastWatchStatement, snapshotStatement]);
-			const changes = Number(results?.[0]?.meta?.changes ?? results?.[0]?.changes ?? 0) || 0;
-			return {
-				admitted: changes > 0,
-				schemaVersion: kernel.D1_SCHEMA_VERSION,
-				reason: changes > 0 ? "admitted" : "deduped_or_stale"
-			};
-		},
-		async getServerLastWatch(db, nodeNames = []) {
-			const names = kernel.normalizeNodeIndex(nodeNames);
-			const result = /* @__PURE__ */ new Map();
-			if (!db || names.length === 0) return result;
-			await kernel.ensureServerLastWatchSchema(db);
-			for (let offset = 0; offset < names.length; offset += 90) {
-				const chunk = names.slice(offset, offset + 90);
-				const placeholders = chunk.map(() => "?").join(", ");
-				const rows = await db.prepare(`SELECT node_name, last_watched_at, updated_at
-              FROM ${kernel.SERVER_LAST_WATCH_TABLE}
-              WHERE node_name IN (${placeholders})`).bind(...chunk).all();
-				for (const row of rows?.results || []) {
-					const name = String(row?.node_name || "").trim().toLowerCase();
-					if (!name) continue;
-					result.set(name, {
-						lastWatchedAt: String(row?.last_watched_at || "").trim(),
-						updatedAt: String(row?.updated_at || "").trim()
-					});
-				}
-			}
-			return result;
-		},
-		async persistServerRecordProbeSnapshots(db, entries = []) {
-			if (!db) return 0;
-			const snapshots = (Array.isArray(entries) ? entries : []).map((entry) => {
-				const nodeName = String(entry?.nodeName || "").trim().toLowerCase();
-				const counts = isPlainObject(entry?.counts) ? entry.counts : {};
-				const normalizeCount = (value) => value !== null && value !== void 0 && value !== "" && Number.isFinite(Number(value)) && Number(value) >= 0 ? Math.trunc(Number(value)) : null;
-				const movieCount = normalizeCount(counts.movies);
-				const seriesCount = normalizeCount(counts.series);
-				const episodeCount = normalizeCount(counts.episodes);
-				if (!nodeName || [
-					movieCount,
-					seriesCount,
-					episodeCount
-				].every((value) => value === null)) return null;
-				const errors = isPlainObject(counts.errors) ? counts.errors : {};
-				const checkedAtMs = Date.parse(String(entry?.checkedAt || "").trim());
-				return {
-					nodeName,
-					movieCount,
-					seriesCount,
-					episodeCount,
-					countsState: [
-						movieCount,
-						seriesCount,
-						episodeCount
-					].every((value) => value !== null) ? "ok" : "partial",
-					countsErrorsJson: JSON.stringify(errors),
-					statsCheckedAt: Number.isFinite(checkedAtMs) ? new Date(checkedAtMs).toISOString() : (/* @__PURE__ */ new Date()).toISOString(),
-					updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-				};
-			}).filter(Boolean);
-			if (!snapshots.length) return 0;
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			let written = 0;
-			for (let offset = 0; offset < snapshots.length; offset += 50) {
-				const statements = snapshots.slice(offset, offset + 50).map((snapshot) => db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-              node_name, movie_count, series_count, episode_count, counts_state,
-              counts_errors_json, stats_checked_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(node_name) DO UPDATE SET
-              movie_count = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.movie_count ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.movie_count END,
-              series_count = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.series_count ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.series_count END,
-              episode_count = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.episode_count ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.episode_count END,
-              counts_state = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.counts_state ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.counts_state END,
-              counts_errors_json = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.counts_errors_json ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.counts_errors_json END,
-              stats_checked_at = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.stats_checked_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at END,
-              updated_at = CASE WHEN excluded.stats_checked_at >= ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.stats_checked_at THEN excluded.updated_at ELSE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}.updated_at END`).bind(snapshot.nodeName, snapshot.movieCount, snapshot.seriesCount, snapshot.episodeCount, snapshot.countsState, snapshot.countsErrorsJson, snapshot.statsCheckedAt, snapshot.updatedAt));
-				await db.batch(statements);
-				written += statements.length;
-			}
-			return written;
-		},
-		async persistServerRecordPosterSearchMetadata(db, candidate = {}, media = {}) {
-			const nodeName = String(candidate?.nodeName || "").trim().toLowerCase();
-			const itemId = String(candidate?.itemId || "").trim().slice(0, 256);
-			const watchedAt = String(candidate?.watchedAt || "").trim();
-			if (!db || !nodeName || !itemId || !watchedAt || !await kernel.hasServerRecordPosterSearchSchema(db)) return false;
-			const itemName = String(media?.itemName || "").trim().slice(0, 256);
-			const itemType = String(media?.itemType || "").trim().slice(0, 64);
-			const seriesName = String(media?.seriesName || "").trim().slice(0, 256);
-			const originalTitle = String(media?.originalTitle || "").trim().slice(0, 256);
-			const year = normalizeServerRecordPosterYear(media?.year ?? media?.productionYear);
-			const imageTag = String(media?.imageTag || "").trim().slice(0, 256);
-			const result = await db.prepare(`UPDATE ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} SET
-            last_item_name = CASE WHEN ? != '' THEN ? ELSE last_item_name END,
-            last_item_type = CASE WHEN ? != '' THEN ? ELSE last_item_type END,
-            last_item_series_name = CASE WHEN ? != '' THEN ? ELSE last_item_series_name END,
-			last_item_original_title = CASE WHEN ? != '' THEN ? ELSE last_item_original_title END,
-			last_item_year = COALESCE(?, last_item_year),
-			last_item_image_tag = CASE WHEN ? != '' THEN ? ELSE last_item_image_tag END,
-			updated_at = ?
-			WHERE node_name = ? AND last_item_id = ? AND last_item_watched_at = ?`).bind(itemName, itemName, itemType, itemType, seriesName, seriesName, originalTitle, originalTitle, year, imageTag, imageTag, (/* @__PURE__ */ new Date()).toISOString(), nodeName, itemId, watchedAt).run();
-			return (Number(result?.meta?.changes ?? result?.changes) || 0) > 0;
-		},
-		async getServerRecordSnapshots(db, nodeNames = []) {
-			const names = kernel.normalizeNodeIndex(nodeNames);
-			const result = /* @__PURE__ */ new Map();
-			if (!db || names.length === 0) return result;
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			const posterSearchReady = await kernel.hasServerRecordPosterSearchSchema(db);
-			const posterSearchColumns = posterSearchReady ? ", last_item_original_title, last_item_year" : "";
-			for (let offset = 0; offset < names.length; offset += 90) {
-				const chunk = names.slice(offset, offset + 90);
-				const placeholders = chunk.map(() => "?").join(", ");
-				const rows = await db.prepare(`SELECT
-				node_name, movie_count, series_count, episode_count, counts_state,
-				counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-				last_item_type, last_item_series_name, last_item_image_tag${posterSearchColumns},
-              last_item_watched_at, updated_at
-              FROM ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}
-              WHERE node_name IN (${placeholders})`).bind(...chunk).all();
-				for (const row of rows?.results || []) {
-					const name = String(row?.node_name || "").trim().toLowerCase();
-					if (!name) continue;
-					let countErrors = {};
-					try {
-						const parsed = JSON.parse(String(row?.counts_errors_json || "{}"));
-						if (isPlainObject(parsed)) countErrors = parsed;
-					} catch {}
-					const normalizeStoredCount = (value) => value === null || value === void 0 || !Number.isFinite(Number(value)) ? null : Math.max(0, Math.trunc(Number(value)));
-					result.set(name, {
-						counts: {
-							movies: normalizeStoredCount(row?.movie_count),
-							series: normalizeStoredCount(row?.series_count),
-							episodes: normalizeStoredCount(row?.episode_count),
-							state: String(row?.counts_state || "unavailable").trim(),
-							errors: countErrors,
-							checkedAt: String(row?.stats_checked_at || "").trim(),
-							source: "persisted"
-						},
-						lastItem: {
-							itemId: String(row?.last_item_id || "").trim(),
-							itemName: String(row?.last_item_name || "").trim(),
-						itemType: String(row?.last_item_type || "").trim(),
-						seriesName: String(row?.last_item_series_name || "").trim(),
-						imageTag: String(row?.last_item_image_tag || "").trim(),
-							originalTitle: posterSearchReady ? String(row?.last_item_original_title || "").trim() : "",
-							year: posterSearchReady ? normalizeServerRecordPosterYear(row?.last_item_year) : null,
-							watchedAt: String(row?.last_item_watched_at || "").trim()
-						},
-						updatedAt: String(row?.updated_at || "").trim()
-					});
-				}
-			}
-			return result;
-		},
-		getServerRecordNodeLifecycle(mutation = {}) {
-			if (mutation?.nodeChanged !== true) return null;
-			const previousName = String(mutation?.previousName || "").trim().toLowerCase();
-			const nextName = String(mutation?.nextName || "").trim().toLowerCase();
-			if (!previousName) return null;
-			if (!mutation?.nextNode) return {
-				type: "delete",
-				previousName,
-				nextName: previousName,
-				names: [previousName]
-			};
-			if (!nextName || previousName === nextName) return null;
-			return {
-				type: "rename",
-				previousName,
-				nextName,
-				names: [previousName, nextName]
-			};
-		},
-		async readServerRecordNodeLifecycleRows(db, nodeNames = []) {
-			const names = kernel.normalizeNodeIndex(nodeNames);
-			const rows = {
-				lastWatch: [],
-				snapshots: [],
-				watchLifecycleSchemaReady: false,
-				posterSearchSchemaReady: false
-			};
-			if (!db || names.length === 0) return rows;
-			await kernel.ensureServerLastWatchSchema(db);
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			const watchLifecycleSchemaReady = await kernel.hasServerWatchLifecycleSchema(db);
-			const posterSearchSchemaReady = await kernel.hasServerRecordPosterSearchSchema(db);
-			rows.watchLifecycleSchemaReady = watchLifecycleSchemaReady;
-			rows.posterSearchSchemaReady = posterSearchSchemaReady;
-			const placeholders = names.map(() => "?").join(", ");
-			const [lastWatchRows, snapshotRows] = await Promise.all([db.prepare(`SELECT node_name, last_watched_at,
-              ${watchLifecycleSchemaReady ? "playback_session_fingerprint" : "'' AS playback_session_fingerprint"},
-              ${watchLifecycleSchemaReady ? "playback_session_strength" : "'' AS playback_session_strength"},
-              ${watchLifecycleSchemaReady ? "playback_event_phase" : "'stopped' AS playback_event_phase"}, updated_at
-              FROM ${kernel.SERVER_LAST_WATCH_TABLE}
-              WHERE node_name IN (${placeholders})`).bind(...names).all(), db.prepare(`SELECT
-              node_name, movie_count, series_count, episode_count, counts_state,
-              counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-			  last_item_type, last_item_series_name, last_item_image_tag,
-              ${posterSearchSchemaReady ? "last_item_original_title, last_item_year," : "'' AS last_item_original_title, NULL AS last_item_year,"}
-              last_item_watched_at, updated_at
-              FROM ${kernel.SERVER_RECORD_SNAPSHOT_TABLE}
-              WHERE node_name IN (${placeholders})`).bind(...names).all()]);
-			rows.lastWatch = (lastWatchRows?.results || []).map((row) => ({ ...row }));
-			rows.snapshots = (snapshotRows?.results || []).map((row) => ({ ...row }));
-			return rows;
-		},
-		getNewestServerRecordLifecycleRow(rows = [], timestampField = "") {
-			let newest = null;
-			let newestTimestamp = -1;
-			for (const row of Array.isArray(rows) ? rows : []) {
-				if (!row) continue;
-				const timestamp = Date.parse(String(row?.[timestampField] || "").trim());
-				if (!Number.isFinite(timestamp)) continue;
-				if (!newest || timestamp > newestTimestamp) {
-					newest = row;
-					newestTimestamp = timestamp;
-				}
-			}
-			return newest;
-		},
-		buildMergedServerRecordLifecycleRows(lifecycle = {}, before = {}) {
-			if (lifecycle?.type !== "rename") return {
-				lastWatch: null,
-				snapshot: null
-			};
-			const nextName = String(lifecycle.nextName || "").trim().toLowerCase();
-			const lastWatchRows = Array.isArray(before?.lastWatch) ? before.lastWatch : [];
-			const snapshotRows = Array.isArray(before?.snapshots) ? before.snapshots : [];
-			const newestWatch = kernel.getNewestServerRecordLifecycleRow(lastWatchRows, "last_watched_at");
-			const newestCounts = kernel.getNewestServerRecordLifecycleRow(snapshotRows, "stats_checked_at");
-			const watchedAt = String(newestWatch?.last_watched_at || "").trim();
-			const matchingMedia = watchedAt ? snapshotRows.filter((row) => String(row?.last_item_watched_at || "").trim() === watchedAt) : [];
-			const newestMedia = kernel.getNewestServerRecordLifecycleRow(matchingMedia, "updated_at");
-			const lastWatch = newestWatch ? {
-				node_name: nextName,
-				last_watched_at: watchedAt,
-				playback_session_fingerprint: String(newestWatch.playback_session_fingerprint || "").trim(),
-				playback_session_strength: String(newestWatch.playback_session_strength || "").trim(),
-				playback_event_phase: String(newestWatch.playback_event_phase || "stopped").trim() || "stopped",
-				updated_at: String(newestWatch.updated_at || (/* @__PURE__ */ new Date()).toISOString()).trim()
-			} : null;
-			if (!newestCounts && !newestMedia) return {
-				lastWatch,
-				snapshot: null
-			};
-			const snapshotUpdatedAt = kernel.getNewestServerRecordLifecycleRow([newestCounts, newestMedia].filter(Boolean), "updated_at");
-			return {
-				lastWatch,
-				snapshot: {
-					node_name: nextName,
-					movie_count: newestCounts?.movie_count ?? null,
-					series_count: newestCounts?.series_count ?? null,
-					episode_count: newestCounts?.episode_count ?? null,
-					counts_state: String(newestCounts?.counts_state || "unavailable").trim() || "unavailable",
-					counts_errors_json: String(newestCounts?.counts_errors_json || "{}").trim() || "{}",
-					stats_checked_at: String(newestCounts?.stats_checked_at || "").trim(),
-					last_item_id: String(newestMedia?.last_item_id || "").trim(),
-					last_item_name: String(newestMedia?.last_item_name || "").trim(),
-					last_item_type: String(newestMedia?.last_item_type || "").trim(),
-					last_item_series_name: String(newestMedia?.last_item_series_name || "").trim(),
-					last_item_image_tag: String(newestMedia?.last_item_image_tag || "").trim(),
-					last_item_original_title: String(newestMedia?.last_item_original_title || "").trim(),
-					last_item_year: normalizeServerRecordPosterYear(newestMedia?.last_item_year),
-					last_item_watched_at: String(newestMedia?.last_item_watched_at || "").trim(),
-					updated_at: String(snapshotUpdatedAt?.updated_at || (/* @__PURE__ */ new Date()).toISOString()).trim()
-				}
-			};
-		},
-		buildServerRecordNodeLifecycleRestoreStatements(db, lifecycle = {}, before = {}) {
-			const names = kernel.normalizeNodeIndex(lifecycle?.names || []);
-			if (!names.length) return [];
-			const placeholders = names.map(() => "?").join(", ");
-			const statements = [db.prepare(`DELETE FROM ${kernel.SERVER_LAST_WATCH_TABLE} WHERE node_name IN (${placeholders})`).bind(...names), db.prepare(`DELETE FROM ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} WHERE node_name IN (${placeholders})`).bind(...names)];
-			for (const row of Array.isArray(before?.lastWatch) ? before.lastWatch : []) {
-				const values = [String(row?.node_name || "").trim().toLowerCase(), String(row?.last_watched_at || "").trim()];
-				if (before?.watchLifecycleSchemaReady === true) values.push(String(row?.playback_session_fingerprint || "").trim(), String(row?.playback_session_strength || "").trim(), String(row?.playback_event_phase || "stopped").trim() || "stopped");
-				values.push(String(row?.updated_at || "").trim());
-				const lifecycleColumns = before?.watchLifecycleSchemaReady === true ? ", playback_session_fingerprint, playback_session_strength, playback_event_phase" : "";
-				const lifecyclePlaceholders = before?.watchLifecycleSchemaReady === true ? ", ?, ?, ?" : "";
-				statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_LAST_WATCH_TABLE} (
-              node_name, last_watched_at${lifecycleColumns}, updated_at
-            ) VALUES (?, ?${lifecyclePlaceholders}, ?)`).bind(...values));
-			}
-			for (const row of Array.isArray(before?.snapshots) ? before.snapshots : []) {
-				const posterColumns = before?.posterSearchSchemaReady === true ? ", last_item_original_title, last_item_year" : "";
-				const posterValues = before?.posterSearchSchemaReady === true ? ", ?, ?" : "";
-				statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-              node_name, movie_count, series_count, episode_count, counts_state,
-              counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-			  last_item_type, last_item_series_name, last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(String(row?.node_name || "").trim().toLowerCase(), row?.movie_count ?? null, row?.series_count ?? null, row?.episode_count ?? null, String(row?.counts_state || "unavailable").trim() || "unavailable", String(row?.counts_errors_json || "{}").trim() || "{}", String(row?.stats_checked_at || "").trim(), String(row?.last_item_id || "").trim(), String(row?.last_item_name || "").trim(), String(row?.last_item_type || "").trim(), String(row?.last_item_series_name || "").trim(), String(row?.last_item_image_tag || "").trim(), String(row?.last_item_watched_at || "").trim(), String(row?.updated_at || "").trim(), ...before?.posterSearchSchemaReady === true ? [String(row?.last_item_original_title || "").trim(), normalizeServerRecordPosterYear(row?.last_item_year)] : []));
-			}
-			return statements;
-		},
-		async applyServerRecordNodeLifecycleMutation(mutation = {}, db = null) {
-			const lifecycle = kernel.getServerRecordNodeLifecycle(mutation);
-			if (!lifecycle || !db) return false;
-			const before = await kernel.readServerRecordNodeLifecycleRows(db, lifecycle.names);
-			const statements = kernel.buildServerRecordNodeLifecycleRestoreStatements(db, lifecycle, {});
-			if (lifecycle.type === "rename") {
-				const merged = kernel.buildMergedServerRecordLifecycleRows(lifecycle, before);
-				if (merged.lastWatch) if (before.watchLifecycleSchemaReady === true) statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_LAST_WATCH_TABLE} (
-                  node_name, last_watched_at, playback_session_fingerprint,
-                  playback_session_strength, playback_event_phase, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?)`).bind(merged.lastWatch.node_name, merged.lastWatch.last_watched_at, merged.lastWatch.playback_session_fingerprint, merged.lastWatch.playback_session_strength, merged.lastWatch.playback_event_phase, merged.lastWatch.updated_at));
-				else statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_LAST_WATCH_TABLE} (
-                  node_name, last_watched_at, updated_at
-                ) VALUES (?, ?, ?)`).bind(merged.lastWatch.node_name, merged.lastWatch.last_watched_at, merged.lastWatch.updated_at));
-				if (merged.snapshot) {
-					const posterColumns = before.posterSearchSchemaReady === true ? ", last_item_original_title, last_item_year" : "";
-					const posterValues = before.posterSearchSchemaReady === true ? ", ?, ?" : "";
-					statements.push(db.prepare(`INSERT INTO ${kernel.SERVER_RECORD_SNAPSHOT_TABLE} (
-                node_name, movie_count, series_count, episode_count, counts_state,
-                counts_errors_json, stats_checked_at, last_item_id, last_item_name,
-				last_item_type, last_item_series_name, last_item_image_tag, last_item_watched_at, updated_at${posterColumns}
-			  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?${posterValues})`).bind(merged.snapshot.node_name, merged.snapshot.movie_count, merged.snapshot.series_count, merged.snapshot.episode_count, merged.snapshot.counts_state, merged.snapshot.counts_errors_json, merged.snapshot.stats_checked_at, merged.snapshot.last_item_id, merged.snapshot.last_item_name, merged.snapshot.last_item_type, merged.snapshot.last_item_series_name, merged.snapshot.last_item_image_tag, merged.snapshot.last_item_watched_at, merged.snapshot.updated_at, ...before.posterSearchSchemaReady === true ? [merged.snapshot.last_item_original_title, merged.snapshot.last_item_year] : []));
-				}
-			}
-			await db.batch(statements);
-			mutation.serverRecordNodeLifecycle = {
-				lifecycle,
-				before
-			};
-			return true;
-		},
-		async rollbackServerRecordNodeLifecycleMutation(mutation = {}, db = null) {
-			const applied = mutation?.serverRecordNodeLifecycle;
-			if (!db || !applied?.lifecycle) return false;
-			await kernel.ensureServerLastWatchSchema(db);
-			await kernel.ensureServerRecordSnapshotSchema(db);
-			await db.batch(kernel.buildServerRecordNodeLifecycleRestoreStatements(db, applied.lifecycle, applied.before));
-			delete mutation.serverRecordNodeLifecycle;
-			return true;
-		}
 	};
 }
 //#endregion
@@ -28863,8 +23911,6 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 			}
 			if (normalizedScope === "all") {
 				kernel.clearD1SchemaReady(db);
-				cacheState.ServerRecordWatchSessions.clear();
-				cacheState.ServerRecordPlaybackContexts.clear();
 				const opsStatusState = databaseReadinessState.OpsStatusShadowCache.get(db);
 				if (opsStatusState?.payloadCache instanceof Map) opsStatusState.payloadCache.clear();
 				databaseReadinessState.AdminShellStatusWriteState.delete(db);
@@ -28874,8 +23920,6 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 				databaseReadinessState.AuthFailuresDbReady.delete(db);
 				databaseReadinessState.CfDashboardCacheDbReady.delete(db);
 				databaseReadinessState.CfRuntimeCacheDbReady.delete(db);
-				databaseReadinessState.ServerLastWatchDbReady.delete(db);
-				databaseReadinessState.ServerRecordSnapshotDbReady.delete(db);
 			}
 		},
 		async bootstrapD1Schema(db, profile = "logs-core") {
@@ -28919,14 +23963,7 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 					name: "ensureCfRuntimeCacheTable",
 					run: () => kernel.ensureCfRuntimeCacheTable(db)
 				},
-				{
-					name: "ensureServerLastWatchSchema",
-					run: () => kernel.ensureServerLastWatchSchema(db)
-				},
-				{
-					name: "ensureServerRecordSnapshotSchema",
-					run: () => kernel.ensureServerRecordSnapshotSchema(db)
-				}
+
 			];
 			const logSteps = [{
 				name: "ensureLogsBaseSchema",
@@ -28960,7 +23997,7 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 				};
 				stepResults.push({
 					name: step.name,
-					ready: step.name === "ensureLogsFtsSchema" ? ftsResult.rebuilt === true : result === true
+					ready: step.name === "ensureLogsFtsSchema" ? await kernel.isLogsFtsReady(db) : result === true
 				});
 			}
 			cacheState.LogsReadinessProbeCache.delete(db);
@@ -29079,14 +24116,6 @@ function buildD1TidyExecutor() {
 				sql: `DELETE FROM ${tableName} WHERE ${whereClause}`,
 				bindParams: [bindParam]
 			}));
-			steps.push({
-				enabled: flags.dropLegacyServerRecordPosterCache === true,
-				count: flags.dropLegacyServerRecordPosterCache === true ? 1 : 0,
-				stepName: "dropLegacyServerRecordPosterCache",
-				db,
-				sql: `DROP TABLE IF EXISTS ${quoteSqlIdentifier(database.SERVER_RECORD_POSTER_CACHE_TABLE)}`,
-				bindParams: []
-			});
 			return steps;
 		},
 		async runDeleteStep({ enabled = false, count = 0, beforeStep = async (_stepName) => {}, stepName = "", db, sql = "", bindParams = [] }) {
@@ -29113,9 +24142,6 @@ function buildD1TidyExecutor() {
 				schemaReady: true,
 				ftsReady,
 				statsReady,
-				schemaVersion: schemaStatus.schemaVersion,
-				runtimeCompatibilityVersion: database.D1_SCHEMA_VERSION,
-				migrationReady: schemaStatus.migrationReady === true,
 				categoryEnabled: true,
 				statsUtcOffsetMinutes: executionPlan.statsUtcOffsetMinutes || executionPlan.utcOffsetMinutes
 			};
@@ -29176,8 +24202,6 @@ function buildD1TidyPlanner() {
 			};
 		},
 		async readFacts(database, db, kv, context) {
-			const tableNames = await database.getD1TableNameSet(db);
-			const legacyPosterCachePresent = context.mode === "manual" && tableNames.has(database.SERVER_RECORD_POSTER_CACHE_TABLE);
 			return {
 				deletedExpiredLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp < ?`, [context.retentionCutoffMs]),
 				preservedLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp >= ?`, [context.retentionCutoffMs]),
@@ -29187,8 +24211,6 @@ function buildD1TidyPlanner() {
 				deletedExpiredAuthFailureCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.AUTH_FAILURES_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
 				deletedExpiredDashboardCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_DASH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
 				deletedExpiredRuntimeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_RUNTIME_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				legacyPosterCachePresent,
-				legacyPosterCacheRowCount: legacyPosterCachePresent ? await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SERVER_RECORD_POSTER_CACHE_TABLE}`) : 0,
 				statsHourlyRowCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.STATS_HOURLY_TABLE}`),
 				dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
 				dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
@@ -29219,7 +24241,6 @@ function buildD1TidyPlanner() {
 				deleteExpiredAuthFailures: facts.deletedExpiredAuthFailureCount > 0,
 				deleteExpiredDashboardCache: facts.deletedExpiredDashboardCacheCount > 0,
 				deleteExpiredRuntimeCache: facts.deletedExpiredRuntimeCacheCount > 0,
-				dropLegacyServerRecordPosterCache: facts.legacyPosterCachePresent === true,
 				rebuildStatsHourly: shouldRebuildStatsHourly,
 				rebuildLogsFts: shouldRebuildLogsFts,
 				rebuildLogsFtsDeferred: context.mode === "scheduled" && hasExpiredLogs && facts.ftsReady && shouldRebuildLogsFts !== true,
@@ -29240,7 +24261,6 @@ function buildD1TidyPlanner() {
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredProbeCacheCount > 0, "dns_ip_probe_cache", "过期 dns_ip_probe_cache 探测缓存", [], facts.deletedExpiredProbeCacheCount, "只会删除 expires_at 已过期的探测缓存。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredAuthFailureCount > 0, "auth_failures", "过期 auth_failures 登录失败计数", [], facts.deletedExpiredAuthFailureCount, "只会删除 expires_at 已过期的登录失败计数。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredDashboardCacheCount > 0, "cf_dashboard_cache", "过期 cf_dashboard_cache 仪表盘缓存", [], facts.deletedExpiredDashboardCacheCount, "只会删除 expires_at 已过期的仪表盘缓存。");
-			pushTidyPreviewGroup(deleteGroups, facts.legacyPosterCachePresent === true, "server_record_poster_cache", "退役 server_record_poster_cache 表", [], Math.max(1, facts.legacyPosterCacheRowCount), "会幂等删除整张退役海报缓存表，不迁移或备份其中数据。");
 			const rewriteGroups = [
 				createTidyPreviewGroup("proxy_stats_hourly", "proxy_stats_hourly 统计表", [], {
 					count: Math.max(1, facts.statsHourlyRowCount),
@@ -29297,7 +24317,6 @@ function buildD1TidyPlanner() {
 				deletedExpiredAuthFailureCount: facts.deletedExpiredAuthFailureCount,
 				deletedExpiredDashboardCacheCount: facts.deletedExpiredDashboardCacheCount,
 				deletedExpiredRuntimeCacheCount: facts.deletedExpiredRuntimeCacheCount,
-				droppedLegacyServerRecordPosterCache: flags.dropLegacyServerRecordPosterCache === true,
 				rebuiltStatsHourly: flags.rebuildStatsHourly === true,
 				rebuiltLogsFts: flags.rebuildLogsFts === true,
 				alignedStatsWindow: flags.alignStatsWindow === true,
@@ -29339,9 +24358,6 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	LOGS_FTS_TABLE: "proxy_logs_fts",
 	LOGS_FTS_INSERT_TRIGGER: "proxy_logs_fts_ai",
 	STATS_HOURLY_TABLE: "proxy_stats_hourly",
-	SERVER_LAST_WATCH_TABLE: "server_last_watch",
-	SERVER_RECORD_SNAPSHOT_TABLE: "server_record_snapshots",
-	SERVER_RECORD_POSTER_CACHE_TABLE: "server_record_poster_cache",
 	AUTH_FAILURES_TABLE: "auth_failures",
 	CF_DASH_CACHE_TABLE: "cf_dashboard_cache",
 	CF_RUNTIME_CACHE_TABLE: "cf_runtime_cache",
@@ -29349,19 +24365,6 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	DNS_IP_POOL_SOURCES_TABLE: "dns_ip_pool_sources",
 	DNS_IP_POOL_FETCH_CACHE_TABLE: "dns_ip_pool_fetch_cache",
 	DNS_IP_PROBE_CACHE_TABLE: "dns_ip_probe_cache",
-	D1_SCHEMA_VERSION: 11,
-	D1_MIGRATIONS_TABLE: "d1_migrations",
-	D1_REQUIRED_MIGRATIONS: Object.freeze([
-		"0001_d1_fresh_baseline",
-		"0002_d1_historical_compatibility",
-		"0003_d1_schema_v5_indexes",
-		"0004_server_watch_stats",
-		"0005_server_record_snapshots",
-		"0006_server_record_poster_cache",
-		"0007_server_watch_lifecycle",
-		"0008_server_record_poster_douban",
-		"0009_drop_server_record_poster_cache"
-	]),
 	OPS_STATUS_DB_SCOPE_ROOT: "ops_status:root",
 	TELEGRAM_ALERT_STATE_DB_SCOPE: "telegram_alert_state",
 	OPS_STATUS_SECTION_SCOPES: Object.freeze({
@@ -29377,7 +24380,7 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 });
 //#endregion
 //#region worker/features/storage/kv/cache-manager.js
-var SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS = 1800 * 1e3;
+
 function buildCacheServices(dependencies = {}) {
 	const { nodeRepository } = dependencies;
 	return {
@@ -29418,8 +24421,7 @@ function buildCacheServices(dependencies = {}) {
 				rate: null,
 				log: null,
 				playbackInfo: null,
-				mediaAggregationInstance: null,
-				failover: null,
+								failover: null,
 				progress: null,
 				monthlyTraffic: null
 			});
@@ -29460,10 +24462,6 @@ function buildCacheServices(dependencies = {}) {
 				state.phase = 5;
 			} else if (state.phase === 5) {
 				cleanMap(cacheState.PlaybackInfoResponseCache, (v) => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
-				cleanMap(cacheState.MediaAggregationAuthCache, (v) => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationAuth");
-				cleanMap(cacheState.MediaAggregationInstanceMap, (v) => !v || (Number(v.expiresAt) || 0) <= now, "mediaAggregationInstance");
-				cleanMap(cacheState.ServerRecordAuthCache, (v) => !v || (Number(v.expiresAt) || 0) <= now, "serverRecordAuth");
-				cleanMap(cacheState.ServerRecordProbeBackoff, (v) => !v || (Number(v.retryAt) || 0) <= now, "serverRecordProbeBackoff");
 				state.phase = 6;
 			} else if (state.phase === 6) {
 				cleanMap(cacheState.ProxyFailoverStateCache, (v) => {
@@ -29489,19 +24487,6 @@ function buildCacheServices(dependencies = {}) {
 					return touchedAt > 0 && touchedAt + staleWindowMs <= now;
 				}, "progress");
 				state.phase = 8;
-			} else if (state.phase === 8) {
-				cleanMap(cacheState.ServerRecordWatchSessions, (v) => {
-					if (!v || typeof v !== "object") return true;
-					const terminalUntil = Number(v.terminalUntil) || 0;
-					if (terminalUntil > 0) return terminalUntil <= now;
-					const touchedAt = Number(v.lastSeenAt || v.firstSeenAt) || 0;
-					return touchedAt > 0 && touchedAt + SERVER_RECORD_WATCH_SESSION_IDLE_TTL_MS <= now;
-				}, "serverRecordWatch");
-				cleanMap(cacheState.ServerRecordPlaybackContexts, (v) => {
-					const expiresAt = Number(v?.expiresAt) || 0;
-					return !v || expiresAt <= now;
-				}, "serverRecordPlaybackContext");
-				state.phase = 9;
 			} else {
 				cleanMap(cacheState.DashboardMonthlyTrafficCache, (v) => !v || (Number(v.staleUntil) || 0) <= now, "monthlyTraffic");
 				state.phase = 0;
@@ -29525,8 +24510,8 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!normalizedLines.length) return null;
 			const activeLineId = kernel.resolveActiveLineId(rawNode.activeLineId, normalizedLines, Array.isArray(rawNode.lines) ? rawNode.lines : [], rawNode.port);
 			const entryMode = normalizeNodeEntryMode(rawNode.entryMode);
-			const resolvedServerRecordCredentials = resolveServerRecordCredentials(rawNode);
-			const explicitServerRecordCredentialSource = ["record", "node"].includes(String(rawNode.serverRecordEmbyCredentialSource || "").trim().toLowerCase()) ? String(rawNode.serverRecordEmbyCredentialSource).trim().toLowerCase() : "";
+
+
 			return {
 				name,
 				cacheRevision: buildNodeDerivedCacheRevision(name, rawNode),
@@ -29538,21 +24523,15 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				tags: normalizeNodeTags(rawNode.tags, rawNode.tag),
 				tagColor: String(rawNode.tagColor ?? ""),
 				remark: String(rawNode.remark ?? ""),
-				serverRecord: normalizeServerRecordSettings(rawNode.serverRecord),
-				serverRecordEmbyUsername: resolvedServerRecordCredentials.username,
-				serverRecordEmbyCredentialsConfigured: hasConfiguredServerRecordCredentials(rawNode),
-				serverRecordEmbyCredentialSource: explicitServerRecordCredentialSource || resolvedServerRecordCredentials.source,
-				lines: normalizedLines.map((line) => ({
+																				lines: normalizedLines.map((line) => ({
 					id: String(line.id || "").trim(),
 					name: String(line.name || "").trim(),
 					target: String(line.target || "").trim()
 				})),
 				activeLineId,
 				playbackInfoMode: normalizeNodePlaybackInfoMode(rawNode.playbackInfoMode),
-				mediaAggregationManagedRewrite: rawNode.mediaAggregationManagedRewrite === true,
-				mediaAuthMode: normalizeNodeMediaAuthMode(rawNode.mediaAuthMode),
-				mediaAggregationEmbyCredentialsConfigured: hasConfiguredMediaAggregationNodeCredentials(rawNode),
-				realClientIpMode: normalizeNodeRealClientIpMode(rawNode.realClientIpMode),
+								mediaAuthMode: normalizeNodeMediaAuthMode(rawNode.mediaAuthMode),
+								realClientIpMode: normalizeNodeRealClientIpMode(rawNode.realClientIpMode),
 				hedgeProbePath: normalizeNodeHedgeProbePath(rawNode.hedgeProbePath),
 				routingDecisionMode: normalizeNodeRoutingDecisionMode(rawNode.routingDecisionMode),
 				mainVideoStreamMode: normalizeNodeMainVideoStreamMode(rawNode.mainVideoStreamMode ?? rawNode.wangpanDirectMode ?? rawNode.wangpanMode)
@@ -29986,14 +24965,11 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				normalizedNames.push(name);
 				cacheState.NodeCache.delete(name);
 				cacheState.PlaybackRouteHotCache.delete(name);
-				cacheState.ServerRecordsSnapshotCache.delete(name);
 			}
 			if (normalizedNames.length > 0) {
 				invalidateNodeCacheTokens(normalizedNames);
 				invalidatePlaybackInfoResponseCacheForNodes(normalizedNames);
 				invalidatePlaybackProgressRelayForNodes(normalizedNames);
-				invalidateServerRecordWatchSessionsForNodes(normalizedNames);
-				invalidateServerRecordPlaybackContextsForNodes(normalizedNames);
 			}
 			if (options.invalidateList) {
 				cacheState.NodesListCache = null;
@@ -30485,11 +25461,9 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 				previousFullIndexBytes: rawStoredSummaryIndexText ? new TextEncoder().encode(rawStoredSummaryIndexText).length : 0
 			};
 		},
-		async classifyKvTidyKeys(kv, allKeys = [], options = {}) {
+		async classifyKvTidyKeys(kv, allKeys = []) {
 			const nodeNames = [];
 			const removableKeys = /* @__PURE__ */ new Set();
-			const preservedD1LegacyKeys = [];
-			const canDeleteD1OwnedLegacyKeys = options.canDeleteD1OwnedLegacyKeys === true;
 			const knownSectionKeys = new Set(Object.values(kernel.LEGACY_OPS_STATUS_SECTION_KEYS));
 			let untouchedOtherKeyCount = 0;
 			let opsStatusKeyCount = 0;
@@ -30538,24 +25512,15 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 					continue;
 				}
 				if (keyName === kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY) {
-					if (canDeleteD1OwnedLegacyKeys) {
-						removableKeys.add(keyName);
-						dnsIpPoolSourceKeyCount += 1;
-					} else preservedD1LegacyKeys.push(keyName);
+					untouchedOtherKeyCount += 1;
 					continue;
 				}
 				if (keyName === kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY) {
-					if (canDeleteD1OwnedLegacyKeys) {
-						removableKeys.add(keyName);
-						telegramAlertStateKeyCount += 1;
-					} else preservedD1LegacyKeys.push(keyName);
+					untouchedOtherKeyCount += 1;
 					continue;
 				}
 				if (knownSectionKeys.has(keyName) || keyName === kernel.LEGACY_OPS_STATUS_KEY) {
-					if (canDeleteD1OwnedLegacyKeys) {
-						removableKeys.add(keyName);
-						opsStatusKeyCount += 1;
-					} else preservedD1LegacyKeys.push(keyName);
+					untouchedOtherKeyCount += 1;
 					continue;
 				}
 				if (keyName.startsWith(kernel.DNS_RECORD_HISTORY_PREFIX)) {
@@ -30569,7 +25534,6 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 			return {
 				nodeNames,
 				removableKeys,
-				preservedD1LegacyKeys,
 				untouchedOtherKeyCount,
 				opsStatusKeyCount,
 				dnsRecordHistoryKeyCount,
@@ -30580,136 +25544,6 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 				telegramAlertStateKeyCount,
 				loginFailureKeyCount,
 				dnsFetchLockKeyCount
-			};
-		},
-		async buildKvD1LegacyMigrationPlan(kv, removableKeys = []) {
-			const migrations = [];
-			const sectionByKey = new Map(Object.entries(kernel.LEGACY_OPS_STATUS_SECTION_KEYS).map(([sectionName, key]) => [key, sectionName]));
-			for (const key of Array.isArray(removableKeys) ? removableKeys : [...removableKeys]) {
-				let kind = "";
-				let sectionName = "";
-				if (key === kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY) kind = "dns_ip_pool_sources";
-				else if (key === kernel.LEGACY_OPS_STATUS_KEY) kind = "ops_status_root";
-				else if (sectionByKey.has(key)) {
-					kind = "ops_status_section";
-					sectionName = String(sectionByKey.get(key) || "");
-				} else if (key === kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY) kind = "telegram_alert_state";
-				if (!kind) continue;
-				const payload = await kvGetStrict(kv, key, { type: "json" });
-				migrations.push({
-					key,
-					kind,
-					sectionName,
-					payload: kernel.normalizeKvD1LegacyMigrationPayload(kind, payload, key)
-				});
-			}
-			return migrations;
-		},
-		normalizeKvD1LegacyMigrationPayload(kind = "", payload = null, key = "") {
-			const normalizedKind = String(kind || "").trim();
-			const fail = (reason) => {
-				const error = /* @__PURE__ */ new Error(`Legacy KV payload cannot be migrated safely: ${String(key || normalizedKind || "unknown")}`);
-				error.code = "D1_LEGACY_PAYLOAD_INVALID";
-				error.status = 409;
-				error.details = {
-					key: String(key || ""),
-					kind: normalizedKind,
-					reason
-				};
-				throw error;
-			};
-			if ([
-				"ops_status_root",
-				"ops_status_section",
-				"telegram_alert_state"
-			].includes(normalizedKind)) {
-				if (!isPlainObject(payload)) fail("expected_object");
-				return payload;
-			}
-			if (normalizedKind === "dns_ip_pool_sources") {
-				const rawSources = Array.isArray(payload) ? payload : isPlainObject(payload) && Array.isArray(payload.sources) ? payload.sources : null;
-				if (!rawSources) fail("expected_source_array");
-				const normalizedSources = rawSources.map((source, index) => {
-					if (!isPlainObject(source)) fail(`invalid_source:${index}`);
-					const sourceId = String(source?.id || "").trim();
-					if (!sourceId) fail(`missing_source_id:${index}`);
-					const normalized = normalizeDnsIpPoolSourceRecord(source, index);
-					if (!hasDnsIpPoolSourceTarget(normalized)) fail(`missing_source_target:${index}`);
-					return {
-						...normalized,
-						id: sourceId
-					};
-				});
-				const sourceIds = normalizedSources.map((source) => String(source?.id || "").trim());
-				if (sourceIds.some((id) => !id) || new Set(sourceIds).size !== sourceIds.length) fail("duplicate_or_missing_source_id");
-				return normalizedSources;
-			}
-			fail("unsupported_kind");
-		},
-		async applyKvD1LegacyMigrations(db, migrations = []) {
-			const actions = (Array.isArray(migrations) ? migrations : []).map((action) => ({
-				...action,
-				payload: kernel.normalizeKvD1LegacyMigrationPayload(action?.kind, action?.payload, action?.key)
-			}));
-			if (!actions.length) return {
-				migratedKeyCount: 0,
-				migratedDnsIpPoolSourceCount: 0
-			};
-			if (!db) {
-				const error = /* @__PURE__ */ new Error("D1 is required before deleting D1-owned legacy KV keys");
-				error.code = "D1_COMPATIBILITY_REQUIRED";
-				error.status = 409;
-				throw error;
-			}
-			let migratedKeyCount = 0;
-			let migratedDnsIpPoolSourceCount = 0;
-			const rootActions = actions.filter((action) => action?.kind === "ops_status_root");
-			const sectionActions = actions.filter((action) => action?.kind === "ops_status_section");
-			const telegramActions = actions.filter((action) => action?.kind === "telegram_alert_state");
-			const dnsSourceActions = actions.filter((action) => action?.kind === "dns_ip_pool_sources");
-			const updatedAtMs = nowMs();
-			const putStatusStrict = async (scope, payload) => {
-				if (await kernel.putOpsStatusPayloadToDb(db, scope, payload, updatedAtMs) === true) return;
-				const error = /* @__PURE__ */ new Error(`D1 legacy state migration failed for ${scope}`);
-				error.code = "D1_LEGACY_MIGRATION_FAILED";
-				error.status = 503;
-				throw error;
-			};
-			if (rootActions.length) {
-				const legacyRoot = rootActions.reduce((current, action) => mergeStatusPatch(current, isPlainObject(action?.payload) ? action.payload : {}), {});
-				const currentRoot = await kernel.getOpsStatusPayloadFromDbStrict(db, kernel.getOpsStatusDbScope());
-				await putStatusStrict(kernel.getOpsStatusDbScope(), mergeStatusPatch(legacyRoot, isPlainObject(currentRoot) ? currentRoot : {}));
-				migratedKeyCount += rootActions.length;
-			}
-			for (const action of sectionActions) {
-				const sectionName = String(action?.sectionName || "").trim();
-				if (!sectionName) continue;
-				const scope = kernel.getOpsStatusDbScope(sectionName);
-				const currentSection = await kernel.getOpsStatusPayloadFromDbStrict(db, scope);
-				await putStatusStrict(scope, mergeStatusPatch(isPlainObject(action?.payload) ? action.payload : {}, isPlainObject(currentSection) ? currentSection : {}));
-				migratedKeyCount += 1;
-			}
-			if (telegramActions.length) {
-				const legacyState = telegramActions.reduce((current, action) => mergeStatusPatch(current, isPlainObject(action?.payload) ? action.payload : {}), {});
-				const currentState = await kernel.getOpsStatusPayloadFromDbStrict(db, kernel.TELEGRAM_ALERT_STATE_DB_SCOPE);
-				await putStatusStrict(kernel.TELEGRAM_ALERT_STATE_DB_SCOPE, mergeStatusPatch(legacyState, isPlainObject(currentState) ? currentState : {}));
-				migratedKeyCount += telegramActions.length;
-			}
-			for (const action of dnsSourceActions) {
-				const legacySources = action.payload;
-				const currentSources = await kernel.getDnsIpPoolSourcesFromDbStrict(db);
-				const mergedSources = /* @__PURE__ */ new Map();
-				for (const source of [...legacySources, ...currentSources]) {
-					const key = String(source?.id || "").trim();
-					if (key) mergedSources.set(key, source);
-				}
-				if (legacySources.length || currentSources.length) await kernel.persistDnsIpPoolSources({ db }, [...mergedSources.values()]);
-				migratedDnsIpPoolSourceCount += legacySources.length;
-				migratedKeyCount += 1;
-			}
-			return {
-				migratedKeyCount,
-				migratedDnsIpPoolSourceCount
 			};
 		},
 		async collectKvTidyNodeMutations(kv, nodeNames = [], nextTidyConfig = {}, rollbackKvEntries = []) {
@@ -30796,10 +25630,6 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 			let deletedLegacySnapshotFieldCount = 0;
 			const migratedConfigKeys = [];
 			for (const snapshot of rawSnapshots) {
-				if (snapshot && typeof snapshot === "object" && !Array.isArray(snapshot) && snapshot.reason === "tidy_kv_data_pre_migration") {
-					rewrittenSnapshots.push(redactConfigSnapshotSecrets(snapshot));
-					continue;
-				}
 				const rewriteResult = rewriteConfigSnapshotToCurrentSchema(snapshot);
 				rewrittenSnapshots.push(redactConfigSnapshotSecrets(rewriteResult.snapshot));
 				if (rewriteResult.rewritten) rewrittenSnapshotCount += 1;
@@ -30854,7 +25684,6 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 				scannedKeys: [...new Set(Array.isArray(plan?.scannedKeys) ? plan.scannedKeys : [])].sort(),
 				revisions: isPlainObject(plan?.revisions) ? plan.revisions : {},
 				mutationPlan,
-				d1LegacyMigrations: Array.isArray(plan?.d1LegacyMigrations) ? plan.d1LegacyMigrations : [],
 				rebuiltNodeSummaries: Array.isArray(plan?.rebuiltNodeSummaries) ? plan.rebuiltNodeSummaries : []
 			}));
 		}
@@ -31302,8 +26131,7 @@ function createWorkerApplication({ includeTestingSupport = false } = {}) {
 		configReader,
 		fetchPort: { fetchRequest },
 		logger,
-		nodeRepository: kernel,
-		watchRepository: kernel
+		nodeRepository: kernel
 	});
 	const adminConsole = new AdminConsoleFacade({
 		actionHandlers: kernel.adminActionHandlers,
@@ -31429,9 +26257,7 @@ function createWorkerApplication({ includeTestingSupport = false } = {}) {
 				if (shellService.isPlaybackCriticalSegments(segments, 1)) return true;
 				return segments.length > 2 && shellService.isPlaybackCriticalSegments(segments, 2);
 			},
-			buildMediaAggregationSourceId,
 			isolateState,
-			mediaAggregationProviderIdsMatch,
 			proxyService: proxyApi.testingSupport
 		});
 	}
@@ -31448,16 +26274,9 @@ export {
   buildDailyTelegramSummaryMessage,
   buildDnsIpWorkspaceSummary,
   buildFastSegmentUpstreamUrlText,
-  buildMediaAggregationIdentity,
-  buildMediaAggregationMatchFingerprintHash,
-  buildMediaAggregationSourceId,
-  buildMediaAggregationSourceIdV2,
-  buildPosterBrowserConfig,
   buildProbeUpstreamUrl,
   buildProxyAccessRuleProfile,
   buildResolvedAdminIndexState,
-  buildServerRecordExpiry,
-  buildServerRecordPosterMetadata,
   buildUpstreamProxyUrl,
   buildWorkerMetadataCacheIdentityPartition,
   buildWorkerMetadataCacheLookupRequest,
@@ -31477,23 +26296,13 @@ export {
   fetchRequest,
   getDueScheduledClockSlots,
   getRuntimeConfig,
-  hasConfiguredMediaAggregationNodeCredentials,
   hasWorkerMetadataPrivateIdentity,
   invalidateNodesRevisionCache,
   invalidateRuntimeConfigCache,
   isEmbyWebProxyPath,
   isTargetRecord,
   isolateState,
-  matchMediaAggregationIdentities,
-  mediaAggregationProviderIdsMatch,
-  normalizeMediaAggregationProviderIds,
-  normalizeMediaAggregationTitle,
-  normalizePosterBrowserOrigin,
-  normalizeTmdbBrowserToken,
-  parseMediaAggregationSourceId,
-  readMediaAggregationCredentialPair,
   resolveEffectiveRoutingDecisionMode,
-  resolveMediaAggregationCredentials,
   resolvePlaybackInfoRewriteUrlMode,
   resolveRoutingDecisionMode,
   runSingleFlight,
@@ -31501,6 +26310,5 @@ export {
   runtimeState,
   sanitizeRuntimeConfig,
   serializeBoundedLogDetailJson,
-  shouldUseSegmentFastUpstreamBuilder,
-  verifyMediaAggregationSourceSignature
+  shouldUseSegmentFastUpstreamBuilder
 };

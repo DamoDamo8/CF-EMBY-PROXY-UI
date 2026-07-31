@@ -1380,7 +1380,6 @@ export function useAdminConsole() {
       logs: false,
       clearLogs: false,
       initLogsDb: false,
-      initLogsFts: false,
       previewTidyData: false,
       tidyKvData: false,
       tidyD1Data: false,
@@ -1424,7 +1423,6 @@ export function useAdminConsole() {
       logs: '',
       clearLogs: '',
       initLogsDb: '',
-      initLogsFts: '',
       previewTidyData: '',
       tidyKvData: '',
       tidyD1Data: '',
@@ -3114,45 +3112,6 @@ export function useAdminConsole() {
         return null;
       } finally {
         state.loading.initLogsDb = false;
-      }
-    },
-    async initLogsFts() {
-      if (state.loading.initLogsFts) return null;
-
-      state.loading.initLogsFts = true;
-      state.errors.initLogsFts = '';
-
-      try {
-        const payload = await callAdminAction('initLogsFts', {}, {
-          seedBootstrap: state.seedBootstrap
-        });
-
-        const nextRevisions = isPlainObject(payload?.revisions) ? payload.revisions : {};
-        patchBootstrapRevisions(nextRevisions);
-        state.errors.logs = '';
-        state.authRequired = false;
-
-        if (isPlainObject(state.logs)) {
-          state.logs = {
-            ...state.logs,
-            revisions: {
-              ...(isPlainObject(state.logs.revisions) ? state.logs.revisions : {}),
-              logsRevision: String(nextRevisions.logsRevision || state.logs?.revisions?.logsRevision || '').trim()
-            }
-          };
-        }
-
-        return payload;
-      } catch (error) {
-        if (isAuthError(error)) {
-          state.authRequired = true;
-          state.errors.initLogsFts = '';
-        } else {
-          state.errors.initLogsFts = getErrorMessage(error, '日志 FTS 初始化失败');
-        }
-        return null;
-      } finally {
-        state.loading.initLogsFts = false;
       }
     }
   };

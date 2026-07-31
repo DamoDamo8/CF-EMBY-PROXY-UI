@@ -211,13 +211,11 @@ const authRequired = computed(() => props.adminConsole?.state?.authRequired === 
 const loadingLogs = computed(() => Boolean(props.adminConsole?.state?.loading?.logs));
 const clearingLogs = computed(() => Boolean(props.adminConsole?.state?.loading?.clearLogs));
 const initializingLogsDb = computed(() => Boolean(props.adminConsole?.state?.loading?.initLogsDb));
-const initializingLogsFts = computed(() => Boolean(props.adminConsole?.state?.loading?.initLogsFts));
 const logsError = computed(() => String(props.adminConsole?.state?.errors?.logs || '').trim());
 const clearLogsError = computed(() => String(props.adminConsole?.state?.errors?.clearLogs || '').trim());
 const initLogsDbError = computed(() => String(props.adminConsole?.state?.errors?.initLogsDb || '').trim());
-const initLogsFtsError = computed(() => String(props.adminConsole?.state?.errors?.initLogsFts || '').trim());
 const logsRevision = computed(() => String(props.adminConsole?.logsRevision || logsState.value?.revisions?.logsRevision || '').trim());
-const maintenanceBusy = computed(() => clearingLogs.value || initializingLogsDb.value || initializingLogsFts.value);
+const maintenanceBusy = computed(() => clearingLogs.value || initializingLogsDb.value);
 const anyBusy = computed(() => loadingLogs.value || maintenanceBusy.value);
 const canGoPrev = computed(() => {
   const currentPage = Math.max(1, Number(logsState.value.page) || 1);
@@ -535,13 +533,13 @@ const statusMeta = computed(() => {
       tone: 'border-amber-400/30 bg-amber-500/12 text-amber-200'
     };
   }
-  if (logsError.value || clearLogsError.value || initLogsDbError.value || initLogsFtsError.value) {
+  if (logsError.value || clearLogsError.value || initLogsDbError.value) {
     return {
       label: '日志异常',
       tone: 'border-rose-400/30 bg-rose-500/12 text-rose-200'
     };
   }
-  if (initializingLogsDb.value || initializingLogsFts.value) {
+  if (initializingLogsDb.value) {
     return {
       label: '正在初始化',
       tone: 'border-brand-400/30 bg-brand-500/12 text-brand-200'
@@ -575,13 +573,12 @@ watch(logsState, (nextState) => {
   syncSeekCursorHistory(nextState);
 }, { immediate: true, deep: true });
 
-watch([logsError, clearLogsError, initLogsDbError, initLogsFtsError], ([
+watch([logsError, clearLogsError, initLogsDbError], ([
   nextLogsError,
   nextClearLogsError,
-  nextInitLogsDbError,
-  nextInitLogsFtsError
+  nextInitLogsDbError
 ]) => {
-  const nextError = nextClearLogsError || nextInitLogsDbError || nextInitLogsFtsError || nextLogsError;
+  const nextError = nextClearLogsError || nextInitLogsDbError || nextLogsError;
   if (nextError) {
     feedback.tone = 'error';
     feedback.text = nextError;
@@ -693,25 +690,7 @@ async function handleInitLogsDb() {
   if (!result) return;
 
   feedback.tone = 'success';
-  feedback.text = `日志表初始化完成，Schema v${formatTextValue(result.schemaVersion, '4')}，查询与持久化链路已就绪。`;
-
-  resetSeekCursorHistory();
-  const query = buildQueryPayload(1);
-  if (!query) return;
-  await props.adminConsole.getLogs(query);
-}
-
-async function handleInitLogsFts() {
-  if (!props.adminConsole || initializingLogsFts.value) return;
-
-  feedback.tone = '';
-  feedback.text = '';
-
-  const result = await props.adminConsole.initLogsFts();
-  if (!result) return;
-
-  feedback.tone = 'success';
-  feedback.text = `日志 FTS 初始化完成，迁移 ${formatTextValue(result.migratedRows, '0')} 行，触发器模式 ${formatTextValue(result.triggerMode, 'insert_only')}。`;
+  feedback.text = `日志表初始化完成，当前 D1 结构、查询与持久化链路已就绪。`;
 
   resetSeekCursorHistory();
   const query = buildQueryPayload(1);
@@ -1686,15 +1665,6 @@ function isCopyTargetActive(target = '') {
         >
           <Database class="h-4 w-4" />
           {{ initializingLogsDb ? '初始化中' : '初始化日志表' }}
-        </button>
-        <button
-          type="button"
-          class="secondary-btn"
-          :disabled="authRequired || anyBusy"
-          @click="handleInitLogsFts"
-        >
-          <Waypoints class="h-4 w-4" />
-          {{ initializingLogsFts ? '构建中' : '初始化 FTS' }}
         </button>
         <button
           type="button"

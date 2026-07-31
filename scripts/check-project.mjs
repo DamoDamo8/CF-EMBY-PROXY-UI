@@ -27,13 +27,13 @@ const requiredChecks = [
     cwd: repositoryRoot
   },
   {
-    name: 'Worker, KV safety, and D1 migrations',
+    name: 'Worker, KV safety, and current D1 schema',
     command: process.execPath,
     args: [
       '--test',
       'tests/worker-defensive-boundaries.test.mjs',
       'tests/config-kv-safety.test.mjs',
-      'tests/d1-migrations.test.mjs',
+      'tests/d1-schema.test.mjs',
       'tests/worker-bundle-smoke.test.mjs',
       'tests/frontend-runtime-enhancements.test.mjs'
     ],
@@ -44,6 +44,12 @@ const requiredChecks = [
     command: process.execPath,
     args: ['./scripts/sync-admin-runtime.mjs', '--check'],
     cwd: frontendDirectory
+  },
+  {
+    name: 'Frontend Vue source syntax',
+    command: process.execPath,
+    args: ['./scripts/check-frontend-sources.mjs'],
+    cwd: repositoryRoot
   },
   {
     name: 'Release CDN paths',

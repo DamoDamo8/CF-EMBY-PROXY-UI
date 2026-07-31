@@ -227,22 +227,16 @@ test("KV tidy quota includes puts, deletes, rollback writes, and rollback delete
   assert.equal(budget.estimatedWorstCaseWriteCount, 4);
 });
 
-test("config snapshots redact secrets and snapshot restoration preserves current secrets", async () => {
+test("config snapshots redact secrets and restoration preserves current secrets", async () => {
   const previousConfig = {
     rateLimitRpm: 10,
     cfApiToken: "previous-cf-secret",
-    tgBotToken: "previous-tg-secret",
-    tmdbBrowserToken: "previous-tmdb-browser-token",
-    doubanBrowserToken: "previous-douban-browser-token",
-    mediaAggregationEmbyPassword: "previous-emby-secret"
+    tgBotToken: "previous-tg-secret"
   };
   const currentConfig = {
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret",
-    tmdbBrowserToken: "current-tmdb-browser-token",
-    doubanBrowserToken: "current-douban-browser-token",
-    mediaAggregationEmbyPassword: "current-emby-secret"
+    tgBotToken: "current-tg-secret"
   };
   const { kv } = createKv({
     [kernel.CONFIG_KEY]: currentConfig,
@@ -258,9 +252,7 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   const [snapshot] = JSON.parse(snapshotsMutation.value);
   assert.equal(snapshot.config.cfApiToken, undefined);
   assert.equal(snapshot.config.tgBotToken, undefined);
-  assert.equal(snapshot.config.tmdbBrowserToken, undefined);
-  assert.equal(snapshot.config.doubanBrowserToken, undefined);
-  assert.equal(snapshot.config.mediaAggregationEmbyPassword, undefined);
+  await kv.put(kernel.CONFIG_SNAPSHOTS_KEY, snapshotsMutation.value);
 
   const env = {
     ENI_KV: kv,
@@ -268,47 +260,12 @@ test("config snapshots redact secrets and snapshot restoration preserves current
   };
   invalidateRuntimeConfigCache();
   try {
-    const restoredConfig = await kernel.restoreTidyKvMigrationSnapshot({
-      id: "snapshot-1",
-      config: { rateLimitRpm: 5 },
-      rollbackPayload: { version: 1, kvEntries: [] }
-    }, { env, kv });
-    assert.equal(restoredConfig.rateLimitRpm, 5);
-    assert.equal(restoredConfig.cfApiToken, "current-cf-secret");
-    assert.equal(restoredConfig.tgBotToken, "current-tg-secret");
-    assert.equal(restoredConfig.tmdbBrowserToken, "current-tmdb-browser-token");
-    assert.equal(restoredConfig.doubanBrowserToken, "current-douban-browser-token");
-    assert.equal(restoredConfig.mediaAggregationEmbyPassword, "current-emby-secret");
-
-    const restoredFromRollback = await kernel.restoreTidyKvMigrationSnapshot({
-      id: "snapshot-2",
-      config: { rateLimitRpm: 4 },
-      rollbackPayload: {
-        version: 1,
-        kvEntries: [
-          {
-            key: kernel.CONFIG_KEY,
-            exists: true,
-            value: JSON.stringify({
-              rateLimitRpm: 3,
-              cfApiToken: "redacted-old-cf-secret",
-              tgBotToken: "redacted-old-tg-secret"
-            })
-          },
-          {
-            key: kernel.CONFIG_SNAPSHOTS_KEY,
-            exists: true,
-            value: JSON.stringify([{ id: "old", config: { rateLimitRpm: 2, cfApiToken: "leaked-secret" } }])
-          }
-        ]
-      }
-    }, { env, kv });
-    assert.equal(restoredFromRollback.rateLimitRpm, 3);
-    assert.equal(restoredFromRollback.cfApiToken, "current-cf-secret");
-    assert.equal(restoredFromRollback.tgBotToken, "current-tg-secret");
-    const persistedSnapshots = JSON.parse(await kv.get(kernel.CONFIG_SNAPSHOTS_KEY));
-    assert.ok(persistedSnapshots.length >= 1);
-    assert.ok(persistedSnapshots.every(item => item?.config?.cfApiToken === undefined && item?.config?.tgBotToken === undefined));
+    const response = await adminActions.restoreConfigSnapshot({ id: snapshot.id }, { env, ctx: null, kv });
+    assert.equal(response.status, 200);
+    const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
+    assert.equal(restored.rateLimitRpm, 10);
+    assert.equal(restored.cfApiToken, "current-cf-secret");
+    assert.equal(restored.tgBotToken, "current-tg-secret");
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -318,11 +275,7 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
   const currentConfig = {
     rateLimitRpm: 20,
     cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret",
-    tmdbBrowserToken: "current-tmdb-browser-token",
-    doubanBrowserToken: "current-douban-browser-token",
-    mediaAggregationEmbyUsername: "current-emby-user",
-    mediaAggregationEmbyPassword: "current-emby-password"
+    tgBotToken: "current-tg-secret"
   };
   const { kv } = createKv({ [kernel.CONFIG_KEY]: currentConfig });
   const env = {
@@ -339,282 +292,11 @@ test("redacted settings backup roundtrip preserves current secrets", async () =>
     assert.equal(backup.secretsRedacted, true);
     assert.equal(backup.config.cfApiToken, undefined);
     assert.equal(backup.config.tgBotToken, undefined);
-    assert.equal(backup.config.tmdbBrowserToken, undefined);
-    assert.equal(backup.config.doubanBrowserToken, undefined);
-    assert.equal(backup.config.mediaAggregationEmbyUsername, undefined);
-    assert.equal(backup.config.mediaAggregationEmbyPassword, undefined);
 
     await adminActions.importSettings(backup, { env, ctx: null, kv, meta: {} });
     const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
-    assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
-    assert.equal(restored.doubanBrowserToken, "current-douban-browser-token");
-    assert.equal(restored.mediaAggregationEmbyUsername, "current-emby-user");
-    assert.equal(restored.mediaAggregationEmbyPassword, "current-emby-password");
-  } finally {
-    invalidateRuntimeConfigCache();
-  }
-});
-
-test("legacy tmdbApiKey is permanently removed by save, export, import, and KV tidy", async () => {
-  const legacySecret = "legacy-tmdb-secret";
-  const { kv } = createKv({ [kernel.CONFIG_KEY]: { rateLimitRpm: 20, tmdbApiKey: legacySecret } });
-  const env = {
-    ENI_KV: kv,
-    JWT_SECRET: "legacy-tmdb-tidy-secret",
-    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-retired-tmdb-key"
-  };
-  invalidateRuntimeConfigCache();
-  try {
-    const saveResponse = await adminActions.saveConfig({
-      config: { rateLimitRpm: 25, tmdbApiKey: "ignored-replacement" }
-    }, { env, ctx: null, kv, meta: { section: "account", source: "ui" } });
-    assert.equal(saveResponse.status, 200);
-    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
-
-    await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 30, tmdbApiKey: legacySecret }));
-    invalidateRuntimeConfigCache();
-    const defaultExport = await adminActions.exportSettings({}, {
-      env,
-      request: new Request("https://worker.test/admin")
-    });
-    const secretExport = await adminActions.exportSettings({ includeSecrets: true }, {
-      env,
-      request: new Request("https://worker.test/admin", { headers: { "X-Admin-Confirm": "exportSettings" } })
-    });
-    assert.equal((await defaultExport.json()).config.tmdbApiKey, undefined);
-    assert.equal((await secretExport.json()).config.tmdbApiKey, undefined);
-
-    const imported = await adminActions.importSettings({
-      config: { rateLimitRpm: 35, tmdbApiKey: "imported-legacy-secret" }
-    }, { env, ctx: null, kv, meta: {} });
-    assert.equal(imported.status, 200);
-    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
-
-    await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 40, tmdbApiKey: legacySecret }));
-    invalidateRuntimeConfigCache();
-    const plan = await kernel.buildKvTidyPlan(env, { kv });
-    assert.ok(plan.mutationPlan.some(mutation => mutation.type === "put" && mutation.key === kernel.CONFIG_KEY));
-    const planToken = await kernel.createKvTidyPlanToken(env, plan);
-    await kernel.tidyKvData(env, { kv, planToken });
-    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).tmdbApiKey, undefined);
-  } finally {
-    invalidateRuntimeConfigCache();
-  }
-});
-
-test("full backup requires confirmation before retaining Emby credentials", async () => {
-  const adminIndexRecord = await buildAdminLocalIndexUploadRecord(
-    '<!doctype html><html><body><div id="app"></div></body></html>',
-    "index.html"
-  );
-  const currentConfig = {
-    rateLimitRpm: 30,
-    cfApiToken: "current-cf-secret",
-    tgBotToken: "current-tg-secret",
-    tmdbBrowserToken: "current-tmdb-browser-token",
-    doubanBrowserToken: "current-douban-browser-token",
-    mediaAggregationEmbyUsername: "global-user",
-    mediaAggregationEmbyPassword: "global-password",
-    indexUrl: adminIndexRecord.sourceUrl
-  };
-  const currentNode = {
-    name: "backup",
-    target: "https://backup.test",
-    lines: [{ id: "main", name: "Main", target: "https://backup.test" }],
-    activeLineId: "main",
-    mediaAggregationEmbyUsername: "node-user",
-    mediaAggregationEmbyPassword: "node-password",
-    serverRecordEmbyUsername: "record-user",
-    serverRecordEmbyPassword: "record-password"
-  };
-  const uploadKey = kernel.buildAdminIndexUploadKey(adminIndexRecord.revision);
-  const { kv } = createKv({
-    [kernel.CONFIG_KEY]: currentConfig,
-    [kernel.NODES_INDEX_KEY]: ["backup"],
-    [`${kernel.PREFIX}backup`]: currentNode,
-    [uploadKey]: adminIndexRecord
-  });
-  const env = {
-    ENI_KV: kv,
-    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-full-roundtrip"
-  };
-  invalidateRuntimeConfigCache();
-  try {
-    const rejectedResponse = await adminActions.exportConfig({ includeEmbyCredentials: true }, {
-      env,
-      ctx: null,
-      request: new Request("https://worker.test/admin")
-    });
-    assert.equal(rejectedResponse.status, 428);
-    assert.equal((await rejectedResponse.json()).error.code, "CONFIRMATION_REQUIRED");
-
-    const redactedResponse = await adminActions.exportConfig({}, {
-      env,
-      ctx: null,
-      request: new Request("https://worker.test/admin")
-    });
-    const redactedBackup = await redactedResponse.json();
-    assert.equal(redactedBackup.secretsRedacted, true);
-    assert.equal(redactedBackup.containsSecrets, false);
-    assert.equal(redactedBackup.config.mediaAggregationEmbyUsername, undefined);
-    assert.equal(redactedBackup.config.mediaAggregationEmbyPassword, undefined);
-    assert.equal(redactedBackup.nodes[0].mediaAggregationEmbyUsername, undefined);
-    assert.equal(redactedBackup.nodes[0].mediaAggregationEmbyPassword, undefined);
-    assert.equal(redactedBackup.nodes[0].serverRecordEmbyUsername, undefined);
-    assert.equal(redactedBackup.nodes[0].serverRecordEmbyPassword, undefined);
-
-    const exportedResponse = await adminActions.exportConfig({ includeEmbyCredentials: true }, {
-      env,
-      ctx: null,
-      request: new Request("https://worker.test/admin", {
-        headers: { "X-Admin-Confirm": "exportConfig" }
-      })
-    });
-    const backup = await exportedResponse.json();
-    assert.equal(backup.secretsRedacted, false);
-    assert.equal(backup.containsSecrets, true);
-    assert.equal(backup.config.cfApiToken, undefined);
-    assert.equal(backup.config.tgBotToken, undefined);
-    assert.equal(backup.config.tmdbBrowserToken, undefined);
-    assert.equal(backup.config.doubanBrowserToken, undefined);
-    assert.equal(backup.config.mediaAggregationEmbyUsername, "global-user");
-    assert.equal(backup.config.mediaAggregationEmbyPassword, "global-password");
-    assert.equal(backup.nodes.length, 1);
-    assert.equal(backup.nodes[0].mediaAggregationEmbyUsername, "node-user");
-    assert.equal(backup.nodes[0].mediaAggregationEmbyPassword, "node-password");
-    assert.equal(backup.nodes[0].serverRecordEmbyUsername, "record-user");
-    assert.equal(backup.nodes[0].serverRecordEmbyPassword, "record-password");
-    assert.equal(backup.adminIndexUpload.revision, adminIndexRecord.revision);
-    assert.equal(backup.adminIndexUpload.html, adminIndexRecord.html);
-
-    await kv.delete(uploadKey);
-    await adminActions.importFull(backup, { env, ctx: null, kv });
-    const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
-    assert.equal(restored.cfApiToken, "current-cf-secret");
-    assert.equal(restored.tgBotToken, "current-tg-secret");
-    assert.equal(restored.tmdbBrowserToken, "current-tmdb-browser-token");
-    assert.equal(restored.doubanBrowserToken, "current-douban-browser-token");
-    assert.equal(restored.mediaAggregationEmbyUsername, "global-user");
-    assert.equal(restored.mediaAggregationEmbyPassword, "global-password");
-    const restoredNode = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
-    assert.equal(restoredNode.mediaAggregationEmbyUsername, "node-user");
-    assert.equal(restoredNode.mediaAggregationEmbyPassword, "node-password");
-    assert.equal(restoredNode.serverRecordEmbyUsername, "record-user");
-    assert.equal(restoredNode.serverRecordEmbyPassword, "record-password");
-    assert.equal((await kernel.getAdminIndexUploadRecord(kv, adminIndexRecord.revision)).html, adminIndexRecord.html);
-  } finally {
-    invalidateRuntimeConfigCache();
-  }
-});
-
-test("full import rejects a server record password without a username before writing", async () => {
-  const { kv, kernel: kvOperations } = createKv({ [kernel.CONFIG_KEY]: {} });
-  const env = {
-    ENI_KV: kv,
-    HOST: "proxy.example",
-    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-server-record-credentials"
-  };
-  invalidateRuntimeConfigCache();
-  try {
-    const response = await adminActions.importFull({
-      nodes: [{
-        name: "orphan-password",
-        target: "https://origin.example",
-        serverRecordEmbyPassword: "secret-without-user"
-      }]
-    }, { env, ctx: null, kv });
-    const payload = await response.json();
-    assert.equal(response.status, 400);
-    assert.equal(payload.error.code, "SERVER_RECORD_CREDENTIALS_INCOMPLETE");
-    assert.equal(await kv.get(`${kernel.PREFIX}orphan-password`, { type: "json" }), null);
-    assert.deepEqual(kvOperations, []);
-  } finally {
-    invalidateRuntimeConfigCache();
-  }
-});
-
-test("media aggregation shortcut requires usernames and accepts an empty global password", async () => {
-  const primaryNode = {
-    name: "primary",
-    target: "https://primary.test",
-    lines: [{ id: "main", target: "https://primary.test" }],
-    activeLineId: "main",
-    mediaAggregationEmbyUsername: "node-user",
-    mediaAggregationEmbyPassword: "node-password"
-  };
-  const backupNode = {
-    name: "backup",
-    target: "https://backup.test",
-    lines: [{ id: "main", target: "https://backup.test" }],
-    activeLineId: "main"
-  };
-  const { kv } = createKv({
-    [kernel.CONFIG_KEY]: {},
-    [kernel.NODES_INDEX_KEY]: ["primary", "backup"],
-    [`${kernel.PREFIX}primary`]: primaryNode,
-    [`${kernel.PREFIX}backup`]: backupNode
-  });
-  const env = {
-    ENI_KV: kv,
-    __CONFIG_CACHE_NAMESPACE: "config-kv-safety-media-aggregation-credentials"
-  };
-  invalidateRuntimeConfigCache();
-  try {
-    const response = await adminActions.saveMediaAggregationPolicyShortcuts({
-      selectedNodeNames: ["primary", "backup"],
-      username: "",
-      password: ""
-    }, { env, ctx: null, kv });
-    const payload = await response.json();
-    assert.equal(response.status, 400);
-    assert.equal(payload.error.code, "MEDIA_AGGREGATION_CREDENTIALS_REQUIRED");
-    assert.deepEqual(payload.error.details.nodeNames, ["backup"]);
-
-    const successResponse = await adminActions.saveMediaAggregationPolicyShortcuts({
-      selectedNodeNames: ["primary", "backup"],
-      username: "global-user",
-      password: "",
-      matchMode: "strict",
-      firstResultTimeoutMs: 2200,
-      gracePeriodMs: 600
-    }, { env, ctx: null, kv });
-    const successPayload = await successResponse.json();
-    assert.equal(successResponse.status, 200);
-    assert.equal(successPayload.success, true);
-    const savedConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
-    assert.equal(savedConfig.mediaAggregationEmbyUsername, "global-user");
-    assert.equal(savedConfig.mediaAggregationEmbyPassword, "");
-    assert.equal(savedConfig.mediaAggregationMatchMode, "strict");
-    assert.equal(savedConfig.mediaAggregationFirstResultTimeoutMs, 2200);
-    assert.equal(savedConfig.mediaAggregationGracePeriodMs, 600);
-    const managedPrimary = await kv.get(`${kernel.PREFIX}primary`, { type: "json" });
-    const managedBackup = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
-    assert.equal(managedPrimary.playbackInfoMode, "rewrite");
-    assert.equal(managedPrimary.mediaAggregationManagedRewrite, true);
-    assert.equal(managedBackup.mediaAggregationManagedRewrite, true);
-
-    await kv.put(`${kernel.PREFIX}backup`, JSON.stringify({
-      ...managedBackup,
-      playbackInfoMode: "rewrite",
-      mediaAggregationManagedRewrite: false
-    }));
-    const disabledResponse = await adminActions.saveMediaAggregationPolicyShortcuts({
-      selectedNodeNames: [],
-      username: "global-user"
-    }, { env, ctx: null, kv });
-    assert.equal(disabledResponse.status, 200);
-    const disabledConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
-    assert.equal(disabledConfig.mediaAggregationMatchMode, "strict");
-    assert.equal(disabledConfig.mediaAggregationFirstResultTimeoutMs, 2200);
-    assert.equal(disabledConfig.mediaAggregationGracePeriodMs, 600);
-    const restoredPrimary = await kv.get(`${kernel.PREFIX}primary`, { type: "json" });
-    const preservedBackup = await kv.get(`${kernel.PREFIX}backup`, { type: "json" });
-    assert.equal(restoredPrimary.playbackInfoMode, "inherit");
-    assert.equal(restoredPrimary.mediaAggregationManagedRewrite, false);
-    assert.equal(preservedBackup.playbackInfoMode, "rewrite");
-    assert.equal(preservedBackup.mediaAggregationManagedRewrite, false);
   } finally {
     invalidateRuntimeConfigCache();
   }
@@ -760,113 +442,6 @@ test("KV tidy removes orphaned local HTML records and preserves referenced versi
   } finally {
     invalidateRuntimeConfigCache();
   }
-});
-
-test("KV tidy preserves D1-owned legacy keys until D1 compatibility is ready", async () => {
-  const legacyKeys = [
-    kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY,
-    kernel.LEGACY_OPS_STATUS_KEY,
-    kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY
-  ];
-  const { kv } = createKv({
-    [kernel.CONFIG_KEY]: {},
-    [kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY]: [{ id: "legacy-source" }],
-    [kernel.LEGACY_OPS_STATUS_KEY]: { scheduled: { status: "legacy" } },
-    [kernel.LEGACY_TELEGRAM_ALERT_STATE_KEY]: { lastAlertAt: "2026-07-25T00:00:00.000Z" }
-  });
-
-  const plan = await kernel.buildKvTidyPlan({ ENI_KV: kv }, { kv });
-  const deletedKeys = plan.mutationPlan
-    .filter(mutation => mutation.type === "delete")
-    .map(mutation => mutation.key);
-  const preserveGroup = plan.preview.preserveGroups.find(group => group.key === "d1_legacy_keys_pending");
-
-  assert.deepEqual(legacyKeys.filter(key => deletedKeys.includes(key)), []);
-  assert.equal(plan.summary.preservedD1LegacyKeyCount, 3);
-  assert.equal(preserveGroup?.count, 3);
-  assert.deepEqual(new Set(preserveGroup?.samples || []), new Set(legacyKeys));
-  assert.equal(plan.d1Compatibility.runtimeCompatibilityReady, false);
-});
-
-test("KV tidy performs no KV deletes when the D1 compatibility copy fails", async () => {
-  const { kv, kernel: kvOperations, values } = createKv({ legacy: { status: "old" } });
-  const originalApplyKvD1LegacyMigrations = kernel.applyKvD1LegacyMigrations;
-  kernel.applyKvD1LegacyMigrations = async () => {
-    throw new Error("d1 copy failed");
-  };
-  try {
-    await assert.rejects(
-      kernel.applyKvTidyPlan({
-        mutationPlan: [{ type: "delete", key: "legacy" }],
-        d1LegacyMigrations: [{ key: "legacy", kind: "ops_status_root", payload: { status: "old" } }],
-        summary: {},
-        preview: { scope: "kv" }
-      }, { kv, db: {} }),
-      /d1 copy failed/
-    );
-    assert.equal(values.has("legacy"), true);
-    assert.deepEqual(kvOperations, []);
-  } finally {
-    kernel.applyKvD1LegacyMigrations = originalApplyKvD1LegacyMigrations;
-  }
-});
-
-test("KV tidy rejects malformed D1-owned legacy payloads before any KV delete", async () => {
-  const legacyKey = kernel.LEGACY_OPS_STATUS_KEY;
-  const { kv, kernel: kvOperations, values } = createKv({
-    [legacyKey]: ["unexpected-array-state"]
-  });
-
-  await assert.rejects(
-    kernel.applyKvTidyPlan({
-      mutationPlan: [{ type: "delete", key: legacyKey }],
-      d1LegacyMigrations: [{
-        key: legacyKey,
-        kind: "ops_status_root",
-        payload: ["unexpected-array-state"]
-      }],
-      summary: {},
-      preview: { scope: "kv" }
-    }, { kv, db: {} }),
-    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
-      && error?.details?.reason === "expected_object"
-  );
-
-  assert.equal(values.has(legacyKey), true);
-  assert.deepEqual(kvOperations, []);
-});
-
-test("KV legacy DNS migration rejects lossy source normalization", async () => {
-  assert.throws(
-    () => kernel.normalizeKvD1LegacyMigrationPayload(
-      "dns_ip_pool_sources",
-      [{ url: "https://missing-id.example/ips.txt" }],
-      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
-    ),
-    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
-      && error?.details?.reason === "missing_source_id:0"
-  );
-  assert.throws(
-    () => kernel.normalizeKvD1LegacyMigrationPayload(
-      "dns_ip_pool_sources",
-      [{ id: "missing-target", name: "Broken source" }],
-      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
-    ),
-    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
-      && error?.details?.reason === "missing_source_target:0"
-  );
-  assert.throws(
-    () => kernel.normalizeKvD1LegacyMigrationPayload(
-      "dns_ip_pool_sources",
-      [
-        { id: "duplicate", url: "https://one.example/ips.txt" },
-        { id: "duplicate", url: "https://two.example/ips.txt" }
-      ],
-      kernel.LEGACY_DNS_IP_POOL_SOURCES_KEY
-    ),
-    error => error?.code === "D1_LEGACY_PAYLOAD_INVALID"
-      && error?.details?.reason === "duplicate_or_missing_source_id"
-  );
 });
 
 test("full import keeps a competing config save queued until rollback completes", async () => {
