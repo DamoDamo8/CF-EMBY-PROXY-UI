@@ -110,23 +110,28 @@ function kc(n, e = 8192) {
     if (i.has(f)) return "[Circular]";
     if (m >= o || c >= s)
       return l = !0, "[Truncated]";
-    if (c += 1, i.add(f), Array.isArray(f)) {
-      const h = [];
-      for (let y = 0; y < f.length && y < t; y += 1) h.push(u(f[y], m + 1));
-      return f.length > t && (l = !0, h.push("[Truncated]")), h;
-    }
-    const p = {};
-    let g = 0;
-    for (const h in f) {
-      if (!Object.prototype.hasOwnProperty.call(f, h)) continue;
-      if (g >= t) {
-        l = !0, p._truncated = !0;
-        break;
+    c += 1, i.add(f);
+    try {
+      if (Array.isArray(f)) {
+        const h = [];
+        for (let y = 0; y < f.length && y < t; y += 1) h.push(u(f[y], m + 1));
+        return f.length > t && (l = !0, h.push("[Truncated]")), h;
       }
-      const y = h.length > r ? `${h.slice(0, r)}...` : h;
-      p[y] = u(f[h], m + 1), g += 1;
+      const p = {};
+      let g = 0;
+      for (const h in f) {
+        if (!Object.prototype.hasOwnProperty.call(f, h)) continue;
+        if (g >= t) {
+          l = !0, p._truncated = !0;
+          break;
+        }
+        const y = h.length > r ? `${h.slice(0, r)}...` : h;
+        p[y] = u(f[h], m + 1), g += 1;
+      }
+      return p;
+    } finally {
+      i.delete(f);
     }
-    return p;
   };
   try {
     const f = JSON.stringify(u(n));

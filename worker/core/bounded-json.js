@@ -24,29 +24,33 @@ export function serializeBoundedJson(value, maxLength = 8192) {
 		}
 		visitedNodes += 1;
 		seen.add(input);
-		if (Array.isArray(input)) {
-			const result = [];
-			for (let index = 0; index < input.length && index < maxEntries; index += 1) result.push(project(input[index], depth + 1));
-			if (input.length > maxEntries) {
-				didTruncate = true;
-				result.push("[Truncated]");
+		try {
+			if (Array.isArray(input)) {
+				const result = [];
+				for (let index = 0; index < input.length && index < maxEntries; index += 1) result.push(project(input[index], depth + 1));
+				if (input.length > maxEntries) {
+					didTruncate = true;
+					result.push("[Truncated]");
+				}
+				return result;
+			}
+			const result = {};
+			let entryCount = 0;
+			for (const rawKey in input) {
+				if (!Object.prototype.hasOwnProperty.call(input, rawKey)) continue;
+				if (entryCount >= maxEntries) {
+					didTruncate = true;
+					result._truncated = true;
+					break;
+				}
+				const key = rawKey.length > maxStringLength ? `${rawKey.slice(0, maxStringLength)}...` : rawKey;
+				result[key] = project(input[rawKey], depth + 1);
+				entryCount += 1;
 			}
 			return result;
+		} finally {
+			seen.delete(input);
 		}
-		const result = {};
-		let entryCount = 0;
-		for (const rawKey in input) {
-			if (!Object.prototype.hasOwnProperty.call(input, rawKey)) continue;
-			if (entryCount >= maxEntries) {
-				didTruncate = true;
-				result._truncated = true;
-				break;
-			}
-			const key = rawKey.length > maxStringLength ? `${rawKey.slice(0, maxStringLength)}...` : rawKey;
-			result[key] = project(input[rawKey], depth + 1);
-			entryCount += 1;
-		}
-		return result;
 	};
 	try {
 		const serialized = JSON.stringify(project(value));

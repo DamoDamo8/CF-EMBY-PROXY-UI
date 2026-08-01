@@ -728,6 +728,18 @@ test("oversized log detail fallback remains valid JSON", () => {
   assert.deepEqual(JSON.parse(serialized), { truncated: true });
 });
 
+test("log detail serialization distinguishes shared references from circular references", () => {
+  const shared = { value: "shared" };
+  const circular = { value: "circular" };
+  circular.self = circular;
+
+  assert.deepEqual(JSON.parse(serializeBoundedLogDetailJson({ first: shared, second: shared, circular })), {
+    first: { value: "shared" },
+    second: { value: "shared" },
+    circular: { value: "circular", self: "[Circular]" }
+  });
+});
+
 test("log detail serialization reads only its bounded field budget", () => {
   let reads = 0;
   const detail = {};
