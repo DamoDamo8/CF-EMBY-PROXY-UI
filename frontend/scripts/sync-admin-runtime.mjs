@@ -141,7 +141,11 @@ function composeAdminRuntimeEnhancements(outputHtml = '') {
     .replace(
     '},syncSettingsFormFromRuntimeConfig',
     "},syncReleaseSourcePreviewInSettingsForm(){const r=this.settingsForm&&typeof this.settingsForm==='object'?this.settingsForm:{};const o=String(r.githubRepo||r.releaseRepo||r.repo||'').trim();if(o&&r.githubRepo!==o)r.githubRepo=o;return o},syncSettingsFormFromRuntimeConfig"
-  );
+  )
+    .replace(
+      'this.apiCall("saveConfig",{config:p,meta:{section:o,source:"ui"}})',
+      'this.apiCall("saveConfig",{config:p,expectedConfigRevision:String(this.adminRevisions?.configRevision||""),meta:{section:o,source:"ui"}})'
+    );
   if (!output.includes('</head>')) {
     throw new Error('frontend/index.html 缺少 </head>，无法组合 runtime enhancements');
   }

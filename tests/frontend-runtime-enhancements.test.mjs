@@ -10,6 +10,10 @@ import {
 import {
   ADMIN_RUNTIME_ENHANCEMENT_SCRIPT
 } from '../frontend/scripts/admin-runtime-enhancements.mjs';
+import {
+  destroyTrendChart,
+  renderTrendChart
+} from '../frontend/src/lib/chart.js';
 
 function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) {
   const inlineScript = ADMIN_RUNTIME_ENHANCEMENT_SCRIPT
@@ -54,6 +58,66 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
 
 test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
+});
+
+test('settings dirty tracking compares normalized state without JSON serialization', async () => {
+  const settingsPanel = await readFile(
+    new URL('../frontend/src/features/settings/SettingsPanel.vue', import.meta.url),
+    'utf8'
+  );
+  assert.match(settingsPanel, /const baseComparableFormState = computed/);
+  assert.match(settingsPanel, /function areComparableFormStatesEqual/);
+  assert.doesNotMatch(settingsPanel, /serializeFormState|JSON\.stringify\(\{[\s\S]*settingsExperienceMode/);
+});
+
+test('trend charts are isolated per canvas and cancelled after teardown', async () => {
+  class FakeChart {
+    static instances = [];
+
+    constructor(canvas) {
+      this.canvas = canvas;
+      this.destroyed = false;
+      FakeChart.instances.push(this);
+    }
+
+    destroy() {
+      this.destroyed = true;
+    }
+  }
+
+  const firstCanvas = { isConnected: true };
+  const secondCanvas = { isConnected: true };
+  const firstChart = await renderTrendChart(firstCanvas, [], { Chart: FakeChart });
+  const secondChart = await renderTrendChart(secondCanvas, [], { Chart: FakeChart });
+  assert.equal(firstChart.destroyed, false);
+  assert.equal(secondChart.destroyed, false);
+
+  destroyTrendChart(firstCanvas);
+  assert.equal(firstChart.destroyed, true);
+  assert.equal(secondChart.destroyed, false);
+
+  let resolveChartModule;
+  const detachedCanvas = { isConnected: true };
+  const pendingRender = renderTrendChart(detachedCanvas, [], {
+    loadChart: () => new Promise(resolve => {
+      resolveChartModule = resolve;
+    })
+  });
+  destroyTrendChart(detachedCanvas);
+  resolveChartModule({ default: FakeChart });
+  assert.equal(await pendingRender, null);
+  assert.equal(FakeChart.instances.length, 2);
+  destroyTrendChart(secondCanvas);
+});
+
+test('overview chart has one lifecycle-driven render path', async () => {
+  const overviewPanel = await readFile(
+    new URL('../frontend/src/features/overview/OverviewPanel.vue', import.meta.url),
+    'utf8'
+  );
+  assert.match(overviewPanel, /watch\(\[chartPoints, canvasRef\]/);
+  assert.doesNotMatch(overviewPanel, /onMounted/);
+  assert.match(overviewPanel, /destroyTrendChart\(canvasRef\.value\)/);
 });
 
 test('dashboard refresh separates stats, runtime status, and D1 hotspot failures', () => {
@@ -164,6 +228,11 @@ test('backup view exposes only the paired Worker and HTML upload flow', async ()
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('updateWorkerAndAdminIndex'/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /workerFileName: state\.workerFile\.name/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /indexFileName: state\.indexFile\.name/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /waitForAdminShellRevision/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /X-Admin-Shell-Revision/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /delays = \[500, 1000, 2000, 4000, 8000\]/);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /navigateWithAdminCacheBust/);
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /window\.location\.reload\(\)/);
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /必须同时选择 worker\.js 和 index\.html/);
   assert.doesNotMatch(vueRuntimeConfig, /VITE_INDEX_URL|VITE_RELEASE_INDEX_URL/);
   assert.doesNotMatch(vueAdminConsole, /updateWorkerScriptContent|releaseRepo|releaseBranch|releaseTag/);

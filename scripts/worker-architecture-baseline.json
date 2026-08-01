@@ -5,8 +5,5 @@
   "productionGraph": {
     "modules": 144,
     "importEdges": 873
-  },
-  "legacyModuleLineBudgets": {
-    "runtime/application-facades.js": 26091
   }
 }

@@ -15,6 +15,7 @@ const entryName = 'index.js';
 const facadeModuleName = 'runtime/application-facades.js';
 const testingHooksName = 'testing/hooks.js';
 const defaultModuleMaxLines = 1500;
+const facadeRegionMaxLines = 1500;
 const facadeSignatures = new Map([
   ['AdminConsoleFacade', ['request', 'env', 'ctx']],
   ['NodeProxyFacade', ['request', 'env', 'ctx', 'routeContext']],
@@ -34,6 +35,27 @@ const businessFactoryPattern = /^create(?:Admin|Database|Proxy|Analytics|Schema|
 
 function normalizeName(name) {
   return String(name || '').replaceAll('\\', '/').replace(/^\.\//, '');
+}
+
+function getFacadeRegionSpans(source) {
+  const lines = String(source || '').split(/\r?\n/);
+  const spans = [];
+  let active = null;
+  for (let index = 0; index < lines.length; index += 1) {
+    const region = /^\/\/\#region\s+(.+)$/.exec(lines[index]);
+    if (region) {
+      active = { name: region[1].trim(), line: index + 1 };
+      continue;
+    }
+    if (!/^\/\/\#endregion\b/.test(lines[index]) || !active) continue;
+    spans.push({
+      name: active.name,
+      line: active.line,
+      lines: index + 1 - active.line + 1
+    });
+    active = null;
+  }
+  return spans;
 }
 
 function classify(name) {
@@ -218,7 +240,7 @@ function validateDependency(sourceName, targetName, node, errors) {
   }
 }
 
-function analyzeFiles(fileSources, { strictRepository = false, moduleLineBudgets = {} } = {}) {
+function analyzeFiles(fileSources, { strictRepository = false } = {}) {
   const errors = [];
   const names = [...fileSources.keys()].map(normalizeName).sort();
   const fileSet = new Set(names);
@@ -246,10 +268,19 @@ function analyzeFiles(fileSources, { strictRepository = false, moduleLineBudgets
     if (production && !['entry', 'runtime', 'core', 'platform'].includes(layer)) {
       errors.push(makeError('UNKNOWN_LAYER', name, 'production modules must use entry/runtime/core/platform boundaries'));
     }
-    const legacyLineBudget = Number(moduleLineBudgets[name]);
-    if (production && Number.isFinite(legacyLineBudget) && legacyLineBudget > 0 && lineCount > legacyLineBudget) {
-      errors.push(makeError('MODULE_LINE_BUDGET', name, `legacy module exceeds its ${legacyLineBudget}-line budget; found ${lineCount}`));
-    } else if (production && !Number.isFinite(legacyLineBudget) && name !== entryName && lineCount > defaultModuleMaxLines) {
+    if (production && name === facadeModuleName) {
+      const spans = getFacadeRegionSpans(source);
+      if (!spans.length) {
+        errors.push(makeError('FACADE_REGIONS', name, 'facade modules must declare bounded //#region blocks'));
+      }
+      for (const span of spans) {
+        if (span.lines > facadeRegionMaxLines) {
+          errors.push(makeError('FACADE_REGION_TOO_LARGE', name, `${span.name} exceeds its ${facadeRegionMaxLines}-line budget; found ${span.lines}`, {
+            loc: { start: { line: span.line, column: 0 } }
+          }));
+        }
+      }
+    } else if (production && name !== entryName && lineCount > defaultModuleMaxLines) {
       errors.push(makeError('MODULE_TOO_LARGE', name, `new production modules may not exceed ${defaultModuleMaxLines} lines; found ${lineCount}`));
     }
     if (production && (name.includes('/public/') || /(?:capabilities|compat-facades)\.js$/.test(name))) {
@@ -466,8 +497,7 @@ function analyzeFiles(fileSources, { strictRepository = false, moduleLineBudgets
       sourceImportEdges: importEdges,
       productionModules: productionNames.length,
       productionImportEdges,
-      facadeSpans: Object.fromEntries([...facadeSpans].sort()),
-      legacyModuleBudgets: Object.keys(moduleLineBudgets).length
+      facadeSpans: Object.fromEntries([...facadeSpans].sort())
     }
   };
 }
@@ -527,8 +557,7 @@ const [fileSources, baseline, fixtureCount] = await Promise.all([
   runArchitectureFixtures()
 ]);
 const result = analyzeFiles(fileSources, {
-  strictRepository: true,
-  moduleLineBudgets: baseline.legacyModuleLineBudgets || {}
+  strictRepository: true
 });
 if (result.errors.length) {
   console.error('[check-worker-architecture] failed');
@@ -541,6 +570,6 @@ console.log(
   `[check-worker-architecture] production graph ${baseline.productionGraph.modules} modules/${baseline.productionGraph.importEdges} edges -> `
   + `${result.stats.productionModules} modules/${result.stats.productionImportEdges} edges; `
   + `source graph ${result.stats.sourceModules} modules/${result.stats.sourceImportEdges} edges; `
-  + `Facade spans ${spans}; ${result.stats.legacyModuleBudgets} legacy line budgets; `
+  + `Facade spans ${spans}; facade regions <= ${facadeRegionMaxLines} lines; `
   + `${fixtureCount.valid} valid/${fixtureCount.invalid} invalid fixtures passed`
 );

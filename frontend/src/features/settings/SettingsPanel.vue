@@ -71,7 +71,12 @@ const clearConfigSnapshotsError = computed(() => String(props.adminConsole?.stat
 const restoreConfigSnapshotError = computed(() => String(props.adminConsole?.state?.errors?.restoreConfigSnapshot || '').trim());
 
 const baseFormState = computed(() => buildFormFromConfig(config.value));
-const hasChanges = computed(() => serializeFormState(form) !== serializeFormState(baseFormState.value));
+const baseComparableFormState = computed(() => buildComparableFormState(baseFormState.value));
+const currentComparableFormState = computed(() => buildComparableFormState(form));
+const hasChanges = computed(() => areComparableFormStatesEqual(
+  currentComparableFormState.value,
+  baseComparableFormState.value
+));
 const anySettingsBusy = computed(() => (
   loadingSettings.value
   || loadConfigLoading.value
@@ -1333,8 +1338,8 @@ function joinTextList(values = []) {
     .join('\n');
 }
 
-function serializeFormState(value = {}) {
-  return JSON.stringify({
+function buildComparableFormState(value = {}) {
+  return {
     settingsExperienceMode: resolveSelectValue(value.settingsExperienceMode, 'novice'),
     uiRadiusPx: String(value.uiRadiusPx || '').trim(),
     protocolStrategy: resolveSelectValue(value.protocolStrategy, 'compat'),
@@ -1420,7 +1425,27 @@ function serializeFormState(value = {}) {
     dnsDefaultFallbackCname: String(value.dnsDefaultFallbackCname || '').trim(),
     tgBotToken: String(value.tgBotToken || '').trim(),
     tgChatId: String(value.tgChatId || '').trim()
-  });
+  };
+}
+
+function areComparableFormStatesEqual(leftState = {}, rightState = {}) {
+  const leftKeys = Object.keys(leftState);
+  const rightKeys = Object.keys(rightState);
+  if (leftKeys.length !== rightKeys.length) return false;
+
+  for (const key of leftKeys) {
+    const leftValue = leftState[key];
+    const rightValue = rightState[key];
+    if (Array.isArray(leftValue) || Array.isArray(rightValue)) {
+      if (!Array.isArray(leftValue) || !Array.isArray(rightValue) || leftValue.length !== rightValue.length) return false;
+      for (let index = 0; index < leftValue.length; index += 1) {
+        if (leftValue[index] !== rightValue[index]) return false;
+      }
+      continue;
+    }
+    if (leftValue !== rightValue) return false;
+  }
+  return true;
 }
 
 function compactRevision(rawValue = '') {

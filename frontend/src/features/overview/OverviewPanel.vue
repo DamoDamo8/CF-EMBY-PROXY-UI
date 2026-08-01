@@ -1,5 +1,5 @@
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import {
   Activity,
   BadgeAlert,
@@ -72,33 +72,23 @@ const peakPoint = computed(() => {
 });
 
 onBeforeUnmount(() => {
-  destroyTrendChart();
+  destroyTrendChart(canvasRef.value);
 });
 
-onMounted(async () => {
-  if (!canvasRef.value || !chartPoints.value.length) return;
-  await nextTick();
-  await renderTrendChart(canvasRef.value, chartPoints.value, {
-    label: '每小时请求量',
-    borderColor: '#38bdf8',
-    backgroundColor: 'rgba(56, 189, 248, 0.18)'
-  });
-});
-
-watch(chartPoints, async (points) => {
-  if (!canvasRef.value) return;
+watch([chartPoints, canvasRef], async ([points, canvas]) => {
+  if (!canvas) return;
   if (!points.length) {
-    destroyTrendChart();
+    destroyTrendChart(canvas);
     return;
   }
 
   await nextTick();
-  await renderTrendChart(canvasRef.value, points, {
+  await renderTrendChart(canvas, points, {
     label: '每小时请求量',
     borderColor: '#38bdf8',
     backgroundColor: 'rgba(56, 189, 248, 0.18)'
   });
-}, { immediate: true, deep: true });
+}, { immediate: true, deep: true, flush: 'post' });
 
 const cloudflareCards = computed(() => {
   const cloudflare = runtimeStatus.value.cloudflare;

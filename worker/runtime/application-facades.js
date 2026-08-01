@@ -1,9 +1,13 @@
-import {
-	decodeBufferedBodyText,
-	parseContentLengthHeader,
-	readResponseBytesWithLimit,
-	readResponseTextWithLimit
-} from "../core/http-body.js";
+import { decodeBufferedBodyText, parseContentLengthHeader, readResponseBytesWithLimit, readResponseTextWithLimit } from "../core/http-body.js";
+import { createBindingStateManager } from "../core/binding-state.js";
+import { serializeBoundedJson } from "../core/bounded-json.js";
+import { hashPlaybackSessionFingerprint, hashStableStringParts, hashStableText, sha256HexText } from "../core/hashing.js";
+import { clampIntegerConfig, clampNumberConfig, escapeSqlLike, hasOwnConfigKey, isLikelyColoCode, isLikelyIpAddress, isPlainObject, normalizeDistinctConfigKeyList, normalizeHostnameText, normalizeNodeNameList, parseHostnameCandidate } from "../core/primitives.js";
+import { createCleanupState, makeKvMutationBindingStateManager, makeRuntimeConfigBindingStateManager } from "../core/runtime-binding-state.js";
+import { getCryptoSubtle, getDefaultCacheHandle } from "../core/runtime-globals.js";
+import { defineActionRegistry } from "./admin/action-registry.js";
+import { makeKvMutationQueueRunner } from "./maintenance/mutation-queues.js";
+import { makeLogBindingStateManager } from "./observability/log-binding-state.js";
 import { guardApiResponseMime as guardApiResponseMimeRepresentation } from "./proxy/http/api-mime-guard.js";
 import {
 	isJsonHttpMediaType,
@@ -15,7 +19,7 @@ import {
 	isPlaybackInfoRepresentation,
 	parsePlaybackInfoRootObject
 } from "./proxy/playback/contract.js";
-import { createPlaybackInfoCacheKey, PlaybackInfoCacheStore } from "./proxy/playback/cache.js";
+import { PlaybackInfoCacheStore } from "./proxy/playback/cache.js";
 import {
 	decodePlaybackInfoJsonValue,
 	normalizePlaybackInfoObjectArray,
@@ -30,45 +34,63 @@ import {
 
 //#endregion
 //#region worker/kernel/isolate-state.js
+function createNodeBindingCacheState() {
+	return {
+		NodeCache: /* @__PURE__ */ new Map(),
+		PlaybackRouteHotCache: /* @__PURE__ */ new Map(),
+		NodesListCache: null,
+		NodesRevisionCache: null,
+		NodesIndexCache: null,
+		NodesRevisionCacheGeneration: 0,
+		NodeCacheResetGeneration: 0,
+		NodeCacheGenerationNonce: 0,
+		NodeCacheGenerationEvictionEpoch: 0,
+		NodeCacheGenerations: /* @__PURE__ */ new Map(),
+		SingleFlightTasks: /* @__PURE__ */ new Map(),
+		NodeIndexMutationChain: Promise.resolve(),
+		CleanupIterators: { node: null, playbackRoute: null },
+		CleanupState: createCleanupState()
+	};
+}
+const nodeBindingCacheStates = createBindingStateManager(createNodeBindingCacheState);
+const getNodeBindingCacheState = (kv = null) => nodeBindingCacheStates.get(kv);
+function resetNodeBindingCacheStates() { nodeBindingCacheStates.reset(); }
+const logBindingStates = makeLogBindingStateManager();
+const runtimeConfigBindingStates = makeRuntimeConfigBindingStateManager();
+const kvMutationBindingStates = makeKvMutationBindingStateManager();
+const { runDataMutation: runKvDataMutation, runTidyMutation: runKvTidyMutation } = makeKvMutationQueueRunner(kvMutationBindingStates);
+function resetRuntimeBindingStates() {
+	runtimeConfigBindingStates.reset();
+	kvMutationBindingStates.reset();
+}
 var cacheState = {
-	NodeCache: /* @__PURE__ */ new Map(),
-	PlaybackRouteHotCache: /* @__PURE__ */ new Map(),
 	ProxyFailoverStateCache: /* @__PURE__ */ new Map(),
-	ConfigCache: null,
 	CryptoKeyCache: /* @__PURE__ */ new Map(),
-	NodesListCache: null,
-	NodesRevisionCache: null,
-	NodesIndexCache: null,
 	PlaybackInfoResponseCache: /* @__PURE__ */ new Map(),
 					PlaybackProgressRelay: /* @__PURE__ */ new Map(),
 				DashboardMonthlyTrafficCache: /* @__PURE__ */ new Map(),
 	SingleFlightTasks: /* @__PURE__ */ new Map(),
-	RuntimeConfigCacheGeneration: 0,
-	NodesRevisionCacheGeneration: 0,
-	NodeCacheResetGeneration: 0,
-	NodeCacheGenerationNonce: 0,
-	NodeCacheGenerationEvictionEpoch: 0,
-	NodeCacheGenerations: /* @__PURE__ */ new Map(),
 	AdminRemoteShellCacheMutationChains: /* @__PURE__ */ new Map(),
 	LogsReadinessProbeCache: /* @__PURE__ */ new WeakMap(),
 	ProxyAccessRuleProfileCache: /* @__PURE__ */ new WeakMap()
 };
+for (const key of ["NodeCache", "PlaybackRouteHotCache", "NodesListCache", "NodesRevisionCache", "NodesIndexCache", "NodesRevisionCacheGeneration", "NodeCacheResetGeneration", "NodeCacheGenerationNonce", "NodeCacheGenerationEvictionEpoch", "NodeCacheGenerations"]) Object.defineProperty(cacheState, key, {
+	enumerable: true,
+	configurable: false,
+	get: () => nodeBindingCacheStates.current()[key],
+	set: (value) => {
+		nodeBindingCacheStates.current()[key] = value;
+	}
+});
+for (const key of ["ConfigCache", "RuntimeConfigCacheGeneration"]) Object.defineProperty(cacheState, key, {
+	enumerable: true,
+	configurable: false,
+	get: () => runtimeConfigBindingStates.current()[key],
+	set: (value) => {
+		runtimeConfigBindingStates.current()[key] = value;
+	}
+});
 var runtimeState = {
-	CleanupState: {
-		phase: 0,
-		lastRunAt: 0,
-		iterators: {
-			node: null,
-			playbackRoute: null,
-			crypto: null,
-			rate: null,
-			log: null,
-			playbackInfo: null,
-						failover: null,
-			progress: null,
-			monthlyTraffic: null
-		}
-	},
 	LogQueue: [],
 	LogDedupe: /* @__PURE__ */ new Map(),
 	RateLimitCache: /* @__PURE__ */ new Map(),
@@ -78,10 +100,24 @@ var runtimeState = {
 	LogLastFlushAt: 0,
 	OpsStatusWriteChain: Promise.resolve(),
 	NodeIndexMutationChain: Promise.resolve(),
-	KvDataMutationChain: Promise.resolve(),
-	KvTidyMutationChain: Promise.resolve(),
 	InitCheckWarnedFingerprints: /* @__PURE__ */ new Set()
 };
+for (const key of ["CleanupState"]) Object.defineProperty(runtimeState, key, {
+	enumerable: true,
+	configurable: false,
+	get: () => nodeBindingCacheStates.current()[key],
+	set: (value) => {
+		nodeBindingCacheStates.current()[key] = value;
+	}
+});
+for (const key of ["KvDataMutationChain", "KvTidyMutationChain"]) Object.defineProperty(runtimeState, key, {
+	enumerable: true,
+	configurable: false,
+	get: () => kvMutationBindingStates.current()[key],
+	set: (value) => {
+		kvMutationBindingStates.current()[key] = value;
+	}
+});
 var databaseReadinessState = {
 	D1SchemaReadyState: /* @__PURE__ */ new WeakMap(),
 	D1DatabaseInitReady: /* @__PURE__ */ new WeakMap(),
@@ -114,84 +150,6 @@ var isolateState = createIsolateStateFacade([
 	runtimeState,
 	databaseReadinessState
 ]);
-//#endregion
-//#region worker/core/primitives.js
-function normalizeNodeNameList(input) {
-	const rawList = Array.isArray(input) ? input : String(input || "").split(/[\\r\\n,，;；|]+/);
-	const seen = /* @__PURE__ */ new Set();
-	const result = [];
-	for (const item of rawList) {
-		const value = String(item || "").trim();
-		if (!value) continue;
-		const key = value.toLowerCase();
-		if (seen.has(key)) continue;
-		seen.add(key);
-		result.push(value);
-	}
-	return result;
-}
-function parseHostnameCandidate(rawHostname) {
-	const host = String(rawHostname || "").trim().toLowerCase();
-	if (!host) return null;
-	const wildcard = host.includes("*");
-	const cleaned = host.replace(/^\*\./, "").replace(/^\*+/, "").replace(/\*+$/g, "").replace(/^\.+|\.+$/g, "");
-	if (!cleaned) return null;
-	return {
-		hostname: cleaned,
-		wildcard
-	};
-}
-function normalizeHostnameText(rawHostname) {
-	return parseHostnameCandidate(rawHostname)?.hostname || "";
-}
-function normalizeDistinctConfigKeyList(values = []) {
-	const list = Array.isArray(values) ? values : [values];
-	const result = [];
-	const seen = /* @__PURE__ */ new Set();
-	for (const value of list) {
-		const key = String(value || "").trim();
-		if (!key || seen.has(key)) continue;
-		seen.add(key);
-		result.push(key);
-	}
-	return result;
-}
-function isPlainObject(value) {
-	return !!value && typeof value === "object" && !Array.isArray(value);
-}
-function clampIntegerConfig(value, fallback, min, max) {
-	let num;
-	if (typeof value === "number") num = value;
-	else if (typeof value === "string") {
-		const normalized = value.trim();
-		if (!/^-?\d+$/.test(normalized)) return fallback;
-		num = Number(normalized);
-	} else return fallback;
-	if (!Number.isFinite(num)) return fallback;
-	return Math.min(max, Math.max(min, Math.floor(num)));
-}
-function clampNumberConfig(value, fallback, min, max) {
-	const num = Number(value);
-	if (!Number.isFinite(num)) return fallback;
-	return Math.min(max, Math.max(min, num));
-}
-function hasOwnConfigKey(value, key) {
-	return !!value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, key);
-}
-function escapeSqlLike(value) {
-	return String(value || "").replace(/[\\%_]/g, "\\$&");
-}
-function isLikelyIpAddress(value) {
-	const text = String(value || "").trim();
-	if (!text) return false;
-	if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(text)) return true;
-	return /^[0-9a-f:]+$/i.test(text) && text.includes(":");
-}
-function isLikelyColoCode(value) {
-	const text = String(value || "").trim();
-	if (!text) return false;
-	return /^[a-z]{3,4}$/i.test(text);
-}
 //#endregion
 //#region worker/core/errors.js
 function getErrorMessage(error, fallback = "unknown_error") {
@@ -329,43 +287,6 @@ function serializeConfigValue(value) {
 //#region worker/core/time.js
 var nowMs = () => Date.now();
 var sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
-//#endregion
-//#region worker/kernel/runtime-globals.js
-function getDefaultCacheHandle(runtimeGlobals = globalThis) {
-	try {
-		return runtimeGlobals?.caches?.default ?? null;
-	} catch {
-		return null;
-	}
-}
-function getCryptoSubtle(runtimeGlobals = globalThis) {
-	return runtimeGlobals.crypto.subtle;
-}
-//#endregion
-//#region worker/kernel/hashing.js
-function hashStableText(input = "") {
-	const text = String(input || "");
-	let hash = 2166136261;
-	for (let i = 0; i < text.length; i += 1) {
-		hash ^= text.charCodeAt(i);
-		hash = Math.imul(hash, 16777619);
-	}
-	return (hash >>> 0).toString(36);
-}
-function hashPlaybackSessionFingerprint(input = "") {
-	const bytes = new TextEncoder().encode(String(input || ""));
-	let hash = 14695981039346656037n;
-	const prime = 1099511628211n;
-	for (const byte of bytes) {
-		hash ^= BigInt(byte);
-		hash = BigInt.asUintN(64, hash * prime);
-	}
-	return hash.toString(16).padStart(16, "0");
-}
-async function sha256HexText(input = "") {
-	const digest = await getCryptoSubtle().digest("SHA-256", new TextEncoder().encode(String(input || "")));
-	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
 //#endregion
 //#region worker/features/config/api.js
 var AUTH_DEFAULTS = Object.freeze({
@@ -1729,6 +1650,7 @@ function scoreHostnameCandidate(hostname, options = {}) {
 var ADMIN_LOCAL_INDEX_SOURCE_ORIGIN = "https://admin-local-index.invalid";
 var ADMIN_LOCAL_INDEX_ASSET_REVISION_PREFIX = "local-";
 var ADMIN_LOCAL_INDEX_KV_PREFIX = "sys:admin_index_upload:v1:";
+var ADMIN_ACTIVE_INDEX_KV_KEY = "sys:admin_index_active:v2";
 function normalizeHttpUrl(value = "") {
 	const rawValue = String(value || "").trim();
 	if (!rawValue) return "";
@@ -2260,11 +2182,11 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 	const ADMIN_APP_ROOT_PLACEHOLDER = "__ADMIN_APP_ROOT__";
 	const ADMIN_APP_ROOT_HTML = "";
 	const ADMIN_HTML_CACHE_KEY_ORIGIN = "https://admin-shell-cache.invalid";
-	const ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL = "public, max-age=0, must-revalidate";
+	const ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL = "private, no-store, max-age=0";
 	const ADMIN_REMOTE_SHELL_EDGE_CACHE_CONTROL = "public, max-age=31536000, immutable";
 	const ADMIN_REMOTE_SHELL_REVALIDATE_MS = 300 * 1e3;
 	const ADMIN_REMOTE_SHELL_MAX_BYTES = 2 * 1024 * 1024;
-	const ADMIN_REMOTE_SHELL_TRANSFORM_REVISION = "bootstrap-tailwind-assets-v2";
+	const ADMIN_REMOTE_SHELL_TRANSFORM_REVISION = "bootstrap-tailwind-assets-v3-active-index";
 	const ADMIN_REMOTE_SHELL_CACHED_AT_HEADER = "X-Admin-Shell-Cached-At";
 	const ADMIN_REMOTE_SHELL_SOURCE_ETAG_HEADER = "X-Admin-Shell-Source-Etag";
 	const ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER = "X-Admin-Shell-Source-Last-Modified";
@@ -2792,6 +2714,8 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 		const lastModified = normalizeAdminHttpDateHeader(response?.headers?.get?.("Last-Modified") || "");
 		if (etag) headers.set("ETag", formatAdminHtmlEtag(etag));
 		if (lastModified) headers.set("Last-Modified", lastModified);
+		const shellRevision = String(response?.headers?.get?.("X-Admin-Shell-Revision") || "").trim();
+		if (shellRevision) headers.set("X-Admin-Shell-Revision", shellRevision);
 		applySecurityHeaders(headers);
 		return new Response(null, {
 			status: 304,
@@ -2874,8 +2798,6 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 	function buildAdminRemoteBootstrapMarkup(bootstrapJson = "{}") {
 		return `${buildAdminRemoteBootstrapScriptMarkup(bootstrapJson)}${ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML}`;
 	}
-	const ADMIN_REMOTE_BOOTSTRAP_SCRIPT_REGEX = /<script(?=[^>]*\bid="admin-bootstrap")(?=[^>]*\btype="application\/json")[^>]*>[\s\S]*?<\/script>/i;
-	const ADMIN_REMOTE_BOOTSTRAP_LOADER_REGEX = /<script(?=[^>]*\bid="admin-bootstrap-loader")[^>]*>[\s\S]*?<\/script>/i;
 	const ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML = "<script id=\"admin-bootstrap-loader\">try{window.__ADMIN_BOOTSTRAP__=JSON.parse(document.getElementById(\"admin-bootstrap\")?.textContent||\"{}\")}catch(_){window.__ADMIN_BOOTSTRAP__=window.__ADMIN_BOOTSTRAP__||{},window.__ADMIN_UI_BOOT_ERROR__=window.__ADMIN_UI_BOOT_ERROR__||\"admin bootstrap parse failed: \"+(_?.message||String(_||\"unknown_error\"))}<\/script>";
 	const ADMIN_REMOTE_TAILWIND_PRELUDE_HTML = "<script id=\"admin-tailwind-prelude\">window.tailwind=window.tailwind||{};<\/script>";
 	const ADMIN_HTML_SKIPPED_CONTENT_TAGS = /* @__PURE__ */ new Set([
@@ -2995,8 +2917,16 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 				cursor = commentEnd < 0 ? sourceHtml.length : commentEnd + 3;
 				continue;
 			}
+			const nextCharacter = sourceHtml[tagStart + 1] || "";
+			if (nextCharacter === "!" || nextCharacter === "?" || nextCharacter === "/") {
+				const tagEnd = findAdminHtmlTagEnd(sourceHtml, tagStart + 2);
+				if (tagEnd < 0) return;
+				cursor = tagEnd + 1;
+				continue;
+			}
 			const openingTag = parseAdminHtmlOpeningTag(sourceHtml, tagStart);
 			if (!openingTag) {
+				if (/[A-Za-z]/.test(nextCharacter)) return;
 				cursor = tagStart + 1;
 				continue;
 			}
@@ -3008,6 +2938,7 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 				...openingTag,
 				contentStart,
 				contentEnd: closingTag || !ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName) ? contentEnd : sourceHtml.length,
+				contentTagEnd: closingTag ? closingTag.tagEnd : -1,
 				contentClosed: Boolean(closingTag) || !ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName)
 			};
 			if (ADMIN_HTML_SKIPPED_CONTENT_TAGS.has(openingTag.tagName) && !closingTag) return;
@@ -3017,13 +2948,15 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 		const sourceHtml = String(html || "");
 		const injectedMarkup = String(markup || "");
 		if (!sourceHtml || !injectedMarkup) return sourceHtml;
-		const headCloseMatch = sourceHtml.match(/<\/head>/i);
-		if (headCloseMatch && Number.isInteger(headCloseMatch.index) && headCloseMatch.index >= 0) return `${sourceHtml.slice(0, headCloseMatch.index)}${injectedMarkup}${sourceHtml.slice(headCloseMatch.index)}`;
-		const bodyOpenMatch = sourceHtml.match(/<body[^>]*>/i);
-		if (bodyOpenMatch && Number.isInteger(bodyOpenMatch.index) && bodyOpenMatch.index >= 0) {
-			const insertIndex = bodyOpenMatch.index + bodyOpenMatch[0].length;
-			return `${sourceHtml.slice(0, insertIndex)}${injectedMarkup}${sourceHtml.slice(insertIndex)}`;
+		let bodyInsertIndex = -1;
+		for (const openingTag of iterateAdminHtmlOpeningTags(sourceHtml)) {
+			if (openingTag.tagName === "head") {
+				const insertIndex = openingTag.tagEnd + 1;
+				return `${sourceHtml.slice(0, insertIndex)}${injectedMarkup}${sourceHtml.slice(insertIndex)}`;
+			}
+			if (openingTag.tagName === "body" && bodyInsertIndex < 0) bodyInsertIndex = openingTag.tagEnd + 1;
 		}
+		if (bodyInsertIndex >= 0) return `${sourceHtml.slice(0, bodyInsertIndex)}${injectedMarkup}${sourceHtml.slice(bodyInsertIndex)}`;
 		return `${injectedMarkup}${sourceHtml}`;
 	}
 	function ensureAdminRemoteTailwindConfigGlobal(html = "") {
@@ -3044,13 +2977,20 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 		const sourceHtml = ensureAdminRemoteTailwindConfigGlobal(String(html || ""));
 		if (!sourceHtml) return sourceHtml;
 		const bootstrapScriptMarkup = buildAdminRemoteBootstrapScriptMarkup(bootstrapJson);
-		const hasLoaderScript = ADMIN_REMOTE_BOOTSTRAP_LOADER_REGEX.test(sourceHtml);
-		if (ADMIN_REMOTE_BOOTSTRAP_SCRIPT_REGEX.test(sourceHtml)) {
-			let nextHtml = sourceHtml.replace(ADMIN_REMOTE_BOOTSTRAP_SCRIPT_REGEX, bootstrapScriptMarkup);
-			if (!hasLoaderScript) nextHtml = nextHtml.replace(bootstrapScriptMarkup, `${bootstrapScriptMarkup}${ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML}`);
-			return nextHtml;
+		let bootstrapScript = null;
+		let loaderScript = null;
+		for (const openingTag of iterateAdminHtmlOpeningTags(sourceHtml)) {
+			if (openingTag.tagName !== "script" || !openingTag.contentClosed) continue;
+			const scriptId = String(openingTag.attributes.get("id")?.value || "").trim();
+			if (scriptId === "admin-bootstrap" && String(openingTag.attributes.get("type")?.value || "").trim().toLowerCase() === "application/json") bootstrapScript = openingTag;
+			else if (scriptId === "admin-bootstrap-loader") loaderScript = openingTag;
 		}
-		if (hasLoaderScript) return sourceHtml.replace(ADMIN_REMOTE_BOOTSTRAP_LOADER_REGEX, `${bootstrapScriptMarkup}$&`);
+		if (bootstrapScript && bootstrapScript.contentTagEnd >= bootstrapScript.tagEnd) {
+			const before = sourceHtml.slice(0, bootstrapScript.start);
+			const after = sourceHtml.slice(bootstrapScript.contentTagEnd + 1);
+			return `${before}${bootstrapScriptMarkup}${loaderScript ? "" : ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML}${after}`;
+		}
+		if (loaderScript) return `${sourceHtml.slice(0, loaderScript.start)}${bootstrapScriptMarkup}${sourceHtml.slice(loaderScript.start)}`;
 		return injectMarkupIntoHtmlDocument(sourceHtml, buildAdminRemoteBootstrapMarkup(bootstrapJson));
 	}
 	function getAdminRemoteShellAssetReference(openingTag) {
@@ -3223,44 +3163,8 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 	function collectAdminInlineDynamicImports(scriptBody = "") {
 		const source = String(scriptBody || "");
 		const imports = [];
-		const isIdentifierStart = (character = "") => /[A-Za-z_$]/.test(character);
 		const isIdentifierPart = (character = "") => /[A-Za-z0-9_$]/.test(character);
-		function skipQuotedString(startIndex, quote) {
-			let cursor = startIndex + 1;
-			while (cursor < source.length) if (source[cursor] === "\\") cursor += 2;
-			else if (source[cursor] === quote) return cursor + 1;
-			else cursor += 1;
-			return source.length;
-		}
-		function skipLineComment(startIndex) {
-			const lineEnd = source.indexOf("\n", startIndex + 2);
-			return lineEnd < 0 ? source.length : lineEnd + 1;
-		}
-		function skipBlockComment(startIndex) {
-			const commentEnd = source.indexOf("*/", startIndex + 2);
-			return commentEnd < 0 ? source.length : commentEnd + 2;
-		}
-		function skipRegexLiteral(startIndex) {
-			let cursor = startIndex + 1;
-			let inCharacterClass = false;
-			while (cursor < source.length) {
-				const character = source[cursor];
-				if (character === "\\") cursor += 2;
-				else if (character === "[") {
-					inCharacterClass = true;
-					cursor += 1;
-				} else if (character === "]" && inCharacterClass) {
-					inCharacterClass = false;
-					cursor += 1;
-				} else if (character === "/" && !inCharacterClass) {
-					cursor += 1;
-					while (/[A-Za-z]/.test(source[cursor] || "")) cursor += 1;
-					return cursor;
-				} else cursor += 1;
-			}
-			return source.length;
-		}
-		function skipTrivia(startIndex) {
+		const skipTrivia = (startIndex) => {
 			let cursor = startIndex;
 			while (cursor < source.length) {
 				if (/\s/.test(source[cursor])) {
@@ -3268,117 +3172,31 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 					continue;
 				}
 				if (source.startsWith("//", cursor)) {
-					cursor = skipLineComment(cursor);
+					const lineEnd = source.indexOf("\n", cursor + 2);
+					cursor = lineEnd < 0 ? source.length : lineEnd + 1;
 					continue;
 				}
 				if (source.startsWith("/*", cursor)) {
-					cursor = skipBlockComment(cursor);
+					const commentEnd = source.indexOf("*/", cursor + 2);
+					cursor = commentEnd < 0 ? source.length : commentEnd + 2;
 					continue;
 				}
 				break;
 			}
 			return cursor;
-		}
-		function scanTemplateLiteral(startIndex) {
-			let cursor = startIndex + 1;
-			while (cursor < source.length) if (source[cursor] === "\\") cursor += 2;
-			else if (source[cursor] === "`") return cursor + 1;
-			else if (source[cursor] === "$" && source[cursor + 1] === "{") cursor = scanCode(cursor + 2, "}");
-			else cursor += 1;
-			return source.length;
-		}
-		function scanCode(startIndex = 0, closingCharacter = "") {
-			let cursor = startIndex;
-			let previousToken = "";
-			let canStartRegex = true;
-			const regexPrefixKeywords = /* @__PURE__ */ new Set([
-				"await",
-				"case",
-				"delete",
-				"do",
-				"else",
-				"in",
-				"instanceof",
-				"new",
-				"return",
-				"throw",
-				"typeof",
-				"void",
-				"yield"
-			]);
-			while (cursor < source.length) {
-				const character = source[cursor];
-				if (closingCharacter && character === closingCharacter) return cursor + 1;
-				if (/\s/.test(character)) {
-					cursor += 1;
-					continue;
-				}
-				if (source.startsWith("//", cursor)) {
-					cursor = skipLineComment(cursor);
-					continue;
-				}
-				if (source.startsWith("/*", cursor)) {
-					cursor = skipBlockComment(cursor);
-					continue;
-				}
-				if (character === "\"" || character === "'") {
-					cursor = skipQuotedString(cursor, character);
-					previousToken = "literal";
-					canStartRegex = false;
-					continue;
-				}
-				if (character === "`") {
-					cursor = scanTemplateLiteral(cursor);
-					previousToken = "literal";
-					canStartRegex = false;
-					continue;
-				}
-				if (isIdentifierStart(character)) {
-					const identifierStart = cursor;
-					cursor += 1;
-					while (isIdentifierPart(source[cursor] || "")) cursor += 1;
-					const identifier = source.slice(identifierStart, cursor);
-					if (identifier === "import" && previousToken !== ".") {
-						const callStart = skipTrivia(cursor);
-						if (source[callStart] === "(") imports.push({
-							index: identifierStart,
-							reference: source.slice(identifierStart, callStart + 1)
-						});
-					}
-					previousToken = identifier;
-					canStartRegex = regexPrefixKeywords.has(identifier);
-					continue;
-				}
-				if (/[0-9]/.test(character)) {
-					cursor += 1;
-					while (/[A-Za-z0-9._]/.test(source[cursor] || "")) cursor += 1;
-					previousToken = "number";
-					canStartRegex = false;
-					continue;
-				}
-				if (character === "/" && canStartRegex) {
-					cursor = skipRegexLiteral(cursor);
-					previousToken = "literal";
-					canStartRegex = false;
-					continue;
-				}
-				if (character === "{") {
-					cursor = scanCode(cursor + 1, "}");
-					previousToken = "}";
-					canStartRegex = false;
-					continue;
-				}
-				previousToken = character;
-				cursor += 1;
-				canStartRegex = ![
-					")",
-					"]",
-					"}"
-				].includes(character);
+		};
+		for (let cursor = 0; cursor < source.length;) {
+			if (source.startsWith("import", cursor) && !isIdentifierPart(source[cursor - 1]) && !isIdentifierPart(source[cursor + 6])) {
+				let previous = cursor - 1;
+				while (previous >= 0 && /\s/.test(source[previous])) previous -= 1;
+				const callStart = skipTrivia(cursor + 6);
+				if (source[previous] !== "." && source[callStart] === "(") imports.push({
+					index: cursor,
+					reference: source.slice(cursor, callStart + 1)
+				});
 			}
-			return cursor;
+			cursor += 1;
 		}
-		scanCode();
 		return imports;
 	}
 	function hasAdminRemoteShellInlineDynamicImport(html = "") {
@@ -3466,8 +3284,6 @@ function defineAdminShellAssets(dependencies = {}, shell = {}) {
 	}
 	return {
 		buildAdminRemoteBootstrapMarkup,
-		ADMIN_REMOTE_BOOTSTRAP_SCRIPT_REGEX,
-		ADMIN_REMOTE_BOOTSTRAP_LOADER_REGEX,
 		ADMIN_REMOTE_BOOTSTRAP_LOADER_HTML,
 		ADMIN_REMOTE_TAILWIND_PRELUDE_HTML,
 		ADMIN_HTML_SKIPPED_CONTENT_TAGS,
@@ -3535,26 +3351,41 @@ function buildSingleFlightKey(parts = []) {
 	return (Array.isArray(parts) ? parts : [parts]).map((item) => String(item ?? "").trim()).filter(Boolean).join(":");
 }
 async function runSingleFlight(key, loader) {
+	return await runSingleFlightWithTasks(cacheState.SingleFlightTasks, key, loader);
+}
+async function runSingleFlightWithTasks(tasks, key, loader) {
 	const dedupeKey = String(key || "").trim();
 	if (!dedupeKey) return await loader();
-	const existingTask = cacheState.SingleFlightTasks.get(dedupeKey);
+	const existingTask = tasks.get(dedupeKey);
 	if (existingTask) return await existingTask;
 	const nextTask = Promise.resolve().then(() => loader()).finally(() => {
-		if (cacheState.SingleFlightTasks.get(dedupeKey) === nextTask) cacheState.SingleFlightTasks.delete(dedupeKey);
+		if (tasks.get(dedupeKey) === nextTask) tasks.delete(dedupeKey);
 	});
-	cacheState.SingleFlightTasks.set(dedupeKey, nextTask);
+	tasks.set(dedupeKey, nextTask);
 	return await nextTask;
 }
-function invalidateRuntimeConfigCache() {
-	cacheState.RuntimeConfigCacheGeneration += 1;
-	cacheState.ConfigCache = null;
-}
 function getRuntimeConfigCacheNamespace(env) {
-	return String(env?.__CONFIG_CACHE_NAMESPACE || env?.__WORKER_CACHE_SCOPE || (env?.ENI_KV ? "ENI_KV" : "") || (env?.KV ? "KV" : "") || (env?.EMBY_KV ? "EMBY_KV" : "") || (env?.EMBY_PROXY ? "EMBY_PROXY" : "") || "default");
+	return String(env?.__CONFIG_CACHE_NAMESPACE || env?.__WORKER_CACHE_SCOPE || "default").trim() || "default";
+}
+function getRuntimeConfigCacheState(env) {
+	return runtimeConfigBindingStates.get(getKvBinding(env), getRuntimeConfigCacheNamespace(env));
+}
+function getCachedRuntimeConfig(env) {
+	return getRuntimeConfigCacheState(env).ConfigCache?.data || null;
+}
+function invalidateRuntimeConfigCache(env) {
+	if (arguments.length === 0) {
+		runtimeConfigBindingStates.reset();
+		return;
+	}
+	const state = getRuntimeConfigCacheState(env);
+	state.RuntimeConfigCacheGeneration += 1;
+	state.ConfigCache = null;
 }
 function primeRuntimeConfigCache(env, config) {
-	cacheState.RuntimeConfigCacheGeneration += 1;
-	cacheState.ConfigCache = {
+	const state = getRuntimeConfigCacheState(env);
+	state.RuntimeConfigCacheGeneration += 1;
+	state.ConfigCache = {
 		data: config,
 		exp: Date.now() + Config.Defaults.CacheTTL,
 		namespace: getRuntimeConfigCacheNamespace(env)
@@ -3562,16 +3393,6 @@ function primeRuntimeConfigCache(env, config) {
 }
 //#endregion
 //#region worker/features/maintenance/mutation-queues.js
-async function runKvDataMutation(mutation) {
-	const mutationTask = runtimeState.KvDataMutationChain.catch(() => null).then(() => mutation());
-	runtimeState.KvDataMutationChain = mutationTask.catch(() => null);
-	return await mutationTask;
-}
-async function runKvTidyMutation(mutation) {
-	const mutationTask = runtimeState.KvTidyMutationChain.catch(() => null).then(() => runKvDataMutation(mutation));
-	runtimeState.KvTidyMutationChain = mutationTask.catch(() => null);
-	return await mutationTask;
-}
 async function runAdminRemoteShellCacheMutation(cacheKeyUrl, mutation) {
 	const mutationKey = String(cacheKeyUrl);
 	const nextMutation = (cacheState.AdminRemoteShellCacheMutationChains.get(mutationKey) || Promise.resolve()).catch(() => null).then(() => mutation()).finally(() => {
@@ -3593,6 +3414,8 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 		if (originLastModified) headers.set(shell.ADMIN_REMOTE_SHELL_SOURCE_LAST_MODIFIED_HEADER, originLastModified);
 		const sourceHash = hashStableText(String(options.sourceUrl || "").trim());
 		if (sourceHash) headers.set(shell.ADMIN_REMOTE_SHELL_SOURCE_HASH_HEADER, sourceHash);
+		const shellRevision = normalizeAdminLocalIndexRevision(options.shellRevision || parseAdminLocalIndexSourceUrl(options.sourceUrl));
+		if (shellRevision) headers.set("X-Admin-Shell-Revision", shellRevision);
 		return new Response(String(html || ""), {
 			status: 200,
 			headers
@@ -3811,7 +3634,8 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 				lastModified,
 				originEtag,
 				originLastModified: lastModified,
-				sourceUrl
+				sourceUrl,
+				shellRevision: parseAdminLocalIndexSourceUrl(sourceUrl)
 			}),
 			vendorManifest
 		};
@@ -5813,6 +5637,23 @@ function mergeMissingRuntimeConfigSecrets(input = {}, currentConfig = {}) {
 	}
 	return importedConfig;
 }
+function mergeAdminSettingsRuntimeConfig(input = {}, currentConfig = {}) {
+	const merged = mergeMissingRuntimeConfigSecrets(input, currentConfig);
+	const currentIndexRevision = parseAdminLocalIndexSourceUrl(sanitizeRuntimeConfig(currentConfig).indexUrl);
+	merged.indexUrl = currentIndexRevision ? buildAdminLocalIndexSourceUrl(currentIndexRevision) : "";
+	return merged;
+}
+function assertExpectedRuntimeConfigRevision(expectedRevision = "", currentConfig = {}) {
+	const normalizedExpectedRevision = String(expectedRevision || "").trim();
+	if (!normalizedExpectedRevision) return;
+	const expectedHash = normalizedExpectedRevision.split(".").pop() || "";
+	const currentHash = hashStableText(serializeConfigValue(sanitizeRuntimeConfig(currentConfig)));
+	if (expectedHash === currentHash) return;
+	throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置已被其他设备更新，请刷新设置后重新提交", 409, {
+		expectedRevision: normalizedExpectedRevision,
+		currentHash
+	});
+}
 function redactConfigSnapshotSecrets(snapshot = {}) {
 	if (!isPlainObject(snapshot)) return snapshot;
 	const redacted = {
@@ -6092,15 +5933,16 @@ async function getRuntimeConfig(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
 	const cacheNamespace = getRuntimeConfigCacheNamespace(env);
-	const cachedConfig = cacheState.ConfigCache?.namespace === cacheNamespace ? cacheState.ConfigCache : null;
+	const state = getRuntimeConfigCacheState(env);
+	const cachedConfig = state.ConfigCache;
 	if (cachedConfig?.exp > nowMs() && cachedConfig.data) return cachedConfig.data;
-	const cacheGeneration = cacheState.RuntimeConfigCacheGeneration;
-	return await runSingleFlight(buildSingleFlightKey([
+	const cacheGeneration = state.RuntimeConfigCacheGeneration;
+	return await runSingleFlightWithTasks(state.SingleFlightTasks, buildSingleFlightKey([
 		"runtime_config",
 		cacheNamespace,
 		cacheGeneration
 	]), async () => {
-		const activeCache = cacheState.ConfigCache?.namespace === cacheNamespace ? cacheState.ConfigCache : null;
+		const activeCache = state.ConfigCache;
 		if (activeCache?.exp > nowMs() && activeCache.data) return activeCache.data;
 		const staleConfig = activeCache?.data && typeof activeCache.data === "object" ? activeCache.data : cachedConfig?.data && typeof cachedConfig.data === "object" ? cachedConfig.data : null;
 		let config = staleConfig || {};
@@ -6115,7 +5957,7 @@ async function getRuntimeConfig(env) {
 			});
 			config = hasCachedConfig ? staleConfig : sanitizeRuntimeConfig({});
 		}
-		if (cacheState.RuntimeConfigCacheGeneration === cacheGeneration) cacheState.ConfigCache = {
+		if (state.RuntimeConfigCacheGeneration === cacheGeneration) state.ConfigCache = {
 			data: config,
 			exp: nowMs() + Config.Defaults.CacheTTL,
 			namespace: cacheNamespace
@@ -6133,7 +5975,12 @@ async function getRuntimeConfigStrict(env) {
 function defineAdminShellViews(dependencies = {}, shell = {}) {
 	const { indexRepository } = dependencies;
 	async function renderAdminPage(request, env, ctx, initHealth = buildInitHealth(env), config = null) {
-		const runtimeConfig = isPlainObject(config) ? sanitizeRuntimeConfig(config) : sanitizeRuntimeConfig(await getRuntimeConfigStrict(env));
+		const storedRuntimeConfig = isPlainObject(config) ? sanitizeRuntimeConfig(config) : sanitizeRuntimeConfig(await getRuntimeConfigStrict(env));
+		const activeIndexRecord = await indexRepository.getAdminActiveIndexRecord(indexRepository.getKV(env));
+		const runtimeConfig = activeIndexRecord ? sanitizeRuntimeConfig({
+			...storedRuntimeConfig,
+			indexUrl: activeIndexRecord.sourceUrl
+		}) : storedRuntimeConfig;
 		if (shell.isAdminIndexSetupForced(request)) return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig, "manual_setup_requested");
 		const adminIndexState = buildResolvedAdminIndexState(env, runtimeConfig);
 		if (!adminIndexState.indexUrl) return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig);
@@ -6627,37 +6474,6 @@ function defineAdminShell(dependencies = {}) {
 	for (const [name, value] of Object.entries(defineAdminShellViews(dependencies, shell))) shell[name] = value;
 	for (const [name, value] of Object.entries(defineAdminShellRouting(dependencies, shell))) shell[name] = value;
 	return shell;
-}
-//#endregion
-//#region worker/features/admin/action-registry.js
-function normalizeActionName(value) {
-	return String(value || "").trim();
-}
-function defineActionRegistry(groups = [], options = {}) {
-	const handlers = Object.create(null);
-	const owners = /* @__PURE__ */ new Map();
-	for (const group of groups) {
-		const groupName = normalizeActionName(group?.name) || "anonymous";
-		const groupHandlers = group?.handlers && typeof group.handlers === "object" ? group.handlers : group;
-		for (const [actionName, handler] of Object.entries(groupHandlers || {})) {
-			if (typeof handler !== "function") throw new TypeError(`Admin action ${actionName} from ${groupName} is not a function`);
-			if (handlers[actionName]) throw new Error(`Duplicate admin action ${actionName}: ${owners.get(actionName)} and ${groupName}`);
-			handlers[actionName] = handler;
-			owners.set(actionName, groupName);
-		}
-	}
-	const aliases = Object.freeze({ ...options.aliases || {} });
-	for (const [alias, target] of Object.entries(aliases)) if (!handlers[target]) throw new Error(`Admin action alias ${alias} targets missing action ${target}`);
-	for (const requiredAction of options.requiredActions || []) if (!handlers[requiredAction]) throw new Error(`Missing required admin action ${requiredAction}`);
-	const frozenHandlers = Object.freeze({ ...handlers });
-	return Object.freeze({
-		handlers: frozenHandlers,
-		names: Object.freeze(Object.keys(frozenHandlers).sort()),
-		resolve(actionName) {
-			const normalized = normalizeActionName(actionName);
-			return frozenHandlers[aliases[normalized] || normalized] || null;
-		}
-	});
 }
 //#endregion
 //#region worker/features/observability/cloudflare-client.js
@@ -8590,7 +8406,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 			const rawConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config) ? data.config : {};
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const currentConfig = await getRuntimeConfigStrict(env);
-			const prepared = await kernel.prepareRuntimeConfigPersistence(mergeMissingRuntimeConfigSecrets(rawConfig, currentConfig), {
+			const prepared = await kernel.prepareRuntimeConfigPersistence(mergeAdminSettingsRuntimeConfig(rawConfig, currentConfig), {
 				env,
 				kv,
 				ctx
@@ -8750,7 +8566,8 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 		async saveConfig(data, { env, ctx, kv, meta }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const currentConfig = await getRuntimeConfigStrict(env);
-			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeMissingRuntimeConfigSecrets(data.config, currentConfig), {
+			assertExpectedRuntimeConfigRevision(data?.expectedConfigRevision, currentConfig);
+			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(data.config, currentConfig), {
 				env,
 				kv,
 				ctx,
@@ -8854,7 +8671,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 			const importedConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config) ? data.config : data?.settings && typeof data.settings === "object" && !Array.isArray(data.settings) ? data.settings : null;
 			if (!importedConfig) return jsonError("INVALID_SETTINGS_BACKUP", "设置备份文件无效，缺少 config/settings 对象");
 			const currentConfig = await getRuntimeConfigStrict(env);
-			const savedConfig = await kernel.persistRuntimeConfig(mergeMissingRuntimeConfigSecrets(importedConfig, currentConfig), {
+			const savedConfig = await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(importedConfig, currentConfig), {
 				env,
 				kv,
 				ctx,
@@ -8941,18 +8758,31 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 			if (!snapshot) return jsonError("SNAPSHOT_NOT_FOUND", "指定的配置快照不存在", 404);
 			const currentConfig = await getRuntimeConfigStrict(env);
 			const restoredSnapshotConfig = preserveRuntimeConfigSecrets(snapshot.config || {}, currentConfig);
-			const savedConfig = await kernel.persistRuntimeConfig(restoredSnapshotConfig, {
-				env,
-				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "restore_snapshot",
-					section: "all",
-					source: "snapshot",
-					actor: "admin",
-					note: snapshotId
-				}
-			});
+			const restoredIndexRevision = parseAdminLocalIndexSourceUrl(restoredSnapshotConfig.indexUrl || "");
+			const restoredIndexRecord = restoredIndexRevision ? await kernel.getAdminIndexUploadRecord(kv, restoredIndexRevision) : null;
+			if (restoredIndexRevision && !restoredIndexRecord) return jsonError("SNAPSHOT_ADMIN_INDEX_MISSING", "配置快照引用的 index.html 已不存在", 409, { revision: restoredIndexRevision });
+			const previousActiveIndexValue = await kv.get(kernel.ADMIN_ACTIVE_INDEX_KEY);
+			if (restoredIndexRecord) await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(restoredIndexRecord));
+			else await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
+			let savedConfig;
+			try {
+				savedConfig = await kernel.persistRuntimeConfig(restoredSnapshotConfig, {
+					env,
+					kv,
+					ctx,
+					snapshotMeta: {
+						reason: "restore_snapshot",
+						section: "all",
+						source: "snapshot",
+						actor: "admin",
+						note: snapshotId
+					}
+				});
+			} catch (error) {
+				if (previousActiveIndexValue === null) await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
+				else await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, previousActiveIndexValue);
+				throw error;
+			}
 			return jsonResponse({
 				success: true,
 				config: redactAdminRuntimeConfig(savedConfig),
@@ -9125,13 +8955,13 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, buildAdminLocalIndexUploadRecord } = dependencies;
 	return {
-		async saveOrImport(data, { action, ctx, kv, env }) {
+	async saveOrImport(data, { action, ctx, kv, env }) {
 			const nodesToSave = action === "save" ? [data] : data.nodes;
 			const reservedNodeConflict = findReservedNodeNameConflict(nodesToSave, env);
 			if (reservedNodeConflict) return jsonError("NODE_NAME_RESERVED", "节点路径与系统保留路由冲突，请更换后重试", 409, reservedNodeConflict);
 			const hostPrefixValidationError = findHostPrefixNodeValidationError(nodesToSave, env);
 			if (hostPrefixValidationError) return jsonError(hostPrefixValidationError.code, hostPrefixValidationError.message, 400, hostPrefixValidationError);
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				const savedNodeNames = [];
 				const renameMap = /* @__PURE__ */ new Map();
 				const preparedMutations = [];
@@ -9249,7 +9079,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 		},
 		async saveMainVideoStreamPolicyShortcuts(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				const currentNodes = await kernel.loadAllNodeEntitiesFromKv(kv, { ctx });
 				const allowedNames = Array.isArray(currentNodes) ? currentNodes.map((node) => node?.name) : [];
 				const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], { allowedNames });
@@ -9366,7 +9196,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 				});
 			});
 		},
-				async importFull(data, { env, ctx, kv }) {
+		async importFull(data, { env, ctx, kv }) {
 			const reservedNodeConflict = findReservedNodeNameConflict(data?.nodes, env);
 			if (reservedNodeConflict) return jsonError("NODE_NAME_RESERVED", "节点路径与系统保留路由冲突，请更换后重试", 409, reservedNodeConflict);
 			const hostPrefixValidationError = findHostPrefixNodeValidationError(data?.nodes, env);
@@ -9389,7 +9219,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 			if (importedIndexRevision && !importedIndexRecord) {
 				if (!await kernel.getAdminIndexUploadRecord(kv, importedIndexRevision)) return jsonError("ADMIN_INDEX_BACKUP_MISSING", "完整备份缺少当前配置引用的 index.html", 400, { revision: importedIndexRevision });
 			}
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				const currentConfig = await getRuntimeConfigStrict(env);
 				const configRollbackState = data.config ? await kernel.captureRuntimeConfigRollbackState(env, kv) : null;
 				const importedConfig = data.config ? mergeMissingRuntimeConfigSecrets(data.config, currentConfig) : null;
@@ -9397,6 +9227,8 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 				const configuredHost = resolveConfiguredHost(env);
 				const importedIndexKey = importedIndexRecord ? kernel.buildAdminIndexUploadKey(importedIndexRecord.revision) : "";
 				const previousImportedIndexValue = importedIndexKey ? await kv.get(importedIndexKey) : null;
+				const previousActiveIndexValue = data.config ? await kv.get(kernel.ADMIN_ACTIVE_INDEX_KEY) : null;
+				const importedActiveIndexRecord = importedIndexRevision ? importedIndexRecord || await kernel.getAdminIndexUploadRecord(kv, importedIndexRevision) : null;
 				const preparedMutations = [];
 				if (Array.isArray(data.nodes)) for (const n of data.nodes) {
 					if (!n.name || !n.target && !(Array.isArray(n.lines) && n.lines.length)) continue;
@@ -9418,6 +9250,10 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 				let nodeMutationCommitted = false;
 				try {
 					if (importedIndexKey) await kv.put(importedIndexKey, JSON.stringify(importedIndexRecord));
+					if (importedConfig) {
+						if (importedActiveIndexRecord) await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(importedActiveIndexRecord));
+						else await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
+					}
 					if (importedConfig) savedConfig = await kernel.commitRuntimeConfig(importedConfig, {
 						env,
 						kv,
@@ -9472,6 +9308,12 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					} catch (restoreError) {
 						adminIndexRollbackError = getErrorMessage(restoreError, "admin_index_restore_failed");
 					}
+					if (data.config) try {
+						if (previousActiveIndexValue === null) await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
+						else await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, previousActiveIndexValue);
+					} catch (restoreError) {
+						adminIndexRollbackError = [adminIndexRollbackError, getErrorMessage(restoreError, "active_admin_index_restore_failed")].filter(Boolean).join("; ");
+					}
 					if (error && typeof error === "object") {
 						if (!String(error.code || "").trim()) error.code = "IMPORT_FULL_FAILED";
 						error.status = normalizeErrorStatus(error.status, 500);
@@ -9505,7 +9347,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 			});
 		},
 		async delete(data, { ctx, kv, env }) {
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				if (data.name) {
 					const delName = String(data.name).toLowerCase();
 					const runtimeConfig = await getRuntimeConfigStrict(env);
@@ -11488,18 +11330,19 @@ function defineDatabaseActions(dependencies = {}, actions = {}) {
 			await kernel.ensureLogsBaseSchema(db);
 			await kernel.ensureStatsHourlySchema(db);
 			const clearEpochMs = nowMs();
-			runtimeState.LogClearEpochMs = Math.max(runtimeState.LogClearEpochMs || 0, clearEpochMs);
+			const logState = logBindingStates.get(db);
+			logState.LogClearEpochMs = Math.max(logState.LogClearEpochMs || 0, clearEpochMs);
 			await kernel.patchOpsStatus(env || db, { log: {
 				clearEpochMs,
 				clearEpochAt: new Date(clearEpochMs).toISOString()
 			} }, ctx);
-			const activeFlushTask = runtimeState.LogFlushTask;
+			const activeFlushTask = logState.LogFlushTask;
 			if (activeFlushTask) try {
 				await activeFlushTask;
 			} catch {}
-			runtimeState.LogQueue.length = 0;
-			runtimeState.LogDedupe.clear();
-			runtimeState.LogLastFlushAt = 0;
+			logState.LogQueue.length = 0;
+			logState.LogDedupe.clear();
+			logState.LogLastFlushAt = 0;
 			await db.prepare(`DELETE FROM ${kernel.LOGS_TABLE}`).run();
 			await kernel.clearStatsHourly(db).catch(() => false);
 			let ftsRebuilt = false;
@@ -11673,52 +11516,55 @@ function touchMapEntry(map, key) {
 }
 //#endregion
 //#region worker/features/nodes/cache-state.js
-function invalidateNodesRevisionCache() {
-	cacheState.NodesRevisionCacheGeneration += 1;
-	cacheState.NodesRevisionCache = null;
+function invalidateNodesRevisionCache(kv = void 0) {
+	const state = kv === void 0 ? nodeBindingCacheStates.current() : getNodeBindingCacheState(kv);
+	state.NodesRevisionCacheGeneration += 1;
+	state.NodesRevisionCache = null;
 }
-function primeNodesRevisionCache(revision) {
-	cacheState.NodesRevisionCacheGeneration += 1;
-	cacheState.NodesRevisionCache = {
+function primeNodesRevisionCache(revision, kv = null) {
+	const state = getNodeBindingCacheState(kv);
+	state.NodesRevisionCacheGeneration += 1;
+	state.NodesRevisionCache = {
 		loaded: true,
 		revision: String(revision || "").trim(),
 		exp: Date.now() + Config.Defaults.NodesRevisionCacheTtlMs
 	};
 }
-function getNodeCacheToken(nodeName) {
+function getNodeCacheToken(nodeName, state = nodeBindingCacheStates.current()) {
 	const normalizedName = String(nodeName || "").trim().toLowerCase();
-	const nodeGeneration = normalizedName ? Number(cacheState.NodeCacheGenerations.get(normalizedName)) || 0 : 0;
-	const generationToken = nodeGeneration ? `node:${nodeGeneration}` : `missing:${cacheState.NodeCacheGenerationEvictionEpoch}`;
-	return `${cacheState.NodeCacheResetGeneration}:${generationToken}`;
+	const nodeGeneration = normalizedName ? Number(state.NodeCacheGenerations.get(normalizedName)) || 0 : 0;
+	const generationToken = nodeGeneration ? `node:${nodeGeneration}` : `missing:${state.NodeCacheGenerationEvictionEpoch}`;
+	return `${state.NodeCacheResetGeneration}:${generationToken}`;
 }
-function invalidateNodeCacheTokens(nodeNames = []) {
+function invalidateNodeCacheTokens(nodeNames = [], state = nodeBindingCacheStates.current()) {
 	for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
 		const name = String(rawName || "").trim().toLowerCase();
 		if (!name) continue;
-		if (!cacheState.NodeCacheGenerations.has(name) && cacheState.NodeCacheGenerations.size >= Config.Defaults.NodeCacheMax) cacheState.NodeCacheGenerationEvictionEpoch += 1;
-		const nextGeneration = ++cacheState.NodeCacheGenerationNonce;
-		setBoundedMapEntry(cacheState.NodeCacheGenerations, name, nextGeneration, Config.Defaults.NodeCacheMax);
+		if (!state.NodeCacheGenerations.has(name) && state.NodeCacheGenerations.size >= Config.Defaults.NodeCacheMax) state.NodeCacheGenerationEvictionEpoch += 1;
+		const nextGeneration = ++state.NodeCacheGenerationNonce;
+		setBoundedMapEntry(state.NodeCacheGenerations, name, nextGeneration, Config.Defaults.NodeCacheMax);
 	}
 }
-function resetNodeCacheTokens() {
-	cacheState.NodeCacheResetGeneration += 1;
-	cacheState.NodeCacheGenerations.clear();
+function resetNodeCacheTokens(state = nodeBindingCacheStates.current()) {
+	state.NodeCacheResetGeneration += 1;
+	state.NodeCacheGenerations.clear();
 }
-async function runNodeIndexMutation(mutation) {
-	const mutationTask = runtimeState.NodeIndexMutationChain.catch(() => null).then(async () => {
-		cacheState.NodesListCache = null;
-		cacheState.NodesIndexCache = null;
-		invalidateNodesRevisionCache();
+async function runNodeIndexMutation(mutation, kv = null) {
+	const state = getNodeBindingCacheState(kv);
+	const mutationTask = state.NodeIndexMutationChain.catch(() => null).then(async () => {
+		state.NodesListCache = null;
+		state.NodesIndexCache = null;
+		invalidateNodesRevisionCache(kv);
 		try {
 			return await mutation();
 		} catch (error) {
-			cacheState.NodesListCache = null;
-			cacheState.NodesIndexCache = null;
-			invalidateNodesRevisionCache();
+			state.NodesListCache = null;
+			state.NodesIndexCache = null;
+			invalidateNodesRevisionCache(kv);
 			throw error;
 		}
 	});
-	runtimeState.NodeIndexMutationChain = mutationTask.catch(() => null);
+	state.NodeIndexMutationChain = mutationTask.catch(() => null);
 	return await mutationTask;
 }
 //#endregion
@@ -13243,29 +13089,30 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 		async applyKvTidyPlan(plan, options = {}) {
 			const kv = options.kv || kernel.getKV(options.env);
 			if (!kv) throw new Error("KV not configured");
+			const nodeState = getNodeBindingCacheState(kv);
 			const mutationPlan = Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : [];
 			try {
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 			} catch (error) {
-				invalidateRuntimeConfigCache();
-				cacheState.NodesListCache = null;
-				cacheState.NodesIndexCache = null;
-				invalidateNodesRevisionCache();
-				resetNodeCacheTokens();
-				cacheState.NodeCache.clear();
-				cacheState.PlaybackRouteHotCache.clear();
+				invalidateRuntimeConfigCache(options.env);
+				nodeState.NodesListCache = null;
+				nodeState.NodesIndexCache = null;
+				invalidateNodesRevisionCache(kv);
+				resetNodeCacheTokens(nodeState);
+				nodeState.NodeCache.clear();
+				nodeState.PlaybackRouteHotCache.clear();
 				throw error;
 			}
-			invalidateRuntimeConfigCache();
-			resetNodeCacheTokens();
-			cacheState.NodeCache.clear();
-			cacheState.PlaybackRouteHotCache.clear();
+			invalidateRuntimeConfigCache(options.env);
+			resetNodeCacheTokens(nodeState);
+			nodeState.NodeCache.clear();
+			nodeState.PlaybackRouteHotCache.clear();
 			if (Array.isArray(plan?.nodesIndex) && plan.nodesIndex.length > 0) {
 				invalidatePlaybackInfoResponseCacheForNodes(plan.nodesIndex);
 				invalidatePlaybackProgressRelayForNodes(plan.nodesIndex);
 			}
-			kernel.primeNodeSummaryCaches(Array.isArray(plan?.rebuiltNodeSummaries) ? plan.rebuiltNodeSummaries : []);
-			cacheState.NodesIndexCache = {
+			kernel.primeNodeSummaryCaches(Array.isArray(plan?.rebuiltNodeSummaries) ? plan.rebuiltNodeSummaries : [], kv);
+			nodeState.NodesIndexCache = {
 				data: Array.isArray(plan?.nodesIndex) ? plan.nodesIndex : [],
 				exp: nowMs() + 6e4
 			};
@@ -13277,7 +13124,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			});
 		},
 		async tidyKvData(env, options = {}) {
-			return await runKvTidyMutation(async () => {
+			return await runKvTidyMutation(options.kv || kernel.getKV(env))(async () => {
 				const tokenPayload = await kernel.verifyKvTidyPlanToken(env, options.planToken);
 				const plan = await kernel.buildKvTidyPlan(env, options);
 				if (String(plan.planHash || "") !== String(tokenPayload.planHash || "")) {
@@ -13410,6 +13257,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const runtimeConfig = sanitizeRuntimeConfig(options.config || (env ? await getRuntimeConfig(env) : {}));
 			const baseContext = D1TidyPlanner.buildContext(runtimeConfig, options);
 			const context = D1TidyPlanner.attachPreviousState(kernel, baseContext, options.previousCleanupStatus);
+			context.logQueuePendingCount = logBindingStates.get(db).LogQueue.length;
 			const facts = await D1TidyPlanner.readFacts(kernel, db, kv, context);
 			const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
 			const flags = D1TidyPlanner.buildFlags(kernel, context, facts, sourcePolicy);
@@ -13492,8 +13340,9 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			};
 			await beforeStep("bootstrapD1Schema");
 			await kernel.bootstrapD1Schema(db, "logs-core");
-			if (runtimeState.LogFlushTask) await Promise.resolve(runtimeState.LogFlushTask).catch(() => {});
-			if (env && Array.isArray(runtimeState.LogQueue) && runtimeState.LogQueue.length > 0) {
+			const logState = logBindingStates.get(db);
+			if (logState.LogFlushTask) await Promise.resolve(logState.LogFlushTask).catch(() => {});
+			if (env && logState.LogQueue.length > 0) {
 				await beforeStep("flushLogQueue");
 				await Logger.flush(env).catch(() => {});
 			}
@@ -13793,11 +13642,8 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				manifest: normalizeAdminReleaseVendorManifestRecord(record.manifest || {})
 			};
 		},
-		async getAdminIndexUploadRecord(kv, revision = "") {
-			const key = kernel.buildAdminIndexUploadKey(revision);
-			if (!kv || !key) return null;
-			const record = await kvGetStrict(kv, key, { type: "json" });
-			const normalizedRecord = kernel.normalizeAdminIndexUploadRecord(record, revision);
+		async validateAdminIndexUploadRecord(record = {}, expectedRevision = "") {
+			const normalizedRecord = kernel.normalizeAdminIndexUploadRecord(record, expectedRevision);
 			if (!normalizedRecord) return null;
 			if (await sha256HexText(normalizedRecord.html) !== normalizedRecord.revision) return null;
 			try {
@@ -13816,6 +13662,17 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 			} catch {
 				return null;
 			}
+		},
+		async getAdminActiveIndexRecord(kv) {
+			if (!kv) return null;
+			return kernel.validateAdminIndexUploadRecord(await kvGetStrict(kv, kernel.ADMIN_ACTIVE_INDEX_KEY, { type: "json" }));
+		},
+		async getAdminIndexUploadRecord(kv, revision = "") {
+			const key = kernel.buildAdminIndexUploadKey(revision);
+			if (!kv || !key) return null;
+			const storedRecord = await kernel.validateAdminIndexUploadRecord(await kvGetStrict(kv, key, { type: "json" }), revision);
+			if (storedRecord) return storedRecord;
+			return kernel.validateAdminIndexUploadRecord(await kvGetStrict(kv, kernel.ADMIN_ACTIVE_INDEX_KEY, { type: "json" }), revision);
 		},
 		collectReferencedAdminIndexUploadRevisions(config = {}, snapshots = []) {
 			const revisions = /* @__PURE__ */ new Set();
@@ -13851,15 +13708,17 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				error.status = 400;
 				throw error;
 			}
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				const uploadKey = kernel.buildAdminIndexUploadKey(normalizedRecord.revision);
 				const previousRecord = await kvGetStrict(kv, uploadKey, { type: "json" });
+				const previousActiveRecord = await kvGetStrict(kv, kernel.ADMIN_ACTIVE_INDEX_KEY, { type: "json" });
 				let existingRecord = kernel.normalizeAdminIndexUploadRecord(previousRecord, normalizedRecord.revision);
 				if (existingRecord) {
 					if (await sha256HexText(existingRecord.html) !== normalizedRecord.revision) existingRecord = null;
 				}
 				const persistedRecord = existingRecord || normalizedRecord;
 				if (!existingRecord) await kv.put(uploadKey, JSON.stringify(normalizedRecord));
+				await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(persistedRecord));
 				try {
 					const currentConfig = env ? await getRuntimeConfigStrict(env) : sanitizeRuntimeConfig(await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {});
 					return {
@@ -13882,6 +13741,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 						record: persistedRecord
 					};
 				} catch (error) {
+					await withNonCriticalFallback(previousActiveRecord ? kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(previousActiveRecord)) : kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY), "admin.active_index_upload_rollback", { revision: normalizedRecord.revision }, null);
 					if (!existingRecord) await withNonCriticalFallback(previousRecord ? kv.put(uploadKey, JSON.stringify(previousRecord)) : kv.delete(uploadKey), "admin.local_index_upload_rollback", { revision: normalizedRecord.revision }, null);
 					throw error;
 				}
@@ -13895,7 +13755,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				error.status = 503;
 				throw error;
 			}
-			return await runKvDataMutation(async () => {
+			return await runKvDataMutation(kv)(async () => {
 				const currentConfig = env ? await getRuntimeConfigStrict(env) : sanitizeRuntimeConfig(await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {});
 				const activatedRevision = parseAdminLocalIndexSourceUrl(activatedConfig?.indexUrl || "");
 				const currentRevision = parseAdminLocalIndexSourceUrl(currentConfig?.indexUrl || "");
@@ -13905,8 +13765,12 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 					reason: currentRevision ? "superseded_by_newer_admin_index" : "admin_index_already_restored"
 				};
 				const previousIndexRevision = parseAdminLocalIndexSourceUrl(previousConfig?.indexUrl || "");
-				return {
-					config: await kernel.commitRuntimeConfig({
+				const previousActiveRecord = await kvGetStrict(kv, kernel.ADMIN_ACTIVE_INDEX_KEY, { type: "json" });
+				const restoredActiveRecord = previousIndexRevision ? await kernel.getAdminIndexUploadRecord(kv, previousIndexRevision) : null;
+				if (restoredActiveRecord) await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(restoredActiveRecord));
+				else await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
+				try {
+					const restoredConfig = await kernel.commitRuntimeConfig({
 						...currentConfig,
 						indexUrl: previousIndexRevision ? buildAdminLocalIndexSourceUrl(previousIndexRevision) : ""
 					}, {
@@ -13919,10 +13783,16 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 							source: "worker_html_upload",
 							actor: "system"
 						}
-					}),
-					skipped: false,
-					reason: ""
-				};
+					});
+					return {
+						config: restoredConfig,
+						skipped: false,
+						reason: ""
+					};
+				} catch (error) {
+					await withNonCriticalFallback(previousActiveRecord ? kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(previousActiveRecord)) : kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY), "admin.active_index_rollback_restore", { revision: activatedRevision }, null);
+					throw error;
+				}
 			});
 		},
 		async clearConfigSnapshots(kv) {
@@ -13964,7 +13834,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				});
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 			}
-			invalidateRuntimeConfigCache();
+			invalidateRuntimeConfigCache(options.env);
 			return options.env ? await getRuntimeConfig(options.env) : fallbackConfig;
 		},
 		async restoreCapturedRuntimeConfigAndDnsState(state = {}, options = {}) {
@@ -14034,7 +13904,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			return snapshot;
 		},
 		async persistRuntimeConfig(rawConfig, options = {}) {
-			return await runKvDataMutation(() => kernel.commitRuntimeConfig(rawConfig, options));
+			return await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, options));
 		},
 		async prepareRuntimeConfigPersistence(rawConfig, options = {}) {
 			const { env, kv, ctx, snapshotMeta } = options;
@@ -15716,7 +15586,7 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 			if (mutation?.nextNode) await kv.put(`${kernel.PREFIX}${nextName}`, JSON.stringify(mutation.nextNode));
 			else if (nextName) await kv.delete(`${kernel.PREFIX}${nextName}`);
 			if (previousName && nextName && previousName !== nextName) await kv.delete(`${kernel.PREFIX}${previousName}`);
-			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
+			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true, kv });
 			return true;
 		},
 		async rollbackPreparedNodeMutation(mutation = {}, options = {}) {
@@ -15727,7 +15597,7 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 			if (previousName) if (mutation?.previousNode) await kv.put(`${kernel.PREFIX}${previousName}`, JSON.stringify(mutation.previousNode));
 			else await kv.delete(`${kernel.PREFIX}${previousName}`);
 			if (nextName && nextName !== previousName) await kv.delete(`${kernel.PREFIX}${nextName}`);
-			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true });
+			kernel.invalidateNodeCaches([previousName, nextName], { invalidateList: true, kv });
 			return true;
 		},
 		async rollbackPreparedNodeMutations(mutations = [], options = {}) {
@@ -15860,26 +15730,27 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 			nodeName = String(nodeName).toLowerCase();
 			const kv = kernel.getKV(env);
 			if (!kv) return null;
-			const memoryCacheToken = getNodeCacheToken(nodeName);
-			const mem = cacheState.NodeCache.get(nodeName);
+			const state = getNodeBindingCacheState(kv);
+			const memoryCacheToken = getNodeCacheToken(nodeName, state);
+			const mem = state.NodeCache.get(nodeName);
 			if (mem && mem.exp > Date.now()) {
 				const currentNodesRevision = await kernel.getNodesRevision(kv);
 				const cachedNodesRevision = String(mem?.nodesRevision || "").trim();
-				if (getNodeCacheToken(nodeName) === memoryCacheToken && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)) {
-					touchMapEntry(cacheState.NodeCache, nodeName);
+				if (getNodeCacheToken(nodeName, state) === memoryCacheToken && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)) {
+					touchMapEntry(state.NodeCache, nodeName);
 					return mem.data;
 				}
-				if (getNodeCacheToken(nodeName) === memoryCacheToken) cacheState.NodeCache.delete(nodeName);
+				if (getNodeCacheToken(nodeName, state) === memoryCacheToken) state.NodeCache.delete(nodeName);
 			}
-			const nodeLoadToken = getNodeCacheToken(nodeName);
-			return await runSingleFlight(buildSingleFlightKey([
+			const nodeLoadToken = getNodeCacheToken(nodeName, state);
+			return await runSingleFlightWithTasks(state.SingleFlightTasks, buildSingleFlightKey([
 				"proxy_node",
 				nodeName,
 				nodeLoadToken
 			]), async () => {
 				try {
 					const nodeData = await kv.get(`${kernel.PREFIX}${nodeName}`, { type: "json" });
-					if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
+					if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 					if (!nodeData) {
 						const summaryNodes = await kernel.getNodesSummaryIndex(kv, { ctx });
 						if (Array.isArray(summaryNodes)) if (summaryNodes.some((node) => String(node?.name || "").toLowerCase().trim() === nodeName)) {
@@ -15888,7 +15759,7 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 							else await syncTask;
 						} else {
 							const currentNodesRevision = await kernel.getNodesRevision(kv);
-							if (getNodeCacheToken(nodeName) === nodeLoadToken) setBoundedMapEntry(cacheState.NodeCache, nodeName, {
+							if (getNodeCacheToken(nodeName, state) === nodeLoadToken) setBoundedMapEntry(state.NodeCache, nodeName, {
 								data: null,
 								exp: Date.now() + Config.Defaults.NodeMissCacheTtlMs,
 								nodesRevision: currentNodesRevision
@@ -15912,8 +15783,8 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 						currentNodesRevision = await kernel.getNodesRevision(kv);
 					} else if (ctx) ctx.waitUntil(syncTask);
 					else await syncTask;
-					if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
-					setBoundedMapEntry(cacheState.NodeCache, nodeName, {
+					if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
+					setBoundedMapEntry(state.NodeCache, nodeName, {
 						data: normalized,
 						exp: Date.now() + Config.Defaults.CacheTTL,
 						nodesRevision: currentNodesRevision
@@ -15928,27 +15799,28 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 			nodeName = String(nodeName).toLowerCase();
 			const kv = kernel.getKV(env);
 			if (!kv) return null;
-			const memoryCacheToken = getNodeCacheToken(nodeName);
-			const mem = cacheState.NodeCache.get(nodeName);
-			if (mem?.data === null) cacheState.NodeCache.delete(nodeName);
+			const state = getNodeBindingCacheState(kv);
+			const memoryCacheToken = getNodeCacheToken(nodeName, state);
+			const mem = state.NodeCache.get(nodeName);
+			if (mem?.data === null) state.NodeCache.delete(nodeName);
 			else if (mem && mem.exp > Date.now()) {
 				const currentNodesRevision = await kernel.getNodesRevision(kv);
 				const cachedNodesRevision = String(mem?.nodesRevision || "").trim();
-				if (getNodeCacheToken(nodeName) === memoryCacheToken && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)) {
-					touchMapEntry(cacheState.NodeCache, nodeName);
+				if (getNodeCacheToken(nodeName, state) === memoryCacheToken && (!cachedNodesRevision || !currentNodesRevision || cachedNodesRevision === currentNodesRevision)) {
+					touchMapEntry(state.NodeCache, nodeName);
 					return mem.data;
 				}
-				if (getNodeCacheToken(nodeName) === memoryCacheToken) cacheState.NodeCache.delete(nodeName);
+				if (getNodeCacheToken(nodeName, state) === memoryCacheToken) state.NodeCache.delete(nodeName);
 			}
-			const nodeLoadToken = getNodeCacheToken(nodeName);
+			const nodeLoadToken = getNodeCacheToken(nodeName, state);
 			try {
 				const nodeData = await kv.get(`${kernel.PREFIX}${nodeName}`, { type: "json" });
-				if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
+				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 				if (!nodeData) return null;
 				const normalized = kernel.normalizeNode(nodeName, nodeData).data;
 				const currentNodesRevision = await kernel.getNodesRevision(kv);
-				if (getNodeCacheToken(nodeName) !== nodeLoadToken) return null;
-				setBoundedMapEntry(cacheState.NodeCache, nodeName, {
+				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
+				setBoundedMapEntry(state.NodeCache, nodeName, {
 					data: normalized,
 					exp: Date.now() + Config.Defaults.CacheTTL,
 					nodesRevision: currentNodesRevision
@@ -16276,21 +16148,6 @@ function buildLogQueryPlanner(dependencies = {}) {
 	return planner;
 }
 //#endregion
-//#region worker/features/observability/log-serialization.js
-var LOG_DETAIL_JSON_MAX_LENGTH = 8192;
-function serializeBoundedLogDetailJson(value, maxLength = LOG_DETAIL_JSON_MAX_LENGTH) {
-	const limit = Math.max(2, Math.floor(Number(maxLength) || 8192));
-	let serialized = "";
-	try {
-		serialized = JSON.stringify(value);
-	} catch {
-		serialized = "";
-	}
-	if (serialized && serialized.length <= limit) return serialized;
-	const truncated = JSON.stringify({ truncated: true });
-	return truncated.length <= limit ? truncated : "{}";
-}
-//#endregion
 //#region worker/features/observability/logger.js
 var SYS_STATUS_TABLE$1 = "sys_status";
 function buildLogger(dependencies = {}) {
@@ -16300,25 +16157,30 @@ function buildLogger(dependencies = {}) {
 			logRuntimeFailure(scope, error, context, "error");
 		},
 		scheduleFlush(env, ctx) {
-			if (!ctx || runtimeState.LogFlushPending) return null;
-			runtimeState.LogFlushPending = true;
+			const db = logRepository.getDB(env);
+			const logState = logBindingStates.get(db);
+			if (!db || !ctx || logState.LogFlushPending) return null;
+			logState.LogFlushPending = true;
 			const flushTask = logger.flush(env).finally(() => {
-				if (runtimeState.LogFlushTask === flushTask) runtimeState.LogFlushTask = null;
-				runtimeState.LogFlushPending = false;
-				runtimeState.LogLastFlushAt = nowMs();
-				if (runtimeState.LogQueue.length > 0) logger.scheduleFlush(env, ctx);
+				if (logState.LogFlushTask === flushTask) logState.LogFlushTask = null;
+				logState.LogFlushPending = false;
+				logState.LogLastFlushAt = nowMs();
+				if (logState.LogQueue.length > 0) logger.scheduleFlush(env, ctx);
 			});
-			runtimeState.LogFlushTask = flushTask;
+			logState.LogFlushTask = flushTask;
 			ctx.waitUntil(flushTask);
 			return flushTask;
 		},
 		record(env, ctx, logData) {
-			if (!logRepository.getDB(env) || !ctx) return;
+			const db = logRepository.getDB(env);
+			if (!db || !ctx) return;
+			const logState = logBindingStates.get(db);
 			if (logData.requestMethod === "OPTIONS") return;
-			const runtimeConfig = cacheState.ConfigCache?.data || {};
+			const runtimeConfig = isPlainObject(logData.runtimeConfig) ? logData.runtimeConfig : getCachedRuntimeConfig(env) || {};
+			logState.runtimeConfig = runtimeConfig;
 			if (runtimeConfig.logEnabled !== false !== true) {
-				if (runtimeState.LogQueue.length > 0) runtimeState.LogQueue.length = 0;
-				runtimeState.LogDedupe.clear();
+				if (logState.LogQueue.length > 0) logState.LogQueue.length = 0;
+				logState.LogDedupe.clear();
 				return;
 			}
 			const statusCode = Number(logData.statusCode) || 0;
@@ -16337,7 +16199,7 @@ function buildLogger(dependencies = {}) {
 			const nodeName = boundedText(logData.nodeName || "unknown", 128) || "unknown";
 			const requestPath = boundedText(logData.requestPath || "/", 2048) || "/";
 			const currentMs = nowMs();
-			const logClearEpochMs = Math.max(0, Number(runtimeState.LogClearEpochMs) || 0);
+			const logClearEpochMs = Math.max(0, Number(logState.LogClearEpochMs) || 0);
 			const recordTimestamp = currentMs <= logClearEpochMs ? logClearEpochMs + 1 : currentMs;
 			let dedupeWindow = 0;
 			if (logData.requestMethod === "HEAD") dedupeWindow = 3e5;
@@ -16351,16 +16213,16 @@ function buildLogger(dependencies = {}) {
 					clientIp,
 					outboundColo
 				].join("|");
-				const lastSeen = runtimeState.LogDedupe.get(dedupKey);
+				const lastSeen = logState.LogDedupe.get(dedupKey);
 				if (lastSeen && currentMs - lastSeen < dedupeWindow) return;
-				runtimeState.LogDedupe.set(dedupKey, currentMs);
-				if (runtimeState.LogDedupe.size > Config.Defaults.LogDedupeMax) for (const [key, ts] of runtimeState.LogDedupe) {
-					if (!runtimeState.LogDedupe.has(key)) continue;
-					if (currentMs - ts > dedupeWindow || runtimeState.LogDedupe.size > Config.Defaults.LogDedupeTrimTarget) runtimeState.LogDedupe.delete(key);
-					if (runtimeState.LogDedupe.size <= Config.Defaults.LogDedupeTrimTarget) break;
+				logState.LogDedupe.set(dedupKey, currentMs);
+				if (logState.LogDedupe.size > Config.Defaults.LogDedupeMax) for (const [key, ts] of logState.LogDedupe) {
+					if (!logState.LogDedupe.has(key)) continue;
+					if (currentMs - ts > dedupeWindow || logState.LogDedupe.size > Config.Defaults.LogDedupeTrimTarget) logState.LogDedupe.delete(key);
+					if (logState.LogDedupe.size <= Config.Defaults.LogDedupeTrimTarget) break;
 				}
 			}
-			runtimeState.LogQueue.push({
+			logState.LogQueue.push({
 				timestamp: recordTimestamp,
 				nodeName,
 				requestPath,
@@ -16374,34 +16236,35 @@ function buildLogger(dependencies = {}) {
 				referer: boundedText(logData.referer, 1024) || null,
 				category: logData.category || "api",
 				errorDetail: boundedText(logData.errorDetail, 2048) || null,
-				detailJson: logData.detailJson ? serializeBoundedLogDetailJson(logData.detailJson) : null,
+				detailJson: logData.detailJson ? serializeBoundedJson(logData.detailJson) : null,
 				createdAt: new Date(recordTimestamp).toISOString()
 			});
-			if (runtimeState.LogQueue.length > Config.Defaults.LogQueueMax) {
-				const overflowDropCount = Math.min(Config.Defaults.LogQueueOverflowDropCount, runtimeState.LogQueue.length);
-				runtimeState.LogQueue.splice(0, overflowDropCount);
+			if (logState.LogQueue.length > Config.Defaults.LogQueueMax) {
+				const overflowDropCount = Math.min(Config.Defaults.LogQueueOverflowDropCount, logState.LogQueue.length);
+				logState.LogQueue.splice(0, overflowDropCount);
 				logRepository.patchOpsStatus(env, { log: {
 					lastOverflowAt: (/* @__PURE__ */ new Date()).toISOString(),
 					lastOverflowDropCount: overflowDropCount,
-					queueLengthAfterDrop: runtimeState.LogQueue.length
+					queueLengthAfterDrop: logState.LogQueue.length
 				} }, ctx);
 				console.error(`Log queue overflow, dropping ${overflowDropCount} logs to preserve isolate headroom.`);
 			}
-			if (!runtimeState.LogLastFlushAt) runtimeState.LogLastFlushAt = currentMs;
-			const configuredDelayMinutes = Number(cacheState.ConfigCache?.data?.logWriteDelayMinutes);
-			const configuredFlushCount = Number(cacheState.ConfigCache?.data?.logFlushCountThreshold);
+			if (!logState.LogLastFlushAt) logState.LogLastFlushAt = currentMs;
+			const configuredDelayMinutes = Number(runtimeConfig.logWriteDelayMinutes);
+			const configuredFlushCount = Number(runtimeConfig.logFlushCountThreshold);
 			const flushWindowMs = Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 6e4 : Config.Defaults.LogFlushDelayMinutes * 6e4);
 			const flushCountThreshold = Math.max(1, Number.isFinite(configuredFlushCount) ? Math.floor(configuredFlushCount) : Config.Defaults.LogFlushCountThreshold);
-			if (logWriteMode === "error" || runtimeState.LogQueue.length >= flushCountThreshold || flushWindowMs === 0 || currentMs - runtimeState.LogLastFlushAt >= flushWindowMs) logger.scheduleFlush(env, ctx);
+			if (logWriteMode === "error" || logState.LogQueue.length >= flushCountThreshold || flushWindowMs === 0 || currentMs - logState.LogLastFlushAt >= flushWindowMs) logger.scheduleFlush(env, ctx);
 		},
 		async flush(env) {
 			const db = logRepository.getDB(env);
-			if (!db || runtimeState.LogQueue.length === 0) return;
-			const runtimeConfig = cacheState.ConfigCache?.data || {};
+			const logState = logBindingStates.get(db);
+			if (!db || logState.LogQueue.length === 0) return;
+			const runtimeConfig = isPlainObject(logState.runtimeConfig) ? logState.runtimeConfig : getCachedRuntimeConfig(env) || {};
 			const statsUtcOffsetMinutes = normalizeScheduleUtcOffsetMinutes(runtimeConfig.scheduleUtcOffsetMinutes);
 			if (runtimeConfig.logEnabled === false) {
-				runtimeState.LogQueue.length = 0;
-				runtimeState.LogDedupe.clear();
+				logState.LogQueue.length = 0;
+				logState.LogDedupe.clear();
 				return;
 			}
 			await logRepository.ensureSysStatusTable(db);
@@ -16410,9 +16273,9 @@ function buildLogger(dependencies = {}) {
 				kv: logRepository.getKV(env)
 			});
 			if (logReadiness.schemaReady !== true) {
-				const droppedCount = runtimeState.LogQueue.length;
-				runtimeState.LogQueue.length = 0;
-				runtimeState.LogDedupe.clear();
+				const droppedCount = logState.LogQueue.length;
+				logState.LogQueue.length = 0;
+				logState.LogDedupe.clear();
 				await logRepository.patchOpsStatus(env, { log: {
 					schemaReady: false,
 					ftsReady: logReadiness.ftsReady === true,
@@ -16428,9 +16291,9 @@ function buildLogger(dependencies = {}) {
 				} });
 				return;
 			}
-			const configuredChunkSize = Number(cacheState.ConfigCache?.data?.logBatchChunkSize);
-			const configuredRetryCount = Number(cacheState.ConfigCache?.data?.logBatchRetryCount);
-			const configuredRetryBackoffMs = Number(cacheState.ConfigCache?.data?.logBatchRetryBackoffMs);
+			const configuredChunkSize = Number(runtimeConfig.logBatchChunkSize);
+			const configuredRetryCount = Number(runtimeConfig.logBatchRetryCount);
+			const configuredRetryBackoffMs = Number(runtimeConfig.logBatchRetryBackoffMs);
 			const chunkSize = clampIntegerConfig(configuredChunkSize, Config.Defaults.LogBatchChunkSize, 1, 100);
 			const maxRetryCount = clampIntegerConfig(configuredRetryCount, Config.Defaults.LogBatchRetryCount, 0, 5);
 			const retryBackoffMs = clampIntegerConfig(configuredRetryBackoffMs, Config.Defaults.LogBatchRetryBackoffMs, 0, 5e3);
@@ -16458,9 +16321,9 @@ function buildLogger(dependencies = {}) {
 				}
 			};
 			try {
-				const clearEpochMs = Math.max(runtimeState.LogClearEpochMs || 0, await logRepository.getLogClearEpochMs(env));
-				while (runtimeState.LogQueue.length > 0) {
-					const chunk = runtimeState.LogQueue.splice(0, chunkSize).filter((item) => (Number(item?.timestamp) || 0) > clearEpochMs);
+				const clearEpochMs = Math.max(logState.LogClearEpochMs || 0, await logRepository.getLogClearEpochMs(env));
+				while (logState.LogQueue.length > 0) {
+					const chunk = logState.LogQueue.splice(0, chunkSize).filter((item) => (Number(item?.timestamp) || 0) > clearEpochMs);
 					if (!chunk.length) continue;
 					activeBatchSize = chunk.length;
 					activeBatchWrittenCount = 0;
@@ -16500,7 +16363,7 @@ function buildLogger(dependencies = {}) {
 					lastFlushCount: writtenCount,
 					lastFlushStatus: "success",
 					lastFlushRetryCount: retryCount,
-					queueLengthAfterFlush: runtimeState.LogQueue.length,
+					queueLengthAfterFlush: logState.LogQueue.length,
 					lastFlushError: null,
 					lastFlushErrorAt: null,
 					lastDroppedBatchSize: 0,
@@ -16520,7 +16383,7 @@ function buildLogger(dependencies = {}) {
 					lastFlushRetryCount: retryCount,
 					lastDroppedBatchSize: Math.max(0, activeBatchSize - activeBatchWrittenCount),
 					lastFlushWrittenBeforeError: writtenCount,
-					queueLengthAfterFlush: runtimeState.LogQueue.length
+					queueLengthAfterFlush: logState.LogQueue.length
 				} });
 				console.log("Log flush failed, dropping batch.", e);
 			}
@@ -16638,7 +16501,8 @@ function defineDatabaseStatusMethods(dependencies = {}) {
 		async getLogClearEpochMs(envOrStore) {
 			const logStatus = await statusMethods.getOpsStatusSection(envOrStore, "log");
 			const epoch = statusMethods.getLogClearEpochMsFromStatus(logStatus);
-			if (epoch > runtimeState.LogClearEpochMs) runtimeState.LogClearEpochMs = epoch;
+			const logState = logBindingStates.get(statusPersistence.resolveOpsStatusStores(envOrStore).db);
+			if (epoch > logState.LogClearEpochMs) logState.LogClearEpochMs = epoch;
 			return epoch;
 		},
 		async patchOpsStatus(envOrKv, patch, ctx = null) {
@@ -18796,6 +18660,7 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 				outboundColo: payload.outboundColo || payload.outboundIp || execution.defaultOutboundColo || "",
 				userAgent: execution.request.headers.get("User-Agent"),
 				referer: execution.request.headers.get("Referer"),
+				runtimeConfig: execution.currentConfig,
 				...payload
 			};
 			Logger.record(execution.env, execution.ctx, logData);
@@ -18807,10 +18672,11 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 			if (currentConfig.logEnabled === false) return;
 			const configuredDelayMinutes = Number(currentConfig.logWriteDelayMinutes);
 			if (Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 6e4 : Config.Defaults.LogFlushDelayMinutes * 6e4) !== 0) return;
-			if (runtimeState.LogFlushTask) try {
-				await runtimeState.LogFlushTask;
+			const logState = logBindingStates.get(execution?.env ? kernel.getDB(execution.env) : null);
+			if (logState.LogFlushTask) try {
+				await logState.LogFlushTask;
 			} catch {}
-			if (runtimeState.LogQueue.length > 0) try {
+			if (logState.LogQueue.length > 0) try {
 				await Logger.flush(execution.env);
 			} catch {}
 		},
@@ -18847,7 +18713,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 		async prepareExecutionContext(request, node, path, name, key, env, ctx, options = {}) {
 			const startTime = Date.now();
 			const requestMethod = request.method;
-			CacheManager.maybeCleanup();
+			CacheManager.maybeCleanup(env);
 			if (!node || !node.target) return { invalidResponse: new Response("Invalid Node", {
 				status: 502,
 				headers: applySecurityHeaders(new Headers())
@@ -19057,15 +18923,13 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			const headers = transport?.newHeaders || execution?.request?.headers || null;
 			const auth = extractMediaRedirectAuth(headers);
 			const cookieHeader = stripCookieHeaderNames(getLooseHeaderValue(headers, "Cookie"), INTERNAL_PROXY_COOKIE_NAMES);
-			return hashStableText(serializeConfigValue({
-				queryToken: requestUrl ? hashStableText(requestUrl.searchParams.get("api_key") || requestUrl.searchParams.get("X-Emby-Token") || requestUrl.searchParams.get("X-MediaBrowser-Token") || "") : "",
-				token: auth?.token ? hashStableText(auth.token) : "",
-				deviceId: auth?.deviceId ? hashStableText(auth.deviceId) : "",
-				authorization: getLooseHeaderValue(headers, "Authorization") ? hashStableText(getLooseHeaderValue(headers, "Authorization")) : "",
-				xEmbyAuthorization: getLooseHeaderValue(headers, "X-Emby-Authorization") ? hashStableText(getLooseHeaderValue(headers, "X-Emby-Authorization")) : "",
-				xMediaBrowserAuthorization: getLooseHeaderValue(headers, "X-MediaBrowser-Authorization") ? hashStableText(getLooseHeaderValue(headers, "X-MediaBrowser-Authorization")) : "",
-				cookie: cookieHeader ? hashStableText(cookieHeader) : ""
-			}));
+			return hashStableStringParts([
+				requestUrl ? hashStableText(requestUrl.searchParams.get("api_key") || requestUrl.searchParams.get("X-Emby-Token") || requestUrl.searchParams.get("X-MediaBrowser-Token") || "") : "",
+				auth?.token ? hashStableText(auth.token) : "", auth?.deviceId ? hashStableText(auth.deviceId) : "",
+				getLooseHeaderValue(headers, "Authorization") ? hashStableText(getLooseHeaderValue(headers, "Authorization")) : "", getLooseHeaderValue(headers, "X-Emby-Authorization") ? hashStableText(getLooseHeaderValue(headers, "X-Emby-Authorization")) : "",
+				getLooseHeaderValue(headers, "X-MediaBrowser-Authorization") ? hashStableText(getLooseHeaderValue(headers, "X-MediaBrowser-Authorization")) : "",
+				cookieHeader ? hashStableText(cookieHeader) : ""
+			]);
 		},
 		buildPlaybackInfoCacheKey(execution, transport = null) {
 			if (execution?.requestTraits?.isPlaybackInfoRequest !== true) return "";
@@ -19081,20 +18945,13 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				return "";
 			}
 			const bodyText = transport?.preparedBodyMode === "buffered" ? String(transport?.preparedBodyText || decodeBufferedBodyText(transport?.preparedBody)) : "";
-			const cacheKey = createPlaybackInfoCacheKey({
-				nodeName: String(execution?.nodeName || "").trim(),
-				nodeRevision: String(execution?.nodeDerivedCacheRevision || "").trim(),
-				requestMethod,
-				proxyPath: String(execution?.proxyPath || "").trim(),
-				query: String(execution?.requestUrl?.search || "").trim(),
-				bodyHash: bodyText ? hashStableText(bodyText) : "",
-				authHash: kernel.buildPlaybackInfoAuthSignature(execution, transport),
-				playbackInfoMode: normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode),
-				playbackInfoRewriteUrlMode: String(execution?.playbackInfoRewriteUrlMode || "relative")
-			}, {
-				hash: hashStableText,
-				serialize: serializeConfigValue
-			});
+			const cacheKey = `playback-info:${hashStableStringParts([
+				String(execution?.nodeName || "").trim(), String(execution?.nodeDerivedCacheRevision || "").trim(), requestMethod,
+				String(execution?.proxyPath || "").trim(), String(execution?.requestUrl?.search || "").trim(),
+				bodyText ? hashStableText(bodyText) : "",
+				kernel.buildPlaybackInfoAuthSignature(execution, transport),
+				normalizeDefaultPlaybackInfoMode(execution?.effectivePlaybackInfoMode), String(execution?.playbackInfoRewriteUrlMode || "relative")
+			])}`;
 			execution.playbackInfoCacheKey = cacheKey;
 			return cacheKey;
 		},
@@ -20058,7 +19915,7 @@ function defineProxyFailoverStateMethods(dependencies = {}, kernel = {}) {
 			const targetKey = buildTargetRecordKey(targetRecord);
 			if (!targetKey) return;
 			if (!(Array.isArray(execution?.playbackRouteHotTargetRecords) ? execution.playbackRouteHotTargetRecords : []).map((item) => buildTargetRecordKey(item)).filter(Boolean).includes(targetKey)) return;
-			nodeRepository.invalidatePlaybackRouteHotCache(execution?.nodeName);
+			nodeRepository.invalidatePlaybackRouteHotCache(execution?.nodeName, execution?.env);
 		},
 		markFailoverTargetFailure(execution, targetRecord, reasonCode = "", options = {}) {
 			const failoverContext = execution?.failoverContext;
@@ -23125,15 +22982,16 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					kv,
 					ctx: options.ctx
 				})).meta;
-			});
+			}, kv);
 		},
 		async getNodesRevision(kv, options = {}) {
 			if (!kv) return "";
+			const state = getNodeBindingCacheState(kv);
 			const now = nowMs();
-			if (options.forceFresh !== true && cacheState.NodesRevisionCache?.loaded === true && cacheState.NodesRevisionCache.exp > now) return String(cacheState.NodesRevisionCache.revision || "").trim();
-			const cacheGeneration = cacheState.NodesRevisionCacheGeneration;
-			return await runSingleFlight(buildSingleFlightKey(["nodes_revision", cacheGeneration]), async () => {
-				const activeCache = cacheState.NodesRevisionCache;
+			if (options.forceFresh !== true && state.NodesRevisionCache?.loaded === true && state.NodesRevisionCache.exp > now) return String(state.NodesRevisionCache.revision || "").trim();
+			const cacheGeneration = state.NodesRevisionCacheGeneration;
+			return await runSingleFlightWithTasks(state.SingleFlightTasks, buildSingleFlightKey(["nodes_revision", cacheGeneration]), async () => {
+				const activeCache = state.NodesRevisionCache;
 				if (options.forceFresh !== true && activeCache?.loaded === true && activeCache.exp > nowMs()) return String(activeCache.revision || "").trim();
 				let meta = null;
 				try {
@@ -23142,7 +23000,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					return "";
 				}
 				const revision = isPlainObject(meta) ? String(meta.revision || "").trim() : "";
-				if (cacheState.NodesRevisionCacheGeneration === cacheGeneration) cacheState.NodesRevisionCache = {
+				if (state.NodesRevisionCacheGeneration === cacheGeneration) state.NodesRevisionCache = {
 					loaded: true,
 					revision,
 					exp: nowMs() + Config.Defaults.NodesRevisionCacheTtlMs
@@ -24067,7 +23925,8 @@ function buildD1TidyPlanner() {
 			];
 			pushTidyPreviewGroup(preserveGroups, facts.d1DnsIpPoolSources.length > 0, "dns_ip_pool_sources_d1_primary", "dns_ip_pool_sources 主数据", d1SourceNames, facts.d1DnsIpPoolSources.length, "dns_ip_pool_sources 现在是正式主数据，本次不会迁回 KV，也不会清空该表。");
 			const warnings = [];
-			if ((Array.isArray(runtimeState.LogQueue) ? runtimeState.LogQueue.length : 0) > 0) warnings.push(`执行前会先尝试 flush ${runtimeState.LogQueue.length} 条内存日志，再开始清理 D1。`);
+			const logQueuePendingCount = Math.max(0, Number(context.logQueuePendingCount) || 0);
+			if (logQueuePendingCount > 0) warnings.push(`执行前会先尝试 flush ${logQueuePendingCount} 条内存日志，再开始清理 D1。`);
 			warnings.push(context.maintenanceMode === "full" ? "当前为 full 维护模式，会强制执行统计、FTS 与 optimize。" : "当前为 smart 维护模式，只在检测到必要条件时执行较重的统计、FTS 与 optimize。");
 			if (deleteGroups.length === 0) warnings.push(context.mode === "scheduled" ? "当前定时 D1 维护没有检测到需要删除的旧数据，本轮会按计划检查统计与索引维护。" : "当前没有检测到需要删除的 D1 旧数据；本次主要会执行统计表与 FTS 维护。");
 			return {
@@ -24101,7 +23960,7 @@ function buildD1TidyPlanner() {
 				preservedDnsIpPoolItemCount: facts.dnsIpPoolItemCount,
 				preservedDnsIpPoolSourceCount: facts.dnsIpPoolSourceCount,
 				preservedSysStatusCount: facts.sysStatusCount,
-				logQueuePendingCount: Array.isArray(runtimeState.LogQueue) ? runtimeState.LogQueue.length : 0,
+				logQueuePendingCount: Math.max(0, Number(context.logQueuePendingCount) || 0),
 				dnsIpPoolSourceAction: sourcePolicy.dnsIpPoolSourceAction,
 				lastFtsRebuildAt: context.lastFtsRebuildAt,
 				lastOptimizeAt: context.lastOptimizeAt
@@ -24117,6 +23976,7 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	NODES_INDEX_KEY: "sys:nodes_index:v1",
 	NODES_SUMMARY_INDEX_KEY: "sys:nodes_index_full:v2",
 	ADMIN_INDEX_UPLOAD_PREFIX: ADMIN_LOCAL_INDEX_KV_PREFIX,
+	ADMIN_ACTIVE_INDEX_KEY: ADMIN_ACTIVE_INDEX_KV_KEY,
 	LEGACY_OPS_STATUS_KEY: "sys:ops_status:v1",
 	LEGACY_SCHEDULED_LOCK_KEY: "sys:scheduled_lock:v1",
 	WORKER_PLACEMENT_REGION_OVERRIDE_PREFIX: "sys:worker_placement_region:v1:",
@@ -24161,35 +24021,40 @@ function buildCacheServices(dependencies = {}) {
 	const { nodeRepository } = dependencies;
 	return {
 		async getNodesList(env, ctx) {
-			if (cacheState.NodesListCache && cacheState.NodesListCache.exp > nowMs()) return cacheState.NodesListCache.data;
 			const kv = nodeRepository.getKV(env);
 			if (!kv) return [];
+			const state = getNodeBindingCacheState(kv);
+			if (state.NodesListCache && state.NodesListCache.exp > nowMs()) return state.NodesListCache.data;
 			const summaryNodes = await nodeRepository.getNodesSummaryIndex(kv, { ctx });
 			if (Array.isArray(summaryNodes)) return summaryNodes;
 			const rebuilt = await nodeRepository.rebuildNodeIndexesFromKv(kv, { ctx });
 			return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
 		},
 		async getNodesListStrict(env, ctx) {
-			if (cacheState.NodesListCache && cacheState.NodesListCache.exp > nowMs()) return cacheState.NodesListCache.data;
 			const kv = nodeRepository.getKV(env);
 			if (!kv) return [];
+			const state = getNodeBindingCacheState(kv);
+			if (state.NodesListCache && state.NodesListCache.exp > nowMs()) return state.NodesListCache.data;
 			const summaryNodes = await nodeRepository.getNodesSummaryIndexStrict(kv, { ctx });
 			if (Array.isArray(summaryNodes)) return summaryNodes;
 			const rebuilt = await nodeRepository.rebuildNodeIndexesFromKvStrict(kv, { ctx });
 			return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
 		},
-		async invalidateList(ctx) {
-			cacheState.NodesListCache = null;
-			cacheState.NodesIndexCache = null;
-			invalidateNodesRevisionCache();
+		async invalidateList(ctx, env = null) {
+			const kv = nodeRepository.getKV(env);
+			const state = getNodeBindingCacheState(kv);
+			state.NodesListCache = null;
+			state.NodesIndexCache = null;
+			invalidateNodesRevisionCache(kv);
 		},
-		maybeCleanup() {
+		maybeCleanup(env = null) {
+			const nodeState = env ? getNodeBindingCacheState(nodeRepository.getKV(env)) : nodeBindingCacheStates.current();
 			const now = nowMs();
-			if (now - (runtimeState.CleanupState.lastRunAt || 0) < Config.Defaults.CleanupMinIntervalMs) return;
-			runtimeState.CleanupState.lastRunAt = now;
+			const state = nodeState.CleanupState;
+			if (now - (state.lastRunAt || 0) < Config.Defaults.CleanupMinIntervalMs) return;
+			state.lastRunAt = now;
 			const budget = Config.Defaults.CleanupBudgetMs;
 			const chunkSize = Config.Defaults.CleanupChunkSize;
-			const state = runtimeState.CleanupState;
 			const iterators = state.iterators || (state.iterators = {
 				node: null,
 				playbackRoute: null,
@@ -24202,17 +24067,17 @@ function buildCacheServices(dependencies = {}) {
 				monthlyTraffic: null
 			});
 			const start = now;
-			const cleanMap = (map, shouldDelete, iteratorKey) => {
-				let iterator = iterators[iteratorKey];
+			const cleanMap = (map, shouldDelete, iteratorKey, iteratorStore = iterators) => {
+				let iterator = iteratorStore[iteratorKey];
 				if (!iterator) {
 					iterator = map.entries();
-					iterators[iteratorKey] = iterator;
+					iteratorStore[iteratorKey] = iterator;
 				}
 				let scanned = 0;
 				while (scanned < chunkSize && (scanned === 0 || nowMs() - start < budget)) {
 					const next = iterator.next();
 					if (next.done) {
-						iterators[iteratorKey] = null;
+						iteratorStore[iteratorKey] = null;
 						break;
 					}
 					scanned += 1;
@@ -24222,10 +24087,10 @@ function buildCacheServices(dependencies = {}) {
 				}
 			};
 			if (state.phase === 0) {
-				cleanMap(cacheState.NodeCache, (v) => v?.exp && v.exp < now, "node");
+				cleanMap(nodeState.NodeCache, (v) => v?.exp && v.exp < now, "node", nodeState.CleanupIterators);
 				state.phase = 1;
 			} else if (state.phase === 1) {
-				cleanMap(cacheState.PlaybackRouteHotCache, (v) => v?.exp && v.exp < now, "playbackRoute");
+				cleanMap(nodeState.PlaybackRouteHotCache, (v) => !v || Number(v.expiresAt) <= now, "playbackRoute", nodeState.CleanupIterators);
 				state.phase = 2;
 			} else if (state.phase === 2) {
 				cleanMap(cacheState.CryptoKeyCache, (v) => v?.exp && v.exp < now, "crypto");
@@ -24234,7 +24099,6 @@ function buildCacheServices(dependencies = {}) {
 				cleanMap(runtimeState.RateLimitCache, (v) => !v || v.resetAt < now, "rate");
 				state.phase = 4;
 			} else if (state.phase === 4) {
-				cleanMap(runtimeState.LogDedupe, (v) => !v || now - v > 3e5, "log");
 				state.phase = 5;
 			} else if (state.phase === 5) {
 				cleanMap(cacheState.PlaybackInfoResponseCache, (v) => !v || (Number(v.expiresAt) || 0) <= now, "playbackInfo");
@@ -24404,44 +24268,47 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				requiresRebuild
 			};
 		},
-		primeNodeSummaryCaches(nodes = []) {
+		primeNodeSummaryCaches(nodes = [], kv = null) {
+			const state = getNodeBindingCacheState(kv);
 			const normalizedNodes = Array.isArray(nodes) ? nodes.filter((node) => isPlainObject(node) && node.name) : [];
 			const normalizedIndex = kernel.normalizeNodeIndex(normalizedNodes.map((node) => node.name));
-			cacheState.NodesListCache = {
+			state.NodesListCache = {
 				data: normalizedNodes.map((node) => ({ ...node })),
 				exp: nowMs() + 6e4
 			};
-			cacheState.NodesIndexCache = {
+			state.NodesIndexCache = {
 				data: normalizedIndex,
 				exp: nowMs() + 6e4
 			};
 			return normalizedNodes;
 		},
 		async getNodesSummaryIndex(kv, options = {}) {
-			if (options.useCache !== false && cacheState.NodesListCache?.exp > nowMs() && Array.isArray(cacheState.NodesListCache.data)) return cacheState.NodesListCache.data;
 			if (!kv) return null;
-			const cacheGeneration = cacheState.NodesRevisionCacheGeneration;
+			const state = getNodeBindingCacheState(kv);
+			if (options.useCache !== false && state.NodesListCache?.exp > nowMs() && Array.isArray(state.NodesListCache.data)) return state.NodesListCache.data;
+			const cacheGeneration = state.NodesRevisionCacheGeneration;
 			let stored = null;
 			try {
 				stored = await kv.get(kernel.NODES_SUMMARY_INDEX_KEY, { type: "json" });
 			} catch {
 				return null;
 			}
-			if (cacheState.NodesRevisionCacheGeneration !== cacheGeneration) return Array.isArray(stored) ? kernel.normalizeNodeSummaryIndex(stored).nodes : null;
+			if (state.NodesRevisionCacheGeneration !== cacheGeneration) return Array.isArray(stored) ? kernel.normalizeNodeSummaryIndex(stored).nodes : null;
 			if (!Array.isArray(stored)) return null;
 			const normalized = kernel.normalizeNodeSummaryIndex(stored);
 			if (normalized.requiresRebuild === true) {
 				const rebuilt = await kernel.rebuildNodeIndexesFromKv(kv, { ctx: options.ctx });
 				return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
 			}
-			return cacheState.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(normalized.nodes) : normalized.nodes;
+			return state.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(normalized.nodes, kv) : normalized.nodes;
 		},
 		async getNodesSummaryIndexStrict(kv, options = {}) {
-			if (options.useCache !== false && cacheState.NodesListCache?.exp > nowMs() && Array.isArray(cacheState.NodesListCache.data)) return cacheState.NodesListCache.data;
 			if (!kv) return null;
-			const cacheGeneration = cacheState.NodesRevisionCacheGeneration;
+			const state = getNodeBindingCacheState(kv);
+			if (options.useCache !== false && state.NodesListCache?.exp > nowMs() && Array.isArray(state.NodesListCache.data)) return state.NodesListCache.data;
+			const cacheGeneration = state.NodesRevisionCacheGeneration;
 			const stored = await kvGetStrict(kv, kernel.NODES_SUMMARY_INDEX_KEY, { type: "json" });
-			if (cacheState.NodesRevisionCacheGeneration !== cacheGeneration) return Array.isArray(stored) ? kernel.normalizeNodeSummaryIndex(stored).nodes : [];
+			if (state.NodesRevisionCacheGeneration !== cacheGeneration) return Array.isArray(stored) ? kernel.normalizeNodeSummaryIndex(stored).nodes : [];
 			if (!Array.isArray(stored)) {
 				const rebuilt = await kernel.rebuildNodeIndexesFromKvStrict(kv, { ctx: options.ctx });
 				return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
@@ -24451,7 +24318,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				const rebuilt = await kernel.rebuildNodeIndexesFromKvStrict(kv, { ctx: options.ctx });
 				return Array.isArray(rebuilt?.summaries) ? rebuilt.summaries : [];
 			}
-			return cacheState.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(normalized.nodes) : normalized.nodes;
+			return state.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(normalized.nodes, kv) : normalized.nodes;
 		},
 		async loadNodeSummariesForMutation(kv, options = {}) {
 			const stored = await kv.get(kernel.NODES_SUMMARY_INDEX_KEY, { type: "json" });
@@ -24485,9 +24352,9 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				if (ctx) ctx.waitUntil(task);
 				await task;
 			}
-			const committedNodes = kernel.primeNodeSummaryCaches(normalizedNodes);
+			const committedNodes = kernel.primeNodeSummaryCaches(normalizedNodes, kv);
 			const committedMeta = metaNeedsWrite ? nextMeta : currentMeta;
-			primeNodesRevisionCache(committedMeta.revision);
+			primeNodesRevisionCache(committedMeta.revision, kv);
 			return {
 				summaries: committedNodes,
 				meta: committedMeta
@@ -24497,8 +24364,8 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			const { kv, ctx, syncLegacyIndex = false } = options;
 			const normalizedNodes = kernel.normalizeNodeSummaryIndex(nodes).nodes;
 			if (!kv) {
-				const committedNodes = kernel.primeNodeSummaryCaches(normalizedNodes);
-				invalidateNodesRevisionCache();
+				const committedNodes = kernel.primeNodeSummaryCaches(normalizedNodes, kv);
+				invalidateNodesRevisionCache(kv);
 				return committedNodes;
 			}
 			return await runNodeIndexMutation(async () => {
@@ -24507,7 +24374,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					ctx,
 					syncLegacyIndex
 				})).summaries;
-			});
+			}, kv);
 		},
 		async listNodeEntityKeys(kv) {
 			return (await kernel.listKvKeys(kv, { prefix: kernel.PREFIX })).map((key) => String(key || "").replace(kernel.PREFIX, "").toLowerCase().trim()).filter(Boolean);
@@ -24568,7 +24435,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					summaries: committed.summaries,
 					nodes
 				};
-			});
+			}, kv);
 		},
 		async rebuildNodeIndexesFromKvStrict(kv, options = {}) {
 			if (!kv) return {
@@ -24576,10 +24443,11 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				summaries: [],
 				nodes: []
 			};
-			const cacheGeneration = cacheState.NodesRevisionCacheGeneration;
+			const state = getNodeBindingCacheState(kv);
+			const cacheGeneration = state.NodesRevisionCacheGeneration;
 			const nodes = await kernel.loadAllNodeEntitiesFromKvStrict(kv, options);
 			const summaries = nodes.map((node) => kernel.buildNodeSummary(node?.name, node).summary).filter(Boolean);
-			const normalizedSummaries = cacheState.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(summaries) : summaries;
+			const normalizedSummaries = state.NodesRevisionCacheGeneration === cacheGeneration ? kernel.primeNodeSummaryCaches(summaries, kv) : summaries;
 			return {
 				index: kernel.normalizeNodeIndex(normalizedSummaries.map((node) => node?.name)),
 				summaries: normalizedSummaries,
@@ -24593,7 +24461,8 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!name) return null;
 			const normalizedNode = kernel.buildNodeSummary(name, nodeData).summary;
 			if (!normalizedNode) return null;
-			const cachedEntry = cacheState.NodesListCache?.exp > nowMs() && Array.isArray(cacheState.NodesListCache.data) ? cacheState.NodesListCache.data.find((node) => String(node?.name || "").toLowerCase().trim() === name) : null;
+			const state = getNodeBindingCacheState(kv);
+			const cachedEntry = state.NodesListCache?.exp > nowMs() && Array.isArray(state.NodesListCache.data) ? state.NodesListCache.data.find((node) => String(node?.name || "").toLowerCase().trim() === name) : null;
 			if (cachedEntry && kernel.areNodeSummariesEquivalent(cachedEntry, normalizedNode)) return cachedEntry;
 			return await runNodeIndexMutation(async () => {
 				const currentNodes = await kernel.loadNodeSummariesForMutation(kv, { ctx });
@@ -24608,7 +24477,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					kv,
 					ctx
 				})).summaries.find((node) => String(node?.name || "").toLowerCase().trim() === name) || normalizedNode;
-			});
+			}, kv);
 		},
 		async removeNodeSummaryEntry(nodeName, options = {}) {
 			const { kv, ctx } = options;
@@ -24620,27 +24489,28 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					kv,
 					ctx
 				})).summaries;
-			});
+			}, kv);
 		},
 		async getNodesIndex(kv) {
-			if (cacheState.NodesIndexCache?.exp > nowMs() && Array.isArray(cacheState.NodesIndexCache.data)) return [...cacheState.NodesIndexCache.data];
 			if (!kv) return [];
-			if (cacheState.NodesListCache?.exp > nowMs() && Array.isArray(cacheState.NodesListCache.data)) {
-				const cachedIndex = kernel.normalizeNodeIndex(cacheState.NodesListCache.data.map((node) => node?.name));
-				cacheState.NodesIndexCache = {
+			const state = getNodeBindingCacheState(kv);
+			if (state.NodesIndexCache?.exp > nowMs() && Array.isArray(state.NodesIndexCache.data)) return [...state.NodesIndexCache.data];
+			if (state.NodesListCache?.exp > nowMs() && Array.isArray(state.NodesListCache.data)) {
+				const cachedIndex = kernel.normalizeNodeIndex(state.NodesListCache.data.map((node) => node?.name));
+				state.NodesIndexCache = {
 					data: cachedIndex,
 					exp: nowMs() + 6e4
 				};
 				return [...cachedIndex];
 			}
-			const cacheGeneration = cacheState.NodesRevisionCacheGeneration;
+			const cacheGeneration = state.NodesRevisionCacheGeneration;
 			const index = kernel.normalizeNodeIndex(await kv.get(kernel.NODES_INDEX_KEY, { type: "json" }) || []);
-			if (cacheState.NodesRevisionCacheGeneration !== cacheGeneration) return [...index];
+			if (state.NodesRevisionCacheGeneration !== cacheGeneration) return [...index];
 			if (!index.length) {
 				const rebuilt = await kernel.rebuildNodeIndexesFromKv(kv);
 				return [...kernel.normalizeNodeIndex(rebuilt.index)];
 			}
-			if (cacheState.NodesRevisionCacheGeneration === cacheGeneration) cacheState.NodesIndexCache = {
+			if (state.NodesRevisionCacheGeneration === cacheGeneration) state.NodesIndexCache = {
 				data: index,
 				exp: nowMs() + 6e4
 			};
@@ -24688,10 +24558,10 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 				nodeData: snapshotNodeData
 			};
 		},
-		getPlaybackRouteHotSnapshot(nodeName) {
+		getPlaybackRouteHotSnapshot(nodeName, env = null) {
 			const name = String(nodeName || "").toLowerCase().trim();
 			if (!name) return null;
-			const cache = cacheState.PlaybackRouteHotCache;
+			const cache = getNodeBindingCacheState(env ? kernel.getKV(env) : null).PlaybackRouteHotCache;
 			const entry = cache.get(name);
 			if (!entry) return null;
 			if (Number(entry.expiresAt) <= nowMs()) {
@@ -24702,67 +24572,73 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			return entry;
 		},
 		async getVerifiedPlaybackRouteHotSnapshot(nodeName, env) {
-			const nodeCacheToken = getNodeCacheToken(nodeName);
-			const snapshot = kernel.getPlaybackRouteHotSnapshot(nodeName);
-			if (!snapshot) return null;
 			const kv = kernel.getKV(env);
+			const state = getNodeBindingCacheState(kv);
+			const nodeCacheToken = getNodeCacheToken(nodeName, state);
+			const snapshot = kernel.getPlaybackRouteHotSnapshot(nodeName, env);
+			if (!snapshot) return null;
 			if (!kv) return snapshot;
 			const currentNodesRevision = await kernel.getNodesRevision(kv);
-			if (getNodeCacheToken(nodeName) !== nodeCacheToken) return null;
+			if (getNodeCacheToken(nodeName, state) !== nodeCacheToken) return null;
 			if (!snapshot.nodesRevision || !currentNodesRevision || snapshot.nodesRevision === currentNodesRevision) return snapshot;
-			kernel.invalidatePlaybackRouteHotCache(nodeName);
+			kernel.invalidatePlaybackRouteHotCache(nodeName, env);
 			return null;
 		},
-		setPlaybackRouteHotSnapshot(nodeName, nodeData = {}, options = {}) {
+		setPlaybackRouteHotSnapshot(nodeName, nodeData = {}, options = {}, env = null) {
 			const snapshot = kernel.buildPlaybackRouteHotSnapshot(nodeName, nodeData, options);
 			if (!snapshot) return null;
-			setBoundedMapEntry(cacheState.PlaybackRouteHotCache, snapshot.nodeName, snapshot, DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX);
+			setBoundedMapEntry(getNodeBindingCacheState(env ? kernel.getKV(env) : null).PlaybackRouteHotCache, snapshot.nodeName, snapshot, DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX);
 			return snapshot;
 		},
 		async primePlaybackRouteHotSnapshot(nodeName, nodeData = {}, env) {
-			const nodeCacheToken = getNodeCacheToken(nodeName);
 			const kv = kernel.getKV(env);
+			const state = getNodeBindingCacheState(kv);
+			const nodeCacheToken = getNodeCacheToken(nodeName, state);
 			const nodesRevision = kv ? await kernel.getNodesRevision(kv) : "";
-			if (getNodeCacheToken(nodeName) !== nodeCacheToken) return null;
-			return kernel.setPlaybackRouteHotSnapshot(nodeName, nodeData, { nodesRevision });
+			if (getNodeCacheToken(nodeName, state) !== nodeCacheToken) return null;
+			return kernel.setPlaybackRouteHotSnapshot(nodeName, nodeData, { nodesRevision }, env);
 		},
-		invalidatePlaybackRouteHotCache(nodeNames = []) {
+		invalidatePlaybackRouteHotCache(nodeNames = [], env = null) {
+			const cache = getNodeBindingCacheState(env ? kernel.getKV(env) : null).PlaybackRouteHotCache;
 			for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
 				const name = String(rawName || "").toLowerCase().trim();
 				if (!name) continue;
-				cacheState.PlaybackRouteHotCache.delete(name);
+				cache.delete(name);
 			}
 		},
 		invalidateNodeCaches(nodeNames = [], options = {}) {
+			const kv = options.kv || (options.env ? kernel.getKV(options.env) : null);
+			const state = getNodeBindingCacheState(kv);
 			const normalizedNames = [];
 			for (const rawName of Array.isArray(nodeNames) ? nodeNames : [nodeNames]) {
 				const name = String(rawName || "").toLowerCase().trim();
 				if (!name) continue;
 				normalizedNames.push(name);
-				cacheState.NodeCache.delete(name);
-				cacheState.PlaybackRouteHotCache.delete(name);
+				state.NodeCache.delete(name);
+				state.PlaybackRouteHotCache.delete(name);
 			}
 			if (normalizedNames.length > 0) {
-				invalidateNodeCacheTokens(normalizedNames);
+				invalidateNodeCacheTokens(normalizedNames, state);
 				invalidatePlaybackInfoResponseCacheForNodes(normalizedNames);
 				invalidatePlaybackProgressRelayForNodes(normalizedNames);
 			}
 			if (options.invalidateList) {
-				cacheState.NodesListCache = null;
-				cacheState.NodesIndexCache = null;
-				invalidateNodesRevisionCache();
+				state.NodesListCache = null;
+				state.NodesIndexCache = null;
+				invalidateNodesRevisionCache(kv);
 			}
 		},
 		async persistNodesIndex(index, options = {}) {
 			const { kv, ctx, invalidateList = false } = options;
+			const state = getNodeBindingCacheState(kv);
 			const normalizedIndex = kernel.normalizeNodeIndex(index);
-			if (invalidateList) cacheState.NodesListCache = null;
+			if (invalidateList) state.NodesListCache = null;
 			if (!kv) {
-				cacheState.NodesIndexCache = {
+				state.NodesIndexCache = {
 					data: normalizedIndex,
 					exp: nowMs() + 6e4
 				};
-				invalidateNodesRevisionCache();
+				invalidateNodesRevisionCache(kv);
 				return normalizedIndex;
 			}
 			return await runNodeIndexMutation(async () => {
@@ -24795,13 +24671,13 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					if (ctx) ctx.waitUntil(metaTask);
 					await metaTask;
 				}
-				cacheState.NodesIndexCache = {
+				state.NodesIndexCache = {
 					data: normalizedIndex,
 					exp: nowMs() + 6e4
 				};
-				primeNodesRevisionCache(nextMeta.revision);
+				primeNodesRevisionCache(nextMeta.revision, kv);
 				return normalizedIndex;
-			});
+			}, kv);
 		}
 	};
 }
@@ -26073,6 +25949,8 @@ export {
   getDueScheduledClockSlots,
   getRuntimeConfig,
   hasWorkerMetadataPrivateIdentity,
+  hashStableStringParts,
+  getNodeBindingCacheState,
   invalidateNodesRevisionCache,
   invalidateRuntimeConfigCache,
   isEmbyWebProxyPath,
@@ -26081,10 +25959,14 @@ export {
   resolveEffectiveRoutingDecisionMode,
   resolvePlaybackInfoRewriteUrlMode,
   resolveRoutingDecisionMode,
+  runKvDataMutation,
   runSingleFlight,
   runWithConcurrency,
+  resetNodeBindingCacheStates,
+  resetRuntimeBindingStates,
+  logBindingStates,
   runtimeState,
   sanitizeRuntimeConfig,
-  serializeBoundedLogDetailJson,
+  serializeBoundedJson as serializeBoundedLogDetailJson,
   shouldUseSegmentFastUpstreamBuilder
 };

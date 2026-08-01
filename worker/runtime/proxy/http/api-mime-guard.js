@@ -10,11 +10,11 @@ export function guardApiResponseMime(execution, upstreamState, options = {}) {
 		|| response.status === 205
 		|| response.status === 304) return upstreamState;
 	const sanitizePath = typeof options.sanitizePath === "function" ? options.sanitizePath : (value) => String(value || "/");
+	const contentType = response.headers.get("Content-Type");
 	const explicitDocumentRequest = (execution?.requestMethod === "GET" || execution?.requestMethod === "HEAD")
 		&& sanitizePath(execution?.proxyPath || "/") === "/"
-		&& acceptsExplicitHtmlDocument(execution?.request?.headers?.get("Accept"));
+		&& acceptsExplicitHtmlDocument(execution?.request?.headers?.get("Accept"), contentType);
 	if (explicitDocumentRequest) return upstreamState;
-	const contentType = response.headers.get("Content-Type");
 	if (!isHtmlHttpMediaType(contentType)) return upstreamState;
 	const createErrorState = typeof options.buildErrorState === "function" ? options.buildErrorState : buildProxyErrorState;
 	return createErrorState(execution, upstreamState, {

@@ -405,6 +405,105 @@ test("local HTML activation retains only versions referenced by config and snaps
   }
 });
 
+test("stale device settings saves preserve the server-managed admin index", async () => {
+  const record = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">active-admin</div></body></html>',
+    "index.html"
+  );
+  const uploadKey = kernel.buildAdminIndexUploadKey(record.revision);
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: { indexUrl: record.sourceUrl, rateLimitRpm: 10 },
+    [kernel.CONFIG_SNAPSHOTS_KEY]: [],
+    [uploadKey]: record
+  });
+  const env = {
+    ADMIN_PATH: "/ADMIN",
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "stale-device-admin-index"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await kernel.persistAdminIndexUpload(record, { env, kv, ctx: null });
+    const response = await adminActions.saveConfig({
+      config: { rateLimitRpm: 99 }
+    }, { env, kv, ctx: null, meta: { section: "security", source: "stale-device" } });
+    const payload = await response.json();
+    const storedConfig = await kv.get(kernel.CONFIG_KEY, { type: "json" });
+    const activeRecord = await kernel.getAdminActiveIndexRecord(kv);
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.config.indexUrl, record.sourceUrl);
+    assert.equal(storedConfig.indexUrl, record.sourceUrl);
+    assert.equal(storedConfig.rateLimitRpm, 99);
+    assert.equal(activeRecord.revision, record.revision);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("stale config revisions are rejected before settings persistence", async () => {
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: { rateLimitRpm: 20 },
+    [kernel.CONFIG_SNAPSHOTS_KEY]: []
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "stale-config-revision"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      adminActions.saveConfig({
+        config: { rateLimitRpm: 30 },
+        expectedConfigRevision: "2026-01-01T00:00:00.000Z.stale"
+      }, { env, kv, ctx: null, meta: {} }),
+      error => error?.code === "CONFIG_REVISION_CONFLICT" && error?.status === 409
+    );
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 20);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("active admin index renders when a remote PoP still sees stale config", async () => {
+  const record = await buildAdminLocalIndexUploadRecord(
+    '<!doctype html><html><body><div id="app">active-from-envelope</div></body></html>',
+    "index.html"
+  );
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: {},
+    [kernel.CONFIG_SNAPSHOTS_KEY]: []
+  });
+  const env = {
+    ADMIN_PATH: "/ADMIN",
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "active-index-stale-config"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await kernel.persistAdminIndexUpload(record, { env, kv, ctx: null });
+    const response = await adminShell.renderAdminPage(
+      new Request("https://worker.test/ADMIN", { headers: { Accept: "text/html" } }),
+      env,
+      null,
+      { ok: true, missing: [] },
+      {}
+    );
+    const rendered = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Cache-Control"), "private, no-store, max-age=0");
+    assert.equal(response.headers.get("X-Admin-Shell-Revision"), record.revision);
+    assert.match(rendered, /active-from-envelope/);
+    assert.doesNotMatch(rendered, /admin-gate-shell/);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("KV tidy removes orphaned local HTML records and preserves referenced versions", async () => {
   const referencedIndex = await buildAdminLocalIndexUploadRecord(
     '<!doctype html><html><body><div id="app">referenced</div></body></html>',

@@ -11,8 +11,8 @@ export default defineConfig({
     outDir: path.join(repositoryRoot, '.worker-dist'),
     emptyOutDir: true,
     copyPublicDir: false,
-    minify: false,
-    sourcemap: 'hidden',
+    minify: 'esbuild',
+    sourcemap: false,
     lib: {
       entry: path.join(repositoryRoot, 'worker', 'index.js'),
       formats: ['es'],

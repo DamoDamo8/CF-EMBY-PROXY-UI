@@ -1,19 +1,28 @@
-let activeChart = null;
+const chartByCanvas = new WeakMap();
+const renderVersionByCanvas = new WeakMap();
+
+function bumpRenderVersion(canvas) {
+  const nextVersion = (renderVersionByCanvas.get(canvas) || 0) + 1;
+  renderVersionByCanvas.set(canvas, nextVersion);
+  return nextVersion;
+}
 
 export async function renderTrendChart(canvas, points = [], options = {}) {
   if (!canvas) return null;
 
-  const { default: Chart } = await import('chart.js/auto');
+  const renderVersion = bumpRenderVersion(canvas);
+  const Chart = options.Chart || (await (typeof options.loadChart === 'function'
+    ? options.loadChart()
+    : import('chart.js/auto'))).default;
+  if (renderVersionByCanvas.get(canvas) !== renderVersion || canvas.isConnected === false) return null;
   const label = String(options.label || '趋势').trim() || '趋势';
   const borderColor = String(options.borderColor || '#fb923c').trim() || '#fb923c';
   const backgroundColor = String(options.backgroundColor || 'rgba(251, 146, 60, 0.18)').trim() || 'rgba(251, 146, 60, 0.18)';
 
-  if (activeChart) {
-    activeChart.destroy();
-    activeChart = null;
-  }
+  const activeChart = chartByCanvas.get(canvas);
+  if (activeChart) activeChart.destroy();
 
-  activeChart = new Chart(canvas, {
+  const chart = new Chart(canvas, {
     type: 'line',
     data: {
       labels: points.map((point) => point.label),
@@ -71,14 +80,18 @@ export async function renderTrendChart(canvas, points = [], options = {}) {
       }
     }
   });
+  chartByCanvas.set(canvas, chart);
 
-  return activeChart;
+  return chart;
 }
 
-export function destroyTrendChart() {
+export function destroyTrendChart(canvas) {
+  if (!canvas) return;
+  bumpRenderVersion(canvas);
+  const activeChart = chartByCanvas.get(canvas);
   if (!activeChart) return;
   activeChart.destroy();
-  activeChart = null;
+  chartByCanvas.delete(canvas);
 }
 
 export async function renderReleaseChart(canvas, points = []) {
@@ -89,6 +102,6 @@ export async function renderReleaseChart(canvas, points = []) {
   });
 }
 
-export function destroyReleaseChart() {
-  destroyTrendChart();
+export function destroyReleaseChart(canvas) {
+  destroyTrendChart(canvas);
 }

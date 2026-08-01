@@ -1,6 +1,8 @@
 import { build } from 'vite';
 import { fileURLToPath } from 'node:url';
 
+export const MAX_WORKER_BUNDLE_BYTES = 950_000;
+
 /**
  * Build the Worker and enforce its single-module delivery contract.
  *
@@ -29,5 +31,10 @@ export async function buildWorkerBundle({ outDir, write = true }) {
   if (assets.length) {
     throw new Error(`Worker build emitted unsupported assets: ${assets.map(item => item.fileName).join(', ')}`);
   }
+  const bundleBytes = Buffer.byteLength(chunks[0].code, 'utf8');
+  if (bundleBytes > MAX_WORKER_BUNDLE_BYTES) {
+    throw new Error(`Worker bundle exceeds ${MAX_WORKER_BUNDLE_BYTES} byte budget; received ${bundleBytes}`);
+  }
+  console.log(`[worker-build] worker.js ${bundleBytes} bytes (budget ${MAX_WORKER_BUNDLE_BYTES})`);
   return chunks[0];
 }

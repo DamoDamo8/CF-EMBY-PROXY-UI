@@ -1749,6 +1749,11 @@ export function useAdminConsole() {
       try {
         const payload = await callAdminAction('saveConfig', {
           config: isPlainObject(config) ? config : {},
+          expectedConfigRevision: String(
+            options.expectedConfigRevision
+              || this.settingsBootstrap?.revisions?.configRevision
+              || ''
+          ).trim(),
           meta: {
             section: String(options.section || 'settings').trim() || 'settings',
             source: String(options.source || 'frontend-vue').trim() || 'frontend-vue'

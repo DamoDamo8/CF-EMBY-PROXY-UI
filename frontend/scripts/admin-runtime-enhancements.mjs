@@ -438,6 +438,41 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       : Math.round(value / 1024) + ' KiB';
   }
 
+  function buildAdminHardRefreshUrl(revision = '') {
+    const url = new URL(window.location.href);
+    const normalizedRevision = String(revision || '').trim();
+    if (normalizedRevision) url.searchParams.set('__admin_revision', normalizedRevision);
+    url.searchParams.set('__admin_reload', Date.now().toString());
+    return url;
+  }
+
+  function navigateWithAdminCacheBust(revision = '') {
+    window.location.replace(buildAdminHardRefreshUrl(revision).toString());
+  }
+
+  async function waitForAdminShellRevision(revision = '') {
+    const expectedRevision = String(revision || '').trim();
+    if (!expectedRevision) return true;
+    const delays = [500, 1000, 2000, 4000, 8000];
+    for (let attempt = 0; attempt < delays.length; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => window.setTimeout(resolve, delays[attempt - 1]));
+      const probeUrl = buildAdminHardRefreshUrl(expectedRevision);
+      probeUrl.searchParams.set('__admin_probe', String(attempt + 1));
+      try {
+        const response = await window.fetch(probeUrl.toString(), {
+          method: 'HEAD',
+          credentials: 'same-origin',
+          cache: 'reload',
+          headers: { Accept: 'text/html' }
+        });
+        if (response.ok && String(response.headers.get('X-Admin-Shell-Revision') || '').trim() === expectedRevision) return true;
+      } catch {
+        // Deployment propagation is retried with a bounded backoff.
+      }
+    }
+    return false;
+  }
+
   function validateWorkerHtmlUploadFiles(workerFile, indexFile) {
     if (!workerFile || !indexFile) return '必须同时选择 worker.js 和 index.html。';
     if (String(workerFile.name || '').trim().toLowerCase() !== 'worker.js') return 'Worker 文件名必须是 worker.js。';
@@ -520,6 +555,14 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       state.status = 'Worker 和 index.html 已同时更新。';
       state.tone = 'success';
       app.showMessage?.('Worker 和 HTML 已更新。', { tone: 'success' });
+      const targetRevision = String(result?.html?.revision || '').trim();
+      state.status = '更新已提交，正在确认新页面版本...';
+      renderWorkerHtmlUpdateState();
+      if (await waitForAdminShellRevision(targetRevision)) {
+        navigateWithAdminCacheBust(targetRevision);
+        return;
+      }
+      state.status = '更新已完成，但边缘节点尚未确认新页面；请稍后手动刷新。';
     } catch (error) {
       state.status = '更新失败：' + (error?.message || '未知错误');
       state.tone = 'error';
@@ -561,7 +604,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         workerHtmlUpdateState.tone = validateWorkerHtmlUploadFiles(workerHtmlUpdateState.workerFile, workerHtmlUpdateState.indexFile) ? '' : 'success';
         renderWorkerHtmlUpdateState();
       });
-      root.querySelector('[data-admin-worker-html-refresh="1"]')?.addEventListener('click', () => window.location.reload());
+      root.querySelector('[data-admin-worker-html-refresh="1"]')?.addEventListener('click', () => navigateWithAdminCacheBust());
       root.querySelector('[data-admin-worker-html-submit="1"]')?.addEventListener('click', () => submitWorkerHtmlUpdate(app));
       scheduleIconRefresh(root);
     }

@@ -14,20 +14,33 @@ export function isHtmlHttpMediaType(value = "") {
 	return mediaType === "text/html" || mediaType === "application/xhtml+xml";
 }
 
-export function acceptsExplicitHtmlDocument(acceptHeader = "") {
+export function acceptsExplicitHtmlDocument(acceptHeader = "", representationType = "text/html") {
+	const normalizedRepresentationType = normalizeHttpMediaType(representationType);
+	if (!isHtmlHttpMediaType(normalizedRepresentationType)) return false;
+	const [representationMajorType, representationMinorType] = normalizedRepresentationType.split("/", 2);
+	let selectedSpecificity = -1;
+	let selectedQuality = 0;
 	for (const item of String(acceptHeader || "").split(",")) {
-		const [rawMediaType, ...rawParameters] = item.split(";");
-		const mediaType = normalizeHttpMediaType(rawMediaType);
-		if (mediaType !== "text/html" && mediaType !== "application/xhtml+xml") continue;
+		const [rawMediaRange, ...rawParameters] = item.split(";");
+		const mediaRange = normalizeHttpMediaType(rawMediaRange);
+		const [majorType, minorType] = mediaRange.split("/", 2);
+		let specificity = -1;
+		if (majorType === representationMajorType && minorType === representationMinorType) specificity = 2;
+		else if (majorType === representationMajorType && minorType === "*") specificity = 1;
+		else if (majorType === "*" && minorType === "*") specificity = 0;
+		if (specificity < selectedSpecificity || specificity < 0) continue;
 		let quality = 1;
 		for (const rawParameter of rawParameters) {
 			const [rawName, rawValue] = rawParameter.split("=", 2);
 			if (String(rawName || "").trim().toLowerCase() !== "q") continue;
-			const parsedQuality = Number(String(rawValue || "").trim());
-			quality = Number.isFinite(parsedQuality) ? parsedQuality : 0;
+			const qualityValue = String(rawValue || "").trim();
+			quality = /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/.test(qualityValue) ? Number(qualityValue) : 0;
 			break;
 		}
-		if (quality > 0 && quality <= 1) return true;
+		if (specificity > selectedSpecificity) {
+			selectedSpecificity = specificity;
+			selectedQuality = quality;
+		}
 	}
-	return false;
+	return selectedQuality > 0;
 }

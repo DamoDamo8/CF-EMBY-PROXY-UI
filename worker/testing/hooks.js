@@ -5,6 +5,9 @@ import {
   databaseReadinessState,
   fetchRequest,
   isolateState,
+  logBindingStates,
+  resetNodeBindingCacheStates,
+  resetRuntimeBindingStates,
   runtimeState
 } from '../runtime/application-facades.js';
 
@@ -67,6 +70,9 @@ export function createTestApplication() {
 }
 
 export function resetIsolateState() {
+  resetNodeBindingCacheStates();
+  resetRuntimeBindingStates();
+  logBindingStates.reset();
   for (const partition of [cacheState, runtimeState, databaseReadinessState]) {
     for (const [key, value] of Object.entries(partition)) {
       if (value instanceof Map || value instanceof Set) value.clear();
