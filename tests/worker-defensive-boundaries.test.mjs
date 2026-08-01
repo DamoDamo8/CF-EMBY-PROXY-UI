@@ -1128,6 +1128,52 @@ test("manual setup renders GET and HEAD as no-store with the recovery reason", a
   );
 });
 
+test("bundled frontend assets render when no uploaded admin index is configured", async () => {
+  const assetRequests = [];
+  const bundledHtml = '<!doctype html><html><head><title>Bundled UI</title></head><body><div id="app" data-source="bundled"></div></body></html>';
+  const env = {
+    ADMIN_PATH: "/console",
+    ASSETS: {
+      async fetch(request) {
+        assetRequests.push(request);
+        return new Response(bundledHtml, {
+          headers: {
+            "Content-Type": "text/html; charset=utf-8",
+            "ETag": '"bundled-v1"'
+          }
+        });
+      }
+    }
+  };
+
+  const getResponse = await renderAdminPage(
+    new Request("https://worker.test/console"),
+    env,
+    null,
+    { ok: true, missing: [] },
+    {}
+  );
+  const renderedHtml = await getResponse.text();
+  assert.equal(getResponse.status, 200);
+  assert.equal(getResponse.headers.get("Cache-Control"), "private, no-store, max-age=0");
+  assert.match(renderedHtml, /data-source="bundled"/);
+  assert.match(renderedHtml, /"adminPath":"\/console"/);
+  assert.match(renderedHtml, /"mode":"embedded"/);
+  assert.match(renderedHtml, /"bundledShellAvailable":true/);
+  assert.equal(new URL(assetRequests[0].url).pathname, "/index.html");
+  assert.equal(assetRequests[0].method, "GET");
+
+  const headResponse = await renderAdminPage(
+    new Request("https://worker.test/console", { method: "HEAD" }),
+    env,
+    null,
+    { ok: true, missing: [] },
+    {}
+  );
+  assert.equal(headResponse.status, 200);
+  assert.equal(await headResponse.text(), "");
+});
+
 test("Tailwind compatibility prelude is targeted and idempotent", () => {
   const legacyShell = "<!doctype html><html><head><script src=\"https://cdn.tailwindcss.com\"></script><script nonce=\"abc\">tailwind.config={darkMode:'class'}</script></head><body><div id=\"app\"></div></body></html>";
   const migratedShell = ensureAdminRemoteTailwindConfigGlobal(legacyShell);

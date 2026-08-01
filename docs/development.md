@@ -32,6 +32,8 @@ npm.cmd run --workspace frontend build
 
 同步脚本把 `admin-runtime.template.html` 的占位符替换为 bootstrap 和 `#app`，再注入 `admin-runtime-enhancements.mjs` 的 style/script，写出 `frontend/index.html`。Vite 再将其输出到 `frontend/dist/index.html`。不要直接改这两个生成 HTML。
 
+`wrangler.toml` 将 `frontend/dist` 声明为 `ASSETS` 静态资产目录。GitHub Actions 部署会先执行 `npm ci` 和 `npm run build:frontend`，再由 Wrangler 将前端与 Worker 一起上传；Worker 在没有 KV/远端管理端 HTML 配置时直接使用该构建产物。
+
 `frontend/src/` 的 Vue 文件由 `node scripts/check-frontend-sources.mjs` 编译检查，但当前 `frontend/index.html` 没有从 `src/App.vue` 导入的 module script；在修改 Vue 文件前先确认任务是否针对未来组件化链路。
 
 ## 3. 常用命令

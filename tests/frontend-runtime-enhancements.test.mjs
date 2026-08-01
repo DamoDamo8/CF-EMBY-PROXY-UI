@@ -416,6 +416,24 @@ test('formal admin runtime sources contain no unsupported scheduled settings or 
   }
 });
 
+test('deploy workflow builds and publishes the frontend as Worker static assets', async () => {
+  const [wranglerConfig, deployWorkflow] = await Promise.all([
+    readFile(new URL('../wrangler.toml', import.meta.url), 'utf8'),
+    readFile(new URL('../.github/workflows/deploy-worker.yml', import.meta.url), 'utf8')
+  ]);
+
+  assert.match(wranglerConfig, /\[assets\][\s\S]*directory\s*=\s*"\.\/frontend\/dist"/);
+  assert.match(wranglerConfig, /\[assets\][\s\S]*binding\s*=\s*"ASSETS"/);
+  assert.match(wranglerConfig, /\[assets\][\s\S]*run_worker_first\s*=\s*true/);
+  assert.match(wranglerConfig, /\[assets\][\s\S]*html_handling\s*=\s*"none"/);
+  assert.match(deployWorkflow, /node-version:\s*24/);
+  assert.match(deployWorkflow, /run:\s*npm ci/);
+  assert.match(deployWorkflow, /run:\s*npm run build:frontend/);
+  assert.match(deployWorkflow, /- "frontend\/\*\*"/);
+  assert.ok(deployWorkflow.indexOf('npm ci') < deployWorkflow.indexOf('npm run build:frontend'));
+  assert.ok(deployWorkflow.indexOf('npm run build:frontend') < deployWorkflow.indexOf('cloudflare\/wrangler-action@v3'));
+});
+
 test('retired server statistics and aggregation UI cannot be reached or rendered', async () => {
   const [template, generatedIndex, generatedDist, ...sources] = await Promise.all([
     readFile(new URL('../frontend/admin-runtime.template.html', import.meta.url), 'utf8'),

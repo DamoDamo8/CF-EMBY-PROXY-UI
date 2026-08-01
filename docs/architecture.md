@@ -80,8 +80,10 @@ frontend/admin-runtime.template.html
   -> frontend/scripts/sync-admin-runtime.mjs
   -> frontend/index.html
   -> frontend/dist/index.html (Vite build)
-  -> Worker 管理端 shell / vendor 投递
+  -> Wrangler Static Assets (`ASSETS`) / Worker 管理端 shell 投递
 ```
+
+部署时 Wrangler 将 `frontend/dist` 与 Worker 一起上传。已上传到 KV 或显式配置的管理端 HTML 保持最高优先级；未配置时，Worker 从 `ASSETS` 读取 `/index.html`，完成 HTML 校验和 bootstrap 注入后直接返回，因此新部署无需先手动上传前端。
 
 `frontend/src/` 的 Vue SFC、composable 和 feature 目录仍被源码语法/行为检查覆盖，并可作为组件化实现参考；但只修改这些文件不会自动改变当前生产 HTML。涉及 UI 的改动先确认是在模板链还是 Vue 源码链上生效。
 
@@ -105,7 +107,7 @@ D1 保存日志、统计聚合、DNS/IP 工作区数据、运行状态、缓存/
 
 ## 7. 配置与外部依赖
 
-- Cloudflare 绑定和 Cron 位于 `wrangler.toml`：KV binding `ENI_KV`、D1 binding `DB`，Cron 为每小时一次。
+- Cloudflare 绑定和 Cron 位于 `wrangler.toml`：KV binding `ENI_KV`、D1 binding `DB`、静态前端 binding `ASSETS`，Cron 为每小时一次。
 - Worker 环境变量包括 `HOST`、可选 `LEGACY_HOST`、`ADMIN_PATH`、`JWT_SECRET`、`ADMIN_PASS` 以及兼容的绑定名称。
 - 前端环境变量位于 `frontend/.env.example`，主要控制 API base、admin path、CDN base、release channel 和开发代理目标。
 - 前端外部 vendor 资源由 CDN path 检查器约束；不要在生产模板中引入 inline dynamic import 或未声明的相对发布资源。

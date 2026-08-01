@@ -2293,6 +2293,8 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 		const remoteShellIndexUrl = adminIndexState.indexUrl;
 		const embeddedTemplateBytes = measureAdminShellTemplateBytes();
 		const remoteShellConfigured = Boolean(remoteShellIndexUrl);
+		const bundledShellAvailable = Boolean(env?.ASSETS && typeof env.ASSETS.fetch === "function");
+		const gateState = !remoteShellConfigured && bundledShellAvailable ? "shell_ready" : adminIndexState.gateState;
 		const embeddedFallbackAvailable = embeddedTemplateBytes > 0;
 		let remoteShellOrigin = "";
 		if (remoteShellIndexUrl) try {
@@ -2301,17 +2303,19 @@ function defineAdminShellTemplate(dependencies = {}, shell = {}) {
 			remoteShellOrigin = "";
 		}
 		return {
-			mode: remoteShellConfigured ? "remote-preferred" : "setup_required",
-			lifecycleState: buildAdminShellLifecycleState(remoteShellConfigured, adminIndexState.gateState),
+			mode: remoteShellConfigured ? "remote-preferred" : bundledShellAvailable ? "embedded" : "setup_required",
+			lifecycleState: buildAdminShellLifecycleState(remoteShellConfigured, gateState),
 			embeddedFallbackState: embeddedFallbackAvailable ? "retained" : "missing",
 			retirementState: buildAdminShellRetirementState(embeddedFallbackAvailable),
-			gateState: adminIndexState.gateState,
+			gateState,
 			indexUrl: adminIndexState.indexUrl,
 			indexUrlSource: adminIndexState.indexUrlSource,
 			effectiveRef: adminIndexState.effectiveRef,
 			remoteShellConfigured,
 			remoteShellIndexUrl,
 			remoteShellOrigin,
+			bundledShellAvailable,
+			bundledShellSource: bundledShellAvailable ? "frontend/dist/index.html" : "",
 			initHealthOk: initHealth?.ok === true,
 			embeddedFallbackAvailable,
 			embeddedTemplateSource: ADMIN_EMBEDDED_TEMPLATE_MODE,
@@ -3790,6 +3794,54 @@ function defineAdminShellCache(dependencies = {}, shell = {}) {
 //#region worker/features/admin/shell-delivery.js
 function defineAdminShellDelivery(dependencies = {}, shell = {}) {
 	const { indexRepository } = dependencies;
+	async function renderBundledAdminPage(request, env, ctx, initHealth = buildInitHealth(env), config = {}) {
+		const assets = env?.ASSETS;
+		if (!assets || typeof assets.fetch !== "function") return null;
+		const assetUrl = new URL("/index.html", request.url);
+		const assetResponse = await assets.fetch(new Request(assetUrl, {
+			method: "GET",
+			headers: { "Accept": "text/html" }
+		}));
+		if (!assetResponse?.ok) throw new Error(`bundled admin shell fetch failed: HTTP ${Number(assetResponse?.status) || 0}`);
+		const contentLength = Number.parseInt(String(assetResponse.headers.get("Content-Length") || ""), 10);
+		if (Number.isFinite(contentLength) && contentLength > shell.ADMIN_REMOTE_SHELL_MAX_BYTES) throw new Error(`bundled admin shell too large: ${contentLength} bytes`);
+		const assetBody = await readResponseTextWithLimit(assetResponse, shell.ADMIN_REMOTE_SHELL_MAX_BYTES);
+		if (assetBody.exceeded || !assetBody.text) throw new Error(`bundled admin shell payload invalid: ${assetBody.bytes} bytes`);
+		const shellState = shell.buildAdminShellState(env, initHealth, config);
+		const bootstrap = shell.buildAdminBootstrapPayload(env, initHealth, config);
+		const indexState = buildResolvedAdminIndexState(env, config);
+		const sourceUrl = assetUrl.toString();
+		const shellPayload = shell.buildAdminShellStoredPayloadFromHtml(assetBody.text, bootstrap, initHealth, sourceUrl, {
+			sourceLabel: "bundled admin shell",
+			contentType: assetResponse.headers.get("Content-Type") || "text/html",
+			adminPath: bootstrap.adminPath,
+			lastModified: assetResponse.headers.get("Last-Modified") || "Thu, 01 Jan 1970 00:00:00 GMT",
+			originEtag: assetResponse.headers.get("ETag") || ""
+		});
+		const storedResponse = shellPayload?.storedResponse || null;
+		if (!storedResponse) throw new Error("bundled admin shell response is unavailable");
+		await shell.patchAdminShellRuntimeStatus(env, {
+			shellState,
+			initHealth,
+			indexState,
+			mode: "embedded",
+			sourceType: "static_assets",
+			routeState: "embedded_active",
+			gateState: "shell_ready",
+			lifecycleState: "embedded_only",
+			embeddedFallbackState: "active",
+			remoteCacheState: "bypassed",
+			lastFetchStatus: "loaded",
+			reason: "served_bundled_admin_shell",
+			requestPath: new URL(request.url).pathname,
+			indexUrl: sourceUrl,
+			indexUrlSource: "worker_assets",
+			effectiveRef: "frontend/dist/index.html",
+			effectiveRefType: "static_assets"
+		}, ctx);
+		if (shell.requestMatchesAdminHtmlResponse(request, storedResponse)) return shell.buildConditionalNotModifiedResponseFromStoredResponse(storedResponse, shell.ADMIN_REMOTE_SHELL_BROWSER_CACHE_CONTROL);
+		return shell.buildAdminRemoteShellClientResponse(storedResponse, request.method);
+	}
 	async function renderAdminIndexSetupPage(request, env, ctx, initHealth = buildInitHealth(env), config = {}, setupReason = "index_url_not_configured") {
 		const indexState = buildResolvedAdminIndexState(env, config);
 		const shellState = shell.buildAdminShellState(env, initHealth, config);
@@ -4025,6 +4077,7 @@ function defineAdminShellDelivery(dependencies = {}, shell = {}) {
 		return shell.buildAdminReleaseVendorClientResponse(storedResponse, request.method);
 	}
 	return {
+		renderBundledAdminPage,
 		renderAdminIndexSetupPage,
 		isAdminIndexSetupForced,
 		renderAdminRemoteShellErrorPage,
@@ -5983,7 +6036,18 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
 		}) : storedRuntimeConfig;
 		if (shell.isAdminIndexSetupForced(request)) return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig, "manual_setup_requested");
 		const adminIndexState = buildResolvedAdminIndexState(env, runtimeConfig);
-		if (!adminIndexState.indexUrl) return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig);
+		if (!adminIndexState.indexUrl) {
+			try {
+				const bundledResponse = await shell.renderBundledAdminPage(request, env, ctx, initHealth, runtimeConfig);
+				if (bundledResponse) return bundledResponse;
+			} catch (error) {
+				logRuntimeFailure("admin.bundled_shell_render", error, {
+					path: new URL(request.url).pathname
+				});
+				return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig, "bundled_shell_render_failed");
+			}
+			return shell.renderAdminIndexSetupPage(request, env, ctx, initHealth, runtimeConfig);
+		}
 		const remoteShellIndexUrl = adminIndexState.indexUrl;
 		if (remoteShellIndexUrl) try {
 			const remoteResponse = await shell.renderRemoteAdminPage(request, env, ctx, initHealth, remoteShellIndexUrl, runtimeConfig);
@@ -6085,7 +6149,7 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
 	function renderLandingPage(env, initHealth = buildInitHealth(env)) {
 		const adminPath = getAdminPath(env);
 		const initBanner = initHealth.ok ? "" : `<div class="landing-banner"><div class="landing-banner-title">系统未初始化</div><div class="landing-banner-text">缺少关键环境变量：${initHealth.missing.map((item) => escapeHtml(item)).join("、")}</div></div>`;
-		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.3</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.3</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
+		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.3</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.3</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取随部署发布或已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
 		const headers = new Headers({
 			"Content-Type": "text/html;charset=UTF-8",
 			"Cache-Control": "public, max-age=3600, s-maxage=86400"
