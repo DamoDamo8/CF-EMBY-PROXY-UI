@@ -22,7 +22,7 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
   const closureEnd = inlineScript.lastIndexOf('})();');
   assert.notEqual(closureEnd, -1, 'enhancement script must use the expected closure');
   const instrumentedScript = inlineScript.slice(0, closureEnd)
-    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState };\n'
+    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, normalizeHeadProbeResult, formatHeadProbeResult };\n'
     + inlineScript.slice(closureEnd);
   const window = {
     addEventListener() {},
@@ -239,6 +239,72 @@ test('backup view exposes only the paired Worker and HTML upload flow', async ()
   assert.match(vueAdminConsole, /callAdminAction\('updateWorkerAndAdminIndex'/);
   assert.match(vueAdminConsole, /workerScriptContent/);
   assert.match(vueAdminConsole, /indexHtml/);
+});
+
+test('node GET probes use the fixed public-info path without path selectors', async () => {
+  const [template, runtimeIndex, nodesPanel, adminConsole, settingsPanel] = await Promise.all([
+    readFile(new URL('../frontend/admin-runtime.template.html', import.meta.url), 'utf8'),
+    readFile(new URL('../frontend/index.html', import.meta.url), 'utf8'),
+    readFile(new URL('../frontend/src/features/nodes/NodesPanel.vue', import.meta.url), 'utf8'),
+    readFile(new URL('../frontend/src/composables/useAdminConsole.js', import.meta.url), 'utf8'),
+    readFile(new URL('../frontend/src/features/settings/SettingsPanel.vue', import.meta.url), 'utf8')
+  ]);
+  assert.match(template, /nodeModalProbePath:"\/emby\/system\/info\/public"/);
+  assert.doesNotMatch(runtimeIndex, /globalHeadProbePath|nodeModalProbePath/);
+  assert.doesNotMatch(runtimeIndex, /aria-label":"\\u5168\\u5c40 HEAD \\u63a2\\u6d4b\\u8def\\u5f84/);
+  assert.doesNotMatch(runtimeIndex, /aria-label":"HEAD \\u63a2\\u6d4b\\u8def\\u5f84/);
+  assert.match(runtimeIndex, /GET_PROBE_PATH = '\/emby\/system\/info\/public'/);
+  assert.match(runtimeIndex, /全局 GET 测试/);
+  assert.match(runtimeIndex, /GET \\u5ef6\\u8fdf/);
+  assert.doesNotMatch(runtimeIndex, /HEAD \\u5ef6\\u8fdf/);
+  assert.match(runtimeIndex, /probePath\s*\}/);
+  assert.match(runtimeIndex, /pingTimeout:1e4/);
+  assert.match(runtimeIndex, /pingTimeout:\{fallback:1e4,min:1e3,max:18e4\}/);
+  assert.match(runtimeIndex, /GET \\u8d85\\u65f6\\u65f6\\u95f4/);
+  assert.match(runtimeIndex, /hedgeProbePreferGet:!0/);
+  assert.match(runtimeIndex, /"hedgeFailoverEnabled","hedgeProbePreferGet","hedgeProbePath"/);
+  assert.match(runtimeIndex, /booleanTrueFields:\[[^\]]*"hedgeProbePreferGet"/);
+  assert.match(runtimeIndex, /key:"hedgeProbePreferGet",id:"cfg-hedge-probe-prefer-get",kind:"checkbox",checkboxMode:"defaultTrue"/);
+  assert.match(runtimeIndex, /cfg-hedge-probe-prefer-get/);
+  assert.doesNotMatch(nodesPanel, /HEAD_PROBE_PATH_OPTIONS|headProbePath/);
+  assert.match(nodesPanel, /handleGlobalHeadProbe/);
+  assert.match(nodesPanel, /globalHeadProbePending/);
+  assert.match(nodesPanel, /全局 GET 测试/);
+  assert.doesNotMatch(adminConsole, /options\.probePath/);
+  assert.match(settingsPanel, /pingTimeout: '10000'/);
+  assert.match(settingsPanel, /GET 超时时间 \(ms\)/);
+  assert.match(settingsPanel, /hedgeProbePreferGet: true/);
+  assert.match(settingsPanel, /优先使用 GET 请求方式/);
+});
+
+test('GET probe results distinguish HTTP and transport failures from true timeout', () => {
+  const { normalizeHeadProbeResult, formatHeadProbeResult } = loadEnhancementTestHooks();
+  const slowSuccess = normalizeHeadProbeResult({
+    probe: {
+      ok: true,
+      reason: 'ok',
+      statusCode: 200,
+      elapsedMs: 6500,
+      methodUsed: 'GET',
+      probePath: '/emby/system/info/public'
+    }
+  });
+  assert.equal(slowSuccess.ok, true);
+  assert.equal(slowSuccess.elapsedMs, 6500);
+  assert.equal(formatHeadProbeResult(slowSuccess), '6500 ms');
+  assert.equal(formatHeadProbeResult({
+    probe: { ok: false, reason: 'http_error', statusCode: 403, elapsedMs: 120 }
+  }), 'HTTP 403 · 120 ms');
+  assert.equal(formatHeadProbeResult({
+    probe: { ok: false, reason: 'tls_error', elapsedMs: 75 }
+  }), 'TLS 错误 · 75 ms');
+  assert.equal(formatHeadProbeResult({
+    probe: { ok: false, reason: 'network_error', elapsedMs: 90 }
+  }), '网络错误 · 90 ms');
+  assert.equal(formatHeadProbeResult({
+    probe: { ok: false, reason: 'timeout', elapsedMs: 10000 }
+  }), '超时 · 10000 ms');
+  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /elapsedMs\s*>\s*5000[^\n]*Timeout/);
 });
 
 test('DNS settings save includes changed preferred sources without redundant source writes', async () => {

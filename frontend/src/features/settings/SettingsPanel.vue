@@ -1005,7 +1005,7 @@ function createEmptyForm() {
     multiLinkCopyPanelEnabled: false,
     dashboardShowD1WriteHotspot: false,
     dashboardShowKvD1Status: false,
-    pingTimeout: '5000',
+    pingTimeout: '10000',
     pingCacheMinutes: '10',
     upstreamTimeoutMs: '8000',
     upstreamRetryAttempts: '0',
@@ -1017,6 +1017,7 @@ function createEmptyForm() {
     corsOrigins: '',
     jwtExpiryDays: '30',
     hedgeFailoverEnabled: false,
+    hedgeProbePreferGet: true,
     hedgeProbePath: '/emby/system/ping',
     hedgeProbeTimeoutMs: '2500',
     hedgeProbeParallelism: '2',
@@ -1106,7 +1107,7 @@ function buildFormFromConfig(rawConfig = {}) {
     multiLinkCopyPanelEnabled: currentConfig.multiLinkCopyPanelEnabled === true,
     dashboardShowD1WriteHotspot: currentConfig.dashboardShowD1WriteHotspot === true,
     dashboardShowKvD1Status: currentConfig.dashboardShowKvD1Status === true,
-    pingTimeout: formatIntegerInput(currentConfig.pingTimeout, 5000),
+    pingTimeout: formatIntegerInput(currentConfig.pingTimeout, 10000),
     pingCacheMinutes: formatIntegerInput(currentConfig.pingCacheMinutes, 10),
     upstreamTimeoutMs: formatIntegerInput(currentConfig.upstreamTimeoutMs, 8000),
     upstreamRetryAttempts: formatIntegerInput(currentConfig.upstreamRetryAttempts, 0),
@@ -1118,6 +1119,7 @@ function buildFormFromConfig(rawConfig = {}) {
     corsOrigins: joinTextList(parseLooseTextList(currentConfig.corsOrigins)),
     jwtExpiryDays: formatIntegerInput(currentConfig.jwtExpiryDays, 30),
     hedgeFailoverEnabled: currentConfig.hedgeFailoverEnabled === true,
+    hedgeProbePreferGet: currentConfig.hedgeProbePreferGet !== false,
     hedgeProbePath: resolveSelectValue(currentConfig.hedgeProbePath, '/emby/system/ping'),
     hedgeProbeTimeoutMs: formatIntegerInput(currentConfig.hedgeProbeTimeoutMs, 2500),
     hedgeProbeParallelism: formatIntegerInput(currentConfig.hedgeProbeParallelism, 2),
@@ -1201,7 +1203,7 @@ function buildConfigPayload(currentConfig = {}, currentForm = {}) {
     multiLinkCopyPanelEnabled: currentForm.multiLinkCopyPanelEnabled === true,
     dashboardShowD1WriteHotspot: currentForm.dashboardShowD1WriteHotspot === true,
     dashboardShowKvD1Status: currentForm.dashboardShowKvD1Status === true,
-    pingTimeout: parseIntegerValue(currentForm.pingTimeout, fallbackConfig.pingTimeout, 5000),
+    pingTimeout: parseIntegerValue(currentForm.pingTimeout, fallbackConfig.pingTimeout, 10000),
     pingCacheMinutes: parseIntegerValue(currentForm.pingCacheMinutes, fallbackConfig.pingCacheMinutes, 10),
     upstreamTimeoutMs: parseIntegerValue(currentForm.upstreamTimeoutMs, fallbackConfig.upstreamTimeoutMs, 8000),
     upstreamRetryAttempts: parseIntegerValue(currentForm.upstreamRetryAttempts, fallbackConfig.upstreamRetryAttempts, 0),
@@ -1213,6 +1215,7 @@ function buildConfigPayload(currentConfig = {}, currentForm = {}) {
     corsOrigins: joinCommaSeparatedList(parseLooseTextList(currentForm.corsOrigins)),
     jwtExpiryDays: parseIntegerValue(currentForm.jwtExpiryDays, fallbackConfig.jwtExpiryDays, 30),
     hedgeFailoverEnabled: currentForm.hedgeFailoverEnabled === true,
+    hedgeProbePreferGet: currentForm.hedgeProbePreferGet !== false,
     hedgeProbePath: resolveSelectValue(currentForm.hedgeProbePath, '/emby/system/ping'),
     hedgeProbeTimeoutMs: parseIntegerValue(currentForm.hedgeProbeTimeoutMs, fallbackConfig.hedgeProbeTimeoutMs, 2500),
     hedgeProbeParallelism: parseIntegerValue(currentForm.hedgeProbeParallelism, fallbackConfig.hedgeProbeParallelism, 2),
@@ -1374,6 +1377,7 @@ function buildComparableFormState(value = {}) {
     corsOrigins: parseLooseTextList(value.corsOrigins),
     jwtExpiryDays: String(value.jwtExpiryDays || '').trim(),
     hedgeFailoverEnabled: value.hedgeFailoverEnabled === true,
+    hedgeProbePreferGet: value.hedgeProbePreferGet !== false,
     hedgeProbePath: resolveSelectValue(value.hedgeProbePath, '/emby/system/ping'),
     hedgeProbeTimeoutMs: String(value.hedgeProbeTimeoutMs || '').trim(),
     hedgeProbeParallelism: String(value.hedgeProbeParallelism || '').trim(),
@@ -1705,7 +1709,7 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
           </label>
 
           <label class="field-shell">
-            <span class="field-label">Ping 超时 (ms)</span>
+            <span class="field-label">GET 超时时间 (ms)</span>
             <input v-model="form.pingTimeout" type="number" min="1000" max="180000" class="field-input" />
           </label>
 
@@ -1944,6 +1948,10 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
           <label class="toggle-card">
             <input v-model="form.hedgeFailoverEnabled" type="checkbox" class="h-4 w-4 rounded" />
             <span>启用 Hedge / Failover</span>
+          </label>
+          <label class="toggle-card">
+            <input v-model="form.hedgeProbePreferGet" type="checkbox" class="h-4 w-4 rounded" />
+            <span>优先使用 GET 请求方式</span>
           </label>
         </div>
       </article>

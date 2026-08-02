@@ -83,6 +83,7 @@ let editorRequestId = 0;
 let lineDraftSequence = 0;
 
 const query = ref('');
+const globalHeadProbePending = ref(false);
 const feedback = reactive({
   tone: '',
   text: ''
@@ -258,6 +259,29 @@ async function handleRefresh() {
   feedback.tone = '';
   feedback.text = '';
   await props.adminConsole?.hydrateNodes();
+}
+
+async function handleGlobalHeadProbe() {
+  if (!props.adminConsole || globalHeadProbePending.value) return;
+  const currentNodes = nodes.value.slice();
+  if (!currentNodes.length) return;
+
+  globalHeadProbePending.value = true;
+  feedback.tone = '';
+  feedback.text = '';
+  let successCount = 0;
+  try {
+    for (const node of currentNodes) {
+      const result = await props.adminConsole.pingNode({
+        name: String(node?.name || '').trim()
+      });
+      if (result?.probe?.ok === true) successCount += 1;
+    }
+    feedback.tone = successCount === currentNodes.length ? 'success' : 'warning';
+    feedback.text = `全局 GET 测试完成：${successCount}/${currentNodes.length} 个节点成功。`;
+  } finally {
+    globalHeadProbePending.value = false;
+  }
 }
 
 function handleOpenImport() {
@@ -621,9 +645,9 @@ async function handlePing(node, line = null, options = {}) {
     : activeLine;
   const displayName = resolveDisplayName(result.node || node);
   const successText = matchedLine
-    ? `节点 ${displayName} 的线路 ${resolveLineLabel(matchedLine)} 探测完成，延迟 ${formatLatency(matchedLine.latencyMs)}。`
+    ? `节点 ${displayName} 的线路 ${resolveLineLabel(matchedLine)} 探测完成，结果 ${formatLineProbe(matchedLine)}。`
     : activeLine
-      ? `节点 ${displayName} 探测完成，当前线路 ${resolveLineLabel(activeLine)}，延迟 ${formatLatency(activeLine.latencyMs)}。`
+      ? `节点 ${displayName} 探测完成，当前线路 ${resolveLineLabel(activeLine)}，结果 ${formatLineProbe(activeLine)}。`
       : `节点 ${displayName} 探测完成。`;
 
   feedback.tone = 'success';
@@ -835,6 +859,7 @@ function createEmptyLineDraft(index = 0, source = {}) {
     target: String(source?.target || '').trim(),
     latencyMs: normalizeLatencyNumber(source?.latencyMs),
     latencyUpdatedAt: String(source?.latencyUpdatedAt || '').trim(),
+    probe: isPlainObject(source?.probe) ? { ...source.probe } : null,
     probeStatus: String(source?.probeStatus || source?.status || source?.healthStatus || source?.healthState || '').trim(),
     remark: String(source?.remark || '').trim()
   };
@@ -947,6 +972,7 @@ function mergeLineDiagnosticsIntoDrafts(node = {}) {
       savedId,
       latencyMs: normalizeLatencyNumber(runtimeLine?.latencyMs),
       latencyUpdatedAt: String(runtimeLine?.latencyUpdatedAt || '').trim(),
+      probe: isPlainObject(runtimeLine?.probe) ? { ...runtimeLine.probe } : null,
       probeStatus: String(runtimeLine?.probeStatus || runtimeLine?.status || runtimeLine?.healthStatus || runtimeLine?.healthState || '').trim(),
       remark: String(runtimeLine?.remark || line?.remark || '').trim()
     };
@@ -1253,6 +1279,7 @@ function normalizeDiagnosticKey(value = '') {
 }
 
 function normalizeLatencyNumber(value = null) {
+  if (value === null || value === undefined || String(value).trim() === '') return null;
   const ms = Number(value);
   return Number.isFinite(ms) ? Math.max(0, Math.round(ms)) : null;
 }
@@ -1358,6 +1385,18 @@ function resolveNodeHealthMeta(node = {}) {
 }
 
 function resolveLineProbeMeta(line = {}) {
+  if (isPlainObject(line?.probe)) {
+    const probe = normalizeLineProbe(line);
+    return {
+      key: probe.reason,
+      label: formatLineProbe(line),
+      tone: probe.ok
+        ? 'border-mint-400/30 bg-mint-400/12 text-mint-200'
+        : probe.reason === 'timeout'
+          ? 'border-amber-400/30 bg-amber-500/12 text-amber-200'
+          : 'border-rose-400/30 bg-rose-500/12 text-rose-100'
+    };
+  }
   const probeKey = normalizeDiagnosticKey(
     line?.probeStatus
     || line?.status
@@ -1565,7 +1604,11 @@ function resolveTagTone(tagColor = '') {
   return toneMap[normalizedColor] || 'border-white/12 bg-white/8 text-slate-100';
 }
 
-function resolveLatencyTone(latencyMs) {
+function resolveLatencyTone(latencyMs, line = null) {
+  if (line?.probe?.ok === false) return 'border-rose-400/30 bg-rose-500/12 text-rose-200';
+  if (latencyMs === null || latencyMs === undefined || String(latencyMs).trim() === '') {
+    return 'border-white/12 bg-white/6 text-slate-200';
+  }
   const ms = Number(latencyMs);
   if (!Number.isFinite(ms)) return 'border-white/12 bg-white/6 text-slate-200';
   if (ms <= 300) return 'border-mint-400/30 bg-mint-400/12 text-mint-200';
@@ -1580,8 +1623,39 @@ function compactRevision(rawValue = '') {
 }
 
 function formatLatency(latencyMs) {
+  if (latencyMs === null || latencyMs === undefined || String(latencyMs).trim() === '') return '未探测';
   const ms = Number(latencyMs);
   return Number.isFinite(ms) ? `${Math.round(ms)} ms` : '未探测';
+}
+
+function normalizeLineProbe(line = {}) {
+  const probe = isPlainObject(line?.probe) ? line.probe : {};
+  const reason = String(probe.reason || '').trim().toLowerCase();
+  const statusCode = Number(probe.statusCode);
+  const elapsedValue = Number(probe.elapsedMs ?? line?.latencyMs);
+  const hasElapsed = probe.elapsedMs !== null
+    && probe.elapsedMs !== undefined
+    && Number.isFinite(elapsedValue)
+    && elapsedValue >= 0;
+  const ok = probe.ok === true || (!reason && normalizeLatencyNumber(line?.latencyMs) !== null);
+  return {
+    ok,
+    reason: ok ? 'ok' : reason || 'network_error',
+    statusCode: Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599 ? statusCode : null,
+    elapsedMs: hasElapsed ? Math.round(elapsedValue) : null
+  };
+}
+
+function formatLineProbe(line = {}) {
+  if (!isPlainObject(line?.probe)) return formatLatency(line?.latencyMs);
+  const probe = normalizeLineProbe(line);
+  const elapsed = probe.elapsedMs === null ? '' : ` · ${probe.elapsedMs} ms`;
+  if (probe.ok) return probe.elapsedMs === null ? '探测正常' : `${probe.elapsedMs} ms`;
+  if (probe.reason === 'http_error') return `HTTP ${probe.statusCode || '错误'}${elapsed}`;
+  if (probe.reason === 'timeout') return `超时${elapsed}`;
+  if (probe.reason === 'tls_error') return `TLS 错误${elapsed}`;
+  if (probe.reason === 'invalid_target') return '目标无效';
+  return `网络错误${elapsed}`;
 }
 
 function formatDateTime(rawValue = '') {
@@ -1643,6 +1717,15 @@ async function copyText(text = '') {
         <div class="inline-flex rounded-full border px-3 py-1 text-xs font-semibold" :class="resolveStatusTone()">
           {{ resolveStatusLabel() }}
         </div>
+        <button
+          type="button"
+          class="secondary-btn"
+          :disabled="globalHeadProbePending || loadingNodes || savingNode || importingNodes || !nodes.length"
+          @click="handleGlobalHeadProbe"
+        >
+          <Activity class="h-4 w-4" :class="{ 'animate-pulse': globalHeadProbePending }" />
+          {{ globalHeadProbePending ? 'GET 测试中' : '全局 GET 测试' }}
+        </button>
         <button
           type="button"
           class="secondary-btn"
@@ -1937,7 +2020,7 @@ async function copyText(text = '') {
             </p>
           </div>
 
-          <div class="flex flex-wrap gap-3">
+          <div class="flex w-full min-w-0 flex-wrap gap-3 lg:w-auto">
             <button
               type="button"
               class="secondary-btn"
@@ -2451,9 +2534,9 @@ async function copyText(text = '') {
                 </span>
                 <span
                   class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium"
-                  :class="resolveLatencyTone(line.latencyMs)"
+                  :class="resolveLatencyTone(line.latencyMs, line)"
                 >
-                  {{ formatLatency(line.latencyMs) }}
+                  {{ formatLineProbe(line) }}
                 </span>
                 <span
                   v-if="resolveLineProbeMeta(line)"
@@ -2537,9 +2620,9 @@ async function copyText(text = '') {
 
           <div
             class="inline-flex rounded-full border px-3 py-1 text-xs font-semibold"
-            :class="resolveLatencyTone(resolveActiveLine(node)?.latencyMs)"
+            :class="resolveLatencyTone(resolveActiveLine(node)?.latencyMs, resolveActiveLine(node))"
           >
-            {{ formatLatency(resolveActiveLine(node)?.latencyMs) }}
+            {{ formatLineProbe(resolveActiveLine(node)) }}
           </div>
         </div>
 
@@ -2625,9 +2708,9 @@ async function copyText(text = '') {
                     </div>
                     <div
                       class="inline-flex rounded-full border px-2.5 py-1 text-[11px] font-semibold"
-                      :class="resolveLatencyTone(line.latencyMs)"
+                      :class="resolveLatencyTone(line.latencyMs, line)"
                     >
-                      {{ formatLatency(line.latencyMs) }}
+                      {{ formatLineProbe(line) }}
                     </div>
                     <div
                       v-if="resolveLineProbeMeta(line)"

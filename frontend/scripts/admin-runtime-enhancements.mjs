@@ -1012,6 +1012,88 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     updateDashboardTrafficToggleButton(nodes);
   }
 
+  const GET_PROBE_PATH = '/emby/system/info/public';
+  const HEAD_PROBE_REASONS = new Set([
+    'ok',
+    'http_error',
+    'timeout',
+    'tls_error',
+    'network_error',
+    'invalid_target'
+  ]);
+
+  function normalizeHeadProbePath() {
+    return GET_PROBE_PATH;
+  }
+
+  function normalizeHeadProbeResult(value = {}, fallbackPath = '') {
+    const container = value && typeof value === 'object' ? value : {};
+    const source = container.probe && typeof container.probe === 'object' ? container.probe : container;
+    const rawReason = String(source.reason || '').trim().toLowerCase();
+    const legacyLatency = Number(container.latencyMs);
+    const hasLegacyLatency = container.latencyMs !== null
+      && container.latencyMs !== undefined
+      && String(container.latencyMs).trim() !== ''
+      && Number.isFinite(legacyLatency)
+      && legacyLatency >= 0
+      && legacyLatency !== 9999;
+    const ok = source.ok === true || (!rawReason && hasLegacyLatency);
+    const reason = ok ? 'ok' : HEAD_PROBE_REASONS.has(rawReason) ? rawReason : 'network_error';
+    const rawElapsedMs = Number(source.elapsedMs ?? (hasLegacyLatency ? legacyLatency : Number.NaN));
+    const elapsedMs = Number.isFinite(rawElapsedMs) && rawElapsedMs >= 0 ? Math.round(rawElapsedMs) : null;
+    const statusCode = Number(source.statusCode);
+    const methodUsed = String(source.methodUsed || '').trim().toUpperCase();
+    return {
+      ok,
+      reason,
+      statusCode: Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599 ? statusCode : null,
+      elapsedMs,
+      methodUsed: methodUsed === 'HEAD' || methodUsed === 'GET' ? methodUsed : null,
+      probePath: normalizeHeadProbePath(source.probePath || fallbackPath)
+    };
+  }
+
+  function buildClientHeadProbeFailure(probePath = '', startedAt = Date.now()) {
+    return {
+      ok: false,
+      reason: 'network_error',
+      statusCode: null,
+      elapsedMs: Math.max(0, Date.now() - Number(startedAt || Date.now())),
+      methodUsed: 'GET',
+      probePath: normalizeHeadProbePath(probePath)
+    };
+  }
+
+  function hasHeadProbeValue(value = {}) {
+    if (!value || typeof value !== 'object') return false;
+    if (value.probe && typeof value.probe === 'object') return true;
+    if (String(value.reason || '').trim()) return true;
+    return value.latencyMs !== null
+      && value.latencyMs !== undefined
+      && String(value.latencyMs).trim() !== '';
+  }
+
+  function formatHeadProbeResult(value = {}) {
+    if (!hasHeadProbeValue(value)) return '--';
+    const probe = normalizeHeadProbeResult(value);
+    const elapsed = probe.elapsedMs === null ? '' : ' · ' + probe.elapsedMs + ' ms';
+    if (probe.ok) return probe.elapsedMs === null ? '--' : probe.elapsedMs + ' ms';
+    if (probe.reason === 'http_error') return 'HTTP ' + (probe.statusCode || '错误') + elapsed;
+    if (probe.reason === 'timeout') return '超时' + elapsed;
+    if (probe.reason === 'tls_error') return 'TLS 错误' + elapsed;
+    if (probe.reason === 'invalid_target') return '目标无效';
+    return '网络错误' + elapsed;
+  }
+
+  function formatHeadProbeTitle(value = {}) {
+    if (!hasHeadProbeValue(value)) return '尚未进行 GET 测试';
+    const probe = normalizeHeadProbeResult(value);
+    const details = [formatHeadProbeResult(probe)];
+    if (probe.methodUsed) details.push('方法 ' + probe.methodUsed);
+    if (probe.probePath) details.push('路径 ' + probe.probePath);
+    return details.join(' · ');
+  }
+
   function patchSafetyContractMethods(app) {
     if (!app || patchedSafetyContractApp === app) return;
     patchedSafetyContractApp = app;
@@ -1046,6 +1128,237 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       };
     }
     app.toggleDashboardTrafficPeriodFromUi = () => toggleDashboardTrafficPeriod(app);
+
+    const originalGetNodeLatencyMeta = typeof app.getNodeLatencyMeta === 'function'
+      ? app.getNodeLatencyMeta.bind(app)
+      : null;
+    const originalApplyNodesState = typeof app.applyNodesState === 'function'
+      ? app.applyNodesState.bind(app)
+      : null;
+    app.normalizeNodeProbeResult = function normalizeNodeProbeResult(value = {}, fallbackPath = '') {
+      return normalizeHeadProbeResult(value, fallbackPath);
+    };
+    app.formatNodeProbeResult = function formatNodeProbeResult(value = {}) {
+      return formatHeadProbeResult(value);
+    };
+    app.getNodeProbeTitle = function getNodeProbeTitle(value = {}) {
+      return formatHeadProbeTitle(value);
+    };
+    app.getNodeProbeMeta = function getNodeProbeMeta(line = {}, healthCount = 0) {
+      if (!hasHeadProbeValue(line)) {
+        return originalGetNodeLatencyMeta
+          ? originalGetNodeLatencyMeta(null, healthCount)
+          : { dotClass: 'bg-slate-200 dark:bg-slate-700', textClass: 'text-slate-500 dark:text-slate-400 font-medium', text: '--', titleClass: '' };
+      }
+      const probe = normalizeHeadProbeResult(line);
+      if (probe.ok) {
+        const meta = originalGetNodeLatencyMeta
+          ? originalGetNodeLatencyMeta(probe.elapsedMs, healthCount)
+          : { dotClass: 'bg-emerald-500', textClass: 'text-emerald-600 dark:text-emerald-400 font-medium', titleClass: '' };
+        return { ...meta, text: formatHeadProbeResult(probe) };
+      }
+      return {
+        dotClass: 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.6)] dark:shadow-[0_0_8px_rgba(248,113,113,0.4)]',
+        textClass: 'text-red-600 dark:text-red-400 font-medium',
+        text: formatHeadProbeResult(probe),
+        titleClass: Number(healthCount) > 3 ? 'text-red-600 dark:text-red-400' : ''
+      };
+    };
+    app.getNodePingRuntimeEntry = function getNodePingRuntimeEntryWithProbe(nodeName, lineId = '') {
+      const key = this.buildNodePingRuntimeKey(nodeName, lineId);
+      if (!key) return null;
+      const entry = this.nodePingRuntimeMap && typeof this.nodePingRuntimeMap === 'object'
+        ? this.nodePingRuntimeMap[key]
+        : null;
+      if (!entry || typeof entry !== 'object') return null;
+      const ttlMs = this.getNodePingRuntimeTtlMs();
+      const updatedAtMs = Date.parse(String(entry.latencyUpdatedAt || ''));
+      if (ttlMs > 0 && Number.isFinite(updatedAtMs) && Date.now() - updatedAtMs > ttlMs) return null;
+      const probe = normalizeHeadProbeResult(entry);
+      const latencyUpdatedAt = this.normalizeNodePingRuntimeTimestamp(entry.latencyUpdatedAt);
+      if (!hasHeadProbeValue(entry) && !latencyUpdatedAt) return null;
+      return {
+        latencyMs: probe.ok ? probe.elapsedMs : null,
+        latencyUpdatedAt,
+        ...(hasHeadProbeValue(entry) ? { probe } : {})
+      };
+    };
+    app.getNodeLines = function getNodeLinesWithProbe(node = {}) {
+      const lines = this.getNodeConfigLines(node);
+      const nodeName = this.normalizeNodeKey(node?.name);
+      if (!nodeName) return lines;
+      return lines.map((line) => {
+        const runtime = this.getNodePingRuntimeEntry(nodeName, line?.id);
+        return runtime ? { ...line, ...runtime } : line;
+      });
+    };
+    app.setNodeLineRuntimeProbe = function setNodeLineRuntimeProbe(nodeName, lineId, value = {}, updatedAt = '') {
+      const key = this.buildNodePingRuntimeKey(nodeName, lineId);
+      if (!key) return null;
+      const probe = normalizeHeadProbeResult(value);
+      const latencyUpdatedAt = this.normalizeNodePingRuntimeTimestamp(updatedAt) || new Date().toISOString();
+      const entry = {
+        latencyMs: probe.ok ? probe.elapsedMs : null,
+        latencyUpdatedAt,
+        probe
+      };
+      this.nodePingRuntimeMap = {
+        ...(this.nodePingRuntimeMap && typeof this.nodePingRuntimeMap === 'object' ? this.nodePingRuntimeMap : {}),
+        [key]: entry
+      };
+      return entry;
+    };
+    app.applyPingNodeResponse = function applyPingNodeResponseWithProbe(nodeOrName, payload = {}, _legacyLatency, updatedAt = '') {
+      const inputNode = typeof nodeOrName === 'string'
+        ? this.nodes.find((node) => this.normalizeNodeKey(node?.name) === this.normalizeNodeKey(nodeOrName))
+        : nodeOrName;
+      const response = payload && typeof payload === 'object' ? payload : {};
+      const node = inputNode && typeof inputNode === 'object'
+        ? inputNode
+        : response.node && typeof response.node === 'object'
+          ? this.hydrateNode(response.node)
+          : null;
+      const lineId = this.normalizeNodeKey(response.line?.id || response.activeLineId || this.getActiveNodeLine(node)?.id || '');
+      const nodeName = String(node?.name || response.node?.name || (typeof nodeOrName === 'string' ? nodeOrName : '')).trim();
+      const timestamp = this.normalizeNodePingRuntimeTimestamp(updatedAt || response.line?.latencyUpdatedAt) || new Date().toISOString();
+      return lineId && nodeName
+        ? this.setNodeLineRuntimeProbe(nodeName, lineId, response, timestamp)
+        : null;
+    };
+    app.recordNodeHealthResult = function recordNodeHealthResultWithProbe(nodeName, value = {}, target = null) {
+      const key = this.normalizeNodeKey(nodeName);
+      const state = target && typeof target === 'object' ? target : this.nodeHealth;
+      if (!key) return state;
+      const probe = normalizeHeadProbeResult(value);
+      state[key] = !probe.ok || Number(probe.elapsedMs) > 300 ? (state[key] || 0) + 1 : 0;
+      return state;
+    };
+    if (originalApplyNodesState) {
+      app.applyNodesState = function applyNodesStatePreservingProbe(...args) {
+        const previousRuntime = this.nodePingRuntimeMap && typeof this.nodePingRuntimeMap === 'object'
+          ? this.nodePingRuntimeMap
+          : {};
+        const result = originalApplyNodesState(...args);
+        const nextRuntime = { ...(this.nodePingRuntimeMap || {}) };
+        for (const [key, entry] of Object.entries(nextRuntime)) {
+          if (previousRuntime[key]?.probe) nextRuntime[key] = { ...entry, probe: previousRuntime[key].probe };
+        }
+        this.nodePingRuntimeMap = nextRuntime;
+        return result;
+      };
+    }
+    app.checkSingleNodeHealth = async function checkSingleNodeHealthWithProbe(nodeOrName) {
+      const token = this.beginNodePingRequest(nodeOrName, 'single');
+      if (!token) return;
+      const startedAt = Date.now();
+      const probePath = GET_PROBE_PATH;
+      try {
+        const timeout = Number(this.getEffectiveSettingValue('pingTimeout')) || 10000;
+        const node = typeof nodeOrName === 'string'
+          ? this.nodes.find((item) => this.normalizeNodeKey(item?.name) === this.normalizeNodeKey(nodeOrName))
+          : nodeOrName;
+        const activeLine = this.getActiveNodeLine(node);
+        const target = String(activeLine?.target || '').trim();
+        const request = target
+          ? { target, timeout, forceRefresh: true, probePath }
+          : { ...this.buildActiveLinePingPayload(nodeOrName), timeout, forceRefresh: true, probePath };
+        const payload = await this.apiCall('pingNode', request);
+        const probe = normalizeHeadProbeResult(payload, probePath);
+        this.applyPingNodeResponse(node || nodeOrName, { ...payload, probe });
+        this.recordNodeHealthResult(nodeOrName, probe);
+      } catch {
+        const probe = buildClientHeadProbeFailure(probePath, startedAt);
+        this.applyPingNodeResponse(nodeOrName, { probe });
+        this.recordNodeHealthResult(nodeOrName, probe);
+      } finally {
+        this.finishNodePingRequest(nodeOrName, token);
+      }
+    };
+    app.checkAllNodesHealth = async function checkAllNodesHealthWithProbe() {
+      const timeout = Number(this.getEffectiveSettingValue('pingTimeout')) || 10000;
+      const probePath = GET_PROBE_PATH;
+      const nodes = Array.isArray(this.nodes) ? this.nodes.slice() : [];
+      if (!nodes.length) return;
+      const health = { ...(this.nodeHealth || {}) };
+      const tokens = new Map();
+      for (const node of nodes) {
+        const nodeName = this.normalizeNodeKey(node?.name);
+        if (!nodeName) continue;
+        const token = this.beginNodePingRequest(nodeName, 'batch');
+        if (token) tokens.set(nodeName, token);
+      }
+      for (const node of nodes) {
+        const nodeName = this.normalizeNodeKey(node?.name);
+        const token = nodeName ? tokens.get(nodeName) : '';
+        if (!nodeName || !token) continue;
+        const startedAt = Date.now();
+        try {
+          const activeLine = this.getActiveNodeLine(node);
+          const target = String(activeLine?.target || '').trim();
+          const request = target
+            ? { target, timeout, forceRefresh: true, probePath }
+            : { ...this.buildActiveLinePingPayload(node), timeout, forceRefresh: true, probePath };
+          const payload = await this.apiCall('pingNode', request);
+          const probe = normalizeHeadProbeResult(payload, probePath);
+          this.applyPingNodeResponse(node, { ...payload, probe });
+          this.recordNodeHealthResult(node.name, probe, health);
+        } catch {
+          const probe = buildClientHeadProbeFailure(probePath, startedAt);
+          this.applyPingNodeResponse(node, { probe });
+          this.recordNodeHealthResult(node.name, probe, health);
+        } finally {
+          this.finishNodePingRequest(nodeName, token);
+        }
+      }
+      this.nodeHealth = health;
+    };
+    app.pingAllNodeLinesInModal = async function pingAllNodeLinesInModalWithProbe() {
+      const lines = this.nodeModalLines.filter((line) => this.validateNodeModalLineTarget(line));
+      if (!lines.length) {
+        this.showMessage('请先至少填写一条有效的 http/https 目标源站', { tone: 'warning' });
+        return;
+      }
+      const autoSort = this.isNodePanelPingAutoSortEnabled();
+      const timeout = Number(this.getEffectiveSettingValue('pingTimeout')) || 10000;
+      const probePath = GET_PROBE_PATH;
+      this.nodeModalPingAllPending = true;
+      this.nodeModalPingAllText = 'GET 测试中...';
+      try {
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          const target = this.getNodeModalLineResolvedTarget(line);
+          const startedAt = Date.now();
+          this.nodeModalPingAllText = 'GET 测试中 ' + (index + 1) + '/' + lines.length;
+          try {
+            const payload = await this.apiCall('pingNode', {
+              target,
+              timeout,
+              forceRefresh: true,
+              probePath
+            });
+            const probe = normalizeHeadProbeResult(payload, probePath);
+            line.probe = probe;
+            line.latencyMs = probe.ok ? probe.elapsedMs : null;
+          } catch {
+            line.probe = buildClientHeadProbeFailure(probePath, startedAt);
+            line.latencyMs = null;
+          }
+          const draft = this.splitNodeModalLineDraft(target);
+          line.target = draft.target;
+          line.port = draft.port;
+          line.latencyUpdatedAt = new Date().toISOString();
+        }
+        if (autoSort) {
+          this.nodeModalLines = this.sortLinesByLatency(this.nodeModalLines);
+          this.syncNodeModalLinesState(this.nodeModalLines[0]?.id || '');
+        } else {
+          this.syncNodeModalLinesState();
+        }
+      } finally {
+        this.nodeModalPingAllPending = false;
+        this.nodeModalPingAllText = '全局 GET 测试';
+      }
+    };
 
     if (typeof app.loadDashboard === 'function') {
       app.loadDashboard = async function loadDashboardInLayers(routeToken = null, options = {}) {

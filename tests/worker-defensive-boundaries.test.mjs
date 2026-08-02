@@ -429,7 +429,7 @@ test("node probes preserve target base paths and require a successful response",
     "https://origin.example/proxy/emby/emby/system/ping"
   );
 
-  const responses = [404, 204, 405, 204, 501, 503, 503];
+  const responses = [404, 204, 503];
   const requests = [];
   await withWorkerGlobals({
     fetch: async (url, init = {}) => {
@@ -437,28 +437,37 @@ test("node probes preserve target base paths and require a successful response",
       return new Response(null, { status: responses.shift() });
     }
   }, async () => {
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
-    const successLatency = await kernel.pingTarget("https://origin.example", 1000, {
-      probePath: "/emby/System/Info/Public"
+	const notFound = await kernel.pingTarget("https://origin.example/emby", 1000);
+	assert.equal(notFound.ok, false);
+	assert.equal(notFound.reason, "http_error");
+	assert.equal(notFound.statusCode, 404);
+	assert.equal(notFound.methodUsed, "GET");
+	const success = await kernel.pingTarget("https://origin.example", 1000, {
+      probePath: "/emby/system/ping"
     });
-    assert.ok(successLatency >= 0 && successLatency < 9999);
-    const fallbackLatency = await kernel.pingTarget("https://origin.example/emby", 1000);
-    assert.ok(fallbackLatency >= 0 && fallbackLatency < 9999);
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
-    assert.equal(await kernel.pingTarget("https://origin.example/emby", 1000), 9999);
+	assert.equal(success.ok, true);
+	assert.equal(success.reason, "ok");
+	assert.equal(success.statusCode, 204);
+	assert.equal(success.methodUsed, "GET");
+	assert.equal(success.probePath, "/emby/system/info/public");
+	assert.ok(success.elapsedMs >= 0);
+	const unavailable = await kernel.pingTarget("https://origin.example/emby", 1000);
+	assert.equal(unavailable.ok, false);
+	assert.equal(unavailable.reason, "http_error");
+	assert.equal(unavailable.statusCode, 503);
+	assert.equal(unavailable.methodUsed, "GET");
   });
   assert.deepEqual(requests, [
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
-    { url: "https://origin.example/emby/System/Info/Public", method: "HEAD" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
     { url: "https://origin.example/emby/system/info/public", method: "GET" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" },
     { url: "https://origin.example/emby/system/info/public", method: "GET" },
-    { url: "https://origin.example/emby/system/info/public", method: "HEAD" }
+    { url: "https://origin.example/emby/system/info/public", method: "GET" }
   ]);
 });
 
-test("failover probes reuse the base-aware probe URL and accept all 2xx responses", async () => {
+test("failover probes prefer GET by default and retain the optional HEAD fallback", async () => {
+  assert.equal(Config.Defaults.HedgeProbePreferGet, true);
+  assert.equal(sanitizeRuntimeConfig({}).hedgeProbePreferGet, true);
+  assert.equal(sanitizeRuntimeConfig({ hedgeProbePreferGet: false }).hedgeProbePreferGet, false);
   const originalProbeRequest = proxyService.performFailoverProbeRequest;
   const requests = [];
   proxyService.performFailoverProbeRequest = async (_execution, probeUrl, method) => {
@@ -466,19 +475,95 @@ test("failover probes reuse the base-aware probe URL and accept all 2xx response
     return new Response(null, { status: method === "HEAD" ? 405 : 204 });
   };
   try {
-    const result = await proxyService.runFailoverProbeCandidate({
+    const preferredGetResult = await proxyService.runFailoverProbeCandidate({
       failoverContext: { probePath: "/emby/system/ping", probeTimeoutMs: 1000 }
     }, createTargetRecord("https://origin.example/emby"));
-    assert.equal(result.ok, true);
-    assert.equal(result.status, 204);
-    assert.equal(result.methodUsed, "GET");
+    assert.equal(preferredGetResult.ok, true);
+    assert.equal(preferredGetResult.status, 204);
+    assert.equal(preferredGetResult.methodUsed, "GET");
+
+    const headFallbackResult = await proxyService.runFailoverProbeCandidate({
+      failoverContext: { probePath: "/emby/system/ping", probeTimeoutMs: 1000, probePreferGet: false }
+    }, createTargetRecord("https://origin.example/emby"));
+    assert.equal(headFallbackResult.ok, true);
+    assert.equal(headFallbackResult.status, 204);
+    assert.equal(headFallbackResult.methodUsed, "GET");
     assert.deepEqual(requests, [
+      { url: "https://origin.example/emby/system/ping", method: "GET" },
       { url: "https://origin.example/emby/system/ping", method: "HEAD" },
       { url: "https://origin.example/emby/system/ping", method: "GET" }
     ]);
   } finally {
     proxyService.performFailoverProbeRequest = originalProbeRequest;
   }
+});
+
+test("node GET probes use the fixed public-info path with a ten second default", async () => {
+  assert.equal(Config.Defaults.PingTimeoutMs, 10000);
+  const requests = [];
+  await withWorkerGlobals({
+    fetch: async (url, init = {}) => {
+      requests.push({ url: String(url), method: String(init.method || "GET") });
+      return new Response(null, { status: 204 });
+    }
+  }, async () => {
+    const probe = await kernel.pingTarget("https://origin.example/emby", 1000, {
+      probePath: "/emby/system/ping"
+    });
+	assert.equal(probe.ok, true);
+	assert.equal(probe.reason, "ok");
+	assert.equal(probe.statusCode, 204);
+	assert.equal(probe.methodUsed, "GET");
+	assert.equal(probe.probePath, "/emby/system/info/public");
+	assert.ok(probe.elapsedMs >= 0);
+  });
+  assert.deepEqual(requests, [
+    { url: "https://origin.example/emby/system/info/public", method: "GET" }
+  ]);
+});
+
+test("node GET probes distinguish TLS, network, invalid target, and true timeout failures", async () => {
+  let requestCount = 0;
+  await withWorkerGlobals({
+    fetch: async () => {
+      requestCount += 1;
+      if (requestCount === 1) throw new TypeError("TLS certificate handshake failed");
+      throw new TypeError("Network connection lost");
+    }
+  }, async () => {
+    const tlsFailure = await kernel.pingTarget("https://tls.example", 1000);
+    assert.equal(tlsFailure.ok, false);
+    assert.equal(tlsFailure.reason, "tls_error");
+    assert.equal(tlsFailure.statusCode, null);
+    assert.equal(tlsFailure.methodUsed, "GET");
+
+    const networkFailure = await kernel.pingTarget("https://network.example", 1000);
+    assert.equal(networkFailure.ok, false);
+    assert.equal(networkFailure.reason, "network_error");
+    assert.equal(networkFailure.statusCode, null);
+
+    const invalidTarget = await kernel.pingTarget("not-a-url", 1000);
+    assert.equal(invalidTarget.ok, false);
+    assert.equal(invalidTarget.reason, "invalid_target");
+    assert.equal(invalidTarget.methodUsed, null);
+  });
+
+  await withWorkerGlobals({
+    fetch: async (_url, init = {}) => await new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => {
+        const error = new Error("aborted");
+        error.name = "AbortError";
+        reject(error);
+      }, { once: true });
+    })
+  }, async () => {
+    const timeoutFailure = await kernel.pingTarget("https://timeout.example", 5);
+    assert.equal(timeoutFailure.ok, false);
+    assert.equal(timeoutFailure.reason, "timeout");
+    assert.equal(timeoutFailure.statusCode, null);
+    assert.equal(timeoutFailure.methodUsed, "GET");
+    assert.ok(timeoutFailure.elapsedMs >= 5);
+  });
 });
 
 test("PlaybackInfo rewrite decodes object sources and removes invalid entries before client delivery", () => {

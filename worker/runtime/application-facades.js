@@ -367,8 +367,9 @@ var SCHEDULE_DEFAULTS = Object.freeze({
 	TgDailyReportClockTimes: ["09:00"]
 });
 var PROXY_DEFAULTS = Object.freeze({
-	PingTimeoutMs: 5e3,
+	PingTimeoutMs: 1e4,
 	HedgeFailoverEnabled: false,
+	HedgeProbePreferGet: true,
 	HedgeProbePath: "/emby/system/ping",
 	HedgeProbeTimeoutMs: 2500,
 	HedgeProbeParallelism: 2,
@@ -5212,6 +5213,7 @@ var CONFIG_SANITIZE_RULES = {
 		"pingTimeout",
 		"pingCacheMinutes",
 		"hedgeFailoverEnabled",
+		"hedgeProbePreferGet",
 		"hedgeProbePath",
 		"hedgeProbeTimeoutMs",
 		"hedgeProbeParallelism",
@@ -5462,6 +5464,7 @@ var CONFIG_SANITIZE_RULES = {
 		"enablePrewarm",
 		"playbackInfoCacheEnabled",
 		"videoProgressForwardEnabled",
+		"hedgeProbePreferGet",
 		"logEnabled",
 		"logWriteClientIp",
 		"logWriteColo",
@@ -11283,12 +11286,13 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 		async pingNode(data, { env, ctx }) {
 			const currentConfig = await getRuntimeConfig(env);
 			const timeoutMs = clampIntegerConfig(data.timeout, currentConfig.pingTimeout ?? DEFAULT_PING_TIMEOUT_MS, 1e3, 18e4);
-			const requestedProbePath = String(data.probePath || "").trim();
 			if (data.target) {
 				const normalizedTarget = kernel.normalizeSingleTarget(data.target);
 				if (!normalizedTarget) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+				const probe = await kernel.pingTarget(normalizedTarget, timeoutMs);
 				return jsonResponse({
-					ms: await kernel.pingTarget(normalizedTarget, timeoutMs, { probePath: requestedProbePath }),
+					...(probe.ok ? { ms: probe.elapsedMs } : {}),
+					probe,
 					target: normalizedTarget,
 					usedCache: false,
 					scope: "target"
@@ -11301,12 +11305,13 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 			const linesToProbe = requestedLineId ? node.lines.filter((line) => line.id === requestedLineId) : node.lines.slice();
 			if (requestedLineId && !linesToProbe.length) return jsonError("LINE_NOT_FOUND", "线路不存在", 404);
 			const probedLines = await Promise.all(linesToProbe.map(async (line) => {
-				const ms = await kernel.pingTarget(line.target, timeoutMs, { probePath: requestedProbePath });
+				const probe = await kernel.pingTarget(line.target, timeoutMs);
 				return {
 					id: String(line?.id || "").trim(),
 					name: String(line?.name || "").trim(),
 					target: String(line?.target || "").trim(),
-					latencyMs: ms,
+					latencyMs: probe.ok ? probe.elapsedMs : null,
+					probe,
 					latencyUpdatedAt: (/* @__PURE__ */ new Date()).toISOString()
 				};
 			}));
@@ -11317,6 +11322,7 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 					name: updated.name,
 					target: updated.target,
 					latencyMs: updated.latencyMs,
+					probe: updated.probe,
 					latencyUpdatedAt: updated.latencyUpdatedAt
 				} : {
 					id: String(line?.id || "").trim(),
@@ -11333,7 +11339,8 @@ function defineNotificationActions(dependencies = {}, actions = {}) {
 			const matchedLine = requestedLineId ? responseLines.find((line) => line.id === requestedLineId) : activeLine;
 			const summaryNode = kernel.buildNodeSummary(nodeName.toLowerCase(), node).summary || { name: nodeName.toLowerCase() };
 			return jsonResponse({
-				ms: Number(matchedLine?.latencyMs ?? activeLine?.latencyMs ?? 9999),
+				...(matchedLine?.probe?.ok ? { ms: matchedLine.probe.elapsedMs } : {}),
+				probe: matchedLine?.probe || null,
 				usedCache: false,
 				sorted: false,
 				activeLineId,
@@ -15756,36 +15763,52 @@ function defineNodeMutationMethods(dependencies = {}, kernel = {}) {
 function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 	const { CacheManager, persistCloudflareDnsRecordsForHost } = dependencies;
 	return {
-		async pingTarget(target, timeoutMs, options = {}) {
-			const controller = new AbortController();
+		async pingTarget(target, timeoutMs) {
 			const startedAt = nowMs();
-			const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+			const probePath = DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1;
+			const buildResult = (result = {}) => ({
+				ok: result.ok === true,
+				reason: String(result.reason || "network_error"),
+				statusCode: Number.isInteger(result.statusCode) ? result.statusCode : null,
+				elapsedMs: Math.max(0, nowMs() - startedAt),
+				methodUsed: result.methodUsed === "HEAD" || result.methodUsed === "GET" ? result.methodUsed : null,
+				probePath
+			});
+			const targetRecord = createTargetRecord(String(target || "").trim());
+			if (!targetRecord) return buildResult({ reason: "invalid_target" });
+			const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
+			if (!probeUrl) return buildResult({ reason: "invalid_target" });
+			const controller = new AbortController();
+			let timedOut = false;
+			const methodUsed = "GET";
+			const timeoutId = setTimeout(() => {
+				timedOut = true;
+				controller.abort();
+			}, timeoutMs);
 			try {
-				const targetRecord = createTargetRecord(String(target || "").trim());
-				if (!targetRecord) return 9999;
-				const probePath = normalizeNodeLineHeadProbePath(options?.probePath, DEFAULT_NODE_LINE_HEAD_PROBE_PATH$1);
-				const probeUrl = buildProbeUpstreamUrl(targetRecord, probePath);
-				if (!probeUrl) return 9999;
-				let response = await fetchRequest(probeUrl.toString(), {
-					method: "HEAD",
+				const response = await fetchRequest(probeUrl.toString(), {
+					method: "GET",
 					signal: controller.signal
 				});
-				if (response.status === 405 || response.status === 501) {
-					try {
-						response.body?.cancel?.();
-					} catch {}
-					response = await fetchRequest(probeUrl.toString(), {
-						method: "GET",
-						signal: controller.signal
-					});
-				}
-				const healthy = response.ok;
+				const statusCode = Number(response.status);
 				try {
 					response.body?.cancel?.();
 				} catch {}
-				return healthy ? nowMs() - startedAt : 9999;
-			} catch {
-				return 9999;
+				return buildResult({
+					ok: response.ok,
+					reason: response.ok ? "ok" : "http_error",
+					statusCode,
+					methodUsed
+				});
+			} catch (error) {
+				const errorText = [error?.name, error?.message, error?.cause?.name, error?.cause?.message]
+					.map((value) => String(value || ""))
+					.join(" ");
+				const tlsError = /\b(?:tls|ssl|x509|certificate|handshake)\b/i.test(errorText);
+				return buildResult({
+					reason: timedOut ? "timeout" : tlsError ? "tls_error" : "network_error",
+					methodUsed
+				});
 			} finally {
 				clearTimeout(timeoutId);
 			}
@@ -18854,6 +18877,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 			const upstreamTimeoutMs = clampIntegerConfig(currentConfig.upstreamTimeoutMs, DEFAULT_UPSTREAM_TIMEOUT_MS, 0, 18e4);
 			const upstreamRetryAttempts = clampIntegerConfig(currentConfig.upstreamRetryAttempts, DEFAULT_UPSTREAM_RETRY_ATTEMPTS, 0, 3);
 			const hedgeFailoverEnabled = currentConfig.hedgeFailoverEnabled === true;
+			const hedgeProbePreferGet = currentConfig.hedgeProbePreferGet !== false;
 			const hedgeProbePath = resolveEffectiveNodeHedgeProbePath(node, currentConfig);
 			const hedgeProbeTimeoutMs = clampIntegerConfig(currentConfig.hedgeProbeTimeoutMs, DEFAULT_HEDGE_PROBE_TIMEOUT_MS, 250, 1e4);
 			const hedgeProbeParallelism = clampIntegerConfig(currentConfig.hedgeProbeParallelism, DEFAULT_HEDGE_PROBE_PARALLELISM, 1, 2);
@@ -18937,6 +18961,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				upstreamTimeoutMs,
 				upstreamRetryAttempts,
 				hedgeFailoverEnabled,
+				hedgeProbePreferGet,
 				hedgeProbePath,
 				hedgeProbeTimeoutMs,
 				hedgeProbeParallelism,
@@ -19962,6 +19987,7 @@ function defineProxyFailoverStateMethods(dependencies = {}, kernel = {}) {
 				orderedTargetSignature,
 				preferredTtlMs,
 				probePath: normalizeHedgeProbePath(execution?.hedgeProbePath, DEFAULT_HEDGE_PROBE_PATH),
+				probePreferGet: execution?.hedgeProbePreferGet !== false,
 				probeTimeoutMs: Math.max(250, Number(execution?.hedgeProbeTimeoutMs) || DEFAULT_HEDGE_PROBE_TIMEOUT_MS),
 				probeParallelism: Math.max(1, Math.min(2, Number(execution?.hedgeProbeParallelism) || DEFAULT_HEDGE_PROBE_PARALLELISM)),
 				waitTimeoutMs: Math.max(250, Number(execution?.hedgeWaitTimeoutMs) || DEFAULT_HEDGE_WAIT_TIMEOUT_MS),
@@ -20099,10 +20125,11 @@ function defineProxyFailoverProbeMethods(dependencies = {}, kernel = {}) {
 			};
 			const startedAt = nowMs();
 			let response = null;
-			let methodUsed = "HEAD";
+			const preferGet = failoverContext?.probePreferGet !== false;
+			let methodUsed = preferGet ? "GET" : "HEAD";
 			try {
-				response = await kernel.performFailoverProbeRequest(execution, probeUrl, "HEAD", probeTimeoutMs, options.parentSignal || null);
-				if (response.status === 405 || response.status === 501) {
+				response = await kernel.performFailoverProbeRequest(execution, probeUrl, methodUsed, probeTimeoutMs, options.parentSignal || null);
+				if (!preferGet && (response.status === 405 || response.status === 501)) {
 					try {
 						response.body?.cancel?.();
 					} catch {}

@@ -136,8 +136,94 @@ function materializeFrontendIndex(templateHtml = '') {
   return composeAdminRuntimeEnhancements(output);
 }
 
+function replaceRequired(source, search, replacement, label) {
+  if (!source.includes(search)) {
+    throw new Error(`admin runtime template 缺少 GET 探测契约片段：${label}`);
+  }
+  return source.replace(search, replacement);
+}
+
+function replaceAllRequired(source, search, replacement, label) {
+  if (!source.includes(search)) {
+    throw new Error(`admin runtime template 缺少 GET 探测契约片段：${label}`);
+  }
+  return source.replaceAll(search, replacement);
+}
+
+function applyHeadProbeContract(outputHtml = '') {
+  let output = String(outputHtml || '');
+  output = replaceAllRequired(output, 'pingTimeout:5e3', 'pingTimeout:1e4', 'GET 默认超时');
+  output = replaceRequired(output, 'pingTimeout:{fallback:5e3,min:1e3,max:18e4}', 'pingTimeout:{fallback:1e4,min:1e3,max:18e4}', 'GET 超时配置边界');
+  output = replaceAllRequired(output, 'Ping \\u8d85\\u65f6', 'GET \\u8d85\\u65f6', 'GET 超时显示名');
+  output = replaceAllRequired(output, 'HEAD \\u6d4b\\u8bd5', 'GET \\u6d4b\\u8bd5', 'GET 测试显示名');
+  output = replaceAllRequired(output, 'HEAD \\u5ef6\\u8fdf', 'GET \\u5ef6\\u8fdf', 'GET 卡片延迟显示名');
+  output = replaceAllRequired(output, '\\u4e00\\u952e GET \\u6d4b\\u8bd5', '\\u5168\\u5c40 GET \\u6d4b\\u8bd5', '节点线路 GET 测试按钮');
+  output = replaceRequired(output, 'nodeModalProbePath:"/emby/system/info/public",', '', '移除节点探测路径状态');
+  output = replaceRequired(
+    output,
+    's="/emby/system/ping"===this.nodeModalProbePath?"/emby/system/ping":"/emby/system/info/public";',
+    's="/emby/system/info/public";',
+    '固定节点 GET 探测路径'
+  );
+  output = replaceAllRequired(
+    output,
+    'hedgeFailoverEnabled:!1,hedgeProbePath:',
+    'hedgeFailoverEnabled:!1,hedgeProbePreferGet:!0,hedgeProbePath:',
+    '故障转移 GET 优先默认值'
+  );
+  output = replaceRequired(
+    output,
+    '"hedgeFailoverEnabled","hedgeProbePath"',
+    '"hedgeFailoverEnabled","hedgeProbePreferGet","hedgeProbePath"',
+    '故障转移 GET 优先允许字段'
+  );
+  output = replaceRequired(
+    output,
+    '"playbackInfoCacheEnabled","videoProgressForwardEnabled","logEnabled"',
+    '"playbackInfoCacheEnabled","videoProgressForwardEnabled","hedgeProbePreferGet","logEnabled"',
+    '故障转移 GET 优先默认真布尔字段'
+  );
+  output = replaceRequired(
+    output,
+    '{key:"hedgeFailoverEnabled",id:"cfg-hedge-failover-enabled",kind:"checkbox",checkboxMode:"strictTrue"},{key:"hedgeProbePath"',
+    '{key:"hedgeFailoverEnabled",id:"cfg-hedge-failover-enabled",kind:"checkbox",checkboxMode:"strictTrue"},{key:"hedgeProbePreferGet",id:"cfg-hedge-probe-prefer-get",kind:"checkbox",checkboxMode:"defaultTrue"},{key:"hedgeProbePath"',
+    '故障转移 GET 优先表单绑定'
+  );
+  output = replaceRequired(
+    output,
+    'hedgeFailoverEnabled:"\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb",hedgeProbePath:',
+    'hedgeFailoverEnabled:"\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb",hedgeProbePreferGet:"\\u6545\\u969c\\u8f6c\\u79fb GET \\u4f18\\u5148",hedgeProbePath:',
+    '故障转移 GET 优先字段名'
+  );
+  output = replaceRequired(
+    output,
+    'statusMeta(){return this.app.getNodeLatencyMeta(this.activeLine?.latencyMs,this.app.getNodeHealthCount(this.node?.name))}',
+    'statusMeta(){return this.app.getNodeProbeMeta(this.activeLine,this.app.getNodeHealthCount(this.node?.name))}',
+    '节点卡片 GET 探测状态'
+  );
+  output = replaceAllRequired(
+    output,
+    'App.formatLatency(r.latencyMs)',
+    'App.formatNodeProbeResult(r)',
+    '节点线路 GET 探测状态'
+  );
+  output = replaceRequired(
+    output,
+    '_withDirectives(_createElementVNode("select",{"onUpdate:modelValue":r=>App.nodeModalProbePath=r,"aria-label":"HEAD \\u63a2\\u6d4b\\u8def\\u5f84",disabled:App.nodeModalPingAllPending,class:"w-full min-w-0 max-w-full rounded-xl sm:w-auto sm:min-w-[220px] border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm text-slate-700 dark:text-slate-200 outline-none focus:border-brand-400 disabled:opacity-60"},[_createElementVNode("option",{value:"/emby/system/info/public"},"/emby/system/info/public"),_createElementVNode("option",{value:"/emby/system/ping"},"/emby/system/ping")],40,["onUpdate:modelValue","disabled"]),[[_vModelSelect,App.nodeModalProbePath]]),',
+    '',
+    '移除节点 GET 探测路径下拉框'
+  );
+  output = replaceRequired(
+    output,
+    '_createElementVNode("span",null,"\\u5f00\\u542f\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb\\u3002")]),_createElementVNode("div",{class:"grid gap-3 lg:grid-cols-2"}',
+    '_createElementVNode("span",null,"\\u5f00\\u542f\\u7ebf\\u8def\\u6545\\u969c\\u8f6c\\u79fb\\u3002")]),_createElementVNode("label",{class:"flex items-start gap-3 text-sm font-medium cursor-pointer text-slate-900 dark:text-white"},[_withDirectives(_createElementVNode("input",{type:"checkbox",id:"cfg-hedge-probe-prefer-get","onUpdate:modelValue":r=>App.settingsForm.hedgeProbePreferGet=r,class:"mt-0.5 w-4 h-4 rounded"},null,8,["onUpdate:modelValue"]),[[_vModelCheckbox,App.settingsForm.hedgeProbePreferGet]]),_createElementVNode("span",null,"\\u4f18\\u5148\\u4f7f\\u7528 GET \\u8bf7\\u6c42\\u65b9\\u5f0f")]),_createElementVNode("div",{class:"grid gap-3 lg:grid-cols-2"}',
+    '故障转移 GET 优先复选框'
+  );
+  return output;
+}
+
 function composeAdminRuntimeEnhancements(outputHtml = '') {
-  const output = String(outputHtml || '')
+  const output = applyHeadProbeContract(outputHtml)
     .replace(
     '},syncSettingsFormFromRuntimeConfig',
     "},syncReleaseSourcePreviewInSettingsForm(){const r=this.settingsForm&&typeof this.settingsForm==='object'?this.settingsForm:{};const o=String(r.githubRepo||r.releaseRepo||r.repo||'').trim();if(o&&r.githubRepo!==o)r.githubRepo=o;return o},syncSettingsFormFromRuntimeConfig"
