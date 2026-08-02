@@ -140,6 +140,12 @@ const multiLinkCopyPanelEnabled = computed(() => {
   const bootstrapConfig = props.adminConsole?.adminBootstrap?.config;
   return settingsConfig?.multiLinkCopyPanelEnabled === true || bootstrapConfig?.multiLinkCopyPanelEnabled === true;
 });
+const hostPrefixProxyEnabled = computed(() => {
+  const settingsConfig = props.adminConsole?.settingsBootstrap?.config;
+  const bootstrapConfig = props.adminConsole?.adminBootstrap?.config;
+  const config = settingsConfig && typeof settingsConfig === 'object' ? settingsConfig : bootstrapConfig;
+  return config?.enableHostPrefixProxy === true;
+});
 
 const filteredNodes = computed(() => {
   const keyword = String(query.value || '').trim().toLowerCase();
@@ -1182,6 +1188,23 @@ function normalizeEntryMode(value = '') {
   return String(value || '').trim().toLowerCase() === 'host_prefix' ? 'host_prefix' : 'kv_route';
 }
 
+function normalizeHostPrefixDnsHostname(value = '') {
+  const rawText = String(value || '').trim().toLowerCase();
+  if (!rawText) return '';
+  const text = rawText.endsWith('.') ? rawText.slice(0, -1) : rawText;
+  if (!text || text.length > 253 || text.endsWith('.')) return '';
+  if (/\s|[:\/@*?#\\]/.test(text)) return '';
+  if (/^(?:\d{1,3}\.){3}\d{1,3}$/.test(text)) {
+    const parts = text.split('.').map(Number);
+    if (parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return '';
+  }
+  const labels = text.split('.');
+  if (labels.some((label) => !label
+    || label.length > 63
+    || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return '';
+  return text;
+}
+
 function normalizeTagColor(value = '') {
   const normalized = String(value || '').trim().toLowerCase();
   return TAG_COLOR_OPTIONS.some((option) => option.value === normalized) ? normalized : '';
@@ -1522,11 +1545,19 @@ function buildNodeCopyEntries(node = {}) {
     });
   };
 
-  const primaryRouteHref = buildNodeRouteHref(nodeName, entryMode, hostDomain.value);
+  const hostPrefixActive = entryMode === 'host_prefix'
+    && hostPrefixProxyEnabled.value
+    && !!normalizeHostPrefixDnsHostname(hostDomain.value);
+  const primaryRouteHref = buildNodeRouteHref(
+    nodeName,
+    hostPrefixActive ? 'host_prefix' : 'kv_route',
+    hostDomain.value,
+    props.adminConsole?.apiBaseUrl
+  );
   if (primaryRouteHref) {
     pushEntry(
       `route-${nodeName}`,
-      entryMode === 'host_prefix' ? 'Host Prefix 入口' : '主域入口',
+      hostPrefixActive ? 'Host Prefix 入口' : '主域入口',
       primaryRouteHref,
       'route',
       hostDomain.value
@@ -1573,11 +1604,17 @@ function buildNodeCopyEntries(node = {}) {
   return entries;
 }
 
-function buildNodeRouteHref(nodeName = '', entryMode = 'kv_route', routeHost = '') {
-  const host = String(routeHost || '').trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
-  if (!host || !nodeName) return '';
-  if (normalizeEntryMode(entryMode) === 'host_prefix') return `https://${nodeName}.${host}`;
-  return `https://${host}/${nodeName}`;
+function buildNodeRouteHref(nodeName = '', entryMode = 'kv_route', routeHost = '', fallbackBaseUrl = '') {
+  const host = normalizeHostPrefixDnsHostname(routeHost);
+  if (!nodeName) return '';
+  if (normalizeEntryMode(entryMode) === 'host_prefix') return host ? `https://${nodeName}.${host}` : '';
+  if (host) return `https://${host}/${nodeName}`;
+  try {
+    const windowOrigin = typeof window === 'undefined' ? '' : window.location?.origin;
+    return `${new URL(String(fallbackBaseUrl || windowOrigin || '')).origin}/${nodeName}`;
+  } catch {
+    return '';
+  }
 }
 
 function canCopyNode(node = {}) {

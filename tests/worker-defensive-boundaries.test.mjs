@@ -2595,6 +2595,264 @@ test("invalid global host-prefix CNAME targets are rejected before persistence",
   }
 });
 
+test("host-prefix node write entrypoints reject incomplete DNS configuration before mutation", async () => {
+  const entrypoints = [
+    {
+      name: "save",
+      invoke(config, context) {
+        return adminActions.saveOrImport({
+          name: "alpha",
+          target: "https://origin.test",
+          entryMode: "host_prefix"
+        }, { ...context, action: "save" });
+      }
+    },
+    {
+      name: "node-import",
+      invoke(config, context) {
+        return adminActions.saveOrImport({
+          nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+        }, { ...context, action: "import" });
+      }
+    },
+    {
+      name: "full-import",
+      invoke(config, context) {
+        return adminActions.importFull({
+          config,
+          nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+        }, context);
+      }
+    }
+  ];
+  const requiredConfig = { cfZoneId: "zone-id", cfApiToken: "api-token" };
+
+  for (const entrypoint of entrypoints) {
+    for (const missingField of ["HOST", "cfZoneId", "cfApiToken"]) {
+      const config = { ...requiredConfig };
+      if (missingField !== "HOST") delete config[missingField];
+      const { kv, storedValues, putKeys, deleteKeys } = createInMemoryKvStore({
+        [kernel.CONFIG_KEY]: config
+      });
+      const env = {
+        ENI_KV: kv,
+        ...(missingField === "HOST" ? {} : { HOST: "proxy.example" }),
+        __CONFIG_CACHE_NAMESPACE: `host-prefix-required-${entrypoint.name}-${missingField}`
+      };
+      invalidateRuntimeConfigCache();
+
+      try {
+        await assert.rejects(
+          entrypoint.invoke(config, { env, ctx: null, kv }),
+          error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+            && error?.status === 400
+            && error?.details?.missingFields?.includes(missingField)
+        );
+        assert.equal(storedValues.has(`${kernel.PREFIX}alpha`), false);
+        assert.deepEqual(putKeys, []);
+        assert.deepEqual(deleteKeys, []);
+      } finally {
+        invalidateRuntimeConfigCache();
+      }
+    }
+  }
+});
+
+test("host-prefix node writes reject malformed HOST without reflecting its value", async () => {
+  const invalidHosts = [
+    "https://proxy.example/",
+    "user@proxy.example",
+    "proxy.example:443",
+    "proxy.example/path",
+    "proxy.example?query=1",
+    "proxy.example#fragment",
+    "*.proxy.example",
+    "proxy_example",
+    "proxy..example",
+    "192.0.2.1"
+  ];
+
+  for (const [index, HOST] of invalidHosts.entries()) {
+    const { kv, storedValues, putKeys } = createInMemoryKvStore({
+      [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+    });
+    const env = {
+      ENI_KV: kv,
+      HOST,
+      __CONFIG_CACHE_NAMESPACE: `host-prefix-invalid-host-${index}`
+    };
+    invalidateRuntimeConfigCache();
+
+    try {
+      await assert.rejects(
+        adminActions.saveOrImport({
+          name: "alpha",
+          target: "https://origin.test",
+          entryMode: "host_prefix"
+        }, { action: "save", env, ctx: null, kv }),
+        error => error?.code === "HOST_PREFIX_HOST_INVALID"
+          && error?.status === 400
+          && error?.details?.field === "HOST"
+          && !Object.values(error.details).includes(HOST)
+      );
+      assert.equal(storedValues.has(`${kernel.PREFIX}alpha`), false);
+      assert.deepEqual(putKeys, []);
+    } finally {
+      invalidateRuntimeConfigCache();
+    }
+  }
+});
+
+test("enabling host-prefix proxy rejects malformed HOST before config persistence", async () => {
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { enableHostPrefixProxy: false, cfZoneId: "zone-id", cfApiToken: "api-token" }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: "https://proxy.example/",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-invalid-host-config-enable"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      kernel.persistRuntimeConfig({
+        enableHostPrefixProxy: true,
+        cfZoneId: "zone-id",
+        cfApiToken: "api-token"
+      }, { env, kv }),
+      error => error?.code === "HOST_PREFIX_HOST_INVALID"
+        && error?.status === 400
+        && error?.details?.field === "HOST"
+    );
+    assert.equal(JSON.parse(storedValues.get(kernel.CONFIG_KEY)).enableHostPrefixProxy, false);
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("host-prefix HOST canonicalization accepts case whitespace and one trailing dot", async () => {
+  const { kv, storedValues } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" }
+  });
+  const env = {
+    ENI_KV: kv,
+    HOST: " Proxy.Example. ",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-host-canonicalization"
+  };
+  const dns = createCloudflareDnsFetch();
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.saveOrImport({
+      name: "alpha",
+      target: "https://origin.test",
+      entryMode: "host_prefix"
+    }, { action: "save", env, ctx: null, kv }));
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "host_prefix");
+    assert.deepEqual(getComparableDnsRecords(dns.records), [{
+      name: "alpha.proxy.example",
+      type: "CNAME",
+      content: "proxy.example",
+      ttl: 1,
+      proxied: false
+    }]);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("partial host-prefix updates require readiness while downgrade remains available", async () => {
+  const { kv, storedValues } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [`${kernel.PREFIX}alpha`]: { target: "https://old-origin.test", entryMode: "host_prefix" }
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-partial-update"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      adminActions.saveOrImport({
+        name: "alpha",
+        originalName: "alpha",
+        target: "https://new-origin.test"
+      }, { action: "save", env, ctx: null, kv }),
+      error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+        && error?.details?.missingFields?.includes("HOST")
+    );
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).target, "https://old-origin.test");
+
+    const response = await adminActions.saveOrImport({
+      name: "alpha",
+      originalName: "alpha",
+      target: "https://new-origin.test",
+      entryMode: "kv_route"
+    }, { action: "save", env, ctx: null, kv });
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "kv_route");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("host-prefix shortcut node mutations require DNS readiness", async () => {
+  const { kv, storedValues, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: { cfZoneId: "zone-id", cfApiToken: "api-token" },
+    [`${kernel.PREFIX}alpha`]: {
+      target: "https://origin.test",
+      entryMode: "host_prefix",
+      mainVideoStreamMode: "inherit"
+    }
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-shortcut-readiness"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    await assert.rejects(
+      adminActions.saveMainVideoStreamPolicyShortcuts({ selectedNodeNames: ["alpha"] }, { env, ctx: null, kv }),
+      error => error?.code === "HOST_PREFIX_DNS_CONFIG_REQUIRED"
+        && error?.details?.missingFields?.includes("HOST")
+    );
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).mainVideoStreamMode, "inherit");
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("full import validates host-prefix nodes with secrets merged from current config", async () => {
+  const currentConfig = { cfZoneId: "zone-id", cfApiToken: "api-token", rateLimitRpm: 10 };
+  const { kv, storedValues } = createInMemoryKvStore({ [kernel.CONFIG_KEY]: currentConfig });
+  const env = {
+    ENI_KV: kv,
+    HOST: "proxy.example",
+    __CONFIG_CACHE_NAMESPACE: "host-prefix-full-import-merged-secrets"
+  };
+  const dns = createCloudflareDnsFetch();
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({ fetch: dns.fetch }, () => adminActions.importFull({
+      config: { cfZoneId: "zone-id", rateLimitRpm: 20 },
+      nodes: [{ name: "alpha", target: "https://origin.test", entryMode: "host_prefix" }]
+    }, { env, ctx: null, kv }));
+    assert.equal(response.status, 200);
+    assert.equal(JSON.parse(storedValues.get(kernel.CONFIG_KEY)).cfApiToken, "api-token");
+    assert.equal(JSON.parse(storedValues.get(`${kernel.PREFIX}alpha`)).entryMode, "host_prefix");
+    assert.equal(getComparableDnsRecords(dns.records)[0]?.name, "alpha.proxy.example");
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("host-prefix CNAME target priority is node then global then HOST", () => {
   const hostRoot = "proxy.example";
   const inheritedNode = { target: "https://origin.test", entryMode: "host_prefix" };

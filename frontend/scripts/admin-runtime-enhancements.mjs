@@ -87,6 +87,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #node-modal [data-admin-node-entry-field="1"] p{margin-bottom:0}
 #node-modal [data-admin-node-stream-field="1"]{min-width:0}
 @media (max-width:767px){#node-modal [data-admin-node-basic-grid="1"],#node-modal [data-admin-node-meta-grid="1"]{grid-template-columns:minmax(0,1fr) !important}}
+@media (max-width:767px){#node-modal [data-admin-node-lines-panel="1"]>div:first-child{align-items:stretch;flex-direction:column}#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:first-child,#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child{width:100%}#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child button{flex:1 1 0;min-width:0}}
 @media (min-width:768px){#node-modal{max-width:72rem}}
 #view-nodes [data-admin-node-toolbar="1"]{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;align-items:start}
 #view-nodes [data-admin-node-toolbar-main="1"]{width:100%;max-width:none;min-width:0}
@@ -216,6 +217,30 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     runtimeLoading: false,
     hotspotLoading: false
   };
+
+  function normalizeHostPrefixDnsHostname(value = '') {
+    const rawText = String(value || '').trim().toLowerCase();
+    if (!rawText) return '';
+    const text = rawText.endsWith('.') ? rawText.slice(0, -1) : rawText;
+    if (!text || text.length > 253 || text.endsWith('.')) return '';
+    if (/\\s|[:\\/@*?#\\\\]/.test(text)) return '';
+    if (/^(?:\\d{1,3}\\.){3}\\d{1,3}$/.test(text)) {
+      const parts = text.split('.').map(Number);
+      if (parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)) return '';
+    }
+    const labels = text.split('.');
+    if (labels.some((label) => !label
+      || label.length > 63
+      || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return '';
+    return text;
+  }
+
+  function isHostPrefixNodeLinkActive(app, node = {}) {
+    const entryMode = String(node?.entryMode || '').trim().toLowerCase();
+    return entryMode === 'host_prefix'
+      && app?.runtimeConfig?.enableHostPrefixProxy === true
+      && !!normalizeHostPrefixDnsHostname(app?.hostDomain);
+  }
 
   function shouldRetainDashboardD1WriteHotspot(hotspot) {
     if (!hotspot || typeof hotspot !== 'object') return false;
@@ -1106,6 +1131,31 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         const source = String(form.githubRepo || form.releaseRepo || form.repo || '').trim();
         if (source && form.githubRepo !== source) form.githubRepo = source;
         return source;
+      };
+    }
+
+    if (typeof app.buildNodeLinkPath === 'function') {
+      const buildNodeLinkPath = app.buildNodeLinkPath.bind(app);
+      app.isHostPrefixNodeLinkActive = function isHostPrefixNodeLinkActiveForApp(node = {}) {
+        return isHostPrefixNodeLinkActive(this, node);
+      };
+      app.buildHostPrefixNodeOrigin = function buildEffectiveHostPrefixNodeOrigin(node = {}) {
+        const nodeName = String(node?.name || '').trim().toLowerCase();
+        const host = normalizeHostPrefixDnsHostname(this.hostDomain);
+        return nodeName && host ? 'https://' + nodeName + '.' + host : '';
+      };
+      app.buildNodeLink = function buildEffectiveNodeLink(node = {}, kind = 'main') {
+        const normalizedNode = node && typeof node === 'object' ? node : {};
+        const hostPrefixActive = this.isHostPrefixNodeLinkActive(normalizedNode);
+        if (hostPrefixActive) {
+          const origin = this.buildHostPrefixNodeOrigin(normalizedNode);
+          if (origin) {
+            const path = buildNodeLinkPath(normalizedNode, kind);
+            return path ? origin + path : origin;
+          }
+        }
+        const pathNode = hostPrefixActive ? normalizedNode : { ...normalizedNode, entryMode: 'kv_route' };
+        return String(window.location?.origin || '') + buildNodeLinkPath(pathNode, kind);
       };
     }
 

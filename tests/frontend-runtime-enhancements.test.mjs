@@ -8,6 +8,7 @@ import {
   isForbiddenRuntimeAsset
 } from '../frontend/scripts/check-cdn-paths.mjs';
 import {
+  ADMIN_RUNTIME_ENHANCEMENT_STYLE,
   ADMIN_RUNTIME_ENHANCEMENT_SCRIPT
 } from '../frontend/scripts/admin-runtime-enhancements.mjs';
 import {
@@ -22,7 +23,7 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
   const closureEnd = inlineScript.lastIndexOf('})();');
   assert.notEqual(closureEnd, -1, 'enhancement script must use the expected closure');
   const instrumentedScript = inlineScript.slice(0, closureEnd)
-    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, normalizeHeadProbeResult, formatHeadProbeResult };\n'
+    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, normalizeHeadProbeResult, formatHeadProbeResult, normalizeHostPrefixDnsHostname, isHostPrefixNodeLinkActive };\n'
     + inlineScript.slice(closureEnd);
   const window = {
     addEventListener() {},
@@ -58,6 +59,66 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
 
 test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
+});
+
+test('host-prefix node links follow the effective runtime mode and strict hostname', async () => {
+  const { normalizeHostPrefixDnsHostname, patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
+    location: { origin: 'https://proxy.example' }
+  });
+  assert.equal(normalizeHostPrefixDnsHostname(' Proxy.Example. '), 'proxy.example');
+  for (const invalidHost of [
+    'https://proxy.example/',
+    'proxy.example:443',
+    'proxy.example/path',
+    'proxy_example',
+    '*.proxy.example',
+    '192.0.2.1',
+    'proxy..example'
+  ]) {
+    assert.equal(normalizeHostPrefixDnsHostname(invalidHost), '', invalidHost);
+  }
+
+  const app = {
+    hostDomain: 'proxy.example',
+    runtimeConfig: { enableHostPrefixProxy: true },
+    buildNodeLinkPath(node, kind = 'main') {
+      const variant = kind === 'main' ? '' : '/' + kind;
+      return node.entryMode === 'host_prefix' ? variant : '/' + node.name + variant;
+    }
+  };
+  patchSafetyContractMethods(app);
+  const node = { name: 'alpha', entryMode: 'host_prefix' };
+
+  assert.equal(app.buildNodeLink(node), 'https://alpha.proxy.example');
+  assert.equal(app.buildNodeLink(node, 'proxy_a'), 'https://alpha.proxy.example/proxy_a');
+
+  app.runtimeConfig.enableHostPrefixProxy = false;
+  assert.equal(app.buildNodeLink(node), 'https://proxy.example/alpha');
+  assert.equal(app.buildNodeLink(node, 'proxy_b'), 'https://proxy.example/alpha/proxy_b');
+
+  app.runtimeConfig.enableHostPrefixProxy = true;
+  app.hostDomain = 'https://proxy.example/';
+  assert.equal(app.buildNodeLink(node), 'https://proxy.example/alpha');
+
+  const nodesPanel = await readFile(new URL('../frontend/src/features/nodes/NodesPanel.vue', import.meta.url), 'utf8');
+  assert.match(nodesPanel, /const hostPrefixProxyEnabled = computed/);
+  assert.match(nodesPanel, /hostPrefixActive \? 'Host Prefix 入口' : '主域入口'/);
+  assert.match(nodesPanel, /normalizeHostPrefixDnsHostname\(hostDomain\.value\)/);
+});
+
+test('node line editor stacks its heading and actions on mobile', () => {
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /@media \(max-width:767px\)\{#node-modal \[data-admin-node-lines-panel="1"\]>div:first-child\{align-items:stretch;flex-direction:column\}/
+  );
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /\[data-admin-node-lines-panel="1"\]>div:first-child>div:last-child\{width:100%\}/
+  );
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /\[data-admin-node-lines-panel="1"\]>div:first-child>div:last-child button\{flex:1 1 0;min-width:0\}/
+  );
 });
 
 test('settings dirty tracking compares normalized state without JSON serialization', async () => {

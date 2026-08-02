@@ -1552,8 +1552,17 @@ function buildDnsIpWorkspaceSummary(currentHostItems = [], sharedPoolItems = [])
 }
 //#endregion
 //#region worker/features/dns/hostname-model.js
+function normalizeHostPrefixDnsHostname(value = "") {
+	const rawText = String(value || "").trim().toLowerCase();
+	if (!rawText) return "";
+	const text = rawText.endsWith(".") ? rawText.slice(0, -1) : rawText;
+	if (!text || text.length > 253 || text.endsWith(".")) return "";
+	if (/\s|[:\/@*?#\\]/.test(text) || isValidIpv4Address(text) || isValidIpv6Address(text)) return "";
+	if (text.split(".").some((label) => !isValidDnsLabelForHostPrefix(label))) return "";
+	return text;
+}
 function resolveConfiguredHost(env) {
-	return normalizeHostnameText(env?.HOST);
+	return normalizeHostPrefixDnsHostname(env?.HOST);
 }
 function resolveConfiguredLegacyHost(env) {
 	return normalizeHostnameText(env?.LEGACY_HOST);
@@ -1732,23 +1741,35 @@ function assertAdminIndexSourceConfigValid(rawConfig = {}) {
 	throw createStructuredConfigError("ADMIN_INDEX_SOURCE_UPLOAD_ONLY", "管理台 HTML 仅支持本地上传，请通过启动门或 Worker 和 HTML 更新面板提交 index.html", 400, { field: "indexUrl" });
 }
 function buildHostPrefixRuntimeRequirementState(config = {}, env = null) {
+	const rawHost = String(env?.HOST || "").trim();
 	const host = resolveConfiguredHost(env);
 	const cfZoneId = String(config?.cfZoneId || "").trim();
 	const cfApiToken = String(config?.cfApiToken || "").trim();
 	const missingFields = [];
-	if (!host) missingFields.push("HOST");
+	const invalidFields = [];
+	if (!rawHost) missingFields.push("HOST");
+	else if (!host) invalidFields.push("HOST");
 	if (!cfZoneId) missingFields.push("cfZoneId");
 	if (!cfApiToken) missingFields.push("cfApiToken");
 	return {
 		host,
 		cfZoneId,
 		cfApiToken,
-		missingFields
+		missingFields,
+		invalidFields
 	};
+}
+function assertHostPrefixRuntimeHostValid(requirementState = {}) {
+	if (!Array.isArray(requirementState?.invalidFields) || !requirementState.invalidFields.includes("HOST")) return;
+	throw createStructuredConfigError("HOST_PREFIX_HOST_INVALID", "HOST 必须是合法 DNS 主机名，不能包含协议、用户信息、端口、路径、通配符、下划线、空标签或 IP 地址", 400, {
+		field: "HOST",
+		reason: "invalid_hostname"
+	});
 }
 function assertHostPrefixProxyConfigReady(config = {}, env = null) {
 	if (config?.enableHostPrefixProxy !== true) return;
 	const requirementState = buildHostPrefixRuntimeRequirementState(config, env);
+	assertHostPrefixRuntimeHostValid(requirementState);
 	if (requirementState.missingFields.length <= 0) return;
 	throw createStructuredConfigError("HOST_PREFIX_PROXY_CONFIG_REQUIRED", "启用域名前缀代理前，必须先配置 HOST、Cloudflare Zone ID 和 API 令牌", 400, {
 		missingFields: requirementState.missingFields,
@@ -1757,11 +1778,17 @@ function assertHostPrefixProxyConfigReady(config = {}, env = null) {
 }
 function assertHostPrefixDnsSyncReady(config = {}, env = null) {
 	const requirementState = buildHostPrefixRuntimeRequirementState(config, env);
+	assertHostPrefixRuntimeHostValid(requirementState);
 	if (requirementState.missingFields.length <= 0) return requirementState;
 	throw createStructuredConfigError("HOST_PREFIX_DNS_CONFIG_REQUIRED", "保存域名前缀节点前，必须先配置 HOST、Cloudflare Zone ID 和 API 令牌", 400, {
 		missingFields: requirementState.missingFields,
 		host: requirementState.host
 	});
+}
+function assertPreparedHostPrefixDnsSyncReady(mutations = [], config = {}, env = null) {
+	const list = Array.isArray(mutations) ? mutations : [mutations];
+	if (!list.some((mutation) => isHostPrefixEntryMode(mutation?.nextNode?.entryMode))) return null;
+	return assertHostPrefixDnsSyncReady(config, env);
 }
 //#endregion
 //#region worker/features/proxy/constants.js
@@ -9059,6 +9086,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					savedNodeNames.push(name);
 				}
 				if (action === "save" && savedNodeNames.length === 0) return jsonError("INVALID_TARGET", "目标源站必须是有效的 http/https URL");
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, runtimeConfig, env);
 				const shouldRebuildIndexes = savedNodeNames.length > 0 || renameMap.size > 0;
 				let nodeMutationCommitted = false;
 				let configRollbackState = null;
@@ -9147,7 +9175,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 		async saveMainVideoStreamPolicyShortcuts(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_UNAVAILABLE", "KV 未绑定或不可用", 500);
 			return await runKvDataMutation(kv)(async () => {
-				const currentNodes = await kernel.loadAllNodeEntitiesFromKv(kv, { ctx });
+				const currentNodes = await kernel.loadAllNodeEntitiesFromKvStrict(kv, { ctx });
 				const allowedNames = Array.isArray(currentNodes) ? currentNodes.map((node) => node?.name) : [];
 				const selectedNodeNames = reconcileNamedNodeSelection(data?.selectedNodeNames || [], { allowedNames });
 				const selectedKeys = new Set(selectedNodeNames.map((name) => String(name || "").trim().toLowerCase()).filter(Boolean));
@@ -9184,6 +9212,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						updatedNodeCount += 1;
 					}
 				}
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, currentConfig, env);
 				const shouldSyncConfig = serializeConfigValue(currentConfig.sourceDirectNodes || []) !== serializeConfigValue(selectedNodeNames);
 				const configRollbackState = updatedNodeCount > 0 || shouldSyncConfig ? await kernel.captureRuntimeConfigRollbackState(env, kv) : null;
 				let rebuiltState = null;
@@ -9313,6 +9342,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					});
 					preparedMutations.push(mutation);
 				}
+				assertPreparedHostPrefixDnsSyncReady(preparedMutations, nodeDnsConfig, env);
 				let savedConfig = null;
 				let nodeMutationCommitted = false;
 				try {
