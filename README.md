@@ -5,17 +5,17 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-V18.7-2563eb">
+  <img alt="version" src="https://img.shields.io/badge/version-V19.3-2563eb">
   <img alt="platform" src="https://img.shields.io/badge/platform-Cloudflare%20Workers-orange">
   <img alt="storage" src="https://img.shields.io/badge/storage-KV%20%2B%20D1-green">
   <img alt="ui" src="https://img.shields.io/badge/panel-SaaS%20UI-purple">
 </p>
 
-> 一个单文件 `worker.js` 项目：统一多台 Emby 节点入口、隐藏源站 IP、支持直连/反代混合策略、提供 `ADMIN_PATH`（默认 `/admin`）可视化后台，并集成日志、Cloudflare 统计、Telegram 日报与控制面 / 数据面分层优化。
+> 一个以 `worker/` 为生产源码、以根目录 `worker.js` 为单文件部署产物的 Cloudflare Worker 项目：统一多台 Emby 节点入口、隐藏源站 IP、支持直连/反代混合策略、提供 `ADMIN_PATH`（默认 `/admin`）可视化后台，并集成日志、Cloudflare 统计、Telegram 日报与控制面 / 数据面分层优化。
 
-> 当前版本的全局设置页已支持新手 / 高手模式切换、设置变更快照、全局设置专用迁移，以及“系统 UI / 代理与网络 / 静态资源策略 / 安全防护 / 日志设置 / 监控告警 / 账号设置 / 备份与恢复”分区导航；同时继续保留控制面 / 数据面分层、缓存键清洗、转码 `m3u8` 禁缓存、Geo 白/黑名单模式切换等优化。
+> 当前 **V19.3** 在原有新手 / 高手设置模式、配置快照和分区导航基础上，进一步加入节点配置资源上限、全局 GET 探测并发池、元数据预热字节预算、播放列表 / 分片空闲超时，以及带签名预览和硬预算的 D1 整理流程；同时继续保留控制面 / 数据面分层、缓存键清洗、转码 `m3u8` 禁缓存、Geo 白/黑名单模式切换等优化。
 
-  ![img](https://web.axuitomo.qzz.io/api/p/img/github/PixPin_2026-03-22_18-24-20.png?sign=Ow%2Bn2Ua6AigS4Iu%2BSC9wdh%2BO6%2FbxpAY%2BEgA4I0l4DkQ%3D%3A0&ts=1774175139379)
+  ![img](https://web.axuitomo.qzz.io/api/p/img/github/PixPin_2026-08-03_14-00-35.png?download=true&sign=TltPfTfUurzkQ5FsY4rpQ1Wd%2Bwu1Oji3rC%2FVo2NbV%2BM%3D%3A0)
 
 
  - 讨论群：https://t.me/+NhDf7qMxH4ZlODY9
@@ -57,7 +57,7 @@
 - 提供带 UI 的管理后台，而不是纯手改配置
 - 实现“反代 + 直连”混合路由
 
-项目当前版本在单文件内集成了以下模块：认证、KV/D1 数据管理、代理主链路、日志、可视化控制台、定时任务入口。代码头部也明确将其定义为单文件部署架构。 
+项目当前版本由模块化 Worker 源码和同源管理端组成：`worker/index.js` 是唯一生产入口，`worker/` 内按 core、runtime 和代理功能域组织源码，构建后生成根目录 `worker.js` 单文件部署产物；管理端则由 `frontend/admin-runtime.template.html` 与 `frontend/scripts/admin-runtime-enhancements.mjs` 组合，经 Vite 输出到 `frontend/dist/index.html`，再由 Wrangler Static Assets 与 Worker 一起部署。
 
 ---
 
@@ -66,14 +66,16 @@
 ### 1) 可视化管理
 - 后台地址：`ADMIN_PATH`（默认 `/admin`）
 - 支持节点新增、编辑、删除、导入、导出
-- 支持全局 Ping / 健康检查
+- 支持全局 GET / 健康检查，批量探测固定最多 4 个并发请求
 - 支持仪表盘展示请求量、运行状态、流量趋势、资源分类徽章
 - 支持 DNS 编辑双模式：`CNAME模式` / `A模式` 可切换，保存时自动处理互斥关系
 - 支持推荐优选域名卡片、DNS 历史卡片回填，以及 DNS 实用链接快捷跳转
 - 支持全局设置新手 / 高手模式切换，默认新手模式隐藏高风险高级项
 - 支持冷启动初始化自检，缺少 `JWT_SECRET` / `ADMIN_PASS` 时直接在控制台与页面提示
 - 支持“一键整理 KV 数据”，用于修复旧版本升级后 `sys:theme` 脏值、`sys:nodes_index` 错乱与遗留缓存键
+- 支持预览后整理 KV / D1；D1 整理使用签名计划令牌与单轮硬预算，达到预算后可再次预览继续执行
 - 支持设置变更快照、全局设置专用迁移与完整备份
+- 节点保存和批量导入会校验 Worker 资源上限；超限导入整批拒绝，旧版超限节点仍可读取和代理但不进入热缓存或自动回写
 
 ### 2) 智能代理与分流
 - 默认由 Worker 透明中继请求与响应
@@ -86,21 +88,24 @@
 - 静态资源、封面、字幕与视频流分开处理
 - 大视频流不在 Worker 内做对象缓存，响应缓存头尽量沿用源站 / Cloudflare 数据面策略
 - 支持轻量级元数据预热（海报 / 白名单 `.m3u8` / 字幕），不在 Worker 内做视频 Range 旁路预取或大对象缓存
-- 轻量级元数据预热自带快速熔断，源站 3 秒内无响应就直接放弃预热
+- 轻量级元数据预热自带快速熔断、同键 single-flight 与最多 4 个在途任务；源站 3 秒内无响应就直接放弃预热
+- 预热预取字节预算默认 4 MiB、最高 8 MiB，超出声明或流式预算时会主动取消响应体
 - Worker 元数据缓存键会自动清洗 Token、设备号、播放会话等噪声参数，提升跨用户命中率
 - 转码 `m3u8` 与非白名单播放列表不会写入 Worker 缓存
 - 视频主字节流尽量交给 Cloudflare 原生网关、Range 断点续传与 Cache Rules 处理
+- Worker 管理的播放列表和媒体分片响应分别使用 12 秒、15 秒流空闲超时，客户端取消时同步释放上游读取和计时器
 - 支持 WebSocket 透明转发
 - 支持 Emby / Jellyfin 媒体授权头兼容与安全同步，并可按节点显式指定上游类型
 - 支持节点级真实客户端 IP 透传控制，便于兼容按来源 IP 风控的特殊上游
 
 ### 4) 安全与可观测性
-- 登录失败次数限制，达到阈值自动锁定 15 分钟
+- 绑定 D1 时按 IP 记录登录失败；连续失败 5 次后锁定 15 分钟
 - 支持自定义管理路径 `ADMIN_PATH`，降低固定 `/admin` 扫描命中率
 - 国家/地区白名单 / 黑名单模式切换
 - IP 黑名单
 - 单 IP 请求限速（按分钟）
-- 日志写入 D1、运行状态优先写入 D1 `sys_status`（KV 兜底）、定时清理、Telegram 每日报表
+- 日志写入 D1、运行状态写入 D1 `sys_status`、定时清理、Telegram 每日报表
+- D1 整理按每批 500 行执行，单轮最多处理 10000 行或运行 25 秒；预览计数超过 10000 时显示下界，日志量过大时延后 FTS 自动重建
 - DNS 修改属于敏感操作，管理 API 需要显式确认头；当前 UI 主链路按“站点级草稿 -> 保存时统一同步”执行
 - 支持 Cloudflare GraphQL 仪表盘统计与本地 D1 兜底统计
 
@@ -129,8 +134,8 @@ flowchart LR
 
 | 模块 | 说明 |
 |---|---|
-| 后台认证 | JWT 登录态，密码错误累计锁定 |
-| 节点管理 | 节点增删改查、导入导出、备注/标签/密钥 |
+| 后台认证 | JWT 登录态；绑定 D1 时启用按 IP 的密码错误累计锁定 |
+| 节点管理 | 节点增删改查、导入导出、备注/标签/密钥、4 并发 GET 健康探测、资源上限校验 |
 | 路由模式 | 透明反代、同源跳转继续代理、源站直连节点 |
 | 外链策略 | 强制反代外部链接 / 直接下发 Location |
 | 网盘直连 | `wangpandirect` 关键词模糊匹配 |
@@ -138,7 +143,7 @@ flowchart LR
 | 安全 | Geo 白名单/黑名单模式、IP 黑名单、单 IP 限速、真实客户端 IP 透传模式 |
 | 兼容补丁 | `Authorization` / `X-Emby-Authorization` / `X-MediaBrowser-Authorization` 兼容 |
 | 协议优化 | H1/H2/H3 开关、晚高峰自动降级、403 重试 |
-| 日志监控 | D1 请求日志、清理任务、Telegram 日报 |
+| 日志监控 | D1 请求日志、签名预览与预算整理、Telegram 日报 |
 | 仪表盘 | Cloudflare GraphQL 聚合 + D1 本地兜底 |
 | 设置中心 | 新手/高手模式、分区导航、设置快照、专用迁移 |
 | 连接能力 | HTTP(S) + WebSocket |
@@ -214,7 +219,7 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 | 变量名 / 绑定名称 | 类型 | 作用说明 | 配置示例 / 建议 |
 | :--- | :--- | :--- | :--- |
-| **`ENI_KV`** | KV 绑定 | **核心数据存储**。用于持久化保存项目主配置、节点信息、失败计数统计以及登录锁定状态等。 | 绑定你创建的 KV 命名空间（例如：`EMBY_DATA`）。 |
+| **`ENI_KV`** | KV 绑定 | **核心配置存储**。用于持久化保存项目主配置、节点信息、配置快照和 DNS 修改历史等。 | 绑定你创建的 KV 命名空间（例如：`EMBY_DATA`）。 |
 | **`ADMIN_PASS`** | 加密变量 (Secret) | **后台登录密码**。用于验证管理面板的访问权限。 | `MyStrongPassword123` |
 | **`JWT_SECRET`** | 加密变量 (Secret) | **安全会话密钥**。用于生成和校验后台登录状态 (JWT)，防止越权访问。 | 建议填入一段高强度的随机长字符串。 |
 
@@ -224,8 +229,10 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 | 变量名 / 绑定名称 | 类型 | 作用说明 | 配置示例 / 建议 |
 | :--- | :--- | :--- | :--- |
-| **`DB`** | D1 绑定 | **日志数据库**。绑定后可开启请求日志审计、流量统计及自动化日报功能。 | 绑定你创建的 D1 数据库。 |
+| **`DB`** | D1 绑定 | **运行数据库**。保存请求日志、聚合统计、运行状态、任务锁、缓存和认证失败计数等数据。 | 绑定你创建的 D1 数据库。 |
 | **`ADMIN_PATH`** | 文本变量 (Var) | **自定义管理入口**。用于修改默认的 `/admin` 路径，有效防范自动化扫描工具的嗅探。 | `/secret_portal_99`<br>\> ⚠️ **注意**：不能以 `/api` 开头。 |
+| **`HOST`** | 文本变量 (Var) | **主访问域名**。启用 host prefix 代理或保存 host prefix 节点前必须配置；只填写合法 DNS 主机名。 | `emby.example.com`，不要带协议、端口、路径、通配符或 IP。 |
+| **`LEGACY_HOST`** | 文本变量 (Var) | **兼容旧访问域名**。迁移主域名时保留旧的路径式节点入口。 | `old-emby.example.com` |
 
 > 💡 **命名兼容性提示**：
 > 核心代码已向下兼容多种旧版命名（如 `KV` / `EMBY_KV` / `EMBY_PROXY` 会自动映射为 `ENI_KV`，`D1` / `PROXY_LOGS` 会映射为 `DB`）。但**强烈建议在新部署时统一使用 `ENI_KV` 和 `DB`**，以确保与后续的更新、README 说明及自动化脚本保持一致。
@@ -234,7 +241,7 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 ### 二、 SaaS 面板进阶配置（后台 UI 填写）
 
-项目部署成功并登录管理后台后，可在\*\*“全局设置”\*\*中配置以下进阶参数。这些参数最终会安全地加密存储在 `ENI_KV` 中。
+项目部署成功并登录管理后台后，可在\*\*“全局设置”\*\*中配置以下进阶参数。这些参数经后端清洗后以 JSON 写入 `ENI_KV` 的 `sys:theme`；`cfApiToken`、`tgBotToken` 不会写入配置快照，普通备份导出也会默认移除它们，只有经过二次确认的“含密钥”导出才会包含。主配置本身不是静态加密密文，请严格限制 KV 和管理后台的访问权限。
 
 | 参数分类 | 参数名 | 作用说明 |
 | :--: | :--- | :--- |
@@ -295,6 +302,8 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 2. 创建后进入 **Edit code**
 3. 将 `worker.js` 全量替换进去并部署
 
+> 这种方式只部署 Worker 单文件，不会自动上传 `frontend/dist` 或创建 `ASSETS` 绑定。基础代理和管理 API 可以运行，但要使用仓库内置的完整管理端，请优先选择方式 B / C；否则还需要自行配置并上传管理端 HTML。
+
 #### 方式 B：通过 Cloudflare 连接 GitHub 自动部署
 1. 先将当前项目Fork到你自己的 GitHub 仓库
 2. 先打开仓库根目录的 `wrangler.toml`
@@ -314,10 +323,10 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 9. 把修改后的 `wrangler.toml` 提交并推送到你自己的 GitHub 仓库
 10. 在 Cloudflare 中进入 **Workers 和 Pages**，选择连接 GitHub 仓库创建 Worker
 11. 选择本仓库后，保持仓库根目录为部署根目录，然后执行首次部署
-12. Cloudflare 会读取仓库内的 `wrangler.toml`，并以 `worker.js` 作为入口文件
+12. Cloudflare 会读取仓库内的 `wrangler.toml`：构建命令从 `worker/` 生成 `worker.js`，并把仓库中的 `frontend/dist` 作为 `ASSETS` 静态资源随 Worker 上传
 13. 首次部署完成后，后续只要你向已绑定分支 `push` 新提交，Cloudflare 就会自动拉取最新代码并重新部署
 
-> 仓库中的 `wrangler.toml` 现在同时声明 Worker 入口、兼容日期以及 KV / D1 绑定信息；部署前请先把占位符替换成你自己的实际值。
+> 仓库中的 `wrangler.toml` 同时声明 Worker 入口、构建命令、`frontend/dist` 静态资源、兼容日期以及 KV / D1 绑定信息；部署前请先把占位符替换成你自己的实际值。Cloudflare Git 部署会使用仓库已提交的 `frontend/dist`，因此修改管理端源码后要先按仓库脚本重新构建并提交生成物。
 
 完成方式 B 部署后，可以继续跳转到 **第五步：设置环境变量**。
 
@@ -341,11 +350,11 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
    - `CLOUDFLARE_ACCOUNT_ID`：你的 Cloudflare Account ID
    - `CLOUDFLARE_API_TOKEN`：使用 **Edit Cloudflare Workers** 模板创建的 API Token
 10. 将仓库中的 [deploy-worker.yml](./.github/workflows/deploy-worker.yml) 提交并推送到 `main` 或 `master` 分支
-11. 对于当前这种纯 `worker.js` + `wrangler.toml` 结构，GitHub Actions 会直接调用 Wrangler 部署到 Cloudflare Workers
+11. GitHub Actions 会使用 Node 24 执行 `npm ci` 和 `npm run build:frontend`，随后由 Wrangler 按 `wrangler.toml` 构建 `worker.js`，并将 Worker 与 `frontend/dist` 一起部署到 Cloudflare Workers
 12. 如果你的默认部署分支不是 `main` 或 `master`，请先修改 `.github/workflows/deploy-worker.yml` 里的 `branches` 配置
 13. 首次部署后，后续每次向已配置分支 `push` 新提交，GitHub Actions 都会自动重新部署
 
-> 方式 C 不依赖 Cloudflare 的 Git 仓库集成，而是由 GitHub Actions 直接读取仓库根目录的 `worker.js` 和 `wrangler.toml` 完成部署；如果你更希望把部署权限收敛在 GitHub Secrets 中，这种方式会更合适。
+> 方式 C 不依赖 Cloudflare 的 Git 仓库集成，而是由 GitHub Actions 按仓库脚本构建管理端与 Worker，再读取 `wrangler.toml` 完成部署；如果你更希望把部署权限收敛在 GitHub Secrets 中，这种方式会更合适。
 
 完成方式 C 部署后，可以继续跳转到 **第五步：设置环境变量**。
 
@@ -379,7 +388,7 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 1. 打开 Worker 的 **Triggers**
 2. 添加一个 **Cron Trigger**
-3. 例如可先使用每天一次的表达式：`0 1 * * *`
+3. 仓库 `wrangler.toml` 的默认表达式为 `0 * * * *`，即每小时执行一次
 4. 保存后等待 Cloudflare 全球传播生效
 
 > Cloudflare 官方文档说明：注意Cron Trigger 使用 UTC，而中国时区是UTC+8,免费计划最多 5 个、付费计划最多 250 个；单次 Cron 执行最长 15 分钟。
@@ -440,9 +449,9 @@ Worker选择：Worker 一栏选择你第一步创建的那个Worker
 
 如果你想快速理解当前版本里最容易看花眼的部分，建议按下面顺序阅读：
 
-- [全局设置功能文档](./全局设置功能文档.md)：面向小白解释后台“全局设置”每一栏是干什么的、什么时候该改、什么时候别乱动
-- [设置绑定词典](./worker-config-form-dictionary.md)：记录设置字段与界面输入框、默认值、加载/保存规则的对应关系
-- [主流程图](./worker-flow.md)：从 `fetch / scheduled` 入口看整条请求链路怎么分发
+- [仓库文档索引](./docs/README.md)：按任务查找架构、开发、构建和验证文档
+- [当前项目架构](./docs/architecture.md)：说明 Worker 请求生命周期、源码分层、管理端投递链和 KV / D1 边界
+- [开发、构建与验证](./docs/development.md)：说明源码与生成物关系、常用命令、测试范围和发布前顺序
 
 ---
 
@@ -463,7 +472,7 @@ https://你的域名/secret_portal_99
 
 ### 后台主要页面
 - **仪表盘**：展示请求量、流量趋势、资源类别、运行状态、定时任务状态，按需手动刷新
-- **节点管理**：搜索节点、导入/导出配置、全局 Ping
+- **节点管理**：搜索节点、导入/导出配置、单节点或全局 GET 健康探测
 - **日志记录**：按日期范围查询请求记录、初始化 DB、手动清理
 - **DNS 编辑**：当前站点 DNS 草稿编辑、推荐优选域名、历史记录回填、实用链接
 - **设置页**：系统 UI、代理与网络、静态资源策略、安全防护、日志设置、监控告警、账号设置、备份与恢复
@@ -492,9 +501,11 @@ https://你的域名/secret_portal_99
 - HTTP/3 QUIC 开关
 - 晚高峰自动降级到 HTTP/1.1
 - 403 重试与协议回退
+- host prefix 代理开关（启用前必须配置 `HOST`、Cloudflare Zone ID 与 API Token）
 - 轻量级元数据预热
 - 元数据预热缓存时长
 - 预热深度（仅海报 / 海报+索引）
+- 预热预取字节数（默认 4 MiB，最高 8 MiB）
 - 静态文件直连
 - HLS / DASH 直连
 - HLS / DASH 直连命中时，播放列表与分片自动走 307 数据面直传
@@ -551,11 +562,12 @@ https://你的域名/secret_portal_99
 - 导入全局设置 / 导出全局设置（仅 settings，不含节点）
 - 全局设置专用迁移在导入时会整体替换当前 settings，未包含字段回退为默认值
 - 导入完整备份 / 导出完整备份（节点 + 全局设置）
-- 一键整理 KV 数据（高手模式；手动修复 + CRON 一小时自动兜底）
+- 一键整理 KV / D1 数据（高手模式；先生成预览，再使用签名计划执行；CRON 每小时自动兜底）
 
 #### 全局设置上限说明
 - 元数据预热缓存时长：0 到 3600 秒；只作用于 `m3u8 / 字幕` 等轻量索引，不直接缓存视频主字节流。
 - 预热深度：当前支持“仅预热海报”和“预热海报+索引”两档。
+- 预热预取字节数：0 到 8388608 字节；默认 4194304 字节（4 MiB），用于限制单次后台预热的累计读取预算。
 - 静态资源缓存时长：0 到 365 天，统一作用于海报、封面、字幕及前端静态资源策略入口。
 - HLS / DASH 直连与元数据预热联动：开启“HLS / DASH 直连”后，命中的播放列表与分片直接走 307 数据面直传；海报与字幕仍可按当前策略预热。
 - Cloudflare Cache Rules：建议在视频路径上额外配置 “Ignore query string”，让不同用户的不同 Token 指向同一缓存实体。
@@ -592,6 +604,14 @@ https://你的域名/hk/123
 
 客户端只需要把原本的 Emby 源站地址替换成节点地址即可。
 
+### 节点配置资源上限
+
+- 单个节点序列化后最多 256 KiB，最多包含 32 条线路。
+- 自定义请求头最多 64 个、总计最多 64 KiB；单个请求头名称最多 128 字节，单个值最多 8 KiB。
+- `displayName`、`remark`、`tag`、颜色、密钥、Host 前缀目标、探测路径、标签项以及线路 `id / name / target` 等单项文本最多 4 KiB。
+- 新增、保存或导入超限节点时返回 `NODE_RESOURCE_LIMIT_EXCEEDED`；批量导入会在写 KV 前整批校验，任一节点超限都不会产生部分写入。
+- 旧版本遗留的超限节点仍可读取和代理，管理端会明确警告，但 Worker 不会把它放入节点 / 播放路由热缓存，也不会在整理时自动回写。
+
 ---
 
 ## 缓存与性能设计
@@ -608,17 +628,20 @@ https://你的域名/hk/123
 - **Worker Cache Key**：会主动剥离 Token、设备号、客户端版本、播放会话等与媒体二进制无关的 Emby 状态参数
 - **Cloudflare `cf` 提示**：只有字幕这类轻资源才会在回源 `fetch` 时显式附加 `cf.cacheEverything + cacheTtl`；其余请求不会下发 `cacheTtl: 0` 去覆盖 Dashboard Cache Rules
 - **起播探测请求**：保留短时微缓存，减轻源站压力
+- **受管流式响应**：播放列表连续 12 秒、媒体分片连续 15 秒未读取到新数据时会中止上游流并记录 `idle_timeout`；客户端取消也会同步释放读取器和计时器
 
 ### 3. 轻量级元数据预热
 - 预热目标：海报、白名单 `.m3u8` / `.mpd`、字幕等“导火索”资源
 - 预热方式：通过 `ctx.waitUntil` 异步拉取并写入 `caches.default`
 - 熔断策略：后台预热默认 `3 秒` 内拿不到响应就主动 `abort`，避免慢源站拖垮 Worker 后台连接池
+- 并发策略：相同缓存键会加入已有 single-flight，整个 isolate 同时最多保留 4 个不同预热任务
+- 字节预算：默认累计读取 4 MiB、可配置上限 8 MiB；响应声明大小或实际流式读取超过剩余预算时会主动取消
 - 禁区：一旦识别为视频主字节流后缀，立即停止预热，不额外消耗 Worker 内存与 CPU
 - 转码保护：包含 `Transcoding` 参数的 `m3u8`、或不在白名单路径内的播放列表，不会写入 Worker 缓存
 
 ### 4. 上传与重试策略
 - 非 `GET/HEAD` 请求不会一律做内存缓冲重试。
-- 只有当 `Content-Length` 明确存在且不超过 `2 MB` 时，Worker 才会把请求体缓冲到内存里，便于安全重试。
+- 只有当 `Content-Length` 明确存在且不超过 `256 KiB` 时，Worker 才会把请求体缓冲到内存里，便于安全重试。
 - 大于该阈值、长度未知或缓冲失败时，会直接保留流式转发，避免大文件上传把 Worker 内存顶爆。
 
 ### 5. Cloudflare Cache Rules 教程
@@ -674,7 +697,7 @@ https://你的域名/hk/123
 ## 安全机制
 
 ### 登录防暴力破解
-后台登录失败次数会按访问者 IP 计数；达到上限后会自动锁定，默认锁定 **15 分钟**。
+绑定 D1 后，后台登录失败次数会写入 `auth_failures` 并按访问者 IP 计数；连续失败 5 次后锁定 **15 分钟**。未绑定 D1 时登录仍可使用，但失败次数不会持久化，因此不会形成跨请求锁定。
 
 ### 管理后台加固
 - 支持通过环境变量 `ADMIN_PATH` 自定义后台入口，默认仍是 `/admin`
@@ -738,20 +761,15 @@ https://你的域名/hk/123
 | `sys:nodes_index:v1` | 节点索引 | 节点列表页、导入导出和搜索时优先读取；缺失时可根据 `node:*` 自动重建 |
 | `sys:theme` | 全局配置 | 后台“全局设置”保存后的主配置，包含日志、监控、Cloudflare 联动、Telegram 等参数 |
 | `sys:config_snapshots:v1` | 设置快照 | 保存最近几次设置变更前的旧配置，用于“恢复此快照”和回退 |
-| `sys:ops_status:v1` | 运行状态根兜底 | D1 不可用时，用作仪表盘运行状态的 KV 兼容根键 |
-| `sys:ops_status:log:v1` | 日志运行状态兜底 | 保存日志刷盘结果、错误、队列状态等分区信息（D1 不可用时使用） |
-| `sys:ops_status:scheduled:v1` | 定时任务状态兜底 | 保存 Cron 执行状态、KV 整理结果、租约状态等分区信息（D1 不可用时使用） |
-| `sys:cf_dash_cache:{zoneId}:{date}` | 仪表盘缓存 | 缓存 Cloudflare 仪表盘统计结果；KV 整理时会清理遗留缓存键 |
-| `sys:scheduled_lock:v1` | 定时任务租约锁 | 用于避免多个 Cron 并发执行；过期后可被 KV 整理功能移除 |
 | `sys:dns_record_history:v1:{zoneId}:host:{hostname}` | DNS 修改历史 | 记录当前站点最近的 `CNAME` 修改值，供后台 DNS 历史卡片回填 |
-| `sys:telegram_alert_state:v1` | 告警冷却状态 | 防止 Telegram 运行时告警在冷却期内重复发送 |
-| `fail:{ip}` | 登录失败计数 / 锁定 | 后台登录失败次数统计；达到阈值后按 TTL 自动锁定一段时间 |
+
+> `sys:ops_status:*`、`sys:cf_dash_cache*`、`sys:scheduled_lock:v1`、`sys:telegram_alert_state:v1` 和 `fail:*` 都是旧版 KV 键。当前对应数据分别存放在 D1 的 `sys_status`、`cf_dashboard_cache`、`sys_locks` 和 `auth_failures` 中；KV 整理会删除检测到的这些遗留键。
 
 > 如果升级后出现“全局设置读取失败 / 设置页空白 / 节点索引丢失但 `node:*` 还在”的情况，可在后台的“账号与备份”区域使用 **一键整理 KV 数据**：
 > 1. 遍历 KV 并保留所有 `node:*`
 > 2. 基于实际节点键重建 `sys:nodes_index:v1`
 > 3. 强制读取并清洗 `sys:theme`
-> 4. 精准删除 `sys:cf_dash_cache*` 与过期 `sys:scheduled_lock:v1`
+> 4. 删除旧版仪表盘缓存、运维状态、定时租约、Telegram 告警状态和登录失败计数等遗留键
 
 #### 管理 API（`POST ADMIN_PATH`）
 
@@ -766,11 +784,12 @@ https://你的域名/hk/123
 | `delete` | 删 | 删除节点 | 会删除对应 `node:*`，并重建节点索引 |
 | `exportSettings` / `exportConfig` | 读 | 导出全局设置或完整备份 | 数据来源就是当前 KV 中的配置与节点 |
 | `importFull` | 写 | 导入完整备份（节点 + 全局设置） | 会整体写回节点实体与全局配置 |
-| `getRuntimeStatus` | 读 | 读取运行状态 | 优先读 D1；D1 不可用时回退到 KV 兼容键 |
+| `getRuntimeStatus` | 读 | 读取运行状态 | 从 D1 `sys_status` 读取；未绑定或不可用时返回空运行状态，不读取旧 KV 状态键 |
+| `previewTidyData` | 读 | 预览 KV 或 D1 整理计划 | 返回分组计数、警告与短期签名计划令牌；实际执行前会再次核对计划 |
 | `tidyKvData` | 读 + 写 + 删 | 执行一键整理 KV 数据 | 重建索引、清洗 `sys:theme`、删除遗留缓存键和过期租约键 |
 | `listDnsRecords` / `saveDnsRecords` / `updateDnsRecord` | 读 + 写 | 读取当前站点 DNS、按模式整体保存或兼容单条更新 | UI 主链路走 `saveDnsRecords`；DNS 历史仅记录 `CNAME`，实际变更走 Cloudflare API |
 
-> 后台登录接口 `POST ADMIN_PATH/login` 不走 `action` 分发，但会读写 `fail:{ip}` 来做失败计数和临时锁定。
+> 后台登录接口 `POST ADMIN_PATH/login` 不走 `action` 分发；绑定 D1 时会读写 `auth_failures`，按 IP 记录失败次数并执行临时锁定。
 
 #### 后台入口 / 按钮
 
@@ -782,19 +801,23 @@ https://你的域名/hk/123
 | `设置 -> 备份与恢复` | 导入全局设置 / 导入完整备份 | `importSettings` / `importFull` | 把 JSON 内容重新写回 KV |
 | `设置 -> 备份与恢复` | 恢复此快照 / 清理快照 | `restoreConfigSnapshot` / `clearConfigSnapshots` | 管理 `sys:config_snapshots:v1` 中的设置快照 |
 | `设置 -> 备份与恢复`（高手模式） | `一键整理 KV 数据` | `tidyKvData` | 修复旧版本升级后的索引、脏配置和遗留缓存键问题 |
+| `设置 -> 备份与恢复`（高手模式） | `一键整理 D1 数据` | `tidyD1Data` | 先通过 `previewTidyData` 获取签名计划，再按硬预算清理日志、统计、缓存和过期状态 |
 | `DNS 编辑` | 刷新 / 保存 DNS | `listDnsRecords` / `saveDnsRecords` | 按当前站点整体同步 `CNAME` 或 `A / AAAA` 草稿，并维护 CNAME 历史 |
-| `仪表盘` | 打开页面或刷新页面 | `getRuntimeStatus` | 查看日志刷盘、定时任务和租约状态；D1 不可用时回退到 KV 兜底 |
-| `后台登录页` | 提交登录密码 | `POST ADMIN_PATH/login` | 登录失败会写入 `fail:{ip}`，达到阈值后临时锁定 |
+| `仪表盘` | 打开页面或刷新页面 | `getRuntimeStatus` | 查看 D1 中的日志刷盘、定时任务和租约状态；D1 不可用时返回空运行状态 |
+| `后台登录页` | 提交登录密码 | `POST ADMIN_PATH/login` | 绑定 D1 时登录失败会写入 `auth_failures`；连续失败 5 次后锁定 15 分钟 |
 
 ### D1 中的用途
 - 请求日志写入（`proxy_logs`）
 - 日志查询（时间范围、状态码、IP、关键词）
 - 日志过期清理
 - 可选 FTS5 全文检索（`proxy_logs_fts`）
-- 定时任务按保留天数清理过期日志，并按最小间隔自动执行 `PRAGMA optimize`
+- 定时任务按保留天数清理过期日志和统计桶，并按积压、数据量、最小间隔与时间预算决定是否执行 FTS rebuild / `PRAGMA optimize`
 - Telegram 每日报表统计
 - 仪表盘本地统计兜底
 - `sys_status` 运行状态表（日志刷盘状态、定时任务租约等动态状态）
+- DNS/IP 池、探测缓存、Cloudflare 仪表盘 / 运行缓存、认证失败记录与定时任务锁
+
+> D1 整理的预览计数最多扫描 10001 行并以 `10000+` 显示下界；执行时每批 500 行，单轮最多处理 10000 行或运行 25 秒。达到预算后返回剩余 scope，管理端会提示再次预览并继续；基础日志超过 10000 行时不会自动执行 FTS rebuild。
 
 ### DB 速查清单
 
@@ -803,34 +826,38 @@ https://你的域名/hk/123
 | action | 需要 D1 | 主要用途 | 备注 |
 |---|---|---|---|
 | `getDashboardStats` | 可选 | 读取仪表盘请求量、流量趋势、播放次数等统计 | 优先读 Cloudflare GraphQL；失败或未配置时会尽量回退到本地 D1 日志口径 |
-| `getRuntimeStatus` | 可选 | 读取日志刷盘状态、定时任务状态、租约状态等运行信息 | 优先读 D1 `sys_status`，D1 不可用时回退到 KV 兼容键 |
+| `getRuntimeStatus` | 可选 | 读取日志刷盘状态、定时任务状态、租约状态等运行信息 | 从 D1 `sys_status` 读取；D1 不可用时返回空运行状态 |
 | `getLogs` | 必需 | 按页查询请求日志 | 默认带时间范围；关键词搜索最多限制在 3 天窗口内 |
-| `initLogsDb` | 必需 | 初始化日志表和运行状态表 | 创建 `proxy_logs` 与 `sys_status` 基础结构 |
-| `initLogsFts` | 必需 | 初始化 FTS5 检索结构 | 创建 `proxy_logs_fts` 和插入触发器，并迁移历史日志索引 |
+| `initLogsDb` | 必需 | 初始化当前完整 D1 schema | 创建日志、FTS5、运行状态、统计、锁、缓存等当前所需结构，并迁移历史日志索引 |
 | `clearLogs` | 必需 | 清空日志表 | 会清空 `proxy_logs`，并在可用时重建 FTS 索引 |
+| `previewTidyData` / `tidyD1Data` | 必需 | 预览并执行 D1 整理 | 先检查 schema 并生成签名计划；执行时按批次、行数和时间预算公平清理各 scope |
 | `sendDailyReport` | 必需 | 立即生成并发送 Telegram 日报 | 依赖 D1 日志统计和已配置好的 `tgBotToken` / `tgChatId` |
 
 #### 后台入口 / 按钮
 
 | 页面位置 | 入口 / 按钮 | 对应 action | 作用说明 |
 |---|---|---|---|
-| `日志记录` | `初始化 DB` | `initLogsDb` | 首次绑定 D1 后先点一次，完成基础表初始化 |
-| `日志记录`（高手模式） | `初始化 FTS5` | `initLogsFts` | 开启全文搜索前执行一次；适合需要复杂关键词检索时使用 |
+| `日志记录` | `初始化 DB` | `initLogsDb` | 首次绑定 D1 后执行一次，完成当前完整 schema（含 FTS5）初始化 |
 | `日志记录` | `清空日志` | `clearLogs` | 删除所有请求日志；适合调试或重新开始统计 |
 | `日志记录` | `刷新` | `getLogs` | 重新按当前筛选条件拉取日志列表 |
 | `仪表盘` | 打开页面或刷新页面 | `getDashboardStats` + `getRuntimeStatus` | 用于展示请求量、流量趋势、刷盘状态和定时任务状态 |
+| `设置 -> 备份与恢复`（高手模式） | `一键整理 D1 数据` | `previewTidyData` + `tidyD1Data` | 展示实际删除 / 保留分组，确认后按签名计划执行；有剩余数据时可再次运行 |
 | `设置 -> 监控告警` | `手动发送日报` | `sendDailyReport` | 立即按当前 D1 统计口径生成 Telegram 每日报表 |
 
 #### 主要表结构
 
 | 表 / 结构 | 类型 | 关键字段 | 用途说明 |
 |---|---|---|---|
-| `proxy_logs` | 普通表 | `id`, `timestamp`, `node_name`, `request_path`, `request_method`, `status_code`, `response_time`, `client_ip`, `user_agent`, `referer`, `category`, `error_detail`, `created_at` | 请求日志主表；日志页查询、日报统计、仪表盘本地兜底都依赖它 |
-| `proxy_logs` 索引 | 普通索引 | `timestamp`, `client_ip`, `(node_name, timestamp)`, `category`, `(status_code, timestamp)`, `(category, timestamp)` | 优化按时间范围、节点、状态码、分类等常见查询 |
-| `proxy_logs_fts` | FTS5 虚拟表 | `node_name`, `request_path`, `user_agent`, `error_detail` | 关键词搜索专用；通过 `proxy_logs_fts_ai` 插入触发器和 `rebuild` 迁移历史数据 |
+| `proxy_logs` | 普通表 | `id`, `timestamp`, `node_name`, `request_path`, `request_method`, `status_code`, `response_time`, `client_ip`, `inbound_colo`, `outbound_colo`, `user_agent`, `referer`, `category`, `error_detail`, `detail_json`, `created_at` | 请求日志主表；日志页查询、日报统计、仪表盘本地兜底都依赖它 |
+| `proxy_logs` 索引 | 普通索引 | `timestamp`, `(client_ip, timestamp DESC)`, `(status_code, timestamp)`, `(category, timestamp)` | 优化按时间范围、客户端 IP、状态码和分类等常见查询 |
+| `proxy_logs_fts` | FTS5 虚拟表 | `node_name`, `request_path`, `user_agent`, `error_detail`, `detail_json` | 关键词搜索专用；通过触发器同步新增日志，并按维护预算决定是否重建历史索引 |
+| `proxy_stats_hourly` | 普通表 | 日期 / 小时桶、请求数、播放数、PlaybackInfo 数、更新时间 | 仪表盘本地小时聚合；过期日期桶分页删除，统计口径变化时清空后从新日志重新累计 |
 | `sys_status` | 普通表 | `scope`, `payload`, `updated_at` | 保存日志刷盘状态、定时任务状态等动态运行信息 |
+| `sys_locks` / `auth_failures` | 普通表 | scope / token / 到期时间、认证失败计数 | 维护任务租约与后台登录保护；过期记录由 D1 整理清理 |
+| `dns_ip_pool_*` / `dns_ip_probe_cache` | 普通表 | IP 池、抓取源、抓取缓存、探测结果 | 保存 DNS/IP 工作区和探测缓存数据 |
+| `cf_dashboard_cache` / `cf_runtime_cache` | 普通表 | cache key、payload、版本与到期时间 | 保存 Cloudflare 统计和运行时缓存；过期行由 D1 整理分页删除 |
 
-> 常见 `sys_status.scope` 包括：`ops_status:root`、`ops_status:log`、`ops_status:scheduled`。如果 D1 不可用，运行状态会回退到 KV 中的兼容键。
+> 常见 `sys_status.scope` 包括：`ops_status:root`、`ops_status:log`、`ops_status:scheduled`。如果 D1 不可用，运行状态读取返回空对象，不再回退旧 KV 状态键。
 
 > 如果未绑定 D1，核心代理与节点管理通常仍可工作；但日志查询、日志初始化、FTS5 搜索、日报统计和 D1 兜底仪表盘能力会缺失或降级。
 
@@ -903,7 +930,7 @@ graph TD
 - `JWT_SECRET` 未配置
 - `ADMIN_PASS` 错误
 - 首次部署尚未完成初始化，页面顶部已显示“系统未初始化”
-- 连续输错过多次，IP 被锁定 15 分钟
+- 已绑定 D1，且当前 IP 连续输错 5 次后被锁定 15 分钟
 
 ### 3. 为什么有些视频走直连？
 这通常是以下原因之一：
