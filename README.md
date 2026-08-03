@@ -302,7 +302,7 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 2. 创建后进入 **Edit code**
 3. 将 `worker.js` 全量替换进去并部署
 
-> 这种方式只部署 Worker 单文件，不会自动上传 `frontend/dist` 或创建 `ASSETS` 绑定。基础代理和管理 API 可以运行，但要使用仓库内置的完整管理端，请优先选择方式 B / C；否则还需要自行配置并上传管理端 HTML。
+> 这种方式只部署 Worker 单文件，不会自动上传 `frontend/dist` 或创建 `ASSETS` 绑定。基础代理和管理 API 可以运行，但要使用仓库内置的完整管理端，请优先选择方式 B / C；继续使用方式 A 时，请完成下方“第六步：上传管理端 HTML”。
 
 #### 方式 B：通过 Cloudflare 连接 GitHub 自动部署
 1. 先将当前项目Fork到你自己的 GitHub 仓库
@@ -383,7 +383,19 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 > 如果首次请求时缺少 `ADMIN_PASS` 或 `JWT_SECRET`，Worker 会在控制台打印一次初始化警告，首页和管理页也会显示“系统未初始化”提示。
 
-### 第六步：按需添加 Cron Trigger
+### 第六步：上传管理端 HTML（方式 A 必做）
+如果使用方式 A 在 Cloudflare 控制台直接粘贴 `worker.js`，还需要手动上传管理端 HTML；方式 B / C 已由 Wrangler 将 `frontend/dist` 作为静态资源上传，可以跳过本步。
+
+1. 确认已经完成 KV 绑定以及 `ADMIN_PASS`、`JWT_SECRET` 环境变量配置
+2. 打开 `https://你的 Worker 域名/ADMIN_PATH`（默认是 `/admin`），使用 `ADMIN_PASS` 登录
+3. 首次部署且没有 `ASSETS` 绑定时，登录后会自动进入“上传 index.html”页面；如果已经进入管理台，可访问 `https://你的 Worker 域名/ADMIN_PATH?setup=1` 重新打开上传页
+4. 选择仓库中的 `frontend/dist/index.html`
+5. 点击 **上传并进入管理台**，等待页面提示上传成功并自动跳转
+6. 确认管理台可以正常打开后，再继续配置节点和其他功能
+
+> 上传文件名必须保持为 `index.html`，大小不能超过 2 MiB，并且 HTML 会保存到已绑定的 `ENI_KV`。不要上传 `frontend/admin-runtime.template.html`；如果修改过管理端源码，请先运行 `npm.cmd run build:frontend`，再上传重新生成的 `frontend/dist/index.html`。
+
+### 第七步：按需添加 Cron Trigger
 如果你需要自动清理日志、发送 Telegram 日报或定时异常告警，再补这一步：
 
 1. 打开 Worker 的 **Triggers**
@@ -393,7 +405,7 @@ Worker 作为公网入口，外部只能看到 Cloudflare 边缘节点，而不�
 
 > Cloudflare 官方文档说明：注意Cron Trigger 使用 UTC，而中国时区是UTC+8,免费计划最多 5 个、付费计划最多 250 个；单次 Cron 执行最长 15 分钟。
 
-### 第七步：自定义域绑定与优选域名路由教程 
+### 第八步：自定义域绑定与优选域名路由教程
 
 Cloudflare Dashboard->左侧导航栏->域注册->管理域 
 
@@ -437,7 +449,7 @@ Worker选择：Worker 一栏选择你第一步创建的那个Worker
 
 > 反代访问端口需使用 Cloudflare 支持的 HTTPS 端口，例如 `443 / 2053 / 2083 / 2087 / 2096 / 8443`。
 
-###  第八步Cloudflare Cache Rules 教程[违反TOS慎重开启]
+### 第九步：Cloudflare Cache Rules 教程[违反TOS慎重开启]
 
 - [Cloudflare Cache Rules 教程](#Cloudflare Cache Rules 教程) 
 【多人共享可选】【如果无法点击就直接ctrl+f 搜索吧】
