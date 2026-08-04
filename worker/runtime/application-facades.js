@@ -67,7 +67,8 @@ var cacheState = {
 	ProxyFailoverStateCache: /* @__PURE__ */ new Map(),
 	CryptoKeyCache: /* @__PURE__ */ new Map(),
 	PlaybackInfoResponseCache: /* @__PURE__ */ new Map(),
-					PlaybackProgressRelay: /* @__PURE__ */ new Map(),
+	PlaybackProgressRelay: /* @__PURE__ */ new Map(),
+	MetadataPrewarmTasks: /* @__PURE__ */ new Map(),
 				DashboardMonthlyTrafficCache: /* @__PURE__ */ new Map(),
 	SingleFlightTasks: /* @__PURE__ */ new Map(),
 	AdminRemoteShellCacheMutationChains: /* @__PURE__ */ new Map(),
@@ -287,6 +288,25 @@ function serializeConfigValue(value) {
 //#region worker/core/time.js
 var nowMs = () => Date.now();
 var sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+function createCancelableDelay(ms) {
+	let settled = false;
+	let resolveDelay = () => {};
+	const timerId = setTimeout(() => {
+		if (settled) return;
+		settled = true;
+		resolveDelay(true);
+	}, Math.max(0, Number(ms) || 0));
+	return {
+		promise: new Promise((resolve) => { resolveDelay = resolve; }),
+		cancel() {
+			if (settled) return false;
+			settled = true;
+			clearTimeout(timerId);
+			resolveDelay(false);
+			return true;
+		}
+	};
+}
 //#endregion
 //#region worker/features/config/api.js
 var AUTH_DEFAULTS = Object.freeze({
@@ -389,7 +409,7 @@ var PROXY_DEFAULTS = Object.freeze({
 	DefaultPlaybackInfoMode: "passthrough",
 	DefaultRealClientIpMode: "forward",
 	DefaultMediaAuthMode: "auto",
-			});
+	});
 var DNS_DEFAULTS = Object.freeze({
 	ConfigSnapshotLimit: 5,
 	DnsHistoryLimit: 5,
@@ -1835,6 +1855,35 @@ var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheM
 var ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
 var ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES = ADMIN_JSON_REQUEST_MAX_BYTES - 64 * 1024;
 var METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
+var METADATA_PREWARM_MAX_IN_FLIGHT = 4;
+var METADATA_PREWARM_MAX_PREFETCH_BYTES = 8 * 1024 * 1024;
+var NODE_RECORD_MAX_BYTES = 256 * 1024;
+var NODE_LINE_MAX = 32;
+var NODE_HEADER_MAX = 64;
+var NODE_HEADER_TOTAL_MAX_BYTES = 64 * 1024;
+var NODE_HEADER_KEY_MAX_BYTES = 128;
+var NODE_HEADER_VALUE_MAX_BYTES = 8 * 1024;
+var NODE_TEXT_FIELD_MAX_BYTES = 4 * 1024;
+var NODE_BOUNDED_TEXT_FIELDS = Object.freeze(["displayName", "remark", "tag", "tagColor", "remarkColor", "secret", "hostPrefixCnameTarget", "hedgeProbePath"]);
+var D1_TIDY_BATCH_SIZE = 500;
+var D1_TIDY_ROW_LIMIT = 1e4;
+var D1_TIDY_TIME_LIMIT_MS = 25e3;
+var D1_TIDY_PREVIEW_COUNT_LIMIT = 1e4;
+var D1_TIDY_FTS_REBUILD_LOG_LIMIT = 1e4;
+var D1_SCHEMA_REPAIR_ROW_LIMIT = 1e4;
+var D1_SCHEMA_REPAIR_TOKEN_TTL_MS = 10 * 60 * 1e3;
+var D1_SCHEMA_REPAIR_LEASE_MS = 2 * 60 * 1e3;
+var D1_SCHEMA_CONTRACT_VERSION = 1;
+var D1_SCHEMA_REPAIR_PLAN_VERSION = 2;
+
+function normalizeSqliteTypeAffinity(type = "") {
+	const normalized = String(type || "").trim().toUpperCase();
+	if (normalized.includes("INT")) return "INTEGER";
+	if (normalized.includes("CHAR") || normalized.includes("CLOB") || normalized.includes("TEXT")) return "TEXT";
+	if (normalized.includes("REAL") || normalized.includes("FLOA") || normalized.includes("DOUB")) return "REAL";
+	if (!normalized || normalized.includes("BLOB")) return "BLOB";
+	return "NUMERIC";
+}
 
 var IMAGE_FILE_EXTENSION_REGEX = /\.(?:jpg|jpeg|gif|png|svg|ico|webp)$/i;
 var STATIC_ASSET_EXTENSION_REGEX = /\.(?:js|css|woff2?|ttf|otf|map|webmanifest)$/i;
@@ -5463,7 +5512,7 @@ var CONFIG_SANITIZE_RULES = {
 		prewarmPrefetchBytes: {
 			fallback: Config.Defaults.PrewarmPrefetchBytes,
 			min: 0,
-			max: 64 * 1024 * 1024
+			max: METADATA_PREWARM_MAX_PREFETCH_BYTES
 		},
 		playbackInfoCacheTtlSec: {
 			fallback: Config.Defaults.PlaybackInfoCacheTtlSec,
@@ -5732,7 +5781,7 @@ function assertExpectedRuntimeConfigRevision(expectedRevision = "", currentConfi
 	const expectedHash = normalizedExpectedRevision.split(".").pop() || "";
 	const currentHash = hashStableText(serializeConfigValue(sanitizeRuntimeConfig(currentConfig)));
 	if (expectedHash === currentHash) return;
-	throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置已被其他设备更新，请刷新设置后重新提交", 409, {
+	throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置版本已变化，请刷新设置后重新提交", 409, {
 		expectedRevision: normalizedExpectedRevision,
 		currentHash
 	});
@@ -5891,6 +5940,7 @@ function createTidyPreviewGroup(key = "", label = "", values = [], options = {})
 		key: String(key || "").trim(),
 		label: String(label || "").trim(),
 		count,
+		countIsLowerBound: options.countIsLowerBound === true,
 		samples,
 		truncated: count > samples.length,
 		note
@@ -8660,11 +8710,11 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 		async saveConfig(data, { env, ctx, kv, meta }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const currentConfig = await getRuntimeConfigStrict(env);
-			assertExpectedRuntimeConfigRevision(data?.expectedConfigRevision, currentConfig);
 			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(data.config, currentConfig), {
 				env,
 				kv,
 				ctx,
+				expectedConfigRevision: data?.expectedConfigRevision,
 				snapshotMeta: {
 					reason: "save_config",
 					section: String(meta?.section || "all"),
@@ -8938,9 +8988,11 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 				name: nodeName.toLowerCase(),
 				...node
 			};
+			const resourceWarning = buildNodeResourceWarning(nodeName, node);
 			return jsonResponse({
 				success: true,
 				node: adminNode,
+				warnings: resourceWarning ? [resourceWarning] : [],
 				revisions: await kernel.getAdminRevisionsForRead({
 					env,
 					kv,
@@ -9077,6 +9129,8 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 						nextName: name
 					});
 					if (!mutation) continue;
+					const resourceViolation = getNodeResourceLimitViolation(name, mutation.nextNode);
+					if (resourceViolation) return jsonError("NODE_RESOURCE_LIMIT_EXCEEDED", "节点配置超过 Worker 资源限制", 400, resourceViolation);
 					mutation.dnsPlan = kernel.buildHostPrefixDnsSyncPlan(mutation.previousName, mutation.previousNode, mutation.nextName, mutation.nextNode, configuredHost, {
 						config: runtimeConfig,
 						forceUpsert: true
@@ -11468,35 +11522,65 @@ function defineDatabaseActions(dependencies = {}, actions = {}) {
 				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
 			});
 		},
-		async getD1SchemaStatus(data, { db }) {
+		async getD1SchemaStatus(data, { db, env }) {
 			if (!db) return jsonError("D1_NOT_CONFIGURED", "请先绑定 D1 / PROXY_LOGS 数据库", 503);
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			let tokenState = { token: "", expiresAt: 0 };
+			if (plan.phase === "destructive" && plan.blockingIssues.length === 0) tokenState = await kernel.createD1SchemaRepairToken(env, plan);
 			return jsonResponse({
 				success: true,
-				status: await kernel.getD1SchemaStatus(db)
+				status: {
+					...plan.status,
+					repairableIssues: plan.repairableIssues,
+					highRiskIssues: plan.highRiskIssues,
+					blockingIssues: plan.blockingIssues
+				},
+				repairPlan: {
+					version: plan.version,
+					phase: plan.phase,
+					contractVersion: plan.contractVersion,
+					contractHash: plan.contractHash,
+					schemaCookie: plan.schemaCookie,
+					planHash: plan.planHash,
+					risk: plan.risk,
+					repairableIssues: plan.repairableIssues,
+					highRiskIssues: plan.highRiskIssues,
+					blockingIssues: plan.blockingIssues,
+					steps: plan.steps,
+					repairToken: tokenState.token,
+					expiresAt: tokenState.expiresAt ? new Date(tokenState.expiresAt * 1e3).toISOString() : ""
+				}
 			});
 		},
-		async initLogsDb(data, { db }) {
+		async initLogsDb(data, { db, env, request }) {
 			if (!db) return jsonError("D1_NOT_CONFIGURED", "D1 database is not configured", 503);
-			const initialization = await kernel.initializeD1Database(db, { includeFts: true });
+			const initialization = await kernel.initializeD1Database(db, {
+				includeFts: true,
+				env,
+				repairMode: String(data?.repairMode || "safe").trim() || "safe",
+				repairToken: String(data?.repairToken || "").trim(),
+				confirmHighRisk: String(request?.headers?.get("X-Admin-Confirm") || "").trim() === "repairD1Schema"
+			});
 			const status = initialization.status;
 			const ftsReady = status.ftsReady === true;
 			const statsReady = status.tables?.[kernel.STATS_HOURLY_TABLE] === true;
-			const logStatus = await kernel.bumpLogsRevision(db, {
-				schemaReady: status.schemaReady === true,
+			const logStatus = status.schemaReady === true ? await kernel.bumpLogsRevision(db, {
+				schemaReady: true,
 				ftsReady,
 				statsReady,
 				categoryEnabled: true
-			});
+			}) : null;
 			return jsonResponse({
-				success: status.schemaReady === true,
+				success: initialization.completed === true || initialization.pendingHighRisk === true,
 				schemaReady: status.schemaReady === true,
+				pendingHighRisk: initialization.pendingHighRisk === true,
 				categoryEnabled: true,
 				ftsReady,
 				statsReady,
 				initialization,
 				steps: initialization.steps,
 				status,
-				revisions: { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) }
+				revisions: logStatus ? { logsRevision: kernel.getLogsRevisionFromStatus(logStatus?.log || logStatus) } : {}
 			});
 		}
 	};
@@ -11649,6 +11733,48 @@ function invalidateNodeCacheTokens(nodeNames = [], state = nodeBindingCacheState
 function resetNodeCacheTokens(state = nodeBindingCacheStates.current()) {
 	state.NodeCacheResetGeneration += 1;
 	state.NodeCacheGenerations.clear();
+}
+function getUtf8ByteLength(value) {
+	return new TextEncoder().encode(String(value ?? "")).byteLength;
+}
+function getNodeResourceLimitViolation(nodeName, nodeData = {}) {
+	const name = String(nodeName || "").trim().toLowerCase();
+	const node = isPlainObject(nodeData) ? nodeData : {};
+	const lines = Array.isArray(node.lines) ? node.lines : [];
+	if (lines.length > NODE_LINE_MAX) return { nodeName: name, field: "lines", actual: lines.length, limit: NODE_LINE_MAX };
+	const headers = isPlainObject(node.headers) ? node.headers : {};
+	const headerEntries = Object.entries(headers);
+	if (headerEntries.length > NODE_HEADER_MAX) return { nodeName: name, field: "headers.count", actual: headerEntries.length, limit: NODE_HEADER_MAX };
+	let headerBytes = 0;
+	for (const [headerName, value] of headerEntries) {
+		const keyBytes = getUtf8ByteLength(headerName);
+		const valueBytes = getUtf8ByteLength(value);
+		if (keyBytes > NODE_HEADER_KEY_MAX_BYTES) return { nodeName: name, field: `headers.${headerName}.keyBytes`, actual: keyBytes, limit: NODE_HEADER_KEY_MAX_BYTES };
+		if (valueBytes > NODE_HEADER_VALUE_MAX_BYTES) return { nodeName: name, field: `headers.${headerName}.valueBytes`, actual: valueBytes, limit: NODE_HEADER_VALUE_MAX_BYTES };
+		headerBytes += keyBytes + valueBytes;
+	}
+	if (headerBytes > NODE_HEADER_TOTAL_MAX_BYTES) return { nodeName: name, field: "headers.bytes", actual: headerBytes, limit: NODE_HEADER_TOTAL_MAX_BYTES };
+	for (const field of NODE_BOUNDED_TEXT_FIELDS) {
+		const bytes = getUtf8ByteLength(node[field]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	for (let index = 0; index < (Array.isArray(node.tags) ? node.tags.length : 0); index += 1) {
+		const bytes = getUtf8ByteLength(node.tags[index]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field: `tags.${index}`, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	for (let index = 0; index < lines.length; index += 1) for (const field of ["id", "name", "target"]) {
+		const bytes = getUtf8ByteLength(lines[index]?.[field]);
+		if (bytes > NODE_TEXT_FIELD_MAX_BYTES) return { nodeName: name, field: `lines.${index}.${field}`, actual: bytes, limit: NODE_TEXT_FIELD_MAX_BYTES };
+	}
+	let serializedBytes = 0;
+	try { serializedBytes = getUtf8ByteLength(JSON.stringify(node)); }
+	catch { return { nodeName: name, field: "record", actual: null, limit: NODE_RECORD_MAX_BYTES }; }
+	if (serializedBytes > NODE_RECORD_MAX_BYTES) return { nodeName: name, field: "record.bytes", actual: serializedBytes, limit: NODE_RECORD_MAX_BYTES };
+	return null;
+}
+function buildNodeResourceWarning(nodeName, nodeData = {}) {
+	const violation = getNodeResourceLimitViolation(nodeName, nodeData);
+	return violation ? { code: "NODE_RESOURCE_LIMIT_EXCEEDED", ...violation } : null;
 }
 async function runNodeIndexMutation(mutation, kv = null) {
 	const state = getNodeBindingCacheState(kv);
@@ -11909,8 +12035,11 @@ function withDashboardSnapshotCacheStatus(snapshot = {}, cacheStatus = "live", o
 //#region worker/features/proxy/playback/state.js
 function releasePlaybackProgressRelayEntry(entry) {
 	if (!entry || typeof entry !== "object") return;
+	try { entry.cancelScheduledDelay?.(); } catch {}
+	entry.cancelScheduledDelay = null;
 	entry.pendingSnapshot = null;
 	entry.scheduledFlushAt = 0;
+	entry.scheduledPromise = null;
 	entry.waitUntilCtx = null;
 }
 function deletePlaybackProgressRelayEntry(sessionKey) {
@@ -11922,9 +12051,20 @@ function deletePlaybackProgressRelayEntry(sessionKey) {
 }
 function setBoundedPlaybackProgressRelayEntry(sessionKey, entry) {
 	const relayMap = cacheState.PlaybackProgressRelay;
-	if (!(relayMap instanceof Map)) return entry;
-	setBoundedMapEntry(relayMap, sessionKey, entry, Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1));
-	return entry;
+	if (!(relayMap instanceof Map)) return false;
+	const maxSize = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
+	if (!relayMap.has(sessionKey) && relayMap.size >= maxSize) {
+		let evictKey = "";
+		for (const [candidateKey, candidate] of relayMap) if (!candidate?.activeFlushPromise) {
+			evictKey = candidateKey;
+			break;
+		}
+		if (!evictKey) return false;
+		deletePlaybackProgressRelayEntry(evictKey);
+	}
+	if (relayMap.has(sessionKey)) relayMap.delete(sessionKey);
+	relayMap.set(sessionKey, entry);
+	return true;
 }
 //#endregion
 //#region worker/features/proxy/routing/url-model.js
@@ -13355,6 +13495,25 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
 			const schemaStatus = await kernel.getD1SchemaStatus(db);
+			if (schemaStatus.schemaReady !== true) {
+				const preview = kernel.createEmptyTidyPreview("d1");
+				preview.warnings.push("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
+				return {
+					scope: "d1",
+					mode: "manual",
+					maintenanceMode: normalizeTidyMaintenanceMode(options.maintenanceMode, "manual"),
+					schemaStatus,
+					flags: {},
+					summary: {
+						status: "blocked",
+						schemaReady: false,
+						requiresSchemaInitialization: true,
+						issues: schemaStatus.issues
+					},
+					preview,
+					planHash: ""
+				};
+			}
 			const runtimeConfig = sanitizeRuntimeConfig(options.config || (env ? await getRuntimeConfig(env) : {}));
 			const baseContext = D1TidyPlanner.buildContext(runtimeConfig, options);
 			const context = D1TidyPlanner.attachPreviousState(kernel, baseContext, options.previousCleanupStatus);
@@ -13383,6 +13542,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				statsStartTs: context.statsStartTs,
 				statsEndTs: context.statsEndTs,
 				statsUtcOffsetMinutes: context.statsUtcOffsetMinutes,
+				statsRetentionBoundaryDate: facts.statsRetentionBoundaryDate,
 				d1DnsIpPoolSources: facts.d1DnsIpPoolSources,
 				kvDnsIpPoolSources: facts.kvDnsIpPoolSources,
 				dnsIpPoolSourceAction: sourcePolicy.dnsIpPoolSourceAction,
@@ -13447,47 +13607,30 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				await beforeStep("flushLogQueue");
 				await Logger.flush(env).catch(() => {});
 			}
-			performedCleanupWork = await D1TidyExecutor.runDeleteSteps(D1TidyExecutor.buildDeleteSteps(kernel, executionPlan, summary, flags, db), beforeStep) || performedCleanupWork;
-			if (mode === "manual") {
-				if (flags.rebuildStatsHourly === true) {
-					await beforeStep("rebuildStatsHourlyWindow");
-					await kernel.rebuildStatsHourlyWindow(db, {
-						startTs: executionPlan.retentionCutoffMs,
-						endTs: executionPlan.nowMs,
-						utcOffsetMinutes: executionPlan.utcOffsetMinutes
-					});
-					summary.rebuiltStatsHourly = true;
-					summary.statsRebuildStatus = "success";
-					performedCleanupWork = true;
-				} else summary.statsRebuildStatus = "skipped";
-				summary.statsAlignStatus = "skipped";
+			const maintenanceStartedAt = nowMs();
+			const deleteScopes = D1TidyExecutor.buildDeleteScopes(kernel, executionPlan, flags, db);
+			const deleteResult = await D1TidyExecutor.runBudgetedDeleteScopes(deleteScopes, summary, beforeStep, { startedAt: maintenanceStartedAt });
+			summary.hasMore = deleteResult.hasMore;
+			summary.remainingScopes = deleteResult.remainingScopes;
+			summary.budget = deleteResult.budget;
+			performedCleanupWork = deleteResult.budget.processedRows > 0;
+			if (flags.rebuildStatsHourly === true && nowMs() - maintenanceStartedAt < D1_TIDY_TIME_LIMIT_MS) try {
+				await beforeStep("resetStatsHourly");
+				await kernel.clearStatsHourly(db);
+				summary.alignedStatsWindow = true;
+				summary.statsAlignStatus = "success";
+				summary.statsRebuildStatus = "reset_for_new_logs";
+				performedCleanupWork = true;
+			} catch (error) {
+				recordStepFailure("statsRebuildStatus", "statsRebuildError", error, "D1 stats reset Error");
 			} else {
-				if (flags.alignStatsWindow === true) try {
-					await beforeStep("alignStatsHourlyWindow");
-					const aligned = await kernel.ensureStatsHourlyWindowAligned(stores, {
-						config: executionPlan.config,
-						now: executionPlan.dayWindow?.now instanceof Date ? executionPlan.dayWindow.now : new Date(executionPlan.scheduledNowMs || executionPlan.nowMs)
-					});
-					summary.alignedStatsWindow = aligned?.rebuilt === true;
-					summary.statsAlignStatus = aligned?.rebuilt === true ? "success" : "skipped";
-				} catch (error) {
-					recordStepFailure("statsAlignStatus", "statsAlignError", error, "Scheduled stats alignment Error");
-				}
-				if (flags.rebuildDailyStats === true || flags.rebuildStatsHourly === true) try {
-					await beforeStep("rebuildDailyStatsHourly");
-					await kernel.rebuildStatsHourlyForDate(db, {
-						bucketDate: executionPlan.statsBucketDate,
-						startTs: executionPlan.statsStartTs,
-						endTs: executionPlan.statsEndTs,
-						utcOffsetMinutes: executionPlan.statsUtcOffsetMinutes
-					});
-					summary.rebuiltStatsHourly = true;
-					summary.statsRebuildStatus = "success";
-				} catch (error) {
-					recordStepFailure("statsRebuildStatus", "statsRebuildError", error, "Scheduled stats rebuild Error");
-				}
+				summary.statsAlignStatus = flags.rebuildStatsHourly === true ? "deferred_budget" : "skipped";
+				summary.statsRebuildStatus = flags.rebuildStatsHourly === true ? "deferred_budget" : "skipped";
 			}
-			if (flags.rebuildLogsFts === true) try {
+			const maintenanceHasTime = () => nowMs() - maintenanceStartedAt < D1_TIDY_TIME_LIMIT_MS;
+			if (flags.rebuildLogsFtsDeferred === true) summary.ftsRebuildStatus = flags.ftsRebuildDeferredReason || "deferred_size_guard";
+			else if (flags.rebuildLogsFts === true && (summary.hasMore || !maintenanceHasTime())) summary.ftsRebuildStatus = "deferred_budget";
+			else if (flags.rebuildLogsFts === true) try {
 				await beforeStep("rebuildLogsFts");
 				let rebuiltLogsFts = false;
 				if (await kernel.hasLogsFtsTable(db)) rebuiltLogsFts = await kernel.rebuildLogsFts(db);
@@ -13497,22 +13640,9 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				summary.lastFtsRebuildAt = (/* @__PURE__ */ new Date()).toISOString();
 				performedCleanupWork = performedCleanupWork || rebuiltLogsFts === true;
 			} catch (error) {
-				if (mode === "scheduled") try {
-					await beforeStep("rebuildLogsFtsForceRecreate");
-					const ensuredFts = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true });
-					summary.rebuiltLogsFts = ensuredFts.rebuilt === true;
-					summary.ftsRebuildStatus = ensuredFts.rebuilt === true ? "success" : "skipped";
-					summary.ftsRebuildRecovered = ensuredFts.recreated === true;
-					summary.ftsRebuildError = "";
-					summary.lastFtsRebuildAt = (/* @__PURE__ */ new Date()).toISOString();
-					performedCleanupWork = performedCleanupWork || ensuredFts.rebuilt === true;
-					console.warn("Scheduled FTS rebuild recovered by recreating schema.");
-				} catch (repairError) {
-					recordStepFailure("ftsRebuildStatus", "ftsRebuildError", repairError, "Scheduled FTS rebuild Error");
-				}
-				else recordStepFailure("ftsRebuildStatus", "ftsRebuildError", error, "D1 logs FTS rebuild Error");
+				recordStepFailure("ftsRebuildStatus", "ftsRebuildError", error, "D1 logs FTS rebuild Error");
 			}
-			if (flags.optimizeDb === true) try {
+			if (flags.optimizeDb === true && !summary.hasMore && maintenanceHasTime()) try {
 				await beforeStep("optimizeLogsDb");
 				await kernel.optimizeLogsDb(db);
 				summary.optimizedDb = true;
@@ -13521,17 +13651,24 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				performedCleanupWork = true;
 			} catch (error) {
 				recordStepFailure("optimizeStatus", "optimizeError", error, mode === "scheduled" ? "Scheduled DB optimize Error" : "D1 optimize Error");
-			}
+			} else if (flags.optimizeDb === true) summary.optimizeStatus = "deferred_budget";
+			summary.budget.durationMs = Math.max(0, nowMs() - maintenanceStartedAt);
+			if (summary.budget.durationMs >= D1_TIDY_TIME_LIMIT_MS && !summary.budget.exhaustedBy) summary.budget.exhaustedBy = "time_limit";
 			await beforeStep("patchLogStatus");
 			const nowIso = await D1TidyExecutor.patchLogStatus(kernel, db, stores, executionPlan, summary, flags, options);
-			if (summary.status !== "partial_failure" && summary.status !== "failed") if (mode === "scheduled") {
-				const hasDeferredMaintenance = flags.rebuildLogsFtsDeferred === true || flags.optimizeDbDeferred === true;
-				if (performedCleanupWork) summary.status = "success";
-				else {
-					summary.status = "skipped";
-					summary.reason = hasDeferredMaintenance ? "maintenance_deferred" : "no_expired_data";
-				}
-			} else summary.status = "success";
+			if (summary.status !== "partial_failure" && summary.status !== "failed") {
+				if (summary.hasMore) {
+					summary.status = "success";
+					summary.reason = "maintenance_budget_exhausted";
+				} else if (mode === "scheduled") {
+					const hasDeferredMaintenance = flags.rebuildLogsFtsDeferred === true || flags.optimizeDbDeferred === true;
+					if (performedCleanupWork) summary.status = "success";
+					else {
+						summary.status = "skipped";
+						summary.reason = hasDeferredMaintenance ? "maintenance_deferred" : "no_expired_data";
+					}
+				} else summary.status = "success";
+			}
 			summary.finishedAt = nowIso;
 			return kernel.buildTidyResult(executionPlan, summary, "d1");
 		},
@@ -14090,6 +14227,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 		},
 		async commitRuntimeConfig(rawConfig, options = {}) {
 			const { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
+			assertExpectedRuntimeConfigRevision(options.expectedConfigRevision, prevConfig);
 			if (serializeConfigValue(prevConfig) === serializeConfigValue(nextConfig)) {
 				await kernel.ensureConfigMeta(kv, nextConfig, { ctx });
 				return nextConfig;
@@ -15885,6 +16023,12 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 						return null;
 					}
 					const { data: normalized, changed } = kernel.normalizeNode(nodeName, nodeData);
+					const resourceViolation = getNodeResourceLimitViolation(nodeName, normalized);
+					if (resourceViolation) {
+						state.NodeCache.delete(nodeName);
+						state.PlaybackRouteHotCache.delete(nodeName);
+						return normalized;
+					}
 					if (changed) {
 						const task = kv.put(`${kernel.PREFIX}${nodeName}`, JSON.stringify(normalized));
 						if (ctx) ctx.waitUntil(task);
@@ -15935,6 +16079,11 @@ function defineNodeRepositoryMethods(dependencies = {}, kernel = {}) {
 				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 				if (!nodeData) return null;
 				const normalized = kernel.normalizeNode(nodeName, nodeData).data;
+				if (getNodeResourceLimitViolation(nodeName, normalized)) {
+					state.NodeCache.delete(nodeName);
+					state.PlaybackRouteHotCache.delete(nodeName);
+					return normalized;
+				}
 				const currentNodesRevision = await kernel.getNodesRevision(kv);
 				if (getNodeCacheToken(nodeName, state) !== nodeLoadToken) return null;
 				setBoundedMapEntry(state.NodeCache, nodeName, {
@@ -17589,7 +17738,6 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 			};
 			if (!shouldManageProxyBody) {
 				kernel.recordAccessLog(execution, successLogPayload);
-				await kernel.flushCriticalLogsIfNeeded(execution);
 			}
 			if (execution.metadataCacheKey && execution.ctx && finalUpstreamState.response.status === 200) {
 				const cacheClone = finalUpstreamState.response.clone();
@@ -17603,7 +17751,7 @@ function defineProxyUpstreamDeliveryMethods(dependencies = {}, kernel = {}) {
 			if (execution.requestTraits.isPlaybackInfoRequest === true) {
 				await kernel.storePlaybackInfoResponseCache(execution, finalUpstreamState.response, null, finalUpstreamState.playbackInfoRepresentation);
 			}
-			await kernel.maybePrewarmMetadataResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
+			kernel.scheduleMetadataPrewarmResponse(execution.request, finalUpstreamState.response, execution.requestTraits, finalUpstreamState.activeTargetBase, buildFetchOptions, execution.nodeName, execution.nodeKey, execution.requestUrl, execution.ctx, {
 				proxyPath: execution.proxyPath,
 				prewarmCacheTtl: execution.requestTraits.prewarmCacheTtl,
 				imageCacheMaxAge: execution.imageCacheMaxAge,
@@ -17920,9 +18068,9 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 			return parts.join(" | ");
 		},
 		buildTargetHotCacheDiagnosticDetail(execution) {
-			const cacheState = String(execution?.targetHotCacheState || "").trim();
+			const cacheState = String(execution?.nodeCacheState || execution?.targetHotCacheState || "").trim();
 			if (!cacheState) return "";
-			return `TargetHotCache=${cacheState}`;
+			return execution?.nodeCacheState ? `NodeCacheState=${cacheState}` : `TargetHotCache=${cacheState}`;
 		},
 		buildRouteContextDiagnosticDetail(execution) {
 			const routeContextDiagnostics = execution?.routeContextDiagnostics && typeof execution.routeContextDiagnostics === "object" ? execution.routeContextDiagnostics : null;
@@ -18058,6 +18206,7 @@ function defineProxyDiagnosticMethods(dependencies = {}, kernel = {}) {
 				preferredTarget: String(options.preferredTarget || failoverTelemetry.preferredTarget || "").trim() || null,
 				fastFailReason: String(options.fastFailReason || failoverTelemetry.fastFailReason || "").trim() || null,
 				targetHotCache: String(options.targetHotCache || execution?.targetHotCacheState || "").trim() || null,
+				nodeCacheState: String(options.nodeCacheState || execution?.nodeCacheState || "").trim() || null,
 				playbackInfoCache: String(options.playbackInfoCache || execution?.playbackInfoCacheState || "").trim() || null,
 				playbackInfoCacheTtlSec: Number.isFinite(Number(options.playbackInfoCacheTtlSec)) ? Math.max(0, Math.trunc(Number(options.playbackInfoCacheTtlSec))) : Math.max(0, Math.trunc(Number(execution?.playbackInfoCacheTtlSec) || 0)),
 				playbackInfoMode: execution?.requestTraits?.isPlaybackInfoRequest === true ? normalizeDefaultPlaybackInfoMode(options.playbackInfoMode || execution?.effectivePlaybackInfoMode) : null,
@@ -18206,25 +18355,88 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 			});
 			return [...candidates.values()].sort((a, b) => rankMetadataWarmPath(a.proxyPath) - rankMetadataWarmPath(b.proxyPath)).slice(0, 4);
 		},
-		async maybePrewarmMetadataResponse(request, response, requestTraits, activeTargetBase, buildFetchOptions, name, key, requestUrl, ctx, options = {}) {
+		buildBudgetedPrewarmResponse(response, maxBytes) {
+			const limit = Math.max(0, Math.floor(Number(maxBytes) || 0));
+			const declaredBytes = parseContentLengthHeader(response?.headers?.get("Content-Length"));
+			if (limit <= 0 || Number.isFinite(declaredBytes) && declaredBytes > limit) {
+				try { Promise.resolve(response?.body?.cancel?.()).catch(() => {}); } catch {}
+				return null;
+			}
+			if (!response?.body) return { response, getBytes: () => 0 };
+			const reader = response.body.getReader();
+			let bytes = 0;
+			let closed = false;
+			const release = () => {
+				if (closed) return;
+				closed = true;
+				try { reader.releaseLock(); } catch {}
+			};
+			const body = new ReadableStream({
+				async pull(controller) {
+					try {
+						const { done, value } = await reader.read();
+						if (done) {
+							release();
+							controller.close();
+							return;
+						}
+						const chunk = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+						if (bytes + chunk.byteLength > limit) {
+							try { await reader.cancel("metadata_prewarm_budget_exceeded"); } catch {}
+							release();
+							controller.error(new Error("metadata_prewarm_budget_exceeded"));
+							return;
+						}
+						bytes += chunk.byteLength;
+						controller.enqueue(chunk);
+					} catch (error) {
+						release();
+						controller.error(error);
+					}
+				},
+				async cancel(reason) {
+					try { await reader.cancel(reason); } catch {}
+					release();
+				}
+			});
+			return {
+				response: new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers }),
+				getBytes: () => bytes
+			};
+		},
+		async runMetadataPrewarmSingleFlight(cacheKey, task) {
+			const tasks = cacheState.MetadataPrewarmTasks;
+			const taskKey = cacheKey instanceof Request ? cacheKey.url : String(cacheKey || "");
+			if (!taskKey) return { skipped: true, result: null };
+			const existing = tasks.get(taskKey);
+			if (existing) return { joined: true, result: await existing };
+			if (tasks.size >= METADATA_PREWARM_MAX_IN_FLIGHT) return { skipped: true, result: null };
+			const promise = Promise.resolve().then(task).finally(() => {
+				if (tasks.get(taskKey) === promise) tasks.delete(taskKey);
+			});
+			tasks.set(taskKey, promise);
+			return { joined: false, result: await promise };
+		},
+		scheduleMetadataPrewarmResponse(request, response, requestTraits, activeTargetBase, buildFetchOptions, name, key, requestUrl, ctx, options = {}) {
 			if (!ctx || request.method !== "GET" || requestTraits.enablePrewarm !== true) return;
 			if (requestTraits.isPlaybackInfoRequest === true) return;
 			if (requestTraits.isImage || requestTraits.isSubtitle || requestTraits.isManifest || requestTraits.isSegment || requestTraits.isBigStream) return;
 			if (!(response.status >= 200 && response.status < 300)) return;
 			if (!isJsonHttpMediaType(response.headers.get("Content-Type"))) return;
-			const bodyResult = await readResponseTextWithLimit(response.clone(), METADATA_PREWARM_RESPONSE_MAX_BYTES);
-			if (bodyResult.exceeded) return;
-			let payload;
-			try {
-				payload = JSON.parse(bodyResult.text);
-			} catch {
-				return;
-			}
-			const targets = kernel.buildMetadataPrewarmTargets(options.proxyPath, payload, activeTargetBase, name, key, requestTraits.prewarmDepth);
-			if (!targets.length) return;
-			ctx.waitUntil((async () => {
+			let responseClone;
+			try { responseClone = response.clone(); } catch { return; }
+			const task = (async () => {
+				const bodyResult = await readResponseTextWithLimit(responseClone, METADATA_PREWARM_RESPONSE_MAX_BYTES);
+				if (bodyResult.exceeded) return;
+				let payload;
+				try { payload = JSON.parse(bodyResult.text); } catch { return; }
+				const targets = kernel.buildMetadataPrewarmTargets(options.proxyPath, payload, activeTargetBase, name, key, requestTraits.prewarmDepth);
+				if (!targets.length) return;
 				const cache = getDefaultCacheHandle();
+				if (!cache) return;
+				let remainingBytes = clampIntegerConfig(requestTraits.prewarmPrefetchBytes, Config.Defaults.PrewarmPrefetchBytes, 0, METADATA_PREWARM_MAX_PREFETCH_BYTES);
 				for (const target of targets) {
+					if (remainingBytes <= 0) break;
 					if (!shouldWorkerCacheMetadataUrl(target.upstreamUrl)) continue;
 					const identityPartition = await buildWorkerMetadataPrewarmIdentityPartition(request, target.upstreamUrl);
 					const cacheKey = buildCanonicalWorkerMetadataCacheKey(requestUrl, name, key, target.proxyPath, {
@@ -18234,42 +18446,50 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 						identityPartition,
 						cachePolicyRevision: buildWorkerMetadataCachePolicyRevision(target.proxyPath, options)
 					});
+					if (!cacheKey) continue;
 					if (cache && cacheKey) try {
 						if (await cache.match(cacheKey)) continue;
 					} catch {}
 					try {
-						const prewarmOptions = await buildFetchOptions(target.upstreamUrl, { method: "GET" });
-						prewarmOptions.cache = "no-store";
-						const prewarmHeaders = new Headers(prewarmOptions.headers);
-						prewarmHeaders.delete("Range");
-						prewarmHeaders.delete("If-Modified-Since");
-						prewarmHeaders.delete("If-None-Match");
-						prewarmHeaders.set("X-Metadata-Prewarm", "1");
-						prewarmOptions.headers = prewarmHeaders;
-						const prewarmTimeoutMs = clampIntegerConfig(options.prewarmTimeoutMs, DEFAULT_METADATA_PREWARM_TIMEOUT_MS, 250, 1e4);
-						let timeoutId = null;
-						try {
-							if (prewarmTimeoutMs > 0) {
-								const controller = new AbortController();
-								prewarmOptions.signal = controller.signal;
-								timeoutId = setTimeout(() => controller.abort(), prewarmTimeoutMs);
+						const flight = await kernel.runMetadataPrewarmSingleFlight(cacheKey, async () => {
+							const prewarmOptions = await buildFetchOptions(target.upstreamUrl, { method: "GET" });
+							prewarmOptions.cache = "no-store";
+							const prewarmHeaders = new Headers(prewarmOptions.headers);
+							prewarmHeaders.delete("Range");
+							prewarmHeaders.delete("If-Modified-Since");
+							prewarmHeaders.delete("If-None-Match");
+							prewarmHeaders.set("X-Metadata-Prewarm", "1");
+							prewarmOptions.headers = prewarmHeaders;
+							const controller = new AbortController();
+							prewarmOptions.signal = controller.signal;
+							const timeoutMs = clampIntegerConfig(options.prewarmTimeoutMs, DEFAULT_METADATA_PREWARM_TIMEOUT_MS, 250, 1e4);
+							const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+							try {
+								const upstream = await fetchRequest(target.upstreamUrl.toString(), prewarmOptions);
+								if (upstream.status !== 200) {
+									try { await upstream.body?.cancel?.(); } catch {}
+									return { cached: false, bytes: 0 };
+								}
+								const bounded = kernel.buildBudgetedPrewarmResponse(upstream, remainingBytes);
+								if (!bounded) return { cached: false, bytes: 0 };
+								const warmTraits = {
+									isImage: EMBY_IMAGE_PATH_REGEX.test(target.proxyPath) || IMAGE_FILE_EXTENSION_REGEX.test(target.proxyPath),
+									isSubtitle: SUBTITLE_EXTENSION_REGEX.test(target.proxyPath),
+									isManifest: STREAM_MANIFEST_EXTENSION_REGEX.test(target.proxyPath)
+								};
+								const cached = await kernel.storeMetadataCache(cacheKey, bounded.response, warmTraits, { ...options, sourceUrl: target.upstreamUrl });
+								return { cached, bytes: bounded.getBytes() };
+							} finally {
+								clearTimeout(timeoutId);
+								controller.abort();
 							}
-							const prewarmResponse = await fetchRequest(target.upstreamUrl.toString(), prewarmOptions);
-							const warmTraits = {
-								isImage: EMBY_IMAGE_PATH_REGEX.test(target.proxyPath) || IMAGE_FILE_EXTENSION_REGEX.test(target.proxyPath),
-								isSubtitle: SUBTITLE_EXTENSION_REGEX.test(target.proxyPath),
-								isManifest: STREAM_MANIFEST_EXTENSION_REGEX.test(target.proxyPath)
-							};
-							await kernel.storeMetadataCache(cacheKey, prewarmResponse, warmTraits, {
-								...options,
-								sourceUrl: target.upstreamUrl
-							});
-						} finally {
-							if (timeoutId !== null) clearTimeout(timeoutId);
-						}
+						});
+						if (!flight.joined && flight.result) remainingBytes = Math.max(0, remainingBytes - (Number(flight.result.bytes) || 0));
 					} catch {}
 				}
-			})());
+			})().catch(() => {});
+			ctx.waitUntil(task);
+			return task;
 		},
 		shouldRetryWithProtocolFallback(response, state = {}) {
 			if (response.status !== 403) return false;
@@ -18279,11 +18499,13 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 			if (state.preparedBodyMode === "stream") return false;
 			return true;
 		},
-		resolveResponseStreamIdleTimeoutMs(requestTraits, upstreamTimeoutMs) {
+		resolveResponseStreamIdleTimeoutMs(requestTraits) {
+			if (requestTraits?.isManifest === true) return Config.Defaults.ProxyPlaylistIdleTimeoutMs;
+			if (requestTraits?.isSegment === true) return Config.Defaults.ProxyStreamIdleTimeoutMs;
 			return 0;
 		},
 		shouldManageProxyResponseBody(execution, upstreamState) {
-			return execution.requestTraits.isSegment === true && execution.requestMethod !== "HEAD" && upstreamState.response.status !== 101 && !!upstreamState.response.body;
+			return (execution.requestTraits.isSegment === true || execution.requestTraits.isManifest === true) && execution.requestMethod !== "HEAD" && upstreamState.response.status !== 101 && !!upstreamState.response.body;
 		},
 		buildPassthroughProxyResponseBody(execution, upstreamState) {
 			const upstreamBody = execution.requestMethod === "HEAD" ? null : upstreamState.response.body;
@@ -18434,6 +18656,7 @@ function defineProxyMetadataResponseMethods(dependencies = {}, kernel = {}) {
 								return;
 							}
 							controller.enqueue(value);
+							armIdleTimer();
 						} catch (error) {
 							clearIdleTimer();
 							const abortReason = requestLifecycle.getAbortReason();
@@ -18782,21 +19005,6 @@ function defineProxyAccessLogMethods(dependencies = {}, kernel = {}) {
 			};
 			Logger.record(execution.env, execution.ctx, logData);
 		},
-		async flushCriticalLogsIfNeeded(execution) {
-			const requestTraits = execution?.requestTraits || {};
-			if (!(requestTraits.isPlaybackInfoRequest === true || requestTraits.isPlaybackSessionControlRequest === true)) return;
-			const currentConfig = execution?.currentConfig || {};
-			if (currentConfig.logEnabled === false) return;
-			const configuredDelayMinutes = Number(currentConfig.logWriteDelayMinutes);
-			if (Math.max(0, Number.isFinite(configuredDelayMinutes) ? configuredDelayMinutes * 6e4 : Config.Defaults.LogFlushDelayMinutes * 6e4) !== 0) return;
-			const logState = logBindingStates.get(execution?.env ? kernel.getDB(execution.env) : null);
-			if (logState.LogFlushTask) try {
-				await logState.LogFlushTask;
-			} catch {}
-			if (logState.LogQueue.length > 0) try {
-				await Logger.flush(execution.env);
-			} catch {}
-		},
 		buildOptionsResponse(execution) {
 			const headers = new Headers(execution.dynamicCors);
 			applySecurityHeaders(headers);
@@ -19015,6 +19223,7 @@ function definePlaybackExecutionCacheMethods(dependencies = {}, kernel = {}) {
 				rewritePlaybackEntry,
 				playbackRelayTargetUrl: playbackRelay?.targetUrl instanceof URL ? playbackRelay.targetUrl : null,
 				targetHotCacheState: String(options.targetHotCacheState || "").trim() || (requestTraits.isPlaybackCriticalRequest === true ? "miss" : "skip"),
+				nodeCacheState: String(options.nodeCacheState || "").trim(),
 				playbackRouteHotTargetRecords: Array.isArray(options.cachedTargetRecords) ? options.cachedTargetRecords : null,
 				videoProgressForwardEnabled,
 				videoProgressForwardIntervalSec,
@@ -19263,6 +19472,7 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 				pendingSnapshot: null,
 				scheduledFlushAt: 0,
 				scheduledPromise: null,
+				cancelScheduledDelay: null,
 				activeFlushPromise: null,
 				terminalState: "",
 				terminalAt: 0,
@@ -19286,13 +19496,19 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			entry.waitUntilCtx = execution?.ctx || entry.waitUntilCtx || null;
 			entry.nodeName = String(execution?.nodeName || entry.nodeName || "").trim().toLowerCase();
 			entry.nodeRevision = String(execution?.nodeDerivedCacheRevision || entry.nodeRevision || "").trim();
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.pendingSnapshot = null;
 			entry.scheduledFlushAt = 0;
 			entry.terminalState = "stopped";
 			entry.terminalAt = stoppedAt;
 			entry.terminalTombstoneUntil = stoppedAt + kernel.getPlaybackProgressRelayTerminalTtlMs(entry.intervalMs);
 			entry.lastTouchedAt = stoppedAt;
-			setBoundedPlaybackProgressRelayEntry(sessionKey, entry);
+			if (!setBoundedPlaybackProgressRelayEntry(sessionKey, entry)) {
+				releasePlaybackProgressRelayEntry(entry);
+				return null;
+			}
 			return entry;
 		},
 		cleanupPlaybackProgressRelay(now = nowMs()) {
@@ -19311,7 +19527,11 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			}
 			const maxEntries = Math.max(1, Number(Config.Defaults.VideoProgressForwardSessionMax) || 1);
 			while (relayMap.size > maxEntries) {
-				const oldestKey = relayMap.keys().next().value;
+				let oldestKey = "";
+				for (const [candidateKey, candidate] of relayMap) if (!candidate?.activeFlushPromise) {
+					oldestKey = candidateKey;
+					break;
+				}
 				if (!oldestKey) break;
 				deletePlaybackProgressRelayEntry(oldestKey);
 			}
@@ -19341,8 +19561,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			const dueAt = Math.max(nowMs(), Number(entry.lastForwardAt) || 0) + intervalMs;
 			entry.scheduledFlushAt = dueAt;
 			entry.lastTouchedAt = nowMs();
+			const delay = createCancelableDelay(Math.max(0, dueAt - nowMs()));
 			const waitPromise = (async () => {
-				await sleepMs(Math.max(0, dueAt - nowMs()));
+				if (!await delay.promise) return;
 				const currentEntry = cacheState.PlaybackProgressRelay.get(sessionKey);
 				if (!currentEntry || currentEntry !== entry || Number(currentEntry.scheduledFlushAt) !== dueAt) return;
 				currentEntry.scheduledFlushAt = 0;
@@ -19350,8 +19571,13 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 					background: true,
 					attachToCtx: false
 				});
-			})();
+			})().finally(() => {
+				if (entry.scheduledPromise !== waitPromise) return;
+				entry.scheduledPromise = null;
+				entry.cancelScheduledDelay = null;
+			});
 			entry.scheduledPromise = waitPromise;
+			entry.cancelScheduledDelay = delay.cancel;
 			const waitUntilCtx = entry.waitUntilCtx || entry.pendingSnapshot?.ctx || null;
 			if (waitUntilCtx?.waitUntil) waitUntilCtx.waitUntil(waitPromise);
 		},
@@ -19388,6 +19614,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			if (!entry.pendingSnapshot) return false;
 			const snapshot = entry.pendingSnapshot;
 			entry.pendingSnapshot = null;
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.scheduledFlushAt = 0;
 			entry.lastForwardAt = nowMs();
 			entry.lastTouchedAt = entry.lastForwardAt;
@@ -19424,6 +19653,9 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 				await entry.activeFlushPromise;
 			} catch {}
 			if (!entry.pendingSnapshot) return false;
+			try { entry.cancelScheduledDelay?.(); } catch {}
+			entry.cancelScheduledDelay = null;
+			entry.scheduledPromise = null;
 			entry.scheduledFlushAt = 0;
 			return await kernel.flushPlaybackProgressRelayEntry(sessionKey, {
 				background: false,
@@ -19504,7 +19736,11 @@ function definePlaybackProgressRelayMethods(dependencies = {}, kernel = {}) {
 			relayEntry.terminalState = "";
 			relayEntry.terminalAt = 0;
 			relayEntry.terminalTombstoneUntil = 0;
-			setBoundedPlaybackProgressRelayEntry(sessionKey, relayEntry);
+			if (!setBoundedPlaybackProgressRelayEntry(sessionKey, relayEntry)) {
+				releasePlaybackProgressRelayEntry(relayEntry);
+				execution.progressForwardMode = "capacity_bypass";
+				return null;
+			}
 			if (!(relayEntry.lastForwardAt > 0 && now - relayEntry.lastForwardAt < relayEntry.intervalMs) && !relayEntry.activeFlushPromise && !relayEntry.pendingSnapshot) {
 				relayEntry.pendingSnapshot = null;
 				relayEntry.scheduledFlushAt = 0;
@@ -19587,6 +19823,7 @@ function defineProxyRoutingDecisionMethods(dependencies = {}, kernel = {}) {
 				enablePrewarm: currentConfig.enablePrewarm !== false && !legacyEntryOffloadEnabled,
 				prewarmCacheTtl: clampIntegerConfig(currentConfig.prewarmCacheTtl, DEFAULT_PREWARM_CACHE_TTL_SEC, 0, 3600),
 				prewarmDepth: normalizePrewarmDepth(currentConfig.prewarmDepth),
+				prewarmPrefetchBytes: currentConfig.disablePrewarmPrefetch === true ? 0 : clampIntegerConfig(currentConfig.prewarmPrefetchBytes, Config.Defaults.PrewarmPrefetchBytes, 0, METADATA_PREWARM_MAX_PREFETCH_BYTES),
 				isImage,
 				isStaticFile,
 				isSubtitle,
@@ -20853,45 +21090,16 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 		async rebuildStatsHourlyForDate(db, options = {}) {
 			if (!db) return false;
 			const bucketDate = String(options.bucketDate || "").trim();
-			const startTs = Number(options.startTs) || 0;
-			const endTs = Number(options.endTs) || 0;
-			if (!bucketDate || startTs <= 0 || endTs <= 0 || endTs < startTs) return false;
+			if (!bucketDate) return false;
 			await kernel.ensureStatsHourlySchema(db);
 			await db.prepare(`DELETE FROM ${kernel.STATS_HOURLY_TABLE} WHERE bucket_date = ?`).bind(bucketDate).run();
-			const logsResult = await db.prepare(`SELECT timestamp, request_path, category
-            FROM ${kernel.LOGS_TABLE}
-            WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp ASC`).bind(startTs, endTs).all();
-			const normalizedEntries = (Array.isArray(logsResult?.results) ? logsResult.results : []).map((row) => ({
-				timestamp: Number(row?.timestamp) || 0,
-				requestPath: row?.request_path || row?.requestPath || "",
-				category: row?.category || ""
-			}));
-			return await kernel.incrementStatsHourly(db, normalizedEntries, {
-				utcOffsetMinutes: options.utcOffsetMinutes,
-				useBatch: true
-			});
+			return true;
 		},
 		async rebuildStatsHourlyWindow(db, options = {}) {
 			if (!db) return false;
-			const startTs = Number(options.startTs) || 0;
-			const endTs = Number(options.endTs) || 0;
-			if (startTs < 0 || endTs <= 0 || endTs < startTs) return false;
 			await kernel.ensureStatsHourlySchema(db);
 			await kernel.clearStatsHourly(db);
-			const logsResult = await db.prepare(`SELECT timestamp, request_path, category
-            FROM ${kernel.LOGS_TABLE}
-            WHERE timestamp >= ? AND timestamp <= ?
-            ORDER BY timestamp ASC`).bind(startTs, endTs).all();
-			const normalizedEntries = (Array.isArray(logsResult?.results) ? logsResult.results : []).map((row) => ({
-				timestamp: Number(row?.timestamp) || 0,
-				requestPath: row?.request_path || row?.requestPath || "",
-				category: row?.category || ""
-			}));
-			return await kernel.incrementStatsHourly(db, normalizedEntries, {
-				utcOffsetMinutes: options.utcOffsetMinutes,
-				useBatch: true
-			});
+			return true;
 		},
 		async ensureStatsHourlyWindowAligned(envOrStore, options = {}) {
 			const stores = kernel.resolveOpsStatusStores(envOrStore);
@@ -22786,6 +22994,136 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		getDB(env) {
 			return getD1Binding(env);
 		},
+		buildD1CreateTableSql(tableName, targetTableName = tableName, options = {}) {
+			const target = quoteSqlIdentifier(targetTableName);
+			const createTable = `CREATE TABLE${options.ifNotExists === true ? " IF NOT EXISTS" : ""}`;
+			const definitions = {
+				[kernel.D1_SCHEMA_META_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, contract_version INTEGER NOT NULL, contract_hash TEXT NOT NULL, schema_fingerprint TEXT NOT NULL, schema_cookie INTEGER NOT NULL, last_plan_hash TEXT NOT NULL, verified_at TEXT NOT NULL, attestation TEXT NOT NULL, migration_owner TEXT, lease_expires_at INTEGER)`,
+				[kernel.SYS_STATUS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.SCHEDULED_LOCKS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, token TEXT NOT NULL, owner TEXT NOT NULL, acquired_at INTEGER NOT NULL, renewed_at INTEGER, expires_at INTEGER NOT NULL)`,
+				[kernel.AUTH_FAILURES_TABLE]: `${createTable} ${target} (ip TEXT PRIMARY KEY, fail_count INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.CF_DASH_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, zone_id TEXT NOT NULL, bucket_date TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.CF_RUNTIME_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, cache_group TEXT NOT NULL, resource_id TEXT NOT NULL, payload TEXT NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
+				[kernel.DNS_IP_POOL_ITEMS_TABLE]: `${createTable} ${target} (id TEXT PRIMARY KEY, ip TEXT NOT NULL UNIQUE, ip_type TEXT NOT NULL, source_kind TEXT NOT NULL, source_label TEXT, line_label TEXT NOT NULL DEFAULT '', remark TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_POOL_SOURCES_TABLE]: `${createTable} ${target} (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, source_type TEXT NOT NULL DEFAULT 'url', domain TEXT, source_kind TEXT NOT NULL DEFAULT 'custom', preset_id TEXT NOT NULL DEFAULT '', builtin_id TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1, sort_order INTEGER NOT NULL DEFAULT 0, ip_limit INTEGER NOT NULL DEFAULT 5, last_fetch_at TEXT, last_fetch_status TEXT, last_fetch_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_POOL_FETCH_CACHE_TABLE]: `${createTable} ${target} (signature TEXT PRIMARY KEY, items_json TEXT NOT NULL, source_results_json TEXT NOT NULL, imported_count INTEGER NOT NULL DEFAULT 0, enabled_source_count INTEGER NOT NULL DEFAULT 0, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+				[kernel.DNS_IP_PROBE_CACHE_TABLE]: `${createTable} ${target} (ip TEXT NOT NULL, entry_colo TEXT NOT NULL, probe_status TEXT NOT NULL, latency_ms INTEGER, cf_ray TEXT, colo_code TEXT, city_name TEXT, country_code TEXT, country_name TEXT, probed_at TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY (ip, entry_colo))`,
+				[kernel.LOGS_TABLE]: `${createTable} ${target} (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL, node_name TEXT NOT NULL, request_path TEXT NOT NULL, request_method TEXT NOT NULL, status_code INTEGER NOT NULL, response_time INTEGER NOT NULL, client_ip TEXT NOT NULL, inbound_colo TEXT, outbound_colo TEXT, user_agent TEXT, referer TEXT, category TEXT DEFAULT 'api', error_detail TEXT, detail_json TEXT, created_at TEXT NOT NULL, inbound_ip TEXT, outbound_ip TEXT)`,
+				[kernel.STATS_HOURLY_TABLE]: `${createTable} ${target} (bucket_date TEXT NOT NULL, bucket_hour INTEGER NOT NULL, request_count INTEGER NOT NULL DEFAULT 0, play_count INTEGER NOT NULL DEFAULT 0, playback_info_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (bucket_date, bucket_hour))`
+			};
+			const sql = definitions[tableName];
+			if (!sql) throw new Error(`Unknown D1 schema table: ${tableName}`);
+			return sql;
+		},
+		getD1LogsFtsContractSql() {
+			return {
+				createTable: `CREATE VIRTUAL TABLE ${kernel.LOGS_FTS_TABLE} USING fts5(node_name, request_path, user_agent, error_detail, detail_json, content='${kernel.LOGS_TABLE}', content_rowid='id', tokenize='unicode61')`,
+				createTrigger: `CREATE TRIGGER ${kernel.LOGS_FTS_INSERT_TRIGGER} AFTER INSERT ON ${kernel.LOGS_TABLE} BEGIN
+          INSERT INTO ${kernel.LOGS_FTS_TABLE}(rowid, node_name, request_path, user_agent, error_detail, detail_json)
+          VALUES (new.id, new.node_name, new.request_path, COALESCE(new.user_agent, ''), COALESCE(new.error_detail, ''), COALESCE(new.detail_json, ''));
+        END;`
+			};
+		},
+		getD1ContractHash() {
+			const contract = kernel.getD1CurrentSchemaContract();
+			const createTables = Object.keys(contract.columns).sort().map((tableName) => [tableName, kernel.buildD1CreateTableSql(tableName)]);
+			return hashStableText(serializeConfigValue({
+				version: D1_SCHEMA_CONTRACT_VERSION,
+				createTables,
+				columns: contract.columns,
+				columnAffinities: contract.columnAffinities,
+				primaryKeys: contract.primaryKeys,
+				indexes: contract.indexes,
+				uniqueIndexes: contract.uniqueIndexes,
+				fts: kernel.getD1LogsFtsContractSql(),
+				safeColumnAdditions: kernel.getD1RuntimeColumnAdditions()
+			}));
+		},
+		async getD1SchemaCookie(db) {
+			const row = await db.prepare("PRAGMA schema_version").first();
+			return Math.max(0, Number(row?.schema_version) || 0);
+		},
+		buildD1SchemaAttestationPayload(meta = {}) {
+			return serializeConfigValue({
+				scope: "main",
+				contractVersion: Math.max(0, Number(meta.contractVersion ?? meta.contract_version) || 0),
+				contractHash: String((meta.contractHash ?? meta.contract_hash) || ""),
+				schemaFingerprint: String((meta.schemaFingerprint ?? meta.schema_fingerprint) || ""),
+				schemaCookie: Math.max(0, Number(meta.schemaCookie ?? meta.schema_cookie) || 0),
+				lastPlanHash: String((meta.lastPlanHash ?? meta.last_plan_hash) || ""),
+				verifiedAt: String((meta.verifiedAt ?? meta.verified_at) || "")
+			});
+		},
+		async signD1SchemaAttestation(env, meta = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			if (!secret) return "";
+			return await signHmac(secret, kernel.buildD1SchemaAttestationPayload(meta));
+		},
+		async readD1SchemaMeta(db) {
+			try {
+				return await db.prepare(`SELECT scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at FROM ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} WHERE scope = 'main' LIMIT 1`).first();
+			} catch {
+				return null;
+			}
+		},
+		async verifyD1SchemaAttestation(db, env) {
+			const meta = await kernel.readD1SchemaMeta(db);
+			if (!meta) return { valid: false, reason: "missing_meta" };
+			const currentVersion = Math.max(0, Number(meta.contract_version) || 0);
+			if (currentVersion > D1_SCHEMA_CONTRACT_VERSION) return { valid: false, blocked: true, reason: "schema_version_ahead", meta };
+			if (currentVersion !== D1_SCHEMA_CONTRACT_VERSION) return { valid: false, reason: "version_mismatch", meta };
+			if (String(meta.contract_hash || "") !== kernel.getD1ContractHash()) return { valid: false, reason: "contract_hash_mismatch", meta };
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			if (Math.max(0, Number(meta.schema_cookie) || 0) !== schemaCookie) return { valid: false, reason: "schema_cookie_changed", meta, schemaCookie };
+			const expected = await kernel.signD1SchemaAttestation(env, meta);
+			if (!expected || expected !== String(meta.attestation || "")) return { valid: false, reason: "invalid_attestation", meta, schemaCookie };
+			return { valid: true, meta, schemaCookie };
+		},
+		async writeVerifiedD1SchemaMeta(db, env, plan = {}) {
+			const contractHash = kernel.getD1ContractHash();
+			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			const verifiedAt = (/* @__PURE__ */ new Date()).toISOString();
+			const values = {
+				contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+				contractHash,
+				schemaFingerprint,
+				schemaCookie,
+				lastPlanHash: String(plan?.planHash || ""),
+				verifiedAt
+			};
+			const attestation = await kernel.signD1SchemaAttestation(env, values);
+			if (!attestation) return { written: false, reason: "missing_secret", ...values };
+			await db.prepare(`INSERT INTO ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} (scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at)
+        VALUES ('main', ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        ON CONFLICT(scope) DO UPDATE SET contract_version = excluded.contract_version, contract_hash = excluded.contract_hash, schema_fingerprint = excluded.schema_fingerprint, schema_cookie = excluded.schema_cookie, last_plan_hash = excluded.last_plan_hash, verified_at = excluded.verified_at, attestation = excluded.attestation, migration_owner = NULL, lease_expires_at = NULL`).bind(D1_SCHEMA_CONTRACT_VERSION, contractHash, schemaFingerprint, schemaCookie, values.lastPlanHash, verifiedAt, attestation).run();
+			return { written: true, attestation, ...values };
+		},
+		async acquireD1SchemaRepairLease(db, owner, options = {}) {
+			const now = Math.max(0, Number(options.nowMs ?? nowMs()) || 0);
+			const leaseExpiresAt = now + D1_SCHEMA_REPAIR_LEASE_MS;
+			const result = await db.prepare(`INSERT INTO ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} (scope, contract_version, contract_hash, schema_fingerprint, schema_cookie, last_plan_hash, verified_at, attestation, migration_owner, lease_expires_at)
+        VALUES ('main', 0, '', '', 0, '', '', '', ?, ?)
+        ON CONFLICT(scope) DO UPDATE SET migration_owner = excluded.migration_owner, lease_expires_at = excluded.lease_expires_at
+        WHERE ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.migration_owner IS NULL OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.lease_expires_at IS NULL OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.lease_expires_at < ? OR ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)}.migration_owner = excluded.migration_owner`).bind(owner, leaseExpiresAt, now).run();
+			const changes = Math.max(0, Number(result?.meta?.changes ?? result?.changes) || 0);
+			if (changes < 1) { const error = new Error("D1 schema repair is already running"); error.code = "D1_SCHEMA_REPAIR_IN_PROGRESS"; error.status = 409; error.details = { leaseExpiresAt }; throw error; }
+			return { owner, leaseExpiresAt };
+		},
+		async releaseD1SchemaRepairLease(db, owner) {
+			if (!owner) return false;
+			await db.prepare(`UPDATE ${quoteSqlIdentifier(kernel.D1_SCHEMA_META_TABLE)} SET migration_owner = NULL, lease_expires_at = NULL WHERE scope = 'main' AND migration_owner = ?`).bind(owner).run();
+			return true;
+		},
+		getD1UniqueIndexContract() {
+			return {
+				ux_dns_ip_pool_items_ip: {
+					table: kernel.DNS_IP_POOL_ITEMS_TABLE,
+					columns: ["ip"],
+					createSql: `CREATE UNIQUE INDEX ux_dns_ip_pool_items_ip ON ${kernel.DNS_IP_POOL_ITEMS_TABLE} (ip)`
+				}
+			};
+		},
 		getD1RuntimeIndexContract() {
 			return {
 				idx_sys_locks_expires_at: {
@@ -22861,6 +23199,17 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RuntimeColumnAdditions() {
 			return {
+				[kernel.D1_SCHEMA_META_TABLE]: {
+					contract_version: "INTEGER NOT NULL DEFAULT 0",
+					contract_hash: "TEXT NOT NULL DEFAULT ''",
+					schema_fingerprint: "TEXT NOT NULL DEFAULT ''",
+					schema_cookie: "INTEGER NOT NULL DEFAULT 0",
+					last_plan_hash: "TEXT NOT NULL DEFAULT ''",
+					verified_at: "TEXT NOT NULL DEFAULT ''",
+					attestation: "TEXT NOT NULL DEFAULT ''",
+					migration_owner: "TEXT",
+					lease_expires_at: "INTEGER"
+				},
 				[kernel.SYS_STATUS_TABLE]: {
 					payload: "TEXT NOT NULL DEFAULT '{}'",
 					updated_at: "INTEGER NOT NULL DEFAULT 0"
@@ -22971,6 +23320,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RequiredPrimaryKeyContract() {
 			return {
+				[kernel.D1_SCHEMA_META_TABLE]: ["scope"],
 				[kernel.SYS_STATUS_TABLE]: ["scope"],
 				[kernel.SCHEDULED_LOCKS_TABLE]: ["scope"],
 				[kernel.AUTH_FAILURES_TABLE]: ["ip"],
@@ -23194,11 +23544,12 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					db
 				}, "dnsIpPool")
 			]);
-			let configMeta = storedConfigMeta;
-			if (!configMeta) {
-				const sourceConfig = options.config !== void 0 ? options.config : await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {};
-				configMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(sanitizeRuntimeConfig(sourceConfig)));
-			}
+			const sourceConfig = options.config !== void 0 ? options.config : await kvGetStrict(kv, kernel.CONFIG_KEY, { type: "json" }) || {};
+			const derivedConfigMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(sanitizeRuntimeConfig(sourceConfig), {
+				updatedAt: String(storedConfigMeta?.updatedAt || "").trim()
+			}));
+			const storedConfigRevisionHash = String(storedConfigMeta?.revision || "").trim().split(".").pop() || "";
+			const configMeta = storedConfigMeta?.hash === derivedConfigMeta.hash && storedConfigRevisionHash === derivedConfigMeta.hash ? storedConfigMeta : derivedConfigMeta;
 			let nodesMeta = storedNodesMeta;
 			if (!nodesMeta) {
 				const nodes = Array.isArray(options.nodes) ? options.nodes : await kernel.getNodesSummaryIndexStrict(kv, { ctx: options.ctx });
@@ -23302,10 +23653,14 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 		async getTableColumnDefinitions(db, tableName) {
 			if (!db || !tableName) return [];
 			try {
-				return ((await db.prepare(`PRAGMA table_info(${quoteSqlIdentifier(tableName)})`).all())?.results || []).map((row) => ({
+				return ((await db.prepare(`PRAGMA table_xinfo(${quoteSqlIdentifier(tableName)})`).all())?.results || []).map((row) => ({
 					name: String(row?.name || "").toLowerCase(),
 					type: String(row?.type || "").trim().toUpperCase(),
-					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0)
+					affinity: normalizeSqliteTypeAffinity(row?.type),
+					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0),
+					notNull: Number(row?.notnull) === 1,
+					defaultValue: row?.dflt_value ?? null,
+					hidden: Math.max(0, Number(row?.hidden) || 0)
 				})).filter((column) => column.name);
 			} catch (cause) {
 				const error = /* @__PURE__ */ new Error(`D1 schema inspection failed for ${tableName}`);
@@ -23369,6 +23724,7 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 		getD1CurrentSchemaContract() {
 			const primaryKeys = kernel.getD1RequiredPrimaryKeyContract();
 			const primaryKeyTypes = {
+				[kernel.D1_SCHEMA_META_TABLE]: { scope: "TEXT" },
 				[kernel.SYS_STATUS_TABLE]: { scope: "TEXT" },
 				[kernel.SCHEDULED_LOCKS_TABLE]: { scope: "TEXT" },
 				[kernel.AUTH_FAILURES_TABLE]: { ip: "TEXT" },
@@ -23389,7 +23745,30 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				return [tableName, { ...primaryKeyTypes[tableName], ...runtimeTypes }];
 			}));
 			const columns = Object.fromEntries(Object.entries(columnTypes).map(([tableName, definitions]) => [tableName, Object.keys(definitions)]));
-			return { columns, columnTypes, primaryKeys, indexes: kernel.getD1RuntimeIndexContract() };
+			const columnAffinities = Object.fromEntries(Object.entries(columnTypes).map(([tableName, definitions]) => [tableName, Object.fromEntries(Object.entries(definitions).map(([name, type]) => [name, normalizeSqliteTypeAffinity(type)]))]));
+			return {
+				columns,
+				columnTypes,
+				columnAffinities,
+				primaryKeys,
+				indexes: kernel.getD1RuntimeIndexContract(),
+				uniqueIndexes: kernel.getD1UniqueIndexContract()
+			};
+		},
+		async getD1SchemaFingerprint(db) {
+			if (!db) return "";
+			const contract = kernel.getD1CurrentSchemaContract();
+			const schemaRows = (await db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").all())?.results || [];
+			const columnState = {};
+			for (const tableName of Object.keys(contract.columns)) {
+				columnState[tableName] = (await kernel.getTableColumnDefinitions(db, tableName)).map((column) => ({
+					name: column.name,
+					type: column.type,
+					primaryKeyOrder: column.primaryKeyOrder,
+					hidden: column.hidden
+				}));
+			}
+			return hashStableText(serializeConfigValue({ schemaRows, columnState }));
 		},
 		async getD1SchemaStatus(db) {
 			if (!db) return { tables: {}, columns: {}, indexes: {}, constraints: { primaryKeys: {}, uniqueKeys: {} }, ftsReady: false, fts: {}, schemaReady: false, issues: ["db_not_configured"] };
@@ -23415,12 +23794,13 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				const actualColumns = new Map(definitions.map((column) => [column.name, column]));
 				columns[tableName] = Object.fromEntries(requiredColumns.map((name) => {
 					const actual = actualColumns.get(name);
-					const expectedType = String(contract.columnTypes?.[tableName]?.[name] || "").toUpperCase();
-					return [name, !!actual && (!expectedType || actual.type === expectedType)];
+					const expectedAffinity = String(contract.columnAffinities?.[tableName]?.[name] || "").toUpperCase();
+					const exactIntegerRowId = tableName === kernel.LOGS_TABLE && name === "id";
+					return [name, !!actual && (!expectedAffinity || actual.affinity === expectedAffinity) && (!exactIntegerRowId || actual.type === "INTEGER")];
 				}));
 				for (const [name, ready] of Object.entries(columns[tableName])) if (!ready) {
 					const actual = actualColumns.get(name);
-					issues.push(actual ? `invalid_column_type:${tableName}.${name}` : `missing_column:${tableName}.${name}`);
+					issues.push(actual ? `invalid_column_affinity:${tableName}.${name}` : `missing_column:${tableName}.${name}`);
 				}
 				const actualPrimaryKey = definitions.filter((column) => column.primaryKeyOrder > 0).sort((left, right) => left.primaryKeyOrder - right.primaryKeyOrder).map((column) => column.name);
 				const idColumn = tableName === kernel.LOGS_TABLE ? definitions.find((column) => column.name === "id") : null;
@@ -23456,76 +23836,541 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				issues
 			};
 		},
-		async assertD1CurrentSchema(db, status = null) {
-			const current = status || await kernel.getD1SchemaStatus(db);
+		async getD1SchemaReadiness(db, options = {}) {
+			if (options.allowAttestedFastPath === true && options.env) {
+				const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
+				if (attested.blocked) return { schemaReady: false, fastPath: false, issues: ["schema_version_ahead"], attested };
+				if (attested.valid) return {
+					schemaReady: true,
+					fastPath: true,
+					contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+					contractHash: kernel.getD1ContractHash(),
+					schemaFingerprint: String(attested.meta?.schema_fingerprint || ""),
+					schemaCookie: attested.schemaCookie,
+					issues: []
+				};
+			}
+			return { ...await kernel.getD1SchemaStatus(db), fastPath: false };
+		},
+		async probeD1UniqueKeyRepair(db, tableName, columns = []) {
+			const quotedTable = quoteSqlIdentifier(tableName);
+			const quotedColumns = columns.map((name) => quoteSqlIdentifier(name));
+			const emptyPredicate = quotedColumns.map((name) => `${name} IS NULL OR (typeof(${name}) = 'text' AND trim(${name}) = '')`).join(" OR ");
+			const [emptyRow, duplicateRow] = await Promise.all([
+				db.prepare(`SELECT 1 AS present FROM ${quotedTable} WHERE ${emptyPredicate} LIMIT 1`).first(),
+				db.prepare(`SELECT 1 AS present FROM ${quotedTable} GROUP BY ${quotedColumns.join(", ")} HAVING COUNT(*) > 1 LIMIT 1`).first()
+			]);
+			return { empty: !!emptyRow, duplicate: !!duplicateRow };
+		},
+		async probeD1PrimaryKeyRepair(db, tableName, contract) {
+			const definitions = await kernel.getTableColumnDefinitions(db, tableName);
+			const allowsDataLoss = tableName === kernel.LOGS_TABLE;
+			const expectedColumns = new Set(contract.columns?.[tableName] || []);
+			const expectedPrimaryKey = contract.primaryKeys?.[tableName] || [];
+			const actualColumns = new Map(definitions.map((column) => [column.name, column]));
+			const blockers = [];
+			for (const columnName of expectedPrimaryKey) {
+				const actual = actualColumns.get(columnName);
+				const expectedAffinity = contract.columnAffinities?.[tableName]?.[columnName];
+				if (!actual) { if (!allowsDataLoss) blockers.push(`missing_key_column:${tableName}.${columnName}`); }
+				else if (actual.affinity !== expectedAffinity || tableName === kernel.LOGS_TABLE && columnName === "id" && actual.type !== "INTEGER") blockers.push(`invalid_column_affinity:${tableName}.${columnName}`);
+			}
+			const extraColumns = definitions.filter((column) => !expectedColumns.has(column.name)).map((column) => column.name);
+			if (!allowsDataLoss && extraColumns.length) blockers.push(`unsupported_extra_columns:${tableName}:${extraColumns.join(",")}`);
+			if (!allowsDataLoss && definitions.some((column) => column.hidden > 0)) blockers.push(`unsupported_hidden_columns:${tableName}`);
+			const foreignKeys = (await db.prepare(`PRAGMA foreign_key_list(${quoteSqlIdentifier(tableName)})`).all())?.results || [];
+			if (foreignKeys.length) blockers.push(`unsupported_foreign_keys:${tableName}`);
+			const triggerRows = (await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?").bind(tableName).all())?.results || [];
+			const unknownTriggers = triggerRows.filter((row) => {
+				if (tableName !== kernel.LOGS_TABLE) return true;
+				const name = String(row?.name || "").toLowerCase();
+				const sql = normalizeSqlIdentifierSearchText(row?.sql || "");
+				return !(name === String(kernel.LOGS_FTS_INSERT_TRIGGER).toLowerCase() || name === `${kernel.LOGS_TABLE}_ai` || name === `${kernel.LOGS_TABLE}_au` || name === `${kernel.LOGS_TABLE}_ad` || sql.includes(String(kernel.LOGS_FTS_TABLE).toLowerCase()));
+			});
+			if (!allowsDataLoss && unknownTriggers.length) blockers.push(`unsupported_triggers:${tableName}:${unknownTriggers.map((row) => String(row?.name || "")).join(",")}`);
+			const artifactPrefixes = [`__d1_repair_${tableName}_`, `__d1_backup_${tableName}_`];
+			const artifactRow = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND (name GLOB ? OR name GLOB ?) LIMIT 1").bind(`${artifactPrefixes[0]}*`, `${artifactPrefixes[1]}*`).first();
+			if (artifactRow?.name) blockers.push(`repair_artifact_present:${tableName}:${String(artifactRow.name)}`);
+			let rowCount = null;
+			if (!allowsDataLoss) {
+				const quotedTable = quoteSqlIdentifier(tableName);
+				const countRow = await db.prepare(`SELECT COUNT(*) AS total FROM (SELECT 1 FROM ${quotedTable} LIMIT ${D1_SCHEMA_REPAIR_ROW_LIMIT + 1})`).first();
+				rowCount = Math.max(0, Number(countRow?.total) || 0);
+			}
+			if (!allowsDataLoss && rowCount > D1_SCHEMA_REPAIR_ROW_LIMIT) blockers.push(`rebuild_row_limit_exceeded:${tableName}:${rowCount}`);
+			if (!allowsDataLoss && !blockers.length) {
+				const keyState = await kernel.probeD1UniqueKeyRepair(db, tableName, expectedPrimaryKey);
+				if (keyState.empty) blockers.push(`primary_key_empty:${tableName}`);
+				if (keyState.duplicate) blockers.push(`primary_key_duplicate:${tableName}`);
+			}
+			return {
+				repairable: blockers.length === 0,
+				rowCount,
+				estimatedRowsIsLowerBound: rowCount !== null && rowCount > D1_SCHEMA_REPAIR_ROW_LIMIT,
+				rowCountMeasured: rowCount !== null,
+				allowsDataLoss,
+				blockers
+			};
+		},
+		async buildD1SchemaRepairPlan(db) {
+			const status = await kernel.getD1SchemaStatus(db);
 			const contract = kernel.getD1CurrentSchemaContract();
-			const incompatible = [];
-			for (const [tableName, exists] of Object.entries(current.tables || {})) {
-				if (!exists) continue;
-				for (const [columnName, ready] of Object.entries(current.columns?.[tableName] || {})) if (!ready) {
-					const suffix = `${tableName}.${columnName}`;
-					incompatible.push((current.issues || []).find((issue) => String(issue).endsWith(suffix)) || `missing_column:${suffix}`);
+			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			const schemaCookie = await kernel.getD1SchemaCookie(db);
+			const contractHash = kernel.getD1ContractHash();
+			const storedMeta = await kernel.readD1SchemaMeta(db);
+			const repairableIssues = [];
+			const highRiskIssues = [];
+			const blockingIssues = [];
+			const steps = [];
+			const pushStep = (kind, target, risk = "low", estimatedRows = 0, extra = {}) => steps.push({ kind, target, risk, estimatedRows: estimatedRows === null ? null : Math.max(0, Number(estimatedRows) || 0), ...extra });
+			if (Math.max(0, Number(storedMeta?.contract_version) || 0) > D1_SCHEMA_CONTRACT_VERSION) blockingIssues.push(`schema_version_ahead:${Math.max(0, Number(storedMeta.contract_version) || 0)}`);
+			for (const [tableName, exists] of Object.entries(status.tables || {})) {
+				if (!exists) {
+					const issue = `missing_table:${tableName}`;
+					repairableIssues.push(issue);
+					pushStep("create_table", tableName);
+					continue;
 				}
-				if (current.constraints?.primaryKeys?.[tableName] !== true) incompatible.push(`invalid_primary_key:${tableName}`);
+				const lossyLogsRebuild = tableName === kernel.LOGS_TABLE && status.constraints?.primaryKeys?.[tableName] !== true;
+				for (const [columnName, ready] of Object.entries(status.columns?.[tableName] || {})) {
+					if (ready) continue;
+					const suffix = `${tableName}.${columnName}`;
+					const issue = (status.issues || []).find((item) => String(item).endsWith(suffix)) || `missing_column:${suffix}`;
+					if (lossyLogsRebuild && String(issue).startsWith("missing_column:")) highRiskIssues.push(issue);
+					else if (String(issue).startsWith("missing_column:") && kernel.getD1RuntimeColumnAdditions()?.[tableName]?.[columnName]) {
+						repairableIssues.push(issue);
+						pushStep("add_column", suffix);
+					} else blockingIssues.push(issue);
+				}
+				if (status.constraints?.primaryKeys?.[tableName] !== true) {
+					const issue = `invalid_primary_key:${tableName}`;
+					const probe = await kernel.probeD1PrimaryKeyRepair(db, tableName, contract);
+					if (probe.repairable) {
+						highRiskIssues.push(issue);
+						pushStep(probe.allowsDataLoss === true ? "recreate_log_table" : "rebuild_table", tableName, "high", probe.rowCount, {
+							allowsDataLoss: probe.allowsDataLoss === true,
+							willDiscardData: probe.allowsDataLoss === true,
+							dataMode: probe.allowsDataLoss === true ? "discard" : "copy",
+							estimatedRowsIsLowerBound: probe.estimatedRowsIsLowerBound === true,
+							rowCountMeasured: probe.rowCountMeasured === true
+						});
+					} else blockingIssues.push(issue, ...probe.blockers);
+				}
 			}
-			if (current.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && current.constraints?.uniqueKeys?.[`${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`] !== true) incompatible.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
-			for (const [indexName, ready] of Object.entries(current.indexes || {})) if (!ready) {
-				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
-				if (owner) incompatible.push(`invalid_index:${indexName}`);
+			const uniqueKey = `${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`;
+			if (status.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && status.constraints?.uniqueKeys?.[uniqueKey] !== true && status.columns?.[kernel.DNS_IP_POOL_ITEMS_TABLE]?.ip === true) {
+				const state = await kernel.probeD1UniqueKeyRepair(db, kernel.DNS_IP_POOL_ITEMS_TABLE, ["ip"]);
+				if (state.empty) blockingIssues.push(`unique_key_empty:${uniqueKey}`);
+				if (state.duplicate) blockingIssues.push(`unique_key_duplicate:${uniqueKey}`);
+				if (!state.empty && !state.duplicate) {
+					repairableIssues.push(`missing_unique_key:${uniqueKey}`);
+					pushStep("create_unique_index", "ux_dns_ip_pool_items_ip");
+				}
 			}
-			if (current.fts?.tableReady && current.ftsReady !== true) incompatible.push("fts_contract_invalid");
-			if (incompatible.length) {
-				const error = new Error("Existing D1 schema does not match the current contract");
-				error.code = "D1_SCHEMA_INCOMPATIBLE";
+			const recreatesLogs = steps.some((step) => step.kind === "recreate_log_table" && step.target === kernel.LOGS_TABLE);
+			for (const [indexName, ready] of Object.entries(status.indexes || {})) if (!ready) {
+				const issue = (status.issues || []).includes(`invalid_index:${indexName}`) ? `invalid_index:${indexName}` : `missing_index:${indexName}`;
+				repairableIssues.push(issue);
+				if (!(recreatesLogs && contract.indexes?.[indexName]?.table === kernel.LOGS_TABLE)) pushStep(issue.startsWith("invalid_") ? "repair_index" : "create_index", indexName);
+			}
+			if (status.ftsReady !== true) {
+				const issue = status.fts?.tableReady ? "fts_contract_invalid" : `missing_table:${kernel.LOGS_FTS_TABLE}`;
+				repairableIssues.push(issue);
+				if (!recreatesLogs) pushStep(status.fts?.tableReady ? "recreate_fts" : "create_fts", kernel.LOGS_FTS_TABLE);
+			}
+			const unique = (values) => [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
+			const normalizedSteps = [...new Map(steps.map((step) => [`${step.kind}:${step.target}`, step])).values()].sort((left, right) => `${left.risk}:${left.kind}:${left.target}`.localeCompare(`${right.risk}:${right.kind}:${right.target}`));
+			const normalizedRepairable = unique(repairableIssues);
+			const normalizedHighRisk = unique(highRiskIssues);
+			const normalizedBlocking = unique(blockingIssues);
+			const safeSteps = normalizedSteps.filter((step) => step.risk !== "high");
+			const highRiskSteps = normalizedSteps.filter((step) => step.risk === "high");
+			const risk = normalizedBlocking.length ? "blocked" : normalizedHighRisk.length ? "high" : normalizedRepairable.length ? "low" : "none";
+			const phase = normalizedBlocking.length ? "blocked" : safeSteps.length ? "safe" : highRiskSteps.length ? "destructive" : "ready";
+			const planHash = hashStableText(serializeConfigValue({ version: D1_SCHEMA_REPAIR_PLAN_VERSION, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash, schemaCookie, schemaFingerprint, phase, repairableIssues: normalizedRepairable, highRiskIssues: normalizedHighRisk, blockingIssues: normalizedBlocking, steps: normalizedSteps }));
+			return {
+				version: D1_SCHEMA_REPAIR_PLAN_VERSION,
+				phase,
+				contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+				contractHash,
+				schemaCookie,
+				planHash,
+				schemaFingerprint,
+				risk,
+				repairableIssues: normalizedRepairable,
+				highRiskIssues: normalizedHighRisk,
+				blockingIssues: normalizedBlocking,
+				steps: normalizedSteps,
+				status
+			};
+		},
+		async createD1SchemaRepairToken(env, plan, options = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			if (!secret) { const error = new Error("JWT_SECRET is required to sign the D1 schema repair plan"); error.code = "SERVER_MISCONFIGURED"; error.status = 503; throw error; }
+			const issuedAt = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1e3));
+			const expiresAt = issuedAt + Math.floor(D1_SCHEMA_REPAIR_TOKEN_TTL_MS / 1e3);
+			const payloadPart = encodeBase64UrlUtf8(JSON.stringify({
+				version: D1_SCHEMA_REPAIR_PLAN_VERSION,
+				scope: "d1_schema_repair",
+				phase: String(plan?.phase || ""),
+				contractVersion: Math.max(0, Number(plan?.contractVersion) || 0),
+				contractHash: String(plan?.contractHash || ""),
+				schemaCookie: Math.max(0, Number(plan?.schemaCookie) || 0),
+				planHash: String(plan?.planHash || ""),
+				schemaFingerprint: String(plan?.schemaFingerprint || ""),
+				destructiveTargets: (plan?.steps || []).filter((step) => step?.risk === "high").map((step) => String(step?.target || "")),
+				issuedAt,
+				expiresAt
+			}));
+			return { token: `${payloadPart}.${await signHmac(secret, payloadPart)}`, expiresAt };
+		},
+		async verifyD1SchemaRepairToken(env, token, plan, options = {}) {
+			const secret = String(env?.JWT_SECRET || "").trim();
+			const rawToken = String(token || "").trim();
+			const stale = (reason, details = {}) => { const error = new Error("D1 schema repair plan is stale"); error.code = "D1_SCHEMA_REPAIR_PLAN_STALE"; error.status = 409; error.details = { reason, ...details }; return error; };
+			if (!secret) { const error = new Error("JWT_SECRET is required to verify the D1 schema repair plan"); error.code = "SERVER_MISCONFIGURED"; error.status = 503; throw error; }
+			const dotIndex = rawToken.indexOf(".");
+			if (dotIndex <= 0 || dotIndex === rawToken.length - 1) throw stale("invalid_token");
+			const payloadPart = rawToken.slice(0, dotIndex);
+			if (rawToken.slice(dotIndex + 1) !== await signHmac(secret, payloadPart)) throw stale("invalid_signature");
+			let payload = null;
+			try { payload = JSON.parse(decodeBase64UrlUtf8(payloadPart)); } catch {}
+			if (!isPlainObject(payload) || payload.version !== D1_SCHEMA_REPAIR_PLAN_VERSION || payload.scope !== "d1_schema_repair" || payload.phase !== "destructive") throw stale("invalid_payload");
+			const nowSeconds = Math.max(0, Math.floor(Number(options.nowMs ?? nowMs()) / 1e3));
+			if (Number(payload.expiresAt) <= nowSeconds) throw stale("expired", { expiresAt: Number(payload.expiresAt) || 0 });
+			if (String(payload.planHash || "") !== String(plan?.planHash || "") || String(payload.schemaFingerprint || "") !== String(plan?.schemaFingerprint || "") || Number(payload.schemaCookie) !== Number(plan?.schemaCookie) || String(payload.contractHash || "") !== String(plan?.contractHash || "") || Number(payload.contractVersion) !== Number(plan?.contractVersion)) throw stale("schema_changed", { previewPlanHash: String(payload.planHash || ""), currentPlanHash: String(plan?.planHash || "") });
+			return payload;
+		},
+		getD1SchemaRepairTokenPlanHash(token) {
+			const payloadPart = String(token || "").trim().split(".", 1)[0];
+			if (!payloadPart) return "";
+			try {
+				const payload = JSON.parse(decodeBase64UrlUtf8(payloadPart));
+				return payload?.scope === "d1_schema_repair" ? String(payload?.planHash || "").trim() : "";
+			} catch {
+				return "";
+			}
+		},
+		async getD1TimeTravelBookmark(db) {
+			if (!db || typeof db.withSession !== "function") { const error = new Error("D1 Time Travel bookmark is unavailable on this binding"); error.code = "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE"; error.status = 409; error.details = { reason: "sessions_api_unavailable" }; throw error; }
+			try {
+				const session = db.withSession("first-primary");
+				if (!session || typeof session.prepare !== "function" || typeof session.getBookmark !== "function") throw new Error("invalid_d1_session");
+				await session.prepare("SELECT 1 AS bookmark_probe").run();
+				const bookmark = String(session.getBookmark() || "").trim();
+				if (!bookmark) throw new Error("empty_bookmark");
+				return { bookmark, consistency: "first-primary", capturedAt: (/* @__PURE__ */ new Date()).toISOString() };
+			} catch (cause) {
+				if (String(cause?.code || "") === "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE") throw cause;
+				const error = new Error("Unable to capture a D1 Time Travel bookmark");
+				error.code = "D1_SCHEMA_REPAIR_RECOVERY_UNAVAILABLE";
 				error.status = 409;
-				error.details = { phase: "preflight", issues: [...new Set(incompatible)] };
+				error.details = { reason: "bookmark_failed", cause: getErrorMessage(cause, "bookmark_failed") };
 				throw error;
 			}
-			return true;
+		},
+		async ensureD1KnownColumns(db, options = {}) {
+			const tableNames = await kernel.getD1TableNameSet(db);
+			const skippedTables = new Set(Array.isArray(options.skipTables) ? options.skipTables : []);
+			const addedColumns = [];
+			for (const [tableName, additions] of Object.entries(kernel.getD1RuntimeColumnAdditions())) {
+				if (!tableNames.has(tableName) || skippedTables.has(tableName)) continue;
+				const columns = await kernel.getTableColumns(db, tableName);
+				for (const [columnName, definition] of Object.entries(additions)) {
+					if (columns.has(columnName)) continue;
+					await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
+					columns.add(columnName);
+					addedColumns.push(`${tableName}.${columnName}`);
+				}
+			}
+			return addedColumns;
+		},
+		async repairD1RuntimeIndexes(db, options = {}) {
+			const tableNames = await kernel.getD1TableNameSet(db);
+			const skippedTables = new Set(Array.isArray(options.skipTables) ? options.skipTables : []);
+			const createdIndexes = [];
+			const repairedIndexes = [];
+			for (const [indexName, definition] of Object.entries(kernel.getD1RuntimeIndexContract())) {
+				if (!tableNames.has(definition.table)) continue;
+				if (skippedTables.has(definition.table)) continue;
+				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
+				let valid = false;
+				if (owner) {
+					const listed = (await kernel.getTableIndexDefinitions(db, definition.table)).find((item) => item.name === indexName);
+					valid = String(owner?.tbl_name || "") === definition.table && listed?.unique === false && listed?.partial === false && serializeConfigValue(await kernel.getIndexKeyColumns(db, indexName)) === serializeConfigValue(definition.columns);
+				}
+				if (valid) continue;
+				if (owner) { await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run(); repairedIndexes.push(indexName); }
+				else createdIndexes.push(indexName);
+				await db.prepare(definition.createSql).run();
+			}
+			return { createdIndexes, repairedIndexes };
+		},
+		async ensureD1UniqueIndexes(db) {
+			const uniqueIndexesCreated = [];
+			for (const [indexName, definition] of Object.entries(kernel.getD1UniqueIndexContract())) {
+				const tableNames = await kernel.getD1TableNameSet(db);
+				if (!tableNames.has(definition.table)) continue;
+				let ready = false;
+				for (const index of (await kernel.getTableIndexDefinitions(db, definition.table)).filter((item) => item.unique && !item.partial)) {
+					if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(definition.columns)) { ready = true; break; }
+				}
+				if (ready) continue;
+				const owner = await db.prepare("SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1").bind(indexName).first();
+				if (owner) await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(indexName)}`).run();
+				await db.prepare(definition.createSql).run();
+				uniqueIndexesCreated.push(indexName);
+			}
+			return uniqueIndexesCreated;
+		},
+		async rebuildD1TableWithShadow(db, tableName, plan) {
+			const contract = kernel.getD1CurrentSchemaContract();
+			if (!Object.prototype.hasOwnProperty.call(contract.columns, tableName)) throw new Error(`Unknown D1 rebuild table: ${tableName}`);
+			if (tableName === kernel.LOGS_TABLE) throw new Error("proxy_logs must use destructive atomic recreation");
+			const suffix = String(plan?.planHash || "repair").replace(/[^a-z0-9]/gi, "").slice(0, 12) || "repair";
+			const tempTable = `__d1_repair_${tableName}_${suffix}`;
+			const backupTable = `__d1_backup_${tableName}_${suffix}`;
+			const existing = await kernel.getD1TableNameSet(db);
+			if (existing.has(tempTable) || existing.has(backupTable)) { const error = new Error("D1 schema repair temporary table already exists"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: [`repair_artifact_present:${tableName}`] }; throw error; }
+			const columns = contract.columns[tableName];
+			const quotedColumns = columns.map((column) => quoteSqlIdentifier(column)).join(", ");
+			const originalIndexes = (await db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").bind(tableName).all())?.results || [];
+			await db.prepare(kernel.buildD1CreateTableSql(tableName, tempTable)).run();
+			try {
+				await db.batch([
+					db.prepare(`INSERT INTO ${quoteSqlIdentifier(tempTable)} (${quotedColumns}) SELECT ${quotedColumns} FROM ${quoteSqlIdentifier(tableName)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} RENAME TO ${quoteSqlIdentifier(backupTable)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tempTable)} RENAME TO ${quoteSqlIdentifier(tableName)}`),
+					...originalIndexes.map((index) => db.prepare(`DROP INDEX ${quoteSqlIdentifier(index.name)}`)),
+					...originalIndexes.map((index) => db.prepare(String(index.sql)))
+				]);
+			} catch (error) {
+				await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tempTable)}`).run().catch(() => {});
+				throw error;
+			}
+			const row = await db.prepare(`SELECT COUNT(*) AS total FROM ${quoteSqlIdentifier(tableName)}`).first();
+			return {
+				table: tableName,
+				rowCount: Math.max(0, Number(row?.total) || 0),
+				allowsDataLoss: false,
+				willDiscardData: false,
+				dataMode: "copy",
+				backupTable,
+				originalIndexes
+			};
+		},
+		async recreateD1LogsDestructively(db, plan) {
+			const step = (plan?.steps || []).find((item) => item?.kind === "recreate_log_table" && item?.target === kernel.LOGS_TABLE);
+			if (!step || step.willDiscardData !== true || step.dataMode !== "discard") throw new Error("Missing destructive proxy_logs repair step");
+			const fts = kernel.getD1LogsFtsContractSql();
+			const logIndexes = Object.values(kernel.getD1RuntimeIndexContract()).filter((definition) => definition.table === kernel.LOGS_TABLE);
+			await db.batch([
+				db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(kernel.LOGS_FTS_TABLE)}`),
+				db.prepare(`DROP TABLE ${quoteSqlIdentifier(kernel.LOGS_TABLE)}`),
+				db.prepare(kernel.buildD1CreateTableSql(kernel.LOGS_TABLE)),
+				...logIndexes.map((definition) => db.prepare(definition.createSql)),
+				db.prepare(fts.createTable),
+				db.prepare(fts.createTrigger)
+			]);
+			return {
+				table: kernel.LOGS_TABLE,
+				rowCount: 0,
+				rowCountMeasured: false,
+				discardedRows: null,
+				discardedRowsIsLowerBound: false,
+				allowsDataLoss: true,
+				willDiscardData: true,
+				dataMode: "discard"
+			};
+		},
+		async rollbackD1RebuiltTables(db, rebuiltTables = []) {
+			for (const rebuilt of [...rebuiltTables].reverse()) {
+				const tableName = String(rebuilt?.table || "");
+				const backupTable = String(rebuilt?.backupTable || "");
+				if (!tableName || !backupTable || !(await kernel.getD1TableNameSet(db)).has(backupTable)) continue;
+				if (tableName === kernel.LOGS_TABLE) { await kernel.dropLogsFtsSyncTriggers(db).catch(() => 0); await db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(kernel.LOGS_FTS_TABLE)}`).run().catch(() => {}); }
+				for (const row of (await db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL").bind(tableName).all())?.results || []) await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(row.name)}`).run().catch(() => {});
+				await db.batch([
+					db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(tableName)}`),
+					db.prepare(`ALTER TABLE ${quoteSqlIdentifier(backupTable)} RENAME TO ${quoteSqlIdentifier(tableName)}`)
+				]);
+				for (const index of rebuilt.originalIndexes || []) {
+					const sql = String(index?.sql || "").replace(/^CREATE\s+(UNIQUE\s+)?INDEX\s+/i, (_match, unique) => `CREATE ${unique || ""}INDEX IF NOT EXISTS `);
+					if (sql) await db.prepare(sql).run().catch(() => {});
+				}
+				if (tableName === kernel.LOGS_TABLE) await kernel.ensureLogsFtsSchema(db, { forceRecreate: true }).catch(() => {});
+			}
+		},
+		async assertD1CurrentSchema(db) {
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			if (plan.blockingIssues.length) { const error = new Error("D1 schema repair is blocked by incompatible data or table shape"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: plan.blockingIssues, repairPlan: plan }; throw error; }
+			return plan;
 		},
 		async initializeD1Database(db, options = {}) {
 			if (!db) { const error = new Error("D1 not configured"); error.code = "D1_NOT_CONFIGURED"; error.status = 503; throw error; }
 			const profile = options.includeFts === false ? "logs-core" : "logs-fts";
 			let state = databaseReadinessState.D1DatabaseInitReady.get(db);
 			if (!state || !(state.inFlight instanceof Map)) { state = { tail: Promise.resolve(), inFlight: new Map() }; databaseReadinessState.D1DatabaseInitReady.set(db, state); }
-			let initTask = state.inFlight.get(profile);
+			const tokenPlanHash = kernel.getD1SchemaRepairTokenPlanHash(options.repairToken);
+			const operationKey = `${profile}:${tokenPlanHash || "automatic"}`;
+			let initTask = state.inFlight.get(operationKey);
 			if (!initTask) {
 				initTask = Promise.resolve(state.tail).catch(() => {}).then(() => kernel.runD1DatabaseInitialization(db, { ...options, profile }));
 				state.tail = initTask.catch(() => {});
-				state.inFlight.set(profile, initTask);
+				state.inFlight.set(operationKey, initTask);
 			}
 			try { return await initTask; }
-			finally { if (state.inFlight.get(profile) === initTask) state.inFlight.delete(profile); }
+			finally { if (state.inFlight.get(operationKey) === initTask) state.inFlight.delete(operationKey); }
 		},
 		async runD1DatabaseInitialization(db, options = {}) {
 			const profile = options.profile || (options.includeFts === false ? "logs-core" : "logs-fts");
+			const repairMode = String(options.repairMode || (String(options.repairToken || "").trim() ? "confirmed-destructive" : "safe"));
 			kernel.invalidateD1SchemaReadiness(db, "all");
 			const tablesBefore = await kernel.getD1TableNameSet(db);
-			const statusBefore = await kernel.getD1SchemaStatus(db);
-			await kernel.assertD1CurrentSchema(db, statusBefore);
+			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			if (plan.blockingIssues.length) { const error = new Error("D1 schema repair is blocked by incompatible data or table shape"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: plan.blockingIssues, repairPlan: plan }; throw error; }
+			let bookmarkState = null;
+			if (plan.phase === "safe" && repairMode === "confirmed-destructive") {
+				const error = new Error("D1 schema repair must complete safe preparation before destructive repair");
+				error.code = "D1_SCHEMA_REPAIR_PREPARATION_REQUIRED";
+				error.status = 409;
+				error.details = { repairPlan: plan };
+				throw error;
+			}
+			if (plan.phase === "destructive") {
+				if (options.confirmHighRisk !== true || !String(options.repairToken || "").trim()) {
+					const tokenState = options.env ? await kernel.createD1SchemaRepairToken(options.env, plan) : { token: "", expiresAt: 0 };
+					const error = new Error("D1 schema repair requires explicit confirmation");
+					error.code = "D1_SCHEMA_REPAIR_CONFIRMATION_REQUIRED";
+					error.status = 428;
+					error.details = { repairPlan: { ...plan, repairToken: tokenState.token, expiresAt: tokenState.expiresAt ? new Date(tokenState.expiresAt * 1e3).toISOString() : "" } };
+					throw error;
+				}
+				await kernel.verifyD1SchemaRepairToken(options.env, options.repairToken, plan);
+				bookmarkState = await kernel.getD1TimeTravelBookmark(db);
+			}
+			const rebuiltTables = [];
+			const executedSteps = [];
+			let leaseOwner = "";
 			try {
-				const bootstrap = await kernel.bootstrapD1Schema(db, profile);
+				const metaCreateStep = plan.steps.find((step) => step.kind === "create_table" && step.target === kernel.D1_SCHEMA_META_TABLE && step.risk !== "high");
+				if (metaCreateStep) {
+					await db.prepare(kernel.buildD1CreateTableSql(kernel.D1_SCHEMA_META_TABLE, kernel.D1_SCHEMA_META_TABLE, { ifNotExists: true })).run();
+					executedSteps.push({ kind: "create_table", target: kernel.D1_SCHEMA_META_TABLE });
+				}
+				if (plan.phase === "safe" || plan.phase === "destructive") {
+					leaseOwner = String(globalThis.crypto?.randomUUID?.() || `${nowMs()}-${Math.random()}`);
+					await kernel.acquireD1SchemaRepairLease(db, leaseOwner);
+				}
+				if (plan.phase === "destructive") {
+					const lockedPlan = await kernel.buildD1SchemaRepairPlan(db);
+					await kernel.verifyD1SchemaRepairToken(options.env, options.repairToken, lockedPlan);
+				}
+				const executableSteps = plan.phase === "safe" ? plan.steps.filter((step) => step.risk !== "high") : plan.phase === "destructive" ? plan.steps.filter((step) => step.risk === "high") : [];
+				const createTargets = executableSteps.filter((step) => step.kind === "create_table" && step.target !== kernel.LOGS_FTS_TABLE && step.target !== kernel.D1_SCHEMA_META_TABLE).map((step) => step.target);
+				for (const tableName of createTargets) {
+					await db.prepare(kernel.buildD1CreateTableSql(tableName, tableName, { ifNotExists: true })).run();
+					executedSteps.push({ kind: "create_table", target: tableName });
+				}
+				const rebuildSteps = executableSteps.filter((step) => step.kind === "rebuild_table");
+				const rebuildTargets = rebuildSteps.map((step) => step.target);
+				const destructiveLogStep = executableSteps.find((step) => step.kind === "recreate_log_table" && step.target === kernel.LOGS_TABLE);
+				const plannedHighRiskTargets = plan.steps.filter((step) => step.risk === "high" && (step.kind === "rebuild_table" || step.kind === "recreate_log_table")).map((step) => step.target);
+				const skippedTables = [...new Set([...rebuildTargets, ...plannedHighRiskTargets])];
+				const addedColumns = plan.phase === "safe" ? await kernel.ensureD1KnownColumns(db, { skipTables: skippedTables }) : [];
+				for (const target of addedColumns) executedSteps.push({ kind: "add_column", target });
+				for (const tableName of rebuildTargets) {
+					rebuiltTables.push(await kernel.rebuildD1TableWithShadow(db, tableName, plan));
+					executedSteps.push({ kind: "rebuild_table", target: tableName });
+				}
+				if (destructiveLogStep) {
+					rebuiltTables.push(await kernel.recreateD1LogsDestructively(db, plan));
+					executedSteps.push({ kind: "recreate_log_table", target: kernel.LOGS_TABLE });
+				}
+				const destructivelyCreatedIndexes = destructiveLogStep ? Object.entries(kernel.getD1RuntimeIndexContract()).filter(([, definition]) => definition.table === kernel.LOGS_TABLE).map(([name]) => name) : [];
+				const indexChanges = plan.phase === "safe" ? await kernel.repairD1RuntimeIndexes(db, { skipTables: skippedTables }) : { createdIndexes: [], repairedIndexes: [] };
+				for (const target of indexChanges.createdIndexes) executedSteps.push({ kind: "create_index", target });
+				for (const target of indexChanges.repairedIndexes) executedSteps.push({ kind: "repair_index", target });
+				const uniqueIndexesCreated = plan.phase === "safe" ? await kernel.ensureD1UniqueIndexes(db) : [];
+				for (const target of uniqueIndexesCreated) executedSteps.push({ kind: "create_unique_index", target });
+				let ftsResult = { rebuilt: false, recreated: false };
+				const ftsStep = executableSteps.find((step) => step.target === kernel.LOGS_FTS_TABLE);
+				if (ftsStep && options.includeFts !== false && !await kernel.isLogsFtsReady(db)) ftsResult = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true });
+				if (ftsResult?.rebuilt === true) executedSteps.push({ kind: String(ftsStep?.kind || "create_fts"), target: kernel.LOGS_FTS_TABLE });
 				kernel.invalidateD1SchemaReadiness(db, "all");
 				const status = await kernel.getD1SchemaStatus(db);
-				if (!status.schemaReady) {
-					const error = new Error("D1 schema initialization did not produce the current contract");
-					error.code = "D1_SCHEMA_INCOMPATIBLE";
-					error.status = 409;
+				const nextPlan = status.schemaReady ? null : await kernel.buildD1SchemaRepairPlan(db);
+				const pendingHighRisk = nextPlan?.phase === "destructive";
+				if (!status.schemaReady && !pendingHighRisk) {
+					const error = new Error("D1 schema repair did not produce the current contract");
+					error.code = "D1_SCHEMA_REPAIR_FAILED";
+					error.status = 503;
 					error.details = { phase: "final_status", issues: status.issues };
 					throw error;
 				}
-				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => !tablesBefore.has(name));
+				const backupTables = rebuiltTables.filter((rebuilt) => rebuilt?.backupTable);
+				if (backupTables.length) await db.batch(backupTables.map((rebuilt) => db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(rebuilt.backupTable)}`)));
+				let schemaMeta = { written: false, reason: "pending_high_risk" };
+				if (status.schemaReady) {
+					const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
+					schemaMeta = attested.valid ? { written: false, reused: true, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash: plan.contractHash } : await kernel.writeVerifiedD1SchemaMeta(db, options.env, plan);
+				}
+				const reportableTables = new Set([...Object.keys(kernel.getD1CurrentSchemaContract().columns), kernel.LOGS_FTS_TABLE]);
+				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => reportableTables.has(name) && !tablesBefore.has(name));
 				return {
 					profile,
-					schemaReady: true,
+					phase: plan.phase,
+					completed: status.schemaReady,
+					pendingHighRisk,
+					schemaReady: status.schemaReady,
+					contractVersion: D1_SCHEMA_CONTRACT_VERSION,
+					contractHash: plan.contractHash,
+					planHash: plan.planHash,
+					risk: plan.risk,
 					createdTables,
-					ftsRebuilt: bootstrap.ftsResult?.rebuilt === true,
-					ftsRecreated: bootstrap.ftsResult?.recreated === true,
-					steps: bootstrap.steps,
+					addedColumns,
+					createdIndexes: [...indexChanges.createdIndexes, ...destructivelyCreatedIndexes],
+					repairedIndexes: indexChanges.repairedIndexes,
+					uniqueIndexesCreated,
+					rebuiltTables: rebuiltTables.map(({ table, rowCount, rowCountMeasured, discardedRows, discardedRowsIsLowerBound, willDiscardData, dataMode }) => willDiscardData ? {
+						table,
+						rowCount,
+						rowCountMeasured,
+						discardedRows,
+						discardedRowsIsLowerBound,
+						allowsDataLoss: true,
+						willDiscardData: true,
+						dataMode
+					} : { table, rowCount }),
+					ftsRebuilt: ftsResult?.rebuilt === true,
+					ftsRecreated: destructiveLogStep ? true : ftsResult?.recreated === true && plan.status?.fts?.tableReady === true,
+					recoveryBookmark: String(bookmarkState?.bookmark || ""),
+					bookmarkCapturedAt: String(bookmarkState?.capturedAt || ""),
+					schemaMeta,
+					steps: plan.steps.map((step) => ({ ...step, ready: executedSteps.some((executed) => executed.kind === step.kind && executed.target === step.target) || status.schemaReady })),
 					status
 				};
 			} catch (error) {
-				throw error;
+				if (rebuiltTables.length) await kernel.rollbackD1RebuiltTables(db, rebuiltTables).catch(() => {});
+				kernel.invalidateD1SchemaReadiness(db, "all");
+				let remainingIssues = [];
+				try { remainingIssues = (await kernel.getD1SchemaStatus(db))?.issues || []; } catch {}
+				if (error && typeof error === "object") error.details = {
+					...isPlainObject(error.details) ? error.details : {},
+					executedSteps,
+					remainingIssues,
+					recoveryBookmark: String(bookmarkState?.bookmark || ""),
+					bookmarkCapturedAt: String(bookmarkState?.capturedAt || "")
+				};
+				if (String(error?.code || "").startsWith("D1_SCHEMA_REPAIR_")) throw error;
+				const wrapped = new Error(getErrorMessage(error, "D1 schema repair failed"));
+				wrapped.code = "D1_SCHEMA_REPAIR_FAILED";
+				wrapped.status = 503;
+				wrapped.details = { ...isPlainObject(error?.details) ? error.details : {}, phase: "execution" };
+				throw wrapped;
+			} finally {
+				if (leaseOwner) await kernel.releaseD1SchemaRepairLease(db, leaseOwner).catch(() => {});
 			}
 		},
 		async probeLogsReadiness(db, options = {}) {
@@ -23786,6 +24631,14 @@ function buildD1TidyExecutor() {
 			return {
 				...executionPlan.summary || {},
 				mode,
+				deletedExpiredLogCount: 0,
+				deletedExpiredLockCount: 0,
+				deletedExpiredFetchCacheCount: 0,
+				deletedExpiredProbeCacheCount: 0,
+				deletedExpiredAuthFailureCount: 0,
+				deletedExpiredDashboardCacheCount: 0,
+				deletedExpiredRuntimeCacheCount: 0,
+				deletedExpiredStatsHourlyCount: 0,
 				rebuiltStatsHourly: false,
 				rebuiltLogsFts: false,
 				alignedStatsWindow: false,
@@ -23805,87 +24658,63 @@ function buildD1TidyExecutor() {
 				reason: ""
 			};
 		},
-		buildDeleteSteps(database, executionPlan = {}, summary = {}, flags = {}, db) {
-			const steps = [
-				[
-					flags.deleteExpiredLogs,
-					summary.deletedExpiredLogCount,
-					"deleteExpiredLogs",
-					database.LOGS_TABLE,
-					"timestamp < ?",
-					executionPlan.retentionCutoffMs
-				],
-				[
-					flags.deleteExpiredLocks,
-					summary.deletedExpiredLockCount,
-					"deleteExpiredLocks",
-					database.SCHEDULED_LOCKS_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredFetchCache,
-					summary.deletedExpiredFetchCacheCount,
-					"deleteExpiredFetchCache",
-					database.DNS_IP_POOL_FETCH_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredProbeCache,
-					summary.deletedExpiredProbeCacheCount,
-					"deleteExpiredProbeCache",
-					database.DNS_IP_PROBE_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredAuthFailures,
-					summary.deletedExpiredAuthFailureCount,
-					"deleteExpiredAuthFailures",
-					database.AUTH_FAILURES_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredDashboardCache,
-					summary.deletedExpiredDashboardCacheCount,
-					"deleteExpiredDashboardCache",
-					database.CF_DASH_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				],
-				[
-					flags.deleteExpiredRuntimeCache,
-					summary.deletedExpiredRuntimeCacheCount,
-					"deleteExpiredRuntimeCache",
-					database.CF_RUNTIME_CACHE_TABLE,
-					"expires_at <= ?",
-					executionPlan.nowMs
-				]
-			].map(([enabled, count, stepName, tableName, whereClause, bindParam]) => ({
-				enabled,
-				count,
-				stepName,
-				db,
-				sql: `DELETE FROM ${tableName} WHERE ${whereClause}`,
-				bindParams: [bindParam]
-			}));
-			return steps;
+		buildDeleteScopes(database, executionPlan = {}, flags = {}, db) {
+			const definitions = [
+				[flags.deleteExpiredLogs, "proxy_logs", "deletedExpiredLogCount", "deleteExpiredLogs", database.LOGS_TABLE, "timestamp < ?", [executionPlan.retentionCutoffMs]],
+				[flags.deleteExpiredLocks, "sys_locks", "deletedExpiredLockCount", "deleteExpiredLocks", database.SCHEDULED_LOCKS_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredFetchCache, "dns_ip_pool_fetch_cache", "deletedExpiredFetchCacheCount", "deleteExpiredFetchCache", database.DNS_IP_POOL_FETCH_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredProbeCache, "dns_ip_probe_cache", "deletedExpiredProbeCacheCount", "deleteExpiredProbeCache", database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredAuthFailures, "auth_failures", "deletedExpiredAuthFailureCount", "deleteExpiredAuthFailures", database.AUTH_FAILURES_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredDashboardCache, "cf_dashboard_cache", "deletedExpiredDashboardCacheCount", "deleteExpiredDashboardCache", database.CF_DASH_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredRuntimeCache, "cf_runtime_cache", "deletedExpiredRuntimeCacheCount", "deleteExpiredRuntimeCache", database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", [executionPlan.nowMs]],
+				[flags.deleteExpiredStatsHourly, "proxy_stats_hourly", "deletedExpiredStatsHourlyCount", "deleteExpiredStatsHourly", database.STATS_HOURLY_TABLE, "bucket_date < ?", [executionPlan.statsRetentionBoundaryDate]]
+			];
+			return definitions.filter(([enabled]) => enabled === true).map(([, key, summaryKey, stepName, tableName, whereClause, bindParams]) => ({ key, summaryKey, stepName, tableName, whereClause, bindParams, db }));
 		},
-		async runDeleteStep({ enabled = false, count = 0, beforeStep = async (_stepName) => {}, stepName = "", db, sql = "", bindParams = [] }) {
-			if (enabled !== true || Number(count) <= 0) return false;
-			await beforeStep(stepName);
-			await db.prepare(sql).bind(...bindParams).run();
-			return true;
+		readChanges(result) {
+			const value = Number(result?.meta?.changes ?? result?.changes ?? 0);
+			return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 		},
-		async runDeleteSteps(steps = [], beforeStep = async (_stepName) => {}) {
-			let performedWork = false;
-			for (const step of Array.isArray(steps) ? steps : []) performedWork = await executor.runDeleteStep({
-				beforeStep,
-				...isPlainObject(step) ? step : {}
-			}) || performedWork;
-			return performedWork;
+		async hasScopeRows(scope) {
+			return !!await scope.db.prepare(`SELECT 1 AS present FROM ${scope.tableName} WHERE ${scope.whereClause} LIMIT 1`).bind(...scope.bindParams).first();
+		},
+		async runBudgetedDeleteScopes(scopes = [], summary = {}, beforeStep = async (_stepName) => {}, options = {}) {
+			const startedAt = Number(options.startedAt) || nowMs();
+			let processedRows = 0;
+			let exhaustedBy = "";
+			let active = [...scopes];
+			while (active.length > 0 && !exhaustedBy) {
+				const nextActive = [];
+				for (const scope of active) {
+					if (processedRows >= D1_TIDY_ROW_LIMIT) { exhaustedBy = "row_limit"; break; }
+					if (nowMs() - startedAt >= D1_TIDY_TIME_LIMIT_MS) { exhaustedBy = "time_limit"; break; }
+					await beforeStep(scope.stepName);
+					const pageLimit = Math.min(D1_TIDY_BATCH_SIZE, D1_TIDY_ROW_LIMIT - processedRows);
+					const result = await scope.db.prepare(`DELETE FROM ${scope.tableName} WHERE rowid IN (SELECT rowid FROM ${scope.tableName} WHERE ${scope.whereClause} ORDER BY rowid LIMIT ?)`)
+						.bind(...scope.bindParams, pageLimit).run();
+					const changes = executor.readChanges(result);
+					processedRows += changes;
+					summary[scope.summaryKey] = Math.max(0, Number(summary[scope.summaryKey]) || 0) + changes;
+					if (changes >= pageLimit) nextActive.push(scope);
+				}
+				active = nextActive;
+			}
+			const remainingScopes = [];
+			for (const scope of scopes) if (await executor.hasScopeRows(scope)) remainingScopes.push(scope.key);
+			const durationMs = Math.max(0, nowMs() - startedAt);
+			if (!exhaustedBy && remainingScopes.length > 0) exhaustedBy = durationMs >= D1_TIDY_TIME_LIMIT_MS ? "time_limit" : processedRows >= D1_TIDY_ROW_LIMIT ? "row_limit" : "";
+			return {
+				hasMore: remainingScopes.length > 0,
+				remainingScopes,
+				budget: {
+					batchSize: D1_TIDY_BATCH_SIZE,
+					rowLimit: D1_TIDY_ROW_LIMIT,
+					timeLimitMs: D1_TIDY_TIME_LIMIT_MS,
+					processedRows,
+					durationMs,
+					exhaustedBy: exhaustedBy || null
+				}
+			};
 		},
 		async patchLogStatus(database, db, stores, executionPlan, summary, flags, options = {}) {
 			const nowIso = (/* @__PURE__ */ new Date()).toISOString();
@@ -23897,9 +24726,9 @@ function buildD1TidyExecutor() {
 				schemaReady: true,
 				ftsReady,
 				statsReady,
-				categoryEnabled: true,
-				statsUtcOffsetMinutes: executionPlan.statsUtcOffsetMinutes || executionPlan.utcOffsetMinutes
+				categoryEnabled: true
 			};
+			if (flags.rebuildStatsHourly !== true || summary.alignedStatsWindow === true) logPatch.statsUtcOffsetMinutes = executionPlan.statsUtcOffsetMinutes ?? executionPlan.utcOffsetMinutes;
 			if (summary.rebuiltStatsHourly === true || summary.alignedStatsWindow === true) {
 				logPatch.statsAlignedAt = nowIso;
 				logPatch.statsAlignedWindowStartAt = new Date((mode === "scheduled" ? executionPlan.statsStartTs : executionPlan.retentionCutoffMs) || executionPlan.retentionCutoffMs).toISOString();
@@ -23916,6 +24745,17 @@ function buildD1TidyExecutor() {
 //#region worker/features/storage/d1/tidy-planner.js
 function buildD1TidyPlanner() {
 	return {
+		async readBoundedCount(db, tableName, whereClause = "", bindParams = []) {
+			const predicate = String(whereClause || "").trim();
+			const sql = `SELECT COUNT(*) AS total FROM (SELECT 1 FROM ${tableName}${predicate ? ` WHERE ${predicate}` : ""} LIMIT ${D1_TIDY_PREVIEW_COUNT_LIMIT + 1})`;
+			const row = await db.prepare(sql).bind(...bindParams).first();
+			const rawCount = Math.max(0, Number(row?.total ?? row?.count) || 0);
+			return {
+				count: Math.min(D1_TIDY_PREVIEW_COUNT_LIMIT, rawCount),
+				countIsLowerBound: rawCount >= D1_TIDY_PREVIEW_COUNT_LIMIT,
+				exceedsLimit: rawCount > D1_TIDY_PREVIEW_COUNT_LIMIT
+			};
+		},
 		buildContext(runtimeConfig = {}, options = {}) {
 			const mode = String(options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
 			const maintenanceMode = normalizeTidyMaintenanceMode(options.maintenanceMode, mode);
@@ -23957,19 +24797,52 @@ function buildD1TidyPlanner() {
 			};
 		},
 		async readFacts(database, db, kv, context) {
+			const expiredLogs = await this.readBoundedCount(db, database.LOGS_TABLE, "timestamp < ?", [context.retentionCutoffMs]);
+			const preservedLogs = await this.readBoundedCount(db, database.LOGS_TABLE, "timestamp >= ?", [context.retentionCutoffMs]);
+			const expiredLocks = await this.readBoundedCount(db, database.SCHEDULED_LOCKS_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredFetchCache = await this.readBoundedCount(db, database.DNS_IP_POOL_FETCH_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredProbeCache = await this.readBoundedCount(db, database.DNS_IP_PROBE_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredAuthFailures = await this.readBoundedCount(db, database.AUTH_FAILURES_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredDashboardCache = await this.readBoundedCount(db, database.CF_DASH_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const expiredRuntimeCache = await this.readBoundedCount(db, database.CF_RUNTIME_CACHE_TABLE, "expires_at <= ?", [context.nowTimestamp]);
+			const statsHourly = await this.readBoundedCount(db, database.STATS_HOURLY_TABLE);
+			const statsRetentionBoundaryDate = buildOffsetClockParts(context.retentionCutoffMs, context.utcOffsetMinutes).dateKey;
+			const expiredStatsHourly = await this.readBoundedCount(db, database.STATS_HOURLY_TABLE, "bucket_date < ?", [statsRetentionBoundaryDate]);
+			const dnsIpPoolItems = await this.readBoundedCount(db, database.DNS_IP_POOL_ITEMS_TABLE);
+			const dnsIpPoolSources = await this.readBoundedCount(db, database.DNS_IP_POOL_SOURCES_TABLE);
+			const sysStatus = await this.readBoundedCount(db, database.SYS_STATUS_TABLE);
+			const logStatus = await database.getOpsStatusSection({ db, kv }, "log");
 			return {
-				deletedExpiredLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp < ?`, [context.retentionCutoffMs]),
-				preservedLogCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.LOGS_TABLE} WHERE timestamp >= ?`, [context.retentionCutoffMs]),
-				deletedExpiredLockCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SCHEDULED_LOCKS_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredFetchCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_FETCH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredProbeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_PROBE_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredAuthFailureCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.AUTH_FAILURES_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredDashboardCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_DASH_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				deletedExpiredRuntimeCacheCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.CF_RUNTIME_CACHE_TABLE} WHERE expires_at <= ?`, [context.nowTimestamp]),
-				statsHourlyRowCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.STATS_HOURLY_TABLE}`),
-				dnsIpPoolItemCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_ITEMS_TABLE}`),
-				dnsIpPoolSourceCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.DNS_IP_POOL_SOURCES_TABLE}`),
-				sysStatusCount: await database.readD1Count(db, `SELECT COUNT(*) as total FROM ${database.SYS_STATUS_TABLE}`),
+				deletedExpiredLogCount: expiredLogs.count,
+				preservedLogCount: preservedLogs.count,
+				preservedLogCountExceedsLimit: preservedLogs.exceedsLimit,
+				deletedExpiredLockCount: expiredLocks.count,
+				deletedExpiredFetchCacheCount: expiredFetchCache.count,
+				deletedExpiredProbeCacheCount: expiredProbeCache.count,
+				deletedExpiredAuthFailureCount: expiredAuthFailures.count,
+				deletedExpiredDashboardCacheCount: expiredDashboardCache.count,
+				deletedExpiredRuntimeCacheCount: expiredRuntimeCache.count,
+				deletedExpiredStatsHourlyCount: expiredStatsHourly.count,
+				statsRetentionBoundaryDate,
+				statsHourlyRowCount: statsHourly.count,
+				dnsIpPoolItemCount: dnsIpPoolItems.count,
+				dnsIpPoolSourceCount: dnsIpPoolSources.count,
+				sysStatusCount: sysStatus.count,
+				statsUtcOffsetMinutes: database.getStatsUtcOffsetMinutesFromStatus(logStatus),
+				countLowerBounds: {
+					proxy_logs: expiredLogs.countIsLowerBound,
+					proxy_logs_retained: preservedLogs.countIsLowerBound,
+					proxy_logs_fts: preservedLogs.countIsLowerBound,
+					sys_locks: expiredLocks.countIsLowerBound,
+					dns_ip_pool_fetch_cache: expiredFetchCache.countIsLowerBound,
+					dns_ip_probe_cache: expiredProbeCache.countIsLowerBound,
+					auth_failures: expiredAuthFailures.countIsLowerBound,
+					cf_dashboard_cache: expiredDashboardCache.countIsLowerBound,
+					cf_runtime_cache: expiredRuntimeCache.countIsLowerBound,
+					proxy_stats_hourly: statsHourly.countIsLowerBound || expiredStatsHourly.countIsLowerBound,
+					dns_ip_pool_items: dnsIpPoolItems.countIsLowerBound,
+					sys_status: sysStatus.countIsLowerBound
+				},
 				ftsReady: await database.isLogsFtsReady(db),
 				d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db),
 				kvDnsIpPoolSources: []
@@ -23984,10 +24857,12 @@ function buildD1TidyPlanner() {
 		buildFlags(database, context, facts, sourcePolicy) {
 			const hasExpiredLogs = facts.deletedExpiredLogCount > 0;
 			const fullMaintenance = isFullTidyMaintenanceMode(context.maintenanceMode, context.mode);
-			const shouldRebuildLogsFts = fullMaintenance || !facts.ftsReady || hasExpiredLogs && database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp });
+			const ftsIntervalReady = database.shouldRunLogsFtsRebuild(context.lastFtsRebuildAt, { nowMs: context.nowTimestamp });
+			const ftsCandidate = (!facts.ftsReady || fullMaintenance || hasExpiredLogs) && ftsIntervalReady;
+			const ftsSizeGuarded = facts.preservedLogCount > D1_TIDY_FTS_REBUILD_LOG_LIMIT || facts.preservedLogCountExceedsLimit === true;
+			const shouldRebuildLogsFts = ftsCandidate && !ftsSizeGuarded;
 			const shouldOptimizeDb = fullMaintenance ? true : hasExpiredLogs && database.shouldRunLogsOptimize(context.lastOptimizeAt, { nowMs: context.nowTimestamp });
-			const shouldRunScheduledStatsMaintenance = context.mode === "scheduled" && hasExpiredLogs;
-			const shouldRebuildStatsHourly = fullMaintenance || hasExpiredLogs;
+			const shouldResetStatsHourly = fullMaintenance || facts.statsUtcOffsetMinutes !== context.utcOffsetMinutes;
 			return {
 				deleteExpiredLogs: hasExpiredLogs,
 				deleteExpiredLocks: facts.deletedExpiredLockCount > 0,
@@ -23996,14 +24871,16 @@ function buildD1TidyPlanner() {
 				deleteExpiredAuthFailures: facts.deletedExpiredAuthFailureCount > 0,
 				deleteExpiredDashboardCache: facts.deletedExpiredDashboardCacheCount > 0,
 				deleteExpiredRuntimeCache: facts.deletedExpiredRuntimeCacheCount > 0,
-				rebuildStatsHourly: shouldRebuildStatsHourly,
+				deleteExpiredStatsHourly: facts.deletedExpiredStatsHourlyCount > 0,
+				rebuildStatsHourly: shouldResetStatsHourly,
 				rebuildLogsFts: shouldRebuildLogsFts,
-				rebuildLogsFtsDeferred: context.mode === "scheduled" && hasExpiredLogs && facts.ftsReady && shouldRebuildLogsFts !== true,
+				rebuildLogsFtsDeferred: ftsCandidate && !shouldRebuildLogsFts,
+				ftsRebuildDeferredReason: ftsSizeGuarded ? "deferred_size_guard" : "",
 				rebuildLogsFtsForceRecreate: false,
 				optimizeDb: shouldOptimizeDb,
 				optimizeDbDeferred: context.mode === "scheduled" && hasExpiredLogs && shouldOptimizeDb !== true,
-				alignStatsWindow: shouldRunScheduledStatsMaintenance,
-				rebuildDailyStats: shouldRunScheduledStatsMaintenance,
+				alignStatsWindow: shouldResetStatsHourly,
+				rebuildDailyStats: false,
 				processDnsIpPoolSources: false
 			};
 		},
@@ -24016,14 +24893,16 @@ function buildD1TidyPlanner() {
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredProbeCacheCount > 0, "dns_ip_probe_cache", "过期 dns_ip_probe_cache 探测缓存", [], facts.deletedExpiredProbeCacheCount, "只会删除 expires_at 已过期的探测缓存。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredAuthFailureCount > 0, "auth_failures", "过期 auth_failures 登录失败计数", [], facts.deletedExpiredAuthFailureCount, "只会删除 expires_at 已过期的登录失败计数。");
 			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredDashboardCacheCount > 0, "cf_dashboard_cache", "过期 cf_dashboard_cache 仪表盘缓存", [], facts.deletedExpiredDashboardCacheCount, "只会删除 expires_at 已过期的仪表盘缓存。");
+			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredRuntimeCacheCount > 0, "cf_runtime_cache", "过期 cf_runtime_cache 运行缓存", [], facts.deletedExpiredRuntimeCacheCount, "只会删除 expires_at 已过期的运行缓存。");
+			pushTidyPreviewGroup(deleteGroups, facts.deletedExpiredStatsHourlyCount > 0, "proxy_stats_hourly_expired", "过期 proxy_stats_hourly 日期桶", [], facts.deletedExpiredStatsHourlyCount, `只删除早于边界日 ${facts.statsRetentionBoundaryDate} 的统计桶。`);
 			const rewriteGroups = [
 				createTidyPreviewGroup("proxy_stats_hourly", "proxy_stats_hourly 统计表", [], {
 					count: Math.max(1, facts.statsHourlyRowCount),
-					note: context.maintenanceMode === "full" ? `会按保留期内日志全量重建小时统计（当前行数 ${facts.statsHourlyRowCount}）。` : `会在必要时对齐小时统计（当前行数 ${facts.statsHourlyRowCount}）。`
+					note: flags.rebuildStatsHourly ? `会清空当前统计（当前行数 ${facts.statsHourlyRowCount}），并从后续新日志重新累计，不扫描历史日志。` : `保留当前统计，仅分页删除保留期边界前的日期桶（当前行数 ${facts.statsHourlyRowCount}）。`
 				}),
 				createTidyPreviewGroup("proxy_logs_fts", "proxy_logs_fts 全文索引", [], {
 					count: Math.max(1, facts.preservedLogCount),
-					note: facts.ftsReady ? context.maintenanceMode === "full" ? "会基于当前保留日志重建全文索引。" : "会在必要时重建全文索引。" : "当前未检测到 FTS 表，整理时会按策略补建并重建全文索引。"
+					note: flags.ftsRebuildDeferredReason === "deferred_size_guard" ? "基础日志超过 10000 行，本轮不会自动 rebuild。" : facts.ftsReady ? "仅在无清理积压、预算有余量且满足最小间隔时重建。" : "当前未检测到 FTS 表，整理时会按资源预算决定是否补建。"
 				}),
 				createTidyPreviewGroup("scheduled_d1_tidy", "scheduled.d1Tidy 运行状态", ["scheduled.d1Tidy"], {
 					count: 1,
@@ -24045,10 +24924,15 @@ function buildD1TidyPlanner() {
 				})
 			];
 			pushTidyPreviewGroup(preserveGroups, facts.d1DnsIpPoolSources.length > 0, "dns_ip_pool_sources_d1_primary", "dns_ip_pool_sources 主数据", d1SourceNames, facts.d1DnsIpPoolSources.length, "dns_ip_pool_sources 现在是正式主数据，本次不会迁回 KV，也不会清空该表。");
+			const lowerBoundAliases = { proxy_stats_hourly_expired: "proxy_stats_hourly" };
+			for (const group of [...deleteGroups, ...rewriteGroups, ...preserveGroups]) {
+				const countKey = lowerBoundAliases[group.key] || group.key;
+				if (facts.countLowerBounds?.[countKey] === true) group.countIsLowerBound = true;
+			}
 			const warnings = [];
 			const logQueuePendingCount = Math.max(0, Number(context.logQueuePendingCount) || 0);
 			if (logQueuePendingCount > 0) warnings.push(`执行前会先尝试 flush ${logQueuePendingCount} 条内存日志，再开始清理 D1。`);
-			warnings.push(context.maintenanceMode === "full" ? "当前为 full 维护模式，会强制执行统计、FTS 与 optimize。" : "当前为 smart 维护模式，只在检测到必要条件时执行较重的统计、FTS 与 optimize。");
+			warnings.push(context.maintenanceMode === "full" ? "当前为 full 维护模式；统计会清空后重新累计，FTS 与 optimize 仍受大小、积压、间隔和时间预算约束。" : "当前为 smart 维护模式，只在检测到必要条件且预算允许时执行较重的统计、FTS 与 optimize。");
 			if (deleteGroups.length === 0) warnings.push(context.mode === "scheduled" ? "当前定时 D1 维护没有检测到需要删除的旧数据，本轮会按计划检查统计与索引维护。" : "当前没有检测到需要删除的 D1 旧数据；本次主要会执行统计表与 FTS 维护。");
 			return {
 				scope: "d1",
@@ -24073,6 +24957,7 @@ function buildD1TidyPlanner() {
 				deletedExpiredAuthFailureCount: facts.deletedExpiredAuthFailureCount,
 				deletedExpiredDashboardCacheCount: facts.deletedExpiredDashboardCacheCount,
 				deletedExpiredRuntimeCacheCount: facts.deletedExpiredRuntimeCacheCount,
+				deletedExpiredStatsHourlyCount: facts.deletedExpiredStatsHourlyCount,
 				rebuiltStatsHourly: flags.rebuildStatsHourly === true,
 				rebuiltLogsFts: flags.rebuildLogsFts === true,
 				alignedStatsWindow: flags.alignStatsWindow === true,
@@ -24109,6 +24994,7 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	DNS_RECORD_HISTORY_PREFIX: "sys:dns_record_history:v1:",
 	LEGACY_TELEGRAM_ALERT_STATE_KEY: "sys:telegram_alert_state:v1",
 	SYS_STATUS_TABLE: "sys_status",
+	D1_SCHEMA_META_TABLE: "d1_schema_meta",
 	SCHEDULED_LOCKS_TABLE: "sys_locks",
 	SCHEDULED_LOCK_SCOPE: "scheduled",
 	LOGS_TABLE: "proxy_logs",
@@ -24188,7 +25074,7 @@ function buildCacheServices(dependencies = {}) {
 				monthlyTraffic: null
 			});
 			const start = now;
-			const cleanMap = (map, shouldDelete, iteratorKey, iteratorStore = iterators) => {
+			const cleanMap = (map, shouldDelete, iteratorKey, iteratorStore = iterators, deleteEntry = (key) => map.delete(key)) => {
 				let iterator = iteratorStore[iteratorKey];
 				if (!iterator) {
 					iterator = map.entries();
@@ -24204,7 +25090,7 @@ function buildCacheServices(dependencies = {}) {
 					scanned += 1;
 					const [k, v] = next.value;
 					if (!map.has(k)) continue;
-					if (shouldDelete(v, now)) map.delete(k);
+					if (shouldDelete(v, now)) deleteEntry(k);
 				}
 			};
 			if (state.phase === 0) {
@@ -24246,7 +25132,7 @@ function buildCacheServices(dependencies = {}) {
 					if (terminalUntil > 0) return terminalUntil < now;
 					const touchedAt = Number(v.lastTouchedAt || v.lastForwardAt) || 0;
 					return touchedAt > 0 && touchedAt + staleWindowMs <= now;
-				}, "progress");
+				}, "progress", iterators, deletePlaybackProgressRelayEntry);
 				state.phase = 8;
 			} else {
 				cleanMap(cacheState.DashboardMonthlyTrafficCache, (v) => !v || (Number(v.staleUntil) || 0) <= now, "monthlyTraffic");
@@ -24267,7 +25153,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!isPlainObject(rawNode)) return null;
 			const name = String(nodeName || rawNode.name || "").toLowerCase().trim();
 			if (!name) return null;
-			const normalizedLines = kernel.normalizeLines(rawNode.lines, rawNode.target, rawNode.port);
+			const normalizedLines = kernel.normalizeLines(rawNode.lines, rawNode.target, rawNode.port).slice(0, NODE_LINE_MAX);
 			if (!normalizedLines.length) return null;
 			const activeLineId = kernel.resolveActiveLineId(rawNode.activeLineId, normalizedLines, Array.isArray(rawNode.lines) ? rawNode.lines : [], rawNode.port);
 			const entryMode = normalizeNodeEntryMode(rawNode.entryMode);
@@ -24511,7 +25397,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 					const stored = await kv.get(`${kernel.PREFIX}${name}`, { type: "json" });
 					if (!stored) return null;
 					const normalizedNode = kernel.normalizeNode(name, stored);
-					if (normalizedNode.changed) {
+					if (normalizedNode.changed && !getNodeResourceLimitViolation(name, normalizedNode.data)) {
 						const task = kv.put(`${kernel.PREFIX}${name}`, JSON.stringify(normalizedNode.data));
 						if (ctx) ctx.waitUntil(task);
 						else await task;
@@ -24580,6 +25466,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 			if (!kv) return null;
 			const name = String(nodeName || "").toLowerCase().trim();
 			if (!name) return null;
+			if (getNodeResourceLimitViolation(name, nodeData)) return null;
 			const normalizedNode = kernel.buildNodeSummary(name, nodeData).summary;
 			if (!normalizedNode) return null;
 			const state = getNodeBindingCacheState(kv);
@@ -24648,6 +25535,7 @@ function defineNodeIndexMethods(dependencies = {}, kernel = {}) {
 		buildPlaybackRouteHotSnapshot(nodeName, nodeData = {}, options = {}) {
 			const name = String(nodeName || "").toLowerCase().trim();
 			if (!name || !isPlainObject(nodeData)) return null;
+			if (getNodeResourceLimitViolation(name, nodeData)) return null;
 			const orderedLines = kernel.getOrderedNodeLines(nodeData);
 			const targetRecords = (orderedLines.length ? orderedLines.map((line) => line?.target) : String(nodeData.target || "").split(",").map((item) => item.trim()).filter(Boolean)).map((item) => createTargetRecord(item)).filter(isTargetRecord);
 			if (!targetRecords.length) return null;
@@ -25368,6 +26256,7 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 					name: nodeName,
 					...normalizedNode
 				});
+				if (getNodeResourceLimitViolation(nodeName, normalizedNode)) continue;
 				if (!changed) continue;
 				nodeRollbackEntries.push({
 					key,
@@ -25553,9 +26442,11 @@ var NodeProxyFacade = class {
 				if (!routeContext.root) return null;
 				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(routeContext.root, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(routeContext.root, env, ctx);
 				if (!nodeData) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(routeContext.root, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				if (isHostPrefixEntryMode(nodeData?.entryMode)) return null;
 				const secret = nodeData.secret;
 				const routePrefix = buildProxyPrefix(routeContext.root, secret);
@@ -25591,6 +26482,7 @@ var NodeProxyFacade = class {
 					pathNormalizationState,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route"
 				};
 			}
@@ -25606,9 +26498,11 @@ var NodeProxyFacade = class {
 				const nodeName = hostPrefixMatch.prefix;
 				const playbackHotEligible = this.#isHostPrefixPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const linkVariantState = consumeProxyLinkVariantPrefix(routeContext.normalizedPathname);
 				let remaining = linkVariantState.remaining;
 				if (linkVariantState.needsTrailingSlashRedirect === true) return { response: this.#buildTrailingSlashRedirectResponse(request, routeContext.normalizedPathname) };
@@ -25622,6 +26516,7 @@ var NodeProxyFacade = class {
 					requestUrl: routeContext.requestUrl,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "host_prefix"
 				};
 			}
@@ -25640,9 +26535,11 @@ var NodeProxyFacade = class {
 				const nodeName = routeContext.root;
 				const playbackHotEligible = this.#isPlaybackCriticalRouteContext(routeContext);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData || !isHostPrefixEntryMode(nodeData?.entryMode)) return null;
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const routePrefix = buildProxyPrefix(nodeName, "", { entryMode: "kv_route" });
 				const rootPrefixLen = 1 + routeContext.rootRaw.length;
 				const rawPathAfterRoot = routeContext.normalizedPathname.substring(rootPrefixLen);
@@ -25670,6 +26567,7 @@ var NodeProxyFacade = class {
 					pathNormalizationState,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route",
 					routeKindOverride: options.isLegacyHostRequest === true ? "legacy_host_prefix_path_compat" : "host_prefix_path_compat",
 					attachLegacyProxyContext: options.isLegacyHostRequest === true
@@ -25687,9 +26585,11 @@ var NodeProxyFacade = class {
 				if (!nodeName) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
 				const playbackHotEligible = isPlaybackCriticalProxyPath(routeContext.normalizedPathname);
 				let playbackRouteHotSnapshot = playbackHotEligible ? await this.nodeRouteReader.getVerifiedPlaybackRouteHotSnapshot(nodeName, env) : null;
-				const targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
+				let targetHotCacheState = playbackHotEligible ? playbackRouteHotSnapshot ? "hit" : "miss" : "skip";
 				const nodeData = playbackRouteHotSnapshot?.nodeData || await this.nodeRouteReader.getNode(nodeName, env, ctx);
 				if (!nodeData) return { response: this.#buildLegacyProxyContextNotFoundResponse(request, env) };
+				const nodeCacheState = getNodeResourceLimitViolation(nodeName, nodeData) ? "oversized_bypass" : "";
+				if (nodeCacheState) targetHotCacheState = nodeCacheState;
 				const hostPrefixCompat = isHostPrefixEntryMode(nodeData?.entryMode);
 				if (playbackHotEligible && !playbackRouteHotSnapshot) playbackRouteHotSnapshot = await this.nodeRouteReader.primePlaybackRouteHotSnapshot(nodeName, nodeData, env);
 				return {
@@ -25701,6 +26601,7 @@ var NodeProxyFacade = class {
 					requestUrl: routeContext.requestUrl,
 					playbackRouteHotSnapshot,
 					targetHotCacheState,
+					nodeCacheState,
 					entryMode: "kv_route",
 					routeKindOverride: hostPrefixCompat ? "legacy_host_context_cookie_host_prefix_compat" : "legacy_host_context_cookie"
 				};
@@ -25721,6 +26622,7 @@ var NodeProxyFacade = class {
 						requestUrl: hostPrefixRoute.requestUrl || routeContext.requestUrl,
 						linkVariant: hostPrefixRoute.linkVariant,
 						targetHotCacheState: hostPrefixRoute.targetHotCacheState,
+						nodeCacheState: hostPrefixRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(hostPrefixRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: hostPrefixRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25738,6 +26640,7 @@ var NodeProxyFacade = class {
 						linkVariant: hostPrefixCompatRoute.linkVariant,
 						pathNormalizationState: hostPrefixCompatRoute.pathNormalizationState,
 						targetHotCacheState: hostPrefixCompatRoute.targetHotCacheState,
+						nodeCacheState: hostPrefixCompatRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(hostPrefixCompatRoute.playbackRouteHotSnapshot?.targetRecords) ? hostPrefixCompatRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: hostPrefixCompatRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25755,6 +26658,7 @@ var NodeProxyFacade = class {
 						linkVariant: proxyRoute.linkVariant,
 						pathNormalizationState: proxyRoute.pathNormalizationState,
 						targetHotCacheState: proxyRoute.targetHotCacheState,
+						nodeCacheState: proxyRoute.nodeCacheState,
 						cachedTargetRecords: Array.isArray(proxyRoute.playbackRouteHotSnapshot?.targetRecords) ? proxyRoute.playbackRouteHotSnapshot.targetRecords : null,
 						nodeCacheRevision: proxyRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 						runtimeConfig,
@@ -25771,6 +26675,7 @@ var NodeProxyFacade = class {
 							requestUrl: legacyCookieRoute.requestUrl || routeContext.requestUrl,
 							linkVariant: legacyCookieRoute.linkVariant,
 							targetHotCacheState: legacyCookieRoute.targetHotCacheState,
+							nodeCacheState: legacyCookieRoute.nodeCacheState,
 							cachedTargetRecords: Array.isArray(legacyCookieRoute.playbackRouteHotSnapshot?.targetRecords) ? legacyCookieRoute.playbackRouteHotSnapshot.targetRecords : null,
 							nodeCacheRevision: legacyCookieRoute.playbackRouteHotSnapshot?.nodeCacheRevision || "",
 							runtimeConfig,

@@ -1856,7 +1856,7 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
 
           <label class="field-shell">
             <span class="field-label">预热预取字节数</span>
-            <input v-model="form.prewarmPrefetchBytes" type="number" min="0" max="67108864" class="field-input" />
+            <input v-model="form.prewarmPrefetchBytes" type="number" min="0" max="8388608" class="field-input" />
             <span class="field-hint">默认 4194304，等于 4 MiB。</span>
           </label>
 

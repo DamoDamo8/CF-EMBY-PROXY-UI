@@ -79,6 +79,26 @@ const MAIN_VIDEO_STREAM_MODE_OPTIONS = [
   { value: 'direct', label: 'direct' }
 ];
 
+const NODE_GET_PROBE_CONCURRENCY = 4;
+
+async function runWithConcurrency(items = [], concurrency = 1, task = null) {
+  const entries = Array.isArray(items) ? items : [];
+  if (!entries.length || typeof task !== 'function') return;
+  const workerCount = Math.min(
+    entries.length,
+    Math.max(1, Math.floor(Number(concurrency) || 1))
+  );
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < entries.length) {
+      const index = cursor;
+      cursor += 1;
+      await task(entries[index], index);
+    }
+  };
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+}
+
 let editorRequestId = 0;
 let lineDraftSequence = 0;
 
@@ -277,12 +297,12 @@ async function handleGlobalHeadProbe() {
   feedback.text = '';
   let successCount = 0;
   try {
-    for (const node of currentNodes) {
+    await runWithConcurrency(currentNodes, NODE_GET_PROBE_CONCURRENCY, async (node) => {
       const result = await props.adminConsole.pingNode({
         name: String(node?.name || '').trim()
       });
       if (result?.probe?.ok === true) successCount += 1;
-    }
+    });
     feedback.tone = successCount === currentNodes.length ? 'success' : 'warning';
     feedback.text = `全局 GET 测试完成：${successCount}/${currentNodes.length} 个节点成功。`;
   } finally {
@@ -358,6 +378,9 @@ async function handleOpenEdit(node) {
     editor.baseline = serializeNodeForm(form);
   }
 
+  const resourceWarning = formatNodeResourceWarning(result);
+  if (resourceWarning) setEditorAction('warning', resourceWarning);
+
   editor.loadingPrefill = false;
 }
 
@@ -381,6 +404,16 @@ function setEditorAction(tone = '', text = '') {
   editorRuntime.actionText = String(text || '').trim();
 }
 
+function formatNodeResourceWarning(result = {}) {
+  const warning = Array.isArray(result?.warnings)
+    ? result.warnings.find((item) => item?.code === 'NODE_RESOURCE_LIMIT_EXCEEDED')
+    : null;
+  if (!warning) return '';
+  const actual = warning.actual == null ? '?' : String(warning.actual);
+  const limit = warning.limit == null ? '?' : String(warning.limit);
+  return `该旧节点超过 Worker 资源限制（${String(warning.field || 'record')}: ${actual}/${limit}），仍可读取和代理，但不会进入内存缓存或自动回写。`;
+}
+
 async function handleRefreshEditorDetail() {
   if (!props.adminConsole || !editorCanOperateSavedNode.value || editor.loadingPrefill || editorRuntime.refreshingDetail) return;
 
@@ -392,15 +425,16 @@ async function handleRefreshEditorDetail() {
   if (!result?.node) return;
 
   editorRuntime.detailNode = cloneNodeRuntimeState(result.node);
+  const resourceWarning = formatNodeResourceWarning(result);
   if (!hasEditorChanges.value) {
     hydrateNodeForm(buildNodeFormFromNode(result.node));
     editor.baseline = serializeNodeForm(form);
-    setEditorAction('success', `已重新读取 Worker 中 ${resolveDisplayName(result.node)} 的最新详情。`);
+    setEditorAction(resourceWarning ? 'warning' : 'success', resourceWarning || `已重新读取 Worker 中 ${resolveDisplayName(result.node)} 的最新详情。`);
     return;
   }
 
   mergeLineDiagnosticsIntoDrafts(result.node);
-  setEditorAction('success', `已刷新 Worker 中 ${resolveDisplayName(result.node)} 的诊断信息，当前草稿修改已保留。`);
+  setEditorAction(resourceWarning ? 'warning' : 'success', resourceWarning || `已刷新 Worker 中 ${resolveDisplayName(result.node)} 的诊断信息，当前草稿修改已保留。`);
 }
 
 async function handlePingEditorSavedNode(line = null, options = {}) {
@@ -2131,7 +2165,9 @@ async function copyText(text = '') {
           class="mt-5 rounded-2xl border px-4 py-4"
           :class="editorRuntime.actionTone === 'success'
             ? 'border-mint-400/25 bg-mint-400/10 text-mint-100'
-            : 'border-rose-400/25 bg-rose-500/10 text-rose-100'"
+            : editorRuntime.actionTone === 'warning'
+              ? 'border-amber-300/25 bg-amber-500/10 text-amber-50'
+              : 'border-rose-400/25 bg-rose-500/10 text-rose-100'"
         >
           <p class="text-sm leading-6">{{ editorRuntime.actionText }}</p>
         </article>

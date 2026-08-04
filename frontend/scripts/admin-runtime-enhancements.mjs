@@ -60,8 +60,12 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #node-modal [data-admin-node-advanced="1"][open]>summary svg{transform:rotate(180deg)}
 #node-modal [data-admin-node-advanced-content="1"]{display:grid;gap:1rem;padding:0 1rem 1rem;border-top:1px solid #e2e8f0}
 .dark #node-modal [data-admin-node-advanced-content="1"]{border-color:#334155}
+#node-modal [data-admin-node-advanced-content="1"],#node-modal [data-admin-node-advanced-fields="1"],#node-modal [data-admin-node-advanced-headers="1"]{min-width:0;max-width:100%}
 #node-modal [data-admin-node-advanced-fields="1"]{padding-top:1rem}
-#node-modal [data-admin-node-advanced-headers="1"]{margin:0;background:#fff}
+#node-modal [data-admin-node-advanced-fields="1"]>*{min-width:0}
+#node-modal [data-admin-node-advanced-fields="1"] input,#node-modal [data-admin-node-advanced-fields="1"] select{min-width:0;max-width:100%;width:100%}
+#node-modal [data-admin-node-advanced-headers="1"]{margin:0;background:#fff;min-width:0}
+#node-modal [data-admin-node-advanced-headers="1"] #headers-container>div{min-width:0}
 .dark #node-modal [data-admin-node-advanced-headers="1"]{background:rgba(15,23,42,.72)}
 #node-modal>div[data-ui-dialog-surface="1"]{padding:1rem !important}
 #node-modal #node-modal-title{margin-bottom:.75rem !important;font-size:1.125rem;line-height:1.5rem}
@@ -86,7 +90,7 @@ body.bg-slate-50,body.antialiased{background:#f8fafc !important;color:#0f172a !i
 #node-modal [data-admin-node-meta-grid="1"]{grid-template-columns:minmax(0,1.35fr) minmax(0,1fr) minmax(15rem,1fr) !important}
 #node-modal [data-admin-node-entry-field="1"] p{margin-bottom:0}
 #node-modal [data-admin-node-stream-field="1"]{min-width:0}
-@media (max-width:767px){#node-modal [data-admin-node-basic-grid="1"],#node-modal [data-admin-node-meta-grid="1"]{grid-template-columns:minmax(0,1fr) !important}}
+@media (max-width:767px){#node-modal [data-admin-node-basic-grid="1"],#node-modal [data-admin-node-meta-grid="1"],#node-modal [data-admin-node-advanced-fields="1"]{grid-template-columns:minmax(0,1fr) !important}#node-modal [data-admin-node-advanced-headers="1"] #headers-container>div{flex-wrap:wrap}#node-modal [data-admin-node-advanced-headers="1"] #headers-container>div>input{flex:1 1 100%;width:100%}#node-modal [data-admin-node-advanced-headers="1"] #headers-container>div>button{margin-left:auto}}
 @media (max-width:767px){#node-modal [data-admin-node-lines-panel="1"]>div:first-child{align-items:stretch;flex-direction:column}#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:first-child,#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child{width:100%}#node-modal [data-admin-node-lines-panel="1"]>div:first-child>div:last-child button{flex:1 1 0;min-width:0}}
 @media (min-width:768px){#node-modal{max-width:72rem}}
 #view-nodes [data-admin-node-toolbar="1"]{display:grid;grid-template-columns:minmax(0,1fr);gap:1rem;align-items:start}
@@ -708,6 +712,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
     const error = new Error(responsePayload?.error?.message || 'HTTP ' + status);
     error.code = responsePayload?.error?.code || null;
     error.status = status;
+    error.details = responsePayload?.error?.details ?? null;
     return error;
   }
 
@@ -808,9 +813,79 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       ? result.initialization
       : {};
     const createdTables = Array.isArray(initialization.createdTables) ? initialization.createdTables : [];
-    const actionLines = createdTables.length ? ['• 新建表：' + createdTables.join('、')] : ['• 当前结构无需调整'];
+    const actionLines = createdTables.length ? ['• 新建表：' + createdTables.join('、')] : [];
+    const addedColumns = Array.isArray(initialization.addedColumns) ? initialization.addedColumns : [];
+    const createdIndexes = Array.isArray(initialization.createdIndexes) ? initialization.createdIndexes : [];
+    const repairedIndexes = Array.isArray(initialization.repairedIndexes) ? initialization.repairedIndexes : [];
+    const uniqueIndexesCreated = Array.isArray(initialization.uniqueIndexesCreated) ? initialization.uniqueIndexesCreated : [];
+    const rebuiltTables = Array.isArray(initialization.rebuiltTables) ? initialization.rebuiltTables : [];
+    if (addedColumns.length) actionLines.push('• 补全列：' + addedColumns.join('、'));
+    if (createdIndexes.length) actionLines.push('• 新建索引：' + createdIndexes.join('、'));
+    if (repairedIndexes.length) actionLines.push('• 修复索引：' + repairedIndexes.join('、'));
+    if (uniqueIndexesCreated.length) actionLines.push('• 补全唯一索引：' + uniqueIndexesCreated.join('、'));
+    for (const item of rebuiltTables) {
+      const dataWasDiscarded = item?.willDiscardData === true && item?.dataMode === 'discard';
+      if (dataWasDiscarded || item?.allowsDataLoss === true) {
+        if (item?.rowCountMeasured === false) {
+          actionLines.push('• 重建表：' + String(item?.table || '') + '（已清空全部日志，未扫描旧日志数量）');
+          continue;
+        }
+        const discardedRows = Math.max(0, Number(item?.discardedRows) || 0);
+        const discardedLabel = item?.discardedRowsIsLowerBound === true ? '10000+' : String(discardedRows);
+        actionLines.push('• 重建表：' + String(item?.table || '') + '（已清空 ' + discardedLabel + ' 行日志）');
+      } else actionLines.push('• 重建表：' + String(item?.table || '') + '（' + Math.max(0, Number(item?.rowCount) || 0) + ' 行）');
+    }
     if (initialization.ftsRebuilt === true) actionLines.push('• 构建 FTS 全文索引');
+    if (initialization.recoveryBookmark) actionLines.push('• 恢复 bookmark：' + String(initialization.recoveryBookmark));
+    if (!actionLines.length) actionLines.push('• 当前结构无需调整');
     return formatD1SchemaStatus(result?.status || {}) + '\\n\\n本次初始化：\\n' + actionLines.join('\\n');
+  }
+
+  function formatD1RepairIssue(rawIssue = '') {
+    const issue = String(rawIssue || '').trim();
+    const mappings = [
+      [/^missing_table:(.+)$/, '缺少表: $1'],
+      [/^missing_column:(.+)$/, '缺少列: $1'],
+      [/^invalid_column_affinity:(.+)$/, '列类型不兼容: $1'],
+      [/^invalid_primary_key:(.+)$/, '主键结构不兼容: $1'],
+      [/^missing_unique_key:(.+)$/, '缺少唯一约束: $1'],
+      [/^unique_key_duplicate:(.+)$/, '唯一键存在重复数据: $1'],
+      [/^unique_key_empty:(.+)$/, '唯一键存在空值: $1'],
+      [/^rebuild_row_limit_exceeded:([^:]+):(.+)$/, '表 $1 超过自动重建上限（$2 行）'],
+      [/^fts_contract_invalid$/, 'FTS 结构不兼容'],
+      [/^missing_index:(.+)$/, '缺少索引: $1'],
+      [/^invalid_index:(.+)$/, '索引定义不兼容: $1']
+    ];
+    for (const [pattern, replacement] of mappings) if (pattern.test(issue)) return issue.replace(pattern, replacement) + ' [' + issue + ']';
+    return issue;
+  }
+
+  function formatD1RepairPlan(plan = {}) {
+    const lines = [];
+    const low = Array.isArray(plan?.repairableIssues) ? plan.repairableIssues : [];
+    const high = Array.isArray(plan?.highRiskIssues) ? plan.highRiskIssues : [];
+    const blocked = Array.isArray(plan?.blockingIssues) ? plan.blockingIssues : [];
+    if (low.length) lines.push('可安全修复：', ...low.map(issue => '• ' + formatD1RepairIssue(issue)));
+    if (high.length) lines.push(...(lines.length ? [''] : []), '需重建表的高风险修复：', ...high.map(issue => '• ' + formatD1RepairIssue(issue)));
+    if (blocked.length) lines.push(...(lines.length ? [''] : []), '无法自动修复：', ...blocked.map(issue => '• ' + formatD1RepairIssue(issue)));
+    if (!lines.length) lines.push('当前 D1 结构已符合契约。');
+    return lines.join('\\n');
+  }
+
+  function formatD1RepairError(error, fallbackTitle = 'D1 结构修复失败') {
+    const details = error?.details && typeof error.details === 'object' ? error.details : {};
+    const repairPlan = details.repairPlan && typeof details.repairPlan === 'object'
+      ? details.repairPlan
+      : { blockingIssues: details.blockingIssues, repairableIssues: [], highRiskIssues: [] };
+    const lines = [fallbackTitle + ': ' + (error?.message || '未知错误')];
+    const hasIssues = ['repairableIssues', 'highRiskIssues', 'blockingIssues']
+      .some(key => Array.isArray(repairPlan?.[key]) && repairPlan[key].length > 0);
+    if (hasIssues) lines.push('', formatD1RepairPlan(repairPlan));
+    const remainingIssues = Array.isArray(details.issues) ? details.issues : [];
+    if (remainingIssues.length) lines.push('', '最终校验仍存在问题：', ...remainingIssues.map(issue => '• ' + formatD1RepairIssue(issue)));
+    if (details.recoveryBookmark) lines.push('', '恢复 bookmark：' + String(details.recoveryBookmark));
+    if (error?.code) lines.push('', '错误代码：' + String(error.code));
+    return lines.join('\\n');
   }
 
   function getDashboardTrafficNodes() {
@@ -1038,6 +1113,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   }
 
   const GET_PROBE_PATH = '/emby/system/info/public';
+  const NODE_GET_PROBE_CONCURRENCY = 4;
   const HEAD_PROBE_REASONS = new Set([
     'ok',
     'http_error',
@@ -1049,6 +1125,24 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
   function normalizeHeadProbePath() {
     return GET_PROBE_PATH;
+  }
+
+  async function runWithConcurrency(items = [], concurrency = 1, task = null) {
+    const entries = Array.isArray(items) ? items : [];
+    if (!entries.length || typeof task !== 'function') return;
+    const workerCount = Math.min(
+      entries.length,
+      Math.max(1, Math.floor(Number(concurrency) || 1))
+    );
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < entries.length) {
+        const index = cursor;
+        cursor += 1;
+        await task(entries[index], index);
+      }
+    };
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
   }
 
   function normalizeHeadProbeResult(value = {}, fallbackPath = '') {
@@ -1122,6 +1216,167 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
   function patchSafetyContractMethods(app) {
     if (!app || patchedSafetyContractApp === app) return;
     patchedSafetyContractApp = app;
+
+    if (typeof app.apiCall === 'function') {
+      const originalApiCall = app.apiCall.bind(app);
+      app.apiCall = async function apiCallWithNodeResourceWarnings(action, payload = {}) {
+        const result = await originalApiCall(action, payload);
+        if (String(action || '') === 'getNode' && Array.isArray(result?.warnings) && result.warnings.length > 0) {
+          const warning = result.warnings.find((item) => item?.code === 'NODE_RESOURCE_LIMIT_EXCEEDED') || result.warnings[0];
+          const field = String(warning?.field || 'record');
+          const actual = warning?.actual == null ? '?' : String(warning.actual);
+          const limit = warning?.limit == null ? '?' : String(warning.limit);
+          this.showMessage('该旧节点超过 Worker 资源限制（' + field + ': ' + actual + '/' + limit + '），仍可读取和代理，但不会进入内存缓存或自动回写。', { tone: 'warning' });
+        }
+        return result;
+      };
+    }
+
+    app.runD1SchemaRepairFlow = async function runTwoPhaseD1SchemaRepairFlow(options = {}) {
+      const readSnapshot = async () => {
+        const snapshot = await this.apiCall('getD1SchemaStatus');
+        return {
+          snapshot,
+          status: snapshot?.status && typeof snapshot.status === 'object' ? snapshot.status : {},
+          repairPlan: snapshot?.repairPlan && typeof snapshot.repairPlan === 'object' ? snapshot.repairPlan : {}
+        };
+      };
+      const showBlocked = async repairPlan => {
+        await this.showMessage(formatD1RepairPlan(repairPlan), {
+          title: 'D1 结构无法自动修复',
+          tone: 'error',
+          modal: true
+        });
+      };
+
+      let { snapshot, status, repairPlan } = await readSnapshot();
+      if (Array.isArray(repairPlan.blockingIssues) && repairPlan.blockingIssues.length > 0) {
+        await showBlocked(repairPlan);
+        return { completed: false, blocked: true, status, repairPlan };
+      }
+      if (status.schemaReady === true || repairPlan.phase === 'ready' || repairPlan.risk === 'none') {
+        if (options.showNoop !== false) await this.showMessage(formatD1SchemaStatus(status) + '\\n\\n当前结构无需调整。', {
+          title: '初始化 DB 结果',
+          tone: 'success',
+          modal: true
+        });
+        return { completed: true, status, repairPlan, result: snapshot };
+      }
+
+      const accepted = await this.askConfirm(formatD1RepairPlan(repairPlan), {
+        title: '初始化 DB',
+        tone: 'warning',
+        confirmText: '开始安全修复'
+      });
+      if (!accepted) return { completed: false, cancelled: true, status, repairPlan };
+
+      let result = null;
+      if (repairPlan.phase === 'safe') {
+        result = await this.apiCall('initLogsDb', { repairMode: 'safe' });
+        if (result?.revisions) this.applyAdminRevisions(result.revisions);
+        if (result?.pendingHighRisk === true) {
+          ({ snapshot, status, repairPlan } = await readSnapshot());
+          if (Array.isArray(repairPlan.blockingIssues) && repairPlan.blockingIssues.length > 0) {
+            await showBlocked(repairPlan);
+            return { completed: false, blocked: true, status, repairPlan, result };
+          }
+        } else {
+          await this.showMessage(formatD1InitializationResult(result), {
+            title: '初始化 DB 结果',
+            tone: result?.schemaReady === true ? 'success' : 'error',
+            modal: true
+          });
+          return { completed: result?.schemaReady === true, status: result?.status || status, repairPlan, result };
+        }
+      }
+
+      if (repairPlan.phase === 'destructive' || repairPlan.risk === 'high') {
+        const rebuildSteps = Array.isArray(repairPlan.steps)
+          ? repairPlan.steps.filter(step => step?.kind === 'rebuild_table' || step?.kind === 'recreate_log_table')
+          : [];
+        const hasLossyLogsRebuild = rebuildSteps.some(step => step?.willDiscardData === true && step?.dataMode === 'discard');
+        const highRiskMessage = [
+          '以下表需要执行高风险主键修复：',
+          ...rebuildSteps.map(step => step?.willDiscardData === true && step?.dataMode === 'discard'
+            ? '• ' + String(step?.target || '') + '（直接销毁重建，将清空全部日志，不扫描旧日志，不创建本地备份）'
+            : '• ' + String(step?.target || '') + '（使用影子表无损复制 ' + Math.max(0, Number(step?.estimatedRows) || 0) + ' 行）'),
+          '',
+          ...(hasLossyLogsRebuild ? ['执行成功后，旧日志只能通过 D1 Time Travel bookmark 恢复。', ''] : []),
+          '执行前必须成功获取 D1 Time Travel bookmark。'
+        ].join('\\n');
+        const highRiskAccepted = await this.askConfirm(highRiskMessage, {
+          title: '确认重建 D1 表',
+          tone: 'warning',
+          confirmText: hasLossyLogsRebuild ? '确认重建并清空日志' : '确认重建'
+        });
+        if (!highRiskAccepted) return { completed: false, cancelled: true, status, repairPlan };
+        const repairToken = String(repairPlan.repairToken || '').trim();
+        if (!repairToken) {
+          const error = new Error('高风险修复令牌缺失，请重新检查 D1 结构。');
+          error.code = 'D1_SCHEMA_REPAIR_PLAN_STALE';
+          throw error;
+        }
+        result = await callConfirmedAdminAction(this, 'initLogsDb', {
+          repairMode: 'confirmed-destructive',
+          repairToken
+        }, 'repairD1Schema');
+      } else if (!result) result = await this.apiCall('initLogsDb', { repairMode: 'safe' });
+
+      if (result?.revisions) this.applyAdminRevisions(result.revisions);
+      await this.showMessage(formatD1InitializationResult(result), {
+        title: '初始化 DB 结果',
+        tone: result?.schemaReady === true ? 'success' : 'error',
+        modal: true
+      });
+      return { completed: result?.schemaReady === true, status: result?.status || status, repairPlan, result };
+    };
+
+    if (typeof app.formatTidyPreviewGroupText === 'function') {
+      const originalFormatTidyPreviewGroupText = app.formatTidyPreviewGroupText.bind(app);
+      app.formatTidyPreviewGroupText = function formatBoundedTidyPreviewGroupText(group = {}) {
+        if (group?.countIsLowerBound !== true) return originalFormatTidyPreviewGroupText(group);
+        const label = String(group?.label || '').trim() || '未命名分组';
+        const samples = Array.isArray(group?.samples) ? group.samples.map((item) => String(item || '').trim()).filter(Boolean) : [];
+        const note = String(group?.note || '').trim();
+        return '• ' + label + '：10000+ 项' + (samples.length ? '：' + samples.join('、') + (group?.truncated ? ' 等' : '') : '') + (note ? '（' + note + '）' : '');
+      };
+    }
+
+    if (typeof app.buildTidyPreviewConfirmDialog === 'function') {
+      const originalBuildTidyPreviewConfirmDialog = app.buildTidyPreviewConfirmDialog.bind(app);
+      app.buildTidyPreviewConfirmDialog = function buildBoundedTidyPreviewConfirmDialog(preview = {}, scope = 'kv') {
+        const dialog = originalBuildTidyPreviewConfirmDialog(preview, scope);
+        const lowerBoundKeys = new Set([
+          ...Array.isArray(preview?.fieldGroups) ? preview.fieldGroups : [],
+          ...Array.isArray(preview?.deleteGroups) ? preview.deleteGroups : [],
+          ...Array.isArray(preview?.rewriteGroups) ? preview.rewriteGroups : [],
+          ...Array.isArray(preview?.preserveGroups) ? preview.preserveGroups : []
+        ].filter((group) => group?.countIsLowerBound === true).map((group) => String(group?.key || '')));
+        for (const section of Array.isArray(dialog?.sections) ? dialog.sections : []) {
+          for (const item of Array.isArray(section?.items) ? section.items : []) {
+            if (!lowerBoundKeys.has(String(item?.key || ''))) continue;
+            item.countLabel = '10000+';
+            item.label = String(item.label || '').trim() + '（10000+）';
+          }
+        }
+        return dialog;
+      };
+    }
+
+    app.buildD1TidySuccessMessage = function buildBudgetedD1TidySuccessMessage(summary = {}) {
+      const parts = [
+        'D1 整理完成：删除 ' + (Number(summary.deletedExpiredLogCount) || 0) + ' 条超保留期日志',
+        '本轮处理 ' + (Number(summary?.budget?.processedRows) || 0) + ' 行'
+      ];
+      if (Number(summary.deletedExpiredStatsHourlyCount) > 0) parts.push('清理 ' + Number(summary.deletedExpiredStatsHourlyCount) + ' 条过期统计桶');
+      if (summary.rebuiltLogsFts === true) parts.push('重建 proxy_logs_fts');
+      if (summary.statsRebuildStatus === 'reset_for_new_logs') parts.push('统计已清空并将从新日志重新累计');
+      if (summary.hasMore === true) {
+        const scopes = Array.isArray(summary.remainingScopes) ? summary.remainingScopes.filter(Boolean).join('、') : '';
+        parts.push('本轮达到维护预算，仍有待处理数据' + (scopes ? '（' + scopes + '）' : '') + '，可再次预览并继续执行');
+      }
+      return parts.join('，') + '。';
+    };
 
     // Older shells call this helper while hydrating settings, but did not expose it.
     // Keep the preview field populated from either the current or legacy repository key.
@@ -1337,10 +1592,10 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         const token = this.beginNodePingRequest(nodeName, 'batch');
         if (token) tokens.set(nodeName, token);
       }
-      for (const node of nodes) {
+      await runWithConcurrency(nodes, NODE_GET_PROBE_CONCURRENCY, async (node) => {
         const nodeName = this.normalizeNodeKey(node?.name);
         const token = nodeName ? tokens.get(nodeName) : '';
-        if (!nodeName || !token) continue;
+        if (!nodeName || !token) return;
         const startedAt = Date.now();
         try {
           const activeLine = this.getActiveNodeLine(node);
@@ -1359,7 +1614,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
         } finally {
           this.finishNodePingRequest(nodeName, token);
         }
-      }
+      });
       this.nodeHealth = health;
     };
     app.pingAllNodeLinesInModal = async function pingAllNodeLinesInModalWithProbe() {
@@ -1524,23 +1779,8 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
       try {
         let preview = await this.apiCall('previewTidyData', { scope });
         if (scope === 'd1' && preview?.requiresSchemaInitialization === true) {
-          const initializeAccepted = await this.askConfirm(
-            'D1 结构尚未通过兼容检查。当前预览不会授权删除；请先运行统一“初始化 DB”，完成后系统会重新生成实际整理预览。',
-            {
-              title: '整理 D1 前置检查',
-              tone: 'warning',
-              confirmText: '初始化 DB'
-            }
-          );
-          if (!initializeAccepted) return;
-          const initializationResult = await this.apiCall('initLogsDb');
-          if (initializationResult?.revisions) this.applyAdminRevisions(initializationResult.revisions);
-          await this.showMessage(formatD1InitializationResult(initializationResult), {
-            title: '初始化 DB 结果',
-            tone: initializationResult?.schemaReady === true ? 'success' : 'error',
-            modal: true
-          });
-          if (initializationResult?.schemaReady !== true) return;
+          const repair = await this.runD1SchemaRepairFlow({ showNoop: false });
+          if (repair?.completed !== true) return;
           preview = await this.apiCall('previewTidyData', { scope });
           if (preview?.requiresSchemaInitialization === true) {
             const error = new Error('D1 初始化后仍未通过兼容检查，请检查 Schema 状态');
@@ -1589,7 +1829,10 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
           : errorCode === 'TIDY_PLAN_INVALID'
             ? scopeLabel + ' 整理计划凭证无效，请重新预览并确认后再执行。'
             : '';
-        this.showMessage(planRecoveryMessage || title + '失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+        const schemaRepairMessage = errorCode.startsWith('D1_SCHEMA_REPAIR_')
+          ? formatD1RepairError(error, title + '失败')
+          : '';
+        this.showMessage(planRecoveryMessage || schemaRepairMessage || title + '失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
       }
     };
 
@@ -1634,16 +1877,10 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 
     app.initLogsDbFromUi = async function initializeDatabaseFromUi() {
       try {
-        const result = await this.apiCall('initLogsDb');
-        if (result?.revisions) this.applyAdminRevisions(result.revisions);
-        await this.showMessage(formatD1InitializationResult(result), {
-          title: '初始化 DB 结果',
-          tone: result?.schemaReady === true ? 'success' : 'error',
-          modal: true
-        });
+        await this.runD1SchemaRepairFlow();
       } catch (error) {
         console.error('initLogsDbFromUi failed', error);
-        this.showMessage('初始化 DB 失败: ' + (error?.message || '未知错误'), { tone: 'error', modal: true });
+        this.showMessage(formatD1RepairError(error, '初始化 DB 失败'), { tone: 'error', modal: true });
       }
     };
 

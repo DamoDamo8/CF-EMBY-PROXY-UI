@@ -1903,6 +1903,70 @@ test("metadata prewarm partitions each target's sensitive query", async () => {
   assert.doesNotMatch(firstPartition, /target-secret|shared-header-secret|shared-session/);
 });
 
+test("metadata prewarm single-flight has four slots and always releases failed entries", async () => {
+  const tasks = isolateState.MetadataPrewarmTasks;
+  tasks.clear();
+  const gate = createDeferred();
+  let started = 0;
+  const flights = Array.from({ length: 4 }, (_, index) => proxyService.runMetadataPrewarmSingleFlight(
+    new Request(`https://cache.test/asset-${index}`),
+    async () => {
+      started += 1;
+      await gate.promise;
+      return { cached: true, bytes: 1 };
+    }
+  ));
+  await Promise.resolve();
+  assert.equal(started, 4);
+  assert.equal(tasks.size, 4);
+
+  const rejectedForCapacity = await proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/asset-5"),
+    async () => ({ cached: true, bytes: 1 })
+  );
+  assert.equal(rejectedForCapacity.skipped, true);
+  const joined = proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/asset-0"),
+    async () => assert.fail("same final cache key must join the active task")
+  );
+
+  gate.resolve();
+  const joinedResult = await joined;
+  await Promise.all(flights);
+  assert.equal(joinedResult.joined, true);
+  assert.equal(tasks.size, 0);
+
+  await assert.rejects(proxyService.runMetadataPrewarmSingleFlight(
+    new Request("https://cache.test/failure"),
+    async () => { throw new Error("prewarm failed"); }
+  ), /prewarm failed/);
+  assert.equal(tasks.size, 0);
+});
+
+test("metadata prewarm byte guards cancel declared and streaming overages", async () => {
+  let declaredCancelled = false;
+  const declaredResponse = new Response(new ReadableStream({
+    cancel() { declaredCancelled = true; }
+  }), { headers: { "Content-Length": "9" } });
+  assert.equal(proxyService.buildBudgetedPrewarmResponse(declaredResponse, 8), null);
+  await Promise.resolve();
+  assert.equal(declaredCancelled, true);
+
+  let streamingCancelled = false;
+  const streamingResponse = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(5));
+      controller.enqueue(new Uint8Array(5));
+    },
+    cancel() { streamingCancelled = true; }
+  }));
+  const bounded = proxyService.buildBudgetedPrewarmResponse(streamingResponse, 8);
+  await assert.rejects(bounded.response.arrayBuffer(), /metadata_prewarm_budget_exceeded/);
+  assert.equal(streamingCancelled, true);
+  assert.equal(bounded.getBytes(), 5);
+  assert.equal(sanitizeRuntimeConfig({ prewarmPrefetchBytes: 64 * 1024 * 1024 }).prewarmPrefetchBytes, 8 * 1024 * 1024);
+});
+
 test("metadata cache policy revisions change with TTL and asset kind", () => {
   const imageHour = buildWorkerMetadataCachePolicyRevision("/Items/1/Images/Primary", {
     imageCacheMaxAge: 3600,
@@ -1919,6 +1983,16 @@ test("metadata cache policy revisions change with TTL and asset kind", () => {
 
   assert.notEqual(imageHour, imageDisabled);
   assert.notEqual(imageHour, manifest);
+});
+
+test("managed response idle timeouts cover manifests and segments only", () => {
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({ isManifest: true }), 12_000);
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({ isSegment: true }), 15_000);
+  assert.equal(proxyService.resolveResponseStreamIdleTimeoutMs({}), 0);
+  const upstreamState = { response: new Response("body") };
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: { isManifest: true } }, upstreamState), true);
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: { isSegment: true } }, upstreamState), true);
+  assert.equal(proxyService.shouldManageProxyResponseBody({ requestMethod: "GET", requestTraits: {} }, upstreamState), false);
 });
 
 test("metadata cache lookups preserve supported request conditions and bypass If-Range", () => {
@@ -2656,6 +2730,30 @@ test("host-prefix node write entrypoints reject incomplete DNS configuration bef
       }
     }
   }
+});
+
+test("node imports reject an oversized batch atomically before KV mutation", async () => {
+  const { kv, storedValues, putKeys, deleteKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {},
+    [`${kernel.PREFIX}existing`]: { target: "https://existing.test", lines: [{ id: "line-1", target: "https://existing.test" }] }
+  });
+  const response = await adminActions.saveOrImport({
+    nodes: [
+      { name: "valid", target: "https://valid.test", lines: [{ id: "line-1", target: "https://valid.test" }] },
+      { name: "oversized", target: "https://origin.test", lines: [{ id: "line-1", target: "https://origin.test" }], remark: "界".repeat(1400) }
+    ]
+  }, { action: "import", env: { ENI_KV: kv }, ctx: null, kv });
+  const payload = await response.json();
+
+  assert.equal(response.status, 400);
+	assert.equal(payload.error.code, "NODE_RESOURCE_LIMIT_EXCEEDED");
+	assert.equal(payload.error.details.nodeName, "oversized");
+	assert.equal(payload.error.details.field, "remark");
+	assert.ok(payload.error.details.actual > payload.error.details.limit);
+  assert.equal(storedValues.has(`${kernel.PREFIX}valid`), false);
+  assert.equal(storedValues.has(`${kernel.PREFIX}oversized`), false);
+  assert.deepEqual(putKeys, []);
+  assert.deepEqual(deleteKeys, []);
 });
 
 test("host-prefix node writes reject malformed HOST without reflecting its value", async () => {
@@ -3473,6 +3571,37 @@ test("node revision refresh coalesces and hot node reads stay in memory", async 
   assert.equal(revisionReadCount, 1);
   isolateState.NodeCache.clear();
   invalidateNodesRevisionCache();
+});
+
+test("oversized legacy nodes remain readable but bypass node and playback hot caches", async () => {
+  const oversizedNode = {
+    target: "https://origin.test",
+    lines: [{ id: "line-1", name: "Primary", target: "https://origin.test" }],
+    remark: "界".repeat(1400)
+  };
+  const { kv, putKeys } = createInMemoryKvStore({
+    [`${kernel.PREFIX}alpha`]: oversizedNode
+  });
+  const state = getNodeBindingCacheState(kv);
+  const waitUntilTasks = [];
+  const env = { ENI_KV: kv };
+  const ctx = { waitUntil(task) { waitUntilTasks.push(task); } };
+
+  const first = await kernel.getNode("alpha", env, ctx);
+  const second = await kernel.getNodeForRead("alpha", env);
+  assert.equal(first.remark, oversizedNode.remark);
+  assert.equal(second.remark, oversizedNode.remark);
+  assert.equal(state.NodeCache.has("alpha"), false);
+  assert.equal(state.PlaybackRouteHotCache.has("alpha"), false);
+  assert.equal(kernel.buildPlaybackRouteHotSnapshot("alpha", first), null);
+  assert.equal(putKeys.includes(`${kernel.PREFIX}alpha`), false);
+  assert.equal(waitUntilTasks.length, 0);
+
+  const summary = kernel.normalizeNodeSummaryPayload("alpha", {
+    ...first,
+    lines: Array.from({ length: 40 }, (_, index) => ({ id: `line-${index}`, target: `https://origin-${index}.test` }))
+  });
+  assert.equal(summary.lines.length, 32);
 });
 
 test("node revision read failures are retried instead of negative-cached", async () => {
@@ -5453,6 +5582,40 @@ test("playback progress relay enforces its bounded session table on insertion", 
   relayMap.clear();
 });
 
+test("playback relay cancellation settles timers and all-active capacity does not evict", async () => {
+  const relayMap = isolateState.PlaybackProgressRelay;
+  relayMap.clear();
+  const waits = [];
+  const entry = proxyService.buildPlaybackProgressRelayEntry(60_000, { waitUntil(task) { waits.push(task); } });
+  entry.pendingSnapshot = { ctx: entry.waitUntilCtx };
+  relayMap.set("scheduled", entry);
+  proxyService.schedulePlaybackProgressRelayFlush("scheduled", entry);
+  assert.equal(waits.length, 1);
+  proxyService.markPlaybackProgressRelayStopped("scheduled", { videoProgressForwardIntervalSec: 3, nodeName: "alpha" });
+  await waits[0];
+  assert.equal(entry.scheduledPromise, null);
+  assert.equal(entry.pendingSnapshot, null);
+
+  relayMap.clear();
+  const maxEntries = Config.Defaults.VideoProgressForwardSessionMax;
+  const activeGate = createDeferred();
+  for (let index = 0; index < maxEntries; index += 1) {
+    const active = proxyService.buildPlaybackProgressRelayEntry(3000, null);
+    active.activeFlushPromise = activeGate.promise;
+    relayMap.set(`active-${index}`, active);
+  }
+  const admitted = proxyService.markPlaybackProgressRelayStopped("new-session", {
+    videoProgressForwardIntervalSec: 3,
+    nodeName: "alpha"
+  });
+  assert.equal(admitted, null);
+  assert.equal(relayMap.size, maxEntries);
+  assert.equal(relayMap.has("active-0"), true);
+  assert.equal(relayMap.has("new-session"), false);
+  activeGate.resolve();
+  relayMap.clear();
+});
+
 test("incremental isolate cleanup covers nonessential proxy-adjacent caches", () => {
   const now = Date.now();
   const staleCases = [
@@ -5602,7 +5765,9 @@ test("D1 schema initialization is single-flight and creates current runtime inde
   assert.equal(dnsRecorder.prepared.filter(record => /CREATE TABLE IF NOT EXISTS dns_ip_pool_items \(/.test(record.sql)).length, 2);
 
   const workerSource = await readFile(new URL("../worker/runtime/application-facades.js", import.meta.url), "utf8");
-  assert.doesNotMatch(workerSource, /ALTER TABLE/i);
+  assert.match(workerSource, /async rebuildD1TableWithShadow/);
+  assert.match(workerSource, /D1_SCHEMA_REPAIR_CONFIRMATION_REQUIRED/);
+  assert.match(workerSource, /ALTER TABLE \$\{quoteSqlIdentifier\(tableName\)\} ADD COLUMN/);
   assert.match(workerSource, /CREATE INDEX IF NOT EXISTS idx_proxy_logs_category_time/);
   assert.match(workerSource, /CREATE INDEX IF NOT EXISTS idx_dns_ip_pool_items_updated_ip/);
 });

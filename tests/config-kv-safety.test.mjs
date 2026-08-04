@@ -467,6 +467,75 @@ test("stale config revisions are rejected before settings persistence", async ()
   }
 });
 
+test("settings reads derive the config revision when stored metadata is stale", async () => {
+  const staleRevision = "2026-01-01T00:00:00.000Z.stale-meta-hash";
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: { rateLimitRpm: 20 },
+    [kernel.CONFIG_META_KEY]: {
+      revision: staleRevision,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      hash: "stale-meta-hash"
+    },
+    [kernel.CONFIG_SNAPSHOTS_KEY]: []
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "stale-config-meta-read"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const loaded = await (await adminActions.loadConfig({}, { env, kv, db: null, ctx: null })).json();
+    assert.notEqual(loaded.revisions.configRevision, staleRevision);
+
+    const response = await adminActions.saveConfig({
+      config: { rateLimitRpm: 30 },
+      expectedConfigRevision: loaded.revisions.configRevision
+    }, { env, kv, ctx: null, meta: {} });
+
+    assert.equal(response.status, 200);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 30);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("concurrent settings saves cannot both commit the same config revision", async () => {
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: { rateLimitRpm: 20 },
+    [kernel.CONFIG_SNAPSHOTS_KEY]: []
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "concurrent-config-revision"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const loaded = await (await adminActions.loadConfig({}, { env, kv, db: null, ctx: null })).json();
+    const expectedConfigRevision = loaded.revisions.configRevision;
+    const results = await Promise.allSettled([
+      adminActions.saveConfig({
+        config: { rateLimitRpm: 30 },
+        expectedConfigRevision
+      }, { env, kv, ctx: null, meta: {} }),
+      adminActions.saveConfig({
+        config: { rateLimitRpm: 40 },
+        expectedConfigRevision
+      }, { env, kv, ctx: null, meta: {} })
+    ]);
+    const fulfilled = results.filter(result => result.status === "fulfilled");
+    const rejected = results.filter(result => result.status === "rejected");
+
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason?.code, "CONFIG_REVISION_CONFLICT");
+    assert.ok([30, 40].includes((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm));
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("active admin index renders when a remote PoP still sees stale config", async () => {
   const record = await buildAdminLocalIndexUploadRecord(
     '<!doctype html><html><body><div id="app">active-from-envelope</div></body></html>',

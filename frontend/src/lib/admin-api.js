@@ -43,6 +43,7 @@ export class AdminApiError extends Error {
     this.name = 'AdminApiError';
     this.status = Number(options.status) || 500;
     this.code = String(options.code || 'REQUEST_FAILED').trim() || 'REQUEST_FAILED';
+    this.details = options.details ?? null;
     this.payload = options.payload ?? null;
   }
 }
@@ -73,6 +74,7 @@ export async function callAdminAction(action, data = {}, options = {}) {
     throw new AdminApiError(normalizeErrorMessage(response, payload), {
       status: response.status,
       code,
+      details: nestedError?.details ?? null,
       payload
     });
   }

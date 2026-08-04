@@ -23,7 +23,7 @@ function loadEnhancementTestHooks(documentOverrides = {}, windowOverrides = {}) 
   const closureEnd = inlineScript.lastIndexOf('})();');
   assert.notEqual(closureEnd, -1, 'enhancement script must use the expected closure');
   const instrumentedScript = inlineScript.slice(0, closureEnd)
-    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, normalizeHeadProbeResult, formatHeadProbeResult, normalizeHostPrefixDnsHostname, isHostPrefixNodeLinkActive };\n'
+    + 'window.__enhancementTestHooks = { formatD1SchemaStatus, formatD1InitializationResult, formatD1RepairPlan, formatD1RepairError, patchSafetyContractMethods, getDashboardMonthPeriodKey, isDashboardMonthlyTrafficCacheFresh, toggleDashboardTrafficPeriod, dashboardTrafficState, normalizeHeadProbeResult, formatHeadProbeResult, normalizeHostPrefixDnsHostname, isHostPrefixNodeLinkActive, runWithConcurrency, NODE_GET_PROBE_CONCURRENCY };\n'
     + inlineScript.slice(closureEnd);
   const window = {
     addEventListener() {},
@@ -118,6 +118,21 @@ test('node line editor stacks its heading and actions on mobile', () => {
   assert.match(
     ADMIN_RUNTIME_ENHANCEMENT_STYLE,
     /\[data-admin-node-lines-panel="1"\]>div:first-child>div:last-child button\{flex:1 1 0;min-width:0\}/
+  );
+});
+
+test('node advanced settings stay within the mobile modal width', () => {
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /#node-modal \[data-admin-node-advanced-content="1"\],#node-modal \[data-admin-node-advanced-fields="1"\],#node-modal \[data-admin-node-advanced-headers="1"\]\{min-width:0;max-width:100%\}/
+  );
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /@media \(max-width:767px\).*\[data-admin-node-advanced-fields="1"\]\{grid-template-columns:minmax\(0,1fr\) !important\}/
+  );
+  assert.match(
+    ADMIN_RUNTIME_ENHANCEMENT_STYLE,
+    /\[data-admin-node-advanced-headers="1"\] #headers-container>div>input\{flex:1 1 100%;width:100%\}/
   );
 });
 
@@ -331,11 +346,43 @@ test('node GET probes use the fixed public-info path without path selectors', as
   assert.match(nodesPanel, /handleGlobalHeadProbe/);
   assert.match(nodesPanel, /globalHeadProbePending/);
   assert.match(nodesPanel, /全局 GET 测试/);
+  assert.match(nodesPanel, /runWithConcurrency\(currentNodes, NODE_GET_PROBE_CONCURRENCY/);
   assert.doesNotMatch(adminConsole, /options\.probePath/);
   assert.match(settingsPanel, /pingTimeout: '10000'/);
   assert.match(settingsPanel, /GET 超时时间 \(ms\)/);
   assert.match(settingsPanel, /hedgeProbePreferGet: true/);
   assert.match(settingsPanel, /优先使用 GET 请求方式/);
+});
+
+test('global node GET probes use a bounded concurrent request pool', async () => {
+  const { runWithConcurrency, NODE_GET_PROBE_CONCURRENCY } = loadEnhancementTestHooks();
+  let activeCount = 0;
+  let maxActiveCount = 0;
+  const releases = [];
+  const started = [];
+  const run = runWithConcurrency(
+    Array.from({ length: 9 }, (_, index) => index),
+    NODE_GET_PROBE_CONCURRENCY,
+    async (item) => {
+      activeCount += 1;
+      maxActiveCount = Math.max(maxActiveCount, activeCount);
+      started.push(item);
+      await new Promise((resolve) => releases.push(resolve));
+      activeCount -= 1;
+    }
+  );
+
+  await Promise.resolve();
+  assert.equal(NODE_GET_PROBE_CONCURRENCY, 4);
+  assert.equal(started.length, 4);
+  while (releases.length) {
+    releases.shift()();
+    await Promise.resolve();
+  }
+  await run;
+  assert.equal(maxActiveCount, 4);
+  assert.deepEqual(started, [0, 1, 2, 3, 4, 5, 6, 7, 8]);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /runWithConcurrency\(nodes, NODE_GET_PROBE_CONCURRENCY/);
 });
 
 test('GET probe results distinguish HTTP and transport failures from true timeout', () => {
@@ -406,7 +453,18 @@ test('D1 schema dialog reports only the current schema contract', () => {
 test('initialize DB is the single schema mutation action', async () => {
   const { patchSafetyContractMethods, formatD1InitializationResult } = loadEnhancementTestHooks();
   const calls = [];
+  const confirmations = [];
   const messages = [];
+  const snapshot = {
+    status: { schemaReady: false, issues: ['missing_table:proxy_logs'] },
+    repairPlan: {
+      risk: 'low',
+      repairableIssues: ['missing_table:proxy_logs'],
+      highRiskIssues: [],
+      blockingIssues: [],
+      steps: [{ kind: 'create_table', target: 'proxy_logs', risk: 'low' }]
+    }
+  };
   const result = {
     schemaReady: true,
     status: {
@@ -424,7 +482,13 @@ test('initialize DB is the single schema mutation action', async () => {
   const app = {
     async apiCall(action) {
       calls.push(action);
-      return result;
+      if (action === 'getD1SchemaStatus') return snapshot;
+      if (action === 'initLogsDb') return result;
+      throw new Error('unexpected action: ' + action);
+    },
+    async askConfirm(message, options) {
+      confirmations.push({ message, options });
+      return true;
     },
     applyAdminRevisions() {},
     showMessage(message, options) {
@@ -435,13 +499,180 @@ test('initialize DB is the single schema mutation action', async () => {
   patchSafetyContractMethods(app);
   await app.initLogsDbFromUi();
 
-  assert.deepEqual(calls, ['initLogsDb']);
+  assert.deepEqual(calls, ['getD1SchemaStatus', 'initLogsDb']);
+  assert.equal(confirmations.length, 1);
+  assert.match(confirmations[0].message, /missing_table:proxy_logs/);
   assert.equal(messages[0].options.tone, 'success');
   assert.match(messages[0].message, /proxy_logs/);
   assert.match(formatD1InitializationResult(result), /FTS/);
   assert.doesNotMatch(messages[0].message, /migration|version|adopt/i);
   assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /apiCall\('initD1Schema'|apiCall\('initLogsFts'/);
-  assert.doesNotMatch(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /bookmark|time travel/i);
+  assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /bookmark|time travel/i);
+});
+
+test('high-risk D1 repair requires two confirmations and sends the signed repair request', async () => {
+  const fetchCalls = [];
+  const { patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
+    location: { pathname: '/admin' },
+    async fetch(path, init) {
+      fetchCalls.push({ path, init });
+      return new Response(JSON.stringify({
+        schemaReady: true,
+        status: { schemaReady: true, issues: [] },
+        initialization: {
+          rebuiltTables: [{ table: 'sys_status', rowCount: 1 }],
+          recoveryBookmark: 'bookmark-1'
+        }
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }
+  });
+  const confirmations = [];
+  const messages = [];
+  const apiCalls = [];
+  let schemaReadCount = 0;
+  const app = {
+    async apiCall(action, payload = {}) {
+      apiCalls.push({ action, payload });
+      if (action === 'initLogsDb') return { schemaReady: false, pendingHighRisk: true, status: { schemaReady: false } };
+      assert.equal(action, 'getD1SchemaStatus');
+      schemaReadCount += 1;
+      return schemaReadCount === 1 ? {
+        status: { schemaReady: false, issues: ['missing_table:d1_schema_meta', 'invalid_primary_key:sys_status'] },
+        repairPlan: {
+          phase: 'safe',
+          risk: 'high',
+          repairToken: '',
+          repairableIssues: ['missing_table:d1_schema_meta'],
+          highRiskIssues: ['invalid_primary_key:sys_status'],
+          blockingIssues: [],
+          steps: [
+            { kind: 'create_table', target: 'd1_schema_meta', risk: 'low' },
+            { kind: 'rebuild_table', target: 'sys_status', risk: 'high', estimatedRows: 1 }
+          ]
+        }
+      } : {
+        status: { schemaReady: false, issues: ['invalid_primary_key:sys_status'] },
+        repairPlan: {
+          phase: 'destructive',
+          risk: 'high',
+          repairToken: 'signed-repair-token',
+          repairableIssues: [],
+          highRiskIssues: ['invalid_primary_key:sys_status'],
+          blockingIssues: [],
+          steps: [{ kind: 'rebuild_table', target: 'sys_status', risk: 'high', estimatedRows: 1 }]
+        }
+      };
+    },
+    async askConfirm(message, options) {
+      confirmations.push({ message, options });
+      return true;
+    },
+    async showMessage(message, options) {
+      messages.push({ message, options });
+    },
+    applyAdminRevisions() {}
+  };
+
+  patchSafetyContractMethods(app);
+  await app.initLogsDbFromUi();
+
+  assert.equal(confirmations.length, 2);
+  assert.equal(confirmations[0].options.confirmText, '开始安全修复');
+  assert.equal(confirmations[1].options.confirmText, '确认重建');
+  assert.match(confirmations[1].message, /sys_status.*1 行/);
+  assert.equal(fetchCalls.length, 1);
+  assert.equal(fetchCalls[0].init.headers['X-Admin-Confirm'], 'repairD1Schema');
+  assert.deepEqual(JSON.parse(fetchCalls[0].init.body), {
+    action: 'initLogsDb',
+    repairMode: 'confirmed-destructive',
+    repairToken: 'signed-repair-token'
+  });
+  assert.deepEqual(apiCalls.map(call => call.action), ['getD1SchemaStatus', 'initLogsDb', 'getD1SchemaStatus']);
+  assert.equal(apiCalls[1].payload?.repairMode, 'safe');
+  assert.match(messages.at(-1).message, /bookmark-1/);
+});
+
+test('blocked or cancelled high-risk D1 repair never sends a mutation request', async t => {
+  await t.test('blocked plan', async () => {
+    let writes = 0;
+    const { patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
+      async fetch() {
+        writes += 1;
+        throw new Error('unexpected mutation');
+      }
+    });
+    const messages = [];
+    const app = {
+      async apiCall() {
+        return {
+          status: { schemaReady: false },
+          repairPlan: {
+            risk: 'blocked',
+            repairableIssues: [],
+            highRiskIssues: [],
+            blockingIssues: ['unique_key_duplicate:dns_ip_pool_items.ip'],
+            steps: []
+          }
+        };
+      },
+      async showMessage(message, options) { messages.push({ message, options }); }
+    };
+    patchSafetyContractMethods(app);
+    await app.initLogsDbFromUi();
+    assert.equal(writes, 0);
+    assert.match(messages[0].message, /唯一键存在重复数据/);
+    assert.match(messages[0].message, /unique_key_duplicate/);
+  });
+
+  await t.test('second confirmation cancelled', async () => {
+    let writes = 0;
+    let confirmationCount = 0;
+    const confirmations = [];
+    const { patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
+      async fetch() {
+        writes += 1;
+        throw new Error('unexpected mutation');
+      }
+    });
+    const app = {
+      async apiCall() {
+        return {
+          status: { schemaReady: false },
+          repairPlan: {
+            phase: 'destructive',
+            risk: 'high',
+            repairToken: 'signed-repair-token',
+            repairableIssues: [],
+            highRiskIssues: ['invalid_primary_key:proxy_logs'],
+            blockingIssues: [],
+            steps: [{
+              kind: 'recreate_log_table',
+              target: 'proxy_logs',
+              estimatedRows: null,
+              rowCountMeasured: false,
+              allowsDataLoss: true,
+              willDiscardData: true,
+              dataMode: 'discard'
+            }]
+          }
+        };
+      },
+      async askConfirm(message, options) {
+        confirmationCount += 1;
+        confirmations.push({ message, options });
+        return confirmationCount === 1;
+      },
+      async showMessage() {}
+    };
+    patchSafetyContractMethods(app);
+    await app.initLogsDbFromUi();
+    assert.equal(confirmationCount, 2);
+    assert.match(confirmations[1].message, /将清空全部日志/);
+    assert.match(confirmations[1].message, /不创建本地备份/);
+    assert.match(confirmations[1].message, /只能通过 D1 Time Travel bookmark 恢复/);
+    assert.equal(confirmations[1].options.confirmText, '确认重建并清空日志');
+    assert.equal(writes, 0);
+  });
 });
 
 test('D1 tidy initializes, re-previews, and executes only with the second signed plan', async () => {
@@ -459,6 +690,19 @@ test('D1 tidy initializes, re-previews, and executes only with the second signed
         return previewCount === 1
           ? { requiresSchemaInitialization: true, summary: {}, warnings: [] }
           : { requiresSchemaInitialization: false, planToken: 'signed-d1-plan', summary: {}, warnings: [] };
+      }
+      if (action === 'getD1SchemaStatus') {
+        return {
+          status: { schemaReady: false, issues: ['missing_table:proxy_logs'] },
+          repairPlan: {
+            phase: 'safe',
+            risk: 'low',
+            repairableIssues: ['missing_table:proxy_logs'],
+            highRiskIssues: [],
+            blockingIssues: [],
+            steps: [{ kind: 'create_table', target: 'proxy_logs', risk: 'low' }]
+          }
+        };
       }
       if (action === 'initLogsDb') {
         return {
@@ -493,6 +737,7 @@ test('D1 tidy initializes, re-previews, and executes only with the second signed
 
   assert.deepEqual(calls.map(call => call.action), [
     'previewTidyData',
+    'getD1SchemaStatus',
     'initLogsDb',
     'previewTidyData',
     'tidyD1Data'
@@ -500,9 +745,46 @@ test('D1 tidy initializes, re-previews, and executes only with the second signed
   assert.equal(calls.at(-1).payload?.planToken, 'signed-d1-plan');
   assert.deepEqual(Object.keys(calls.at(-1).payload || {}), ['planToken']);
   assert.equal(confirmations.length, 2);
-  assert.equal(confirmations[0].options.confirmText, '初始化 DB');
+  assert.equal(confirmations[0].options.confirmText, '开始安全修复');
   assert.equal(confirmations[1].options.confirmText, '开始整理 D1');
   assert.equal(messages[0].options.title, '初始化 DB 结果');
+});
+
+test('bounded D1 counts and oversized node warnings are explicit in the admin runtime', async () => {
+  const { patchSafetyContractMethods } = loadEnhancementTestHooks();
+  const messages = [];
+  const app = {
+    async apiCall(action) {
+      if (action === 'getNode') return {
+        node: { name: 'alpha' },
+        warnings: [{ code: 'NODE_RESOURCE_LIMIT_EXCEEDED', field: 'remark', actual: 4097, limit: 4096 }]
+      };
+      return {};
+    },
+    showMessage(message, options = {}) { messages.push({ message, options }); },
+    formatTidyPreviewGroupText(group) { return `${group.label}: ${group.count}`; },
+    buildTidyPreviewConfirmDialog(preview) {
+      return { sections: [{ items: preview.deleteGroups.map(group => ({ ...group })) }] };
+    }
+  };
+
+  patchSafetyContractMethods(app);
+  const preview = {
+    deleteGroups: [{ key: 'proxy_logs', label: 'logs', count: 10000, countIsLowerBound: true }]
+  };
+  assert.match(app.formatTidyPreviewGroupText(preview.deleteGroups[0]), /10000\+/);
+  assert.match(app.buildTidyPreviewConfirmDialog(preview, 'd1').sections[0].items[0].label, /10000\+/);
+  assert.match(app.buildD1TidySuccessMessage({
+    hasMore: true,
+    remainingScopes: ['proxy_logs'],
+    budget: { processedRows: 10000 }
+  }), /再次预览并继续执行/);
+
+  const result = await app.apiCall('getNode', { name: 'alpha' });
+  assert.equal(result.node.name, 'alpha');
+  assert.equal(messages[0].options.tone, 'warning');
+  assert.match(messages[0].message, /remark: 4097\/4096/);
+  assert.doesNotMatch(messages[0].message, /headers|secret/i);
 });
 
 for (const [errorCode, expectedMessage] of [
