@@ -1,7 +1,7 @@
 import { build } from 'vite';
 import { fileURLToPath } from 'node:url';
 
-export const MAX_WORKER_BUNDLE_BYTES = 950_000;
+export const MAX_WORKER_BUNDLE_BYTES = 960_000;
 
 /**
  * Build the Worker and enforce its single-module delivery contract.

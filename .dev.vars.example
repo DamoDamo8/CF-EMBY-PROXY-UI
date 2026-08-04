@@ -1,3 +1,7 @@
 # Required for local authentication. Replace both values before starting Wrangler.
 JWT_SECRET=replace-with-a-long-random-secret
 ADMIN_PASS=replace-with-a-local-admin-password
+
+# Configuration authority migration: kv (default), shadow, or d1.
+# Initialize D1 Schema v2 before switching to d1.
+CONFIG_AUTHORITY_MODE=kv

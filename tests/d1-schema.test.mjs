@@ -11,6 +11,7 @@ const CURRENT_TABLES = [
   "d1_schema_meta",
   "sys_status",
   "sys_locks",
+  "runtime_config_versions",
   "auth_failures",
   "cf_dashboard_cache",
   "cf_runtime_cache",
@@ -186,6 +187,137 @@ test("repeated current-schema initialization is idempotent", async () => {
     assert.equal(second.schemaReady, true);
     assert.deepEqual([...getTableNames(database)].sort(), tablesAfterFirst);
     assert.deepEqual(second.createdTables, []);
+  });
+});
+
+test("D1 config genesis is idempotent and validates stored payload hashes", async () => {
+  await withDatabase(async (database, db) => {
+    await kernel.initializeD1Database(db, { includeFts: true });
+    const first = await kernel.bootstrapD1ConfigVersion(db, { rateLimitRpm: 10 });
+    const second = await kernel.bootstrapD1ConfigVersion(db, { rateLimitRpm: 99 });
+
+    assert.equal(first.revision, second.revision);
+    assert.equal(second.config.rateLimitRpm, 10);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM runtime_config_versions").get().total, 1);
+  });
+});
+
+test("D1 config CAS permits only one append from the same parent", async () => {
+  await withDatabase(async (database, db) => {
+    await kernel.initializeD1Database(db, { includeFts: true });
+    const genesis = await kernel.bootstrapD1ConfigVersion(db, { rateLimitRpm: 10 });
+    const results = await Promise.allSettled([
+      kernel.appendD1ConfigVersion(db, { rateLimitRpm: 20 }, {
+        expectedConfigRevision: genesis.revision,
+        mutationId: "save-a"
+      }),
+      kernel.appendD1ConfigVersion(db, { rateLimitRpm: 30 }, {
+        expectedConfigRevision: genesis.revision,
+        mutationId: "save-b"
+      })
+    ]);
+
+    assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+    const rejected = results.find(result => result.status === "rejected");
+    assert.equal(rejected.reason?.code, "CONFIG_REVISION_CONFLICT");
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM runtime_config_versions").get().total, 2);
+  });
+});
+
+test("D1 config mutation ids are idempotent and cannot be reused for other content", async () => {
+  await withDatabase(async (database, db) => {
+    await kernel.initializeD1Database(db, { includeFts: true });
+    const genesis = await kernel.bootstrapD1ConfigVersion(db, { rateLimitRpm: 10 });
+    const first = await kernel.appendD1ConfigVersion(db, { rateLimitRpm: 20 }, {
+      expectedConfigRevision: genesis.revision,
+      mutationId: "retry-save"
+    });
+    const retry = await kernel.appendD1ConfigVersion(db, { rateLimitRpm: 20 }, {
+      expectedConfigRevision: genesis.revision,
+      mutationId: "retry-save"
+    });
+
+    assert.equal(retry.revision, first.revision);
+    assert.equal(retry.idempotent, true);
+    await assert.rejects(
+      kernel.appendD1ConfigVersion(db, { rateLimitRpm: 30 }, {
+        expectedConfigRevision: first.revision,
+        mutationId: "retry-save"
+      }),
+      error => error?.code === "CONFIG_MUTATION_ID_REUSED"
+    );
+  });
+});
+
+test("failed KV config projection remains pending and later converges", async () => {
+  await withDatabase(async (database, db) => {
+    await kernel.initializeD1Database(db, { includeFts: true });
+    const version = await kernel.bootstrapD1ConfigVersion(db, { rateLimitRpm: 25 });
+    const failingKv = createKv();
+    failingKv.put = async () => {
+      throw new Error("KV unavailable");
+    };
+
+    const pending = await kernel.projectD1ConfigVersionToKv(version, { db, kv: failingKv });
+    assert.equal(pending.status, "pending");
+    let row = database.prepare("SELECT projected_at, projection_attempts, projection_error FROM runtime_config_versions WHERE revision = ?").get(version.revision);
+    assert.equal(row.projected_at, null);
+    assert.equal(row.projection_attempts, 1);
+    assert.match(row.projection_error, /KV unavailable/);
+
+    const kv = createKv();
+    const submitted = await kernel.projectD1ConfigVersionToKv(version, { db, kv });
+    assert.equal(submitted.status, "submitted");
+    assert.equal((await kv.get(kernel.CONFIG_ENVELOPE_KEY, { type: "json" })).revision, version.revision);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 25);
+    row = database.prepare("SELECT projected_at, projection_attempts, projection_error FROM runtime_config_versions WHERE revision = ?").get(version.revision);
+    assert.ok(row.projected_at > 0);
+    assert.equal(row.projection_attempts, 2);
+    assert.equal(row.projection_error, null);
+  });
+});
+
+test("d1 authority mode fails writes closed and exposes a read-only KV fallback", async () => {
+  const kv = createKv();
+  await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 12 }));
+  const env = { CONFIG_AUTHORITY_MODE: "d1", ENI_KV: kv };
+
+  const fallback = await kernel.getAuthoritativeRuntimeConfig(env, { allowReadOnlyFallback: true });
+  assert.equal(fallback.readOnly, true);
+  assert.equal(fallback.config.rateLimitRpm, 12);
+  await assert.rejects(
+    kernel.persistRuntimeConfig({ rateLimitRpm: 20 }, {
+      env,
+      kv,
+      expectedConfigRevision: "missing-d1"
+    }),
+    error => error?.code === "CONFIG_AUTHORITY_UNAVAILABLE" && error?.status === 503
+  );
+});
+
+test("d1 authority mode commits before projecting and returns its authoritative revision", async () => {
+  await withDatabase(async (database, db) => {
+    await kernel.initializeD1Database(db, { includeFts: true });
+    const kv = createKv();
+    await kv.put(kernel.CONFIG_KEY, JSON.stringify({ rateLimitRpm: 10 }));
+    const env = { CONFIG_AUTHORITY_MODE: "d1", ENI_KV: kv, DB: db };
+    const authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db });
+    const resultState = {};
+
+    const saved = await kernel.persistRuntimeConfig({ rateLimitRpm: 40 }, {
+      env,
+      kv,
+      db,
+      expectedConfigRevision: authority.version.revision,
+      requireExpectedConfigRevision: true,
+      mutationId: "admin-save",
+      resultState
+    });
+
+    assert.equal(saved.rateLimitRpm, 40);
+    assert.equal(resultState.projection.status, "submitted");
+    assert.equal((await kv.get(kernel.CONFIG_ENVELOPE_KEY, { type: "json" })).revision, resultState.version.revision);
+    assert.equal(database.prepare("SELECT COUNT(*) AS total FROM runtime_config_versions").get().total, 2);
   });
 });
 

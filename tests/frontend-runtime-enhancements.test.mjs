@@ -61,6 +61,51 @@ test('admin runtime enhancement observes lazily mounted logs view', () => {
   assert.match(ADMIN_RUNTIME_ENHANCEMENT_SCRIPT, /shellHookSelector = '[^']*#view-logs/);
 });
 
+test('config authority enhancement adds idempotency and exposes projection state', async () => {
+  const { patchSafetyContractMethods } = loadEnhancementTestHooks();
+  const requests = [];
+  const messages = [];
+  const app = {
+    async apiCall(action, payload) {
+      requests.push({ action, payload });
+      return action === 'saveConfig'
+        ? { success: true, projectionStatus: 'pending', configAuthority: { mode: 'd1', readOnly: false } }
+        : { configAuthority: { mode: 'd1', readOnly: false } };
+    },
+    showMessage(message, options) {
+      messages.push({ message, options });
+    }
+  };
+  patchSafetyContractMethods(app);
+
+  await app.apiCall('getSettingsBootstrap');
+  await app.apiCall('saveConfig', { config: { rateLimitRpm: 20 } });
+
+  assert.equal(app.configAuthority.mode, 'd1');
+  assert.match(requests[1].payload.mutationId, /^cfg-/);
+  assert.equal(messages.at(-1).message, '配置已保存，边缘同步中');
+});
+
+test('config authority enhancement blocks writes during D1 read-only fallback', async () => {
+  const { patchSafetyContractMethods } = loadEnhancementTestHooks();
+  let calls = 0;
+  const app = {
+    configAuthority: { mode: 'd1', readOnly: true },
+    async apiCall() {
+      calls += 1;
+      return {};
+    },
+    showMessage() {}
+  };
+  patchSafetyContractMethods(app);
+
+  await assert.rejects(
+    app.apiCall('saveConfig', { config: {} }),
+    error => error?.code === 'CONFIG_AUTHORITY_UNAVAILABLE' && /当前只读/.test(error.message)
+  );
+  assert.equal(calls, 0);
+});
+
 test('host-prefix node links follow the effective runtime mode and strict hostname', async () => {
   const { normalizeHostPrefixDnsHostname, patchSafetyContractMethods } = loadEnhancementTestHooks({}, {
     location: { origin: 'https://proxy.example' }

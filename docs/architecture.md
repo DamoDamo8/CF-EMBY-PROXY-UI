@@ -95,7 +95,9 @@ KV 用于运行时配置、节点实体与索引、配置快照、DNS 历史、�
 
 ### D1
 
-D1 保存日志、统计聚合、DNS/IP 工作区数据、运行状态、缓存/锁、认证失败和 FTS 结构。`initLogsDb` 是当前统一 schema 初始化动作；D1 整理必须先通过 schema readiness，再使用签名的预览 plan token 执行。
+D1 保存日志、统计聚合、DNS/IP 工作区数据、运行状态、缓存/锁、认证失败和 FTS 结构。D1 Schema v2 还包含追加式 `runtime_config_versions` 配置版本链，以 `parent_revision` 主键完成跨 Worker 实例的 CAS；KV 的 `sys:theme:v2` 是代理运行时读取投影，不是管理端写入权威源。`initLogsDb` 是当前统一 schema 初始化动作；D1 整理必须先通过 schema readiness，再使用签名的预览 plan token 执行。
+
+配置权威迁移由 `CONFIG_AUTHORITY_MODE=kv|shadow|d1` 控制，默认 `kv`。`shadow` 保持 KV 写入并向 D1 镜像，用于上线前观察；`d1` 在 D1 提交失败时拒绝管理写入，KV 投影失败则保留已提交版本并由定时任务重试，代理继续读取最后一个有效投影。切换到 `d1` 前必须先执行 D1 Schema v2 初始化。
 
 ### Isolate 内存
 

@@ -1873,7 +1873,7 @@ var D1_TIDY_FTS_REBUILD_LOG_LIMIT = 1e4;
 var D1_SCHEMA_REPAIR_ROW_LIMIT = 1e4;
 var D1_SCHEMA_REPAIR_TOKEN_TTL_MS = 10 * 60 * 1e3;
 var D1_SCHEMA_REPAIR_LEASE_MS = 2 * 60 * 1e3;
-var D1_SCHEMA_CONTRACT_VERSION = 1;
+var D1_SCHEMA_CONTRACT_VERSION = 2;
 var D1_SCHEMA_REPAIR_PLAN_VERSION = 2;
 
 function normalizeSqliteTypeAffinity(type = "") {
@@ -6062,6 +6062,16 @@ function classifyCloudflareAnalyticsError(message, options = {}) {
 	};
 	return result;
 }
+async function readRuntimeConfigProjection(kv, preferEnvelope = false) {
+	if (preferEnvelope) try {
+		const envelope = await kv.get("sys:theme:v2", { type: "json" });
+		if (isPlainObject(envelope) && Number(envelope.schemaVersion) === 2 && isPlainObject(envelope.config)) {
+			const config = sanitizeRuntimeConfig(envelope.config);
+			if (String(envelope.hash || "") === hashStableText(serializeConfigValue(config)) && String(envelope.revision || "").trim()) return config;
+		}
+	} catch {}
+	return sanitizeRuntimeConfig(await kv.get("sys:theme", { type: "json" }) || {});
+}
 async function getRuntimeConfig(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
@@ -6080,7 +6090,7 @@ async function getRuntimeConfig(env) {
 		const staleConfig = activeCache?.data && typeof activeCache.data === "object" ? activeCache.data : cachedConfig?.data && typeof cachedConfig.data === "object" ? cachedConfig.data : null;
 		let config = staleConfig || {};
 		try {
-			config = sanitizeRuntimeConfig(await kv.get("sys:theme", { type: "json" }) || {});
+			config = await readRuntimeConfigProjection(kv, String(env?.CONFIG_AUTHORITY_MODE || "").trim().toLowerCase() === "d1");
 		} catch (error) {
 			const hasCachedConfig = staleConfig && typeof staleConfig === "object";
 			logRuntimeFailure("runtime_config.load_failed", error, {
@@ -6101,7 +6111,7 @@ async function getRuntimeConfig(env) {
 async function getRuntimeConfigStrict(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
-	return sanitizeRuntimeConfig(await kvGetStrict(kv, "sys:theme", { type: "json" }) || {});
+	return await readRuntimeConfigProjection(kv, String(env?.CONFIG_AUTHORITY_MODE || "").trim().toLowerCase() === "d1");
 }
 //#endregion
 //#region worker/features/admin/shell-views.js
@@ -8210,7 +8220,8 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 		},
 		async getAdminBootstrap(data, { env, ctx, kv, db }) {
 			try {
-				const config = await getRuntimeConfigStrict(env);
+				const authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db, allowReadOnlyFallback: true });
+				const config = authority.config;
 				const initHealth = buildInitHealth(env);
 				const [nodes, configSnapshots, storedSnapshots, runtimeStatusPayload] = await Promise.all([
 					CacheManager.getNodesListStrict(env, ctx),
@@ -8233,6 +8244,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 					nodes,
 					snapshots: storedSnapshots
 				});
+				if (authority.version?.revision) revisions.configRevision = authority.version.revision;
 				return jsonResponse({
 					adminPath: getAdminPath(env),
 					loginPath: getAdminLoginPath(env),
@@ -8246,6 +8258,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 					shell: buildAdminShellState(env, initHealth, config),
 										runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object" ? runtimeStatusPayload.status : withAdminShellRuntimeStatus({}, env, config, initHealth),
 					revisions,
+					configAuthority: { mode: authority.mode, readOnly: authority.readOnly === true, errorCode: authority.errorCode || "" },
 					generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 				});
 			} catch (error) {
@@ -8254,8 +8267,10 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 		},
 		async getSettingsBootstrap(data, { env, ctx, kv, db }) {
 			let config;
+			let authority;
 			try {
-				config = await getRuntimeConfigStrict(env);
+				authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db, allowReadOnlyFallback: true });
+				config = authority.config;
 			} catch (error) {
 				throw remapAdminReadKvError(error, "SETTINGS_BOOTSTRAP_READ_FAILED", "设置页加载失败：KV 读取异常", "admin.read.settings_bootstrap");
 			}
@@ -8299,6 +8314,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 			} catch (error) {
 				console.warn("[settings_bootstrap.revisions_degraded]", getErrorMessage(error));
 			}
+			if (authority?.version?.revision) revisions.configRevision = authority.version.revision;
 			return jsonResponse({
 				config: redactAdminRuntimeConfig(config),
 				hostDomain: resolveConfiguredHost(env),
@@ -8308,6 +8324,7 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				configSnapshots,
 								runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
 				revisions,
+				configAuthority: { mode: authority?.mode || kernel.normalizeConfigAuthorityMode(env), readOnly: authority?.readOnly === true, errorCode: authority?.errorCode || "" },
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		},
@@ -8707,14 +8724,20 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				})
 			});
 		},
-		async saveConfig(data, { env, ctx, kv, meta }) {
+		async saveConfig(data, { env, ctx, kv, db, meta }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-			const currentConfig = await getRuntimeConfigStrict(env);
+			const authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db });
+			const currentConfig = authority.config;
+			const resultState = {};
 			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(data.config, currentConfig), {
 				env,
 				kv,
+				db,
 				ctx,
 				expectedConfigRevision: data?.expectedConfigRevision,
+				requireExpectedConfigRevision: authority.mode === "d1",
+				mutationId: data?.mutationId,
+				resultState,
 				snapshotMeta: {
 					reason: "save_config",
 					section: String(meta?.section || "all"),
@@ -8722,13 +8745,16 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 					actor: "admin"
 				}
 			}) : currentConfig;
+			const revisions = await kernel.getAdminRevisions(env, { ctx, config: savedConfig });
+			if (resultState.version?.revision) revisions.configRevision = resultState.version.revision;
 			return jsonResponse({
 				success: true,
+				committed: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-								revisions: await kernel.getAdminRevisions(env, {
-					ctx,
-					config: savedConfig
-				})
+				revision: String(resultState.version?.revision || revisions.configRevision || ""),
+				projectionStatus: String(resultState.projection?.status || "submitted"),
+				configAuthority: { mode: authority.mode, readOnly: false },
+				revisions
 			});
 		},
 		async uploadAdminIndex(data, { env, ctx, kv }) {
@@ -14119,6 +14145,146 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
+		normalizeConfigAuthorityMode(env = {}) {
+			const mode = String(env?.CONFIG_AUTHORITY_MODE || "kv").trim().toLowerCase();
+			return mode === "d1" || mode === "shadow" ? mode : "kv";
+		},
+		normalizeD1ConfigVersionRow(row = null) {
+			if (!isPlainObject(row)) return null;
+			const payload = String(row.payload || "{}");
+			let config;
+			try {
+				config = sanitizeRuntimeConfig(JSON.parse(payload));
+			} catch {
+				throw createStructuredConfigError("CONFIG_AUTHORITY_CORRUPT", "D1 配置版本内容无效", 503);
+			}
+			const contentHash = hashStableText(payload);
+			if (String(row.content_hash || "") !== contentHash) throw createStructuredConfigError("CONFIG_AUTHORITY_CORRUPT", "D1 配置版本校验失败", 503);
+			return {
+				revision: String(row.revision || ""),
+				sequence: Number(row.sequence) || 0,
+				contentHash,
+				config,
+				createdAt: Number(row.created_at) || 0,
+				projectedAt: row.projected_at == null ? null : Number(row.projected_at) || 0
+			};
+		},
+		async readD1CurrentConfigVersion(db) {
+			if (!db) return null;
+			return kernel.normalizeD1ConfigVersionRow(await db.prepare(`SELECT * FROM ${kernel.CONFIG_VERSIONS_TABLE} ORDER BY sequence DESC LIMIT 1`).first());
+		},
+		async readD1ConfigVersionByMutationId(db, mutationId = "") {
+			if (!db || !mutationId) return null;
+			return kernel.normalizeD1ConfigVersionRow(await db.prepare(`SELECT * FROM ${kernel.CONFIG_VERSIONS_TABLE} WHERE mutation_id = ? ORDER BY sequence DESC LIMIT 1`).bind(String(mutationId)).first());
+		},
+		async bootstrapD1ConfigVersion(db, config = {}, meta = {}) {
+			if (!db) throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
+			const normalizedConfig = sanitizeRuntimeConfig(config);
+			const payload = serializeConfigValue(normalizedConfig);
+			const contentHash = hashStableText(payload);
+			const createdAt = nowMs();
+			const revision = `${buildRevisionValue(contentHash)}.${Math.random().toString(36).slice(2, 10)}`;
+			try {
+				await db.prepare(`INSERT INTO ${kernel.CONFIG_VERSIONS_TABLE} (parent_revision, revision, sequence, content_hash, payload, mutation_id, source, section, actor, created_at, projection_attempts) SELECT '', ?, 1, ?, ?, ?, ?, ?, ?, ?, 0 WHERE NOT EXISTS (SELECT 1 FROM ${kernel.CONFIG_VERSIONS_TABLE})`).bind(revision, contentHash, payload, String(meta.mutationId || "bootstrap"), String(meta.source || "kv_bootstrap"), String(meta.section || "all"), String(meta.actor || "system"), createdAt).run();
+			} catch {}
+			return await kernel.readD1CurrentConfigVersion(db);
+		},
+		async appendD1ConfigVersion(db, rawConfig = {}, options = {}) {
+			if (!db) throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
+			const expectedRevision = String(options.expectedConfigRevision || "").trim();
+			if (!expectedRevision) throw createStructuredConfigError("CONFIG_REVISION_REQUIRED", "保存 D1 配置必须提供当前版本", 428);
+			const mutationId = String(options.mutationId || `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`).trim();
+			const nextConfig = sanitizeRuntimeConfig(rawConfig);
+			const payload = serializeConfigValue(nextConfig);
+			const contentHash = hashStableText(payload);
+			const priorMutation = await kernel.readD1ConfigVersionByMutationId(db, mutationId);
+			if (priorMutation) {
+				if (priorMutation.contentHash !== contentHash) throw createStructuredConfigError("CONFIG_MUTATION_ID_REUSED", "配置请求标识已用于其他内容", 409);
+				return { ...priorMutation, idempotent: true };
+			}
+			const createdAt = nowMs();
+			const revision = `${buildRevisionValue(contentHash)}.${Math.random().toString(36).slice(2, 10)}`;
+			try {
+				await db.prepare(`INSERT INTO ${kernel.CONFIG_VERSIONS_TABLE} (parent_revision, revision, sequence, content_hash, payload, mutation_id, source, section, actor, created_at, projection_attempts) SELECT current.revision, ?, current.sequence + 1, ?, ?, ?, ?, ?, ?, ?, 0 FROM ${kernel.CONFIG_VERSIONS_TABLE} AS current WHERE current.sequence = (SELECT MAX(sequence) FROM ${kernel.CONFIG_VERSIONS_TABLE}) AND current.revision = ?`).bind(revision, contentHash, payload, mutationId, String(options.source || "ui"), String(options.section || "all"), String(options.actor || "admin"), createdAt, expectedRevision).run();
+			} catch {}
+			const committed = await kernel.readD1ConfigVersionByMutationId(db, mutationId);
+			if (committed) return { ...committed, idempotent: false };
+			const current = await kernel.readD1CurrentConfigVersion(db);
+			throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置版本已变化，请刷新后重试", 409, { expectedRevision, currentRevision: current?.revision || "" });
+		},
+		async projectD1ConfigVersionToKv(version, options = {}) {
+			const kv = options.kv || getKvBinding(options.env);
+			if (!kv) throw createStructuredConfigError("KV_NOT_CONFIGURED", "KV 配置投影不可用", 503);
+			const envelope = {
+				schemaVersion: 2,
+				sequence: version.sequence,
+				revision: version.revision,
+				hash: version.contentHash,
+				config: version.config
+			};
+			try {
+				await kv.put(kernel.CONFIG_ENVELOPE_KEY, JSON.stringify(envelope));
+				await kv.put(kernel.CONFIG_KEY, JSON.stringify(version.config));
+				await kv.put(kernel.CONFIG_META_KEY, JSON.stringify({ hash: version.contentHash, revision: version.revision, updatedAt: new Date(version.createdAt).toISOString() }));
+				await options.db?.prepare(`UPDATE ${kernel.CONFIG_VERSIONS_TABLE} SET projected_at = ?, projection_attempts = projection_attempts + 1, projection_error = NULL WHERE revision = ?`).bind(nowMs(), version.revision).run();
+				if (options.env) primeRuntimeConfigCache(options.env, version.config);
+				else invalidateRuntimeConfigCache();
+				return { status: "submitted", revision: version.revision };
+			} catch (error) {
+				await options.db?.prepare(`UPDATE ${kernel.CONFIG_VERSIONS_TABLE} SET projection_attempts = projection_attempts + 1, projection_error = ? WHERE revision = ?`).bind(getErrorMessage(error, "projection_failed").slice(0, 300), version.revision).run().catch(() => {});
+				return { status: "pending", revision: version.revision };
+			}
+		},
+		async reconcileD1ConfigProjection(env, options = {}) {
+			if (kernel.normalizeConfigAuthorityMode(env) !== "d1") return { status: "skipped", reason: "authority_mode" };
+			const db = options.db || getD1Binding(env);
+			const kv = options.kv || getKvBinding(env);
+			if (!db || !kv) return { status: "skipped", reason: "binding_unavailable" };
+			const version = await kernel.readD1CurrentConfigVersion(db);
+			if (!version) return { status: "skipped", reason: "not_initialized" };
+			return await kernel.projectD1ConfigVersionToKv(version, { env, db, kv });
+		},
+		async getAuthoritativeRuntimeConfig(env, options = {}) {
+			const mode = kernel.normalizeConfigAuthorityMode(env);
+			if (mode !== "d1") return { mode, config: await getRuntimeConfigStrict(env), version: null, readOnly: false };
+			const db = options.db || getD1Binding(env);
+			const kv = options.kv || getKvBinding(env);
+			try {
+				let version = await kernel.readD1CurrentConfigVersion(db);
+				if (!version) version = await kernel.bootstrapD1ConfigVersion(db, await getRuntimeConfigStrict(env));
+				return { mode, config: version.config, version, readOnly: false };
+			} catch {
+				if (options.allowReadOnlyFallback === true && kv) return { mode, config: await getRuntimeConfigStrict(env), version: null, readOnly: true, errorCode: "CONFIG_AUTHORITY_UNAVAILABLE" };
+				throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
+			}
+		},
+		async commitD1RuntimeConfig(rawConfig, options = {}) {
+			const env = options.env || {};
+			const db = options.db || getD1Binding(env);
+			const kv = options.kv || getKvBinding(env);
+			let current = await kernel.readD1CurrentConfigVersion(db).catch(() => { throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503); });
+			if (!current) current = await kernel.bootstrapD1ConfigVersion(db, kv ? await getRuntimeConfigStrict(env) : {});
+			let expectedConfigRevision = String(options.expectedConfigRevision || "").trim();
+			if (!expectedConfigRevision && options.requireExpectedConfigRevision === true) throw createStructuredConfigError("CONFIG_REVISION_REQUIRED", "保存 D1 配置必须提供当前版本", 428);
+			if (!expectedConfigRevision) expectedConfigRevision = current.revision;
+			const nextConfig = sanitizeRuntimeConfig(rawConfig);
+			assertHostPrefixCnameTargetValid(nextConfig?.defaultHostPrefixCnameTarget);
+			assertAdminIndexSourceConfigValid(rawConfig);
+			assertHostPrefixProxyConfigReady(nextConfig, env);
+			if (serializeConfigValue(current.config) === serializeConfigValue(nextConfig)) return {
+				config: current.config,
+				version: current,
+				projection: { status: current.projectedAt ? "submitted" : "pending", revision: current.revision }
+			};
+			const version = await kernel.appendD1ConfigVersion(db, nextConfig, {
+				expectedConfigRevision,
+				mutationId: options.mutationId,
+				...options.snapshotMeta
+			});
+			const projection = await kernel.projectD1ConfigVersionToKv(version, { env, kv, db });
+			await kernel.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig: current.config, nextConfig }).catch(() => {});
+			return { config: nextConfig, version, projection };
+		},
 		async recordConfigSnapshot(kv, prevConfig, nextConfig, meta = {}) {
 			if (!kv) return null;
 			const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
@@ -14142,7 +14308,34 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			return snapshot;
 		},
 		async persistRuntimeConfig(rawConfig, options = {}) {
-			return await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, options));
+			const mode = kernel.normalizeConfigAuthorityMode(options.env);
+			if (mode === "d1") {
+				const result = await kernel.commitD1RuntimeConfig(rawConfig, options);
+				if (isPlainObject(options.resultState)) {
+					options.resultState.config = result.config;
+					options.resultState.version = result.version;
+					options.resultState.projection = result.projection;
+				}
+				return result.config;
+			}
+			const saved = await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, options));
+			if (mode === "shadow") {
+				const db = options.db || getD1Binding(options.env);
+				if (db) try {
+					let current = await kernel.readD1CurrentConfigVersion(db);
+					if (!current) current = await kernel.bootstrapD1ConfigVersion(db, saved, { source: "shadow_bootstrap" });
+					if (current.contentHash !== hashStableText(serializeConfigValue(saved))) await kernel.appendD1ConfigVersion(db, saved, {
+						expectedConfigRevision: current.revision,
+						mutationId: options.mutationId,
+						source: "shadow",
+						section: options.snapshotMeta?.section,
+						actor: options.snapshotMeta?.actor
+					});
+				} catch (error) {
+					console.warn("[config.shadow.failed]", String(error?.code || "CONFIG_SHADOW_FAILED"));
+				}
+			}
+			return saved;
 		},
 		async prepareRuntimeConfigPersistence(rawConfig, options = {}) {
 			const { env, kv, ctx, snapshotMeta } = options;
@@ -14226,6 +14419,15 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			return mutationPlan;
 		},
 		async commitRuntimeConfig(rawConfig, options = {}) {
+			if (kernel.normalizeConfigAuthorityMode(options.env) === "d1" && options.forceKvCommit !== true) {
+				const result = await kernel.commitD1RuntimeConfig(rawConfig, options);
+				if (isPlainObject(options.resultState)) {
+					options.resultState.config = result.config;
+					options.resultState.version = result.version;
+					options.resultState.projection = result.projection;
+				}
+				return result.config;
+			}
 			const { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
 			assertExpectedRuntimeConfigRevision(options.expectedConfigRevision, prevConfig);
 			if (serializeConfigValue(prevConfig) === serializeConfigValue(nextConfig)) {
@@ -14888,12 +15090,14 @@ var ScheduledMaintenanceFacade = class {
 					d1Tidy: {},
 					cleanup: {},
 					kvTidy: {},
+					configProjection: {},
 					tgDailyReport: {},
 					alerts: {}
 				};
 				const nowIso = () => makeScheduledIso(/* @__PURE__ */ new Date());
 				try {
 					const config = runtimeConfig || {};
+					scheduledState.configProjection = await scheduledNonCritical(this.service.reconcileD1ConfigProjection(env, { db, kv }), "reconcile_config_projection", null, { status: "failed" });
 					const previousScheduledStatus = await scheduledNonCritical(this.service.getOpsStatusSection(env, "scheduled"), "read_previous_status", null, {});
 					if (db) try {
 						await ensureLeaseActive();
@@ -23001,6 +23205,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				[kernel.D1_SCHEMA_META_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, contract_version INTEGER NOT NULL, contract_hash TEXT NOT NULL, schema_fingerprint TEXT NOT NULL, schema_cookie INTEGER NOT NULL, last_plan_hash TEXT NOT NULL, verified_at TEXT NOT NULL, attestation TEXT NOT NULL, migration_owner TEXT, lease_expires_at INTEGER)`,
 				[kernel.SYS_STATUS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.SCHEDULED_LOCKS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, token TEXT NOT NULL, owner TEXT NOT NULL, acquired_at INTEGER NOT NULL, renewed_at INTEGER, expires_at INTEGER NOT NULL)`,
+				[kernel.CONFIG_VERSIONS_TABLE]: `${createTable} ${target} (parent_revision TEXT PRIMARY KEY, revision TEXT NOT NULL, sequence INTEGER NOT NULL, content_hash TEXT NOT NULL, payload TEXT NOT NULL, mutation_id TEXT NOT NULL, source TEXT NOT NULL, section TEXT NOT NULL, actor TEXT NOT NULL, created_at INTEGER NOT NULL, projected_at INTEGER, projection_attempts INTEGER NOT NULL DEFAULT 0, projection_error TEXT)`,
 				[kernel.AUTH_FAILURES_TABLE]: `${createTable} ${target} (ip TEXT PRIMARY KEY, fail_count INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.CF_DASH_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, zone_id TEXT NOT NULL, bucket_date TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.CF_RUNTIME_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, cache_group TEXT NOT NULL, resource_id TEXT NOT NULL, payload TEXT NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
@@ -23126,6 +23331,21 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RuntimeIndexContract() {
 			return {
+				idx_runtime_config_versions_sequence: {
+					table: kernel.CONFIG_VERSIONS_TABLE,
+					columns: ["sequence"],
+					createSql: `CREATE INDEX idx_runtime_config_versions_sequence ON ${kernel.CONFIG_VERSIONS_TABLE} (sequence DESC)`
+				},
+				idx_runtime_config_versions_revision: {
+					table: kernel.CONFIG_VERSIONS_TABLE,
+					columns: ["revision"],
+					createSql: `CREATE INDEX idx_runtime_config_versions_revision ON ${kernel.CONFIG_VERSIONS_TABLE} (revision)`
+				},
+				idx_runtime_config_versions_mutation: {
+					table: kernel.CONFIG_VERSIONS_TABLE,
+					columns: ["mutation_id"],
+					createSql: `CREATE INDEX idx_runtime_config_versions_mutation ON ${kernel.CONFIG_VERSIONS_TABLE} (mutation_id)`
+				},
 				idx_sys_locks_expires_at: {
 					table: kernel.SCHEDULED_LOCKS_TABLE,
 					columns: ["expires_at"],
@@ -23220,6 +23440,20 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					acquired_at: "INTEGER NOT NULL DEFAULT 0",
 					renewed_at: "INTEGER",
 					expires_at: "INTEGER NOT NULL DEFAULT 0"
+				},
+				[kernel.CONFIG_VERSIONS_TABLE]: {
+					revision: "TEXT NOT NULL DEFAULT ''",
+					sequence: "INTEGER NOT NULL DEFAULT 0",
+					content_hash: "TEXT NOT NULL DEFAULT ''",
+					payload: "TEXT NOT NULL DEFAULT '{}'",
+					mutation_id: "TEXT NOT NULL DEFAULT ''",
+					source: "TEXT NOT NULL DEFAULT ''",
+					section: "TEXT NOT NULL DEFAULT ''",
+					actor: "TEXT NOT NULL DEFAULT ''",
+					created_at: "INTEGER NOT NULL DEFAULT 0",
+					projected_at: "INTEGER",
+					projection_attempts: "INTEGER NOT NULL DEFAULT 0",
+					projection_error: "TEXT"
 				},
 				[kernel.AUTH_FAILURES_TABLE]: {
 					fail_count: "INTEGER NOT NULL DEFAULT 0",
@@ -23323,6 +23557,7 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				[kernel.D1_SCHEMA_META_TABLE]: ["scope"],
 				[kernel.SYS_STATUS_TABLE]: ["scope"],
 				[kernel.SCHEDULED_LOCKS_TABLE]: ["scope"],
+				[kernel.CONFIG_VERSIONS_TABLE]: ["parent_revision"],
 				[kernel.AUTH_FAILURES_TABLE]: ["ip"],
 				[kernel.CF_DASH_CACHE_TABLE]: ["cache_key"],
 				[kernel.CF_RUNTIME_CACHE_TABLE]: ["cache_key"],
@@ -23727,6 +23962,7 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				[kernel.D1_SCHEMA_META_TABLE]: { scope: "TEXT" },
 				[kernel.SYS_STATUS_TABLE]: { scope: "TEXT" },
 				[kernel.SCHEDULED_LOCKS_TABLE]: { scope: "TEXT" },
+				[kernel.CONFIG_VERSIONS_TABLE]: { parent_revision: "TEXT" },
 				[kernel.AUTH_FAILURES_TABLE]: { ip: "TEXT" },
 				[kernel.CF_DASH_CACHE_TABLE]: { cache_key: "TEXT" },
 				[kernel.CF_RUNTIME_CACHE_TABLE]: { cache_key: "TEXT" },
@@ -24427,6 +24663,16 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 //#region worker/features/storage/d1/schema-records-methods.js
 function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 	return {
+		async ensureRuntimeConfigVersionsSchema(db) {
+			if (!db) return false;
+			if (kernel.isD1SchemaReadyCached(db, "runtimeConfigVersionsSchema")) return true;
+			await db.prepare(kernel.buildD1CreateTableSql(kernel.CONFIG_VERSIONS_TABLE, kernel.CONFIG_VERSIONS_TABLE, { ifNotExists: true })).run();
+			for (const definition of Object.values(kernel.getD1RuntimeIndexContract()).filter((item) => item.table === kernel.CONFIG_VERSIONS_TABLE)) {
+				await db.prepare(String(definition.createSql).replace(/^CREATE INDEX\s+/i, "CREATE INDEX IF NOT EXISTS ")).run();
+			}
+			kernel.markD1SchemaReady(db, "runtimeConfigVersionsSchema");
+			return true;
+		},
 		async ensureLogsBaseSchema(db) {
 			if (!db) return false;
 			if (kernel.isD1SchemaReadyCached(db, "logsBaseSchema")) return true;
@@ -24539,6 +24785,10 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 				steps: []
 			};
 			const runtimeSteps = [
+				{
+					name: "ensureRuntimeConfigVersionsSchema",
+					run: () => kernel.ensureRuntimeConfigVersionsSchema(db)
+				},
 				{
 					name: "ensureSysStatusTable",
 					run: () => kernel.ensureSysStatusTable(db)
@@ -24988,6 +25238,8 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	WORKER_PLACEMENT_REGION_OVERRIDE_PREFIX: "sys:worker_placement_region:v1:",
 	CONFIG_SNAPSHOTS_KEY: "sys:config_snapshots:v1",
 	CONFIG_META_KEY: "sys:config_meta:v1",
+	CONFIG_ENVELOPE_KEY: "sys:theme:v2",
+	CONFIG_VERSIONS_TABLE: "runtime_config_versions",
 	CONFIG_SNAPSHOTS_META_KEY: "sys:config_snapshots_meta:v1",
 	NODES_INDEX_META_KEY: "sys:nodes_index_meta:v1",
 	LEGACY_DNS_IP_POOL_SOURCES_KEY: "sys:dns_ip_pool_sources:v1",
