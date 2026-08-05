@@ -209,9 +209,6 @@ function remapAdminReadKvError(error, code, message, scopeBase = "admin.read") {
 	const operation = String(error?.details?.operation || "").trim().toLowerCase() === "list" ? "list" : "get";
 	return remapStructuredKvReadError(error, code, message, `${String(scopeBase || "admin.read").trim() || "admin.read"}.kv_${operation}_failed`);
 }
-function createConfigSnapshotsWriteError(code = "CONFIG_SNAPSHOTS_CLEAR_FAILED", message = "设置快照清理失败：KV 写入异常", details = null) {
-	return createStructuredConfigError(code, message, 503, details);
-}
 function logRuntimeFailure(scope, error, context = null, level = "warn") {
 	const logLevel = level === "error" ? "error" : "warn";
 	const normalizedScope = String(scope || "runtime_failure").trim() || "runtime_failure";
@@ -411,7 +408,6 @@ var PROXY_DEFAULTS = Object.freeze({
 	DefaultMediaAuthMode: "auto",
 	});
 var DNS_DEFAULTS = Object.freeze({
-	ConfigSnapshotLimit: 5,
 	DnsHistoryLimit: 5,
 	DnsIpProbeCacheTtlSec: 600,
 	DnsIpProbeTimeoutMs: 2500,
@@ -426,8 +422,8 @@ var CLOUDFLARE_DEFAULTS = Object.freeze({
 	CfQuotaPlanOverride: ""
 });
 var BUILD_DEFAULTS = Object.freeze({
-	AssetHash: "v19.3",
-	Version: "19.3"
+	AssetHash: "v19.4",
+	Version: "19.4"
 });
 var CONFIG_DEFAULTS = Object.freeze({
 	...AUTH_DEFAULTS,
@@ -1854,6 +1850,9 @@ var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_TTL_MS = CACHE_DEFAULTS.PlaybackRouteHotCac
 var DEFAULT_PLAYBACK_ROUTE_HOT_CACHE_MAX = CACHE_DEFAULTS.PlaybackRouteHotCacheMax;
 var ADMIN_JSON_REQUEST_MAX_BYTES = 12 * 1024 * 1024;
 var ADMIN_FULL_BACKUP_MAX_REQUEST_BYTES = ADMIN_JSON_REQUEST_MAX_BYTES - 64 * 1024;
+var D1_TEXT_VALUE_MAX_BYTES = 2e6;
+var D1_SAFE_SERIALIZED_VALUE_MAX_BYTES = 19e5;
+var D1_LIKE_PATTERN_MAX_BYTES = 50;
 var METADATA_PREWARM_RESPONSE_MAX_BYTES = 512 * 1024;
 var METADATA_PREWARM_MAX_IN_FLIGHT = 4;
 var METADATA_PREWARM_MAX_PREFETCH_BYTES = 8 * 1024 * 1024;
@@ -5242,20 +5241,6 @@ var CONFIG_LEGACY_MIGRATION_SOURCE_FIELDS = [
 	...CONFIG_RETIRED_ALIAS_SOURCE_FIELDS,
 	...CONFIG_PROTOCOL_STRATEGY_LEGACY_FIELDS
 ];
-var CONFIG_SNAPSHOT_CHANGED_KEY_MIGRATIONS = {
-	directSourceNodes: ["sourceDirectNodes"],
-	nodeDirectList: ["sourceDirectNodes"],
-	logIncludeClientIp: ["logWriteClientIp", "logDisplayClientIp"],
-	logIncludeColo: ["logWriteColo", "logDisplayColo"],
-	logIncludeUa: ["logWriteUa", "logDisplayUa"],
-	playbackInfoAutoProxy: ["defaultPlaybackInfoMode"],
-	playbackInfoBlockWangpanProxy: ["defaultPlaybackInfoMode"],
-	enableH2: ["protocolStrategy"],
-	enableH3: ["protocolStrategy"],
-	peakDowngrade: ["protocolStrategy"],
-	tgDailyReportTime: ["tgDailyReportClockTimes"]
-};
-var CONFIG_LEGACY_SNAPSHOT_DROP_KEY_SET = /* @__PURE__ */ new Set([...CONFIG_RETIRED_FIELD_KEYS, ...CONFIG_RETIRED_ALIAS_SOURCE_FIELDS]);
 var CONFIG_SANITIZE_RULES = {
 	allowedFields: [
 		"uiRadiusPx",
@@ -5786,45 +5771,6 @@ function assertExpectedRuntimeConfigRevision(expectedRevision = "", currentConfi
 		currentHash
 	});
 }
-function redactConfigSnapshotSecrets(snapshot = {}) {
-	if (!isPlainObject(snapshot)) return snapshot;
-	const redacted = {
-		...snapshot,
-		config: redactRuntimeConfigSecrets(snapshot.config || {})
-	};
-	if (isPlainObject(snapshot.rollbackPayload) && Array.isArray(snapshot.rollbackPayload.kvEntries)) redacted.rollbackPayload = {
-		...snapshot.rollbackPayload,
-		kvEntries: snapshot.rollbackPayload.kvEntries.map((entry) => {
-			if (!isPlainObject(entry) || entry.exists !== true) return entry;
-			const key = String(entry.key || "");
-			if (key === "sys:config_snapshots:v1") try {
-				const snapshots = JSON.parse(String(entry.value || "[]"));
-				return {
-					...entry,
-					value: JSON.stringify(Array.isArray(snapshots) ? snapshots.map((item) => redactConfigSnapshotSecrets(item)) : [])
-				};
-			} catch {
-				return {
-					...entry,
-					value: JSON.stringify([])
-				};
-			}
-			if (key !== "sys:theme") return entry;
-			try {
-				return {
-					...entry,
-					value: JSON.stringify(redactRuntimeConfigSecrets(JSON.parse(String(entry.value || "{}"))))
-				};
-			} catch {
-				return {
-					...entry,
-					value: JSON.stringify({})
-				};
-			}
-		})
-	};
-	return redacted;
-}
 function collectLegacyRuntimeConfigState(input = {}) {
 	const migrationState = migrateRuntimeConfigLegacyAliases(input);
 	return {
@@ -5842,60 +5788,6 @@ function migrateLegacyRuntimeConfig(input = {}) {
 		deletedLegacyFieldCount: migrationState.deletedLegacyFieldCount,
 		migratedConfigKeys: migrationState.migratedConfigKeys,
 		migratedKeyMap: migrationState.migratedKeyMap
-	};
-}
-function normalizeConfigSnapshotChangedKeys(changedKeys = []) {
-	const normalizedChangedKeys = [];
-	const removedLegacyKeys = [];
-	const seen = /* @__PURE__ */ new Set();
-	for (const rawKey of Array.isArray(changedKeys) ? changedKeys : []) {
-		const key = String(rawKey || "").trim();
-		if (!key) continue;
-		const mappedKeys = CONFIG_SNAPSHOT_CHANGED_KEY_MIGRATIONS[key];
-		if (Array.isArray(mappedKeys) && mappedKeys.length) {
-			removedLegacyKeys.push(key);
-			for (const mappedKey of mappedKeys) {
-				if (!mappedKey || seen.has(mappedKey)) continue;
-				seen.add(mappedKey);
-				normalizedChangedKeys.push(mappedKey);
-			}
-			continue;
-		}
-		if (CONFIG_LEGACY_SNAPSHOT_DROP_KEY_SET.has(key)) {
-			removedLegacyKeys.push(key);
-			continue;
-		}
-		if (seen.has(key)) continue;
-		seen.add(key);
-		normalizedChangedKeys.push(key);
-	}
-	return {
-		changedKeys: normalizedChangedKeys,
-		removedLegacyKeys: normalizeDistinctConfigKeyList(removedLegacyKeys)
-	};
-}
-function rewriteConfigSnapshotToCurrentSchema(snapshot) {
-	if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) return {
-		snapshot,
-		rewritten: false,
-		deletedLegacyFieldCount: 0,
-		migratedConfigKeys: []
-	};
-	const configMigration = migrateLegacyRuntimeConfig(snapshot.config && typeof snapshot.config === "object" && !Array.isArray(snapshot.config) ? snapshot.config : {});
-	const changedKeyMigration = normalizeConfigSnapshotChangedKeys(snapshot.changedKeys);
-	const nextSnapshot = {
-		...snapshot,
-		changedKeys: changedKeyMigration.changedKeys,
-		changeCount: changedKeyMigration.changedKeys.length,
-		config: configMigration.cleanedConfig
-	};
-	const previousChangedKeys = Array.isArray(snapshot.changedKeys) ? snapshot.changedKeys : [];
-	const previousChangeCount = Number(snapshot.changeCount) || previousChangedKeys.length || 0;
-	return {
-		snapshot: nextSnapshot,
-		rewritten: serializeConfigValue(snapshot.config || {}) !== serializeConfigValue(nextSnapshot.config) || serializeConfigValue(previousChangedKeys) !== serializeConfigValue(nextSnapshot.changedKeys) || previousChangeCount !== nextSnapshot.changeCount,
-		deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + changedKeyMigration.removedLegacyKeys.length,
-		migratedConfigKeys: configMigration.migratedConfigKeys
 	};
 }
 function buildRevisionValue(hash = "", updatedAt = "") {
@@ -5960,7 +5852,6 @@ function buildKvTidyFieldGroups(payload = {}) {
 	if (configFieldTargets.length > 0) {
 		const configNoteParts = [];
 		if (payload.sourceDirectNodesFromLegacyNodes === true) configNoteParts.push("包含节点遗留直连标记折叠进 sourceDirectNodes");
-		if (Number(payload.rewrittenSnapshotCount) > 0) configNoteParts.push(`会同步迁移 ${Math.max(0, Math.floor(Number(payload.rewrittenSnapshotCount) || 0))} 份旧快照中的相关配置字段`);
 		fieldGroups.push(createTidyPreviewGroup("config_current_fields", "全局设置当前字段", configFieldTargets, {
 			count: configFieldTargets.length,
 			note: configNoteParts.join("；") || "会把旧版配置别名收敛到当前 schema。"
@@ -6062,14 +5953,7 @@ function classifyCloudflareAnalyticsError(message, options = {}) {
 	};
 	return result;
 }
-async function readRuntimeConfigProjection(kv, preferEnvelope = false) {
-	if (preferEnvelope) try {
-		const envelope = await kv.get("sys:theme:v2", { type: "json" });
-		if (isPlainObject(envelope) && Number(envelope.schemaVersion) === 2 && isPlainObject(envelope.config)) {
-			const config = sanitizeRuntimeConfig(envelope.config);
-			if (String(envelope.hash || "") === hashStableText(serializeConfigValue(config)) && String(envelope.revision || "").trim()) return config;
-		}
-	} catch {}
+async function readRuntimeConfigFromKv(kv) {
 	return sanitizeRuntimeConfig(await kv.get("sys:theme", { type: "json" }) || {});
 }
 async function getRuntimeConfig(env) {
@@ -6090,7 +5974,7 @@ async function getRuntimeConfig(env) {
 		const staleConfig = activeCache?.data && typeof activeCache.data === "object" ? activeCache.data : cachedConfig?.data && typeof cachedConfig.data === "object" ? cachedConfig.data : null;
 		let config = staleConfig || {};
 		try {
-			config = await readRuntimeConfigProjection(kv, String(env?.CONFIG_AUTHORITY_MODE || "").trim().toLowerCase() === "d1");
+			config = await readRuntimeConfigFromKv(kv);
 		} catch (error) {
 			const hasCachedConfig = staleConfig && typeof staleConfig === "object";
 			logRuntimeFailure("runtime_config.load_failed", error, {
@@ -6111,7 +5995,7 @@ async function getRuntimeConfig(env) {
 async function getRuntimeConfigStrict(env) {
 	const kv = getKvBinding(env);
 	if (!kv) return {};
-	return await readRuntimeConfigProjection(kv, String(env?.CONFIG_AUTHORITY_MODE || "").trim().toLowerCase() === "d1");
+	return await readRuntimeConfigFromKv(kv);
 }
 //#endregion
 //#region worker/features/admin/shell-views.js
@@ -6239,7 +6123,7 @@ function defineAdminShellViews(dependencies = {}, shell = {}) {
 	function renderLandingPage(env, initHealth = buildInitHealth(env)) {
 		const adminPath = getAdminPath(env);
 		const initBanner = initHealth.ok ? "" : `<div class="landing-banner"><div class="landing-banner-title">系统未初始化</div><div class="landing-banner-text">缺少关键环境变量：${initHealth.missing.map((item) => escapeHtml(item)).join("、")}</div></div>`;
-		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.3</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.3</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取随部署发布或已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
+		const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>Emby Proxy V19.4</title>${shell.LANDING_PAGE_STYLE_HTML}</head><body><main class="landing-shell"><section class="landing-card"><div class="landing-grid"><div class="landing-primary">${initBanner}<div class="landing-pill">Headless Edge Relay</div><h1 class="landing-title">Emby Proxy V19.4</h1><p class="landing-text">为了极致优化视频代理性能，根路径默认只保留无头中继与说明壳；真正的管理台入口固定收口到 <span class="landing-highlight">${escapeHtml(adminPath)}</span>，并由 Worker 读取随部署发布或已上传的 <code>index.html</code> 返回。</p><div class="landing-actions"><a href="${escapeHtml(adminPath)}" class="landing-btn landing-btn-primary">访问 ${escapeHtml(adminPath)}</a><a href="https://github.com/axuitomo/CF-EMBY-PROXY-UI" target="_blank" rel="noopener noreferrer" class="landing-btn landing-btn-secondary">查看项目说明</a></div></div><div class="landing-side"><div class="landing-notes"><div class="landing-notes-title">Routing Notes</div><ul class="landing-note-list"><li>根路径仅提供静态说明页，不承载实时配置数据。</li><li><code>${escapeHtml(adminPath)}</code> 只负责返回管理台壳与 bootstrap，动态数据继续走 <code>POST ${escapeHtml(adminPath)}</code> API。</li><li>正式真相源固定为 <code>frontend/</code>、<code>worker.js</code> 与 <code>worker.md</code>。</li><li>媒体代理、日志与 KV / D1 逻辑保持原 Worker 主链路不变。</li></ul></div></div></div></section></main></body></html>`;
 		const headers = new Headers({
 			"Content-Type": "text/html;charset=UTF-8",
 			"Cache-Control": "public, max-age=3600, s-maxage=86400"
@@ -7748,8 +7632,6 @@ function pickCloudflareWorkerScriptCandidate(candidates = [], requestHost = "", 
 		filteredCandidates.sort((left, right) => Number(right.exactHostname) - Number(left.exactHostname) || Number(right.exactPath) - Number(left.exactPath) || Number(right.score || 0) - Number(left.score || 0) || String(left.hostname || "").length - String(right.hostname || "").length || String(left.scriptName || "").localeCompare(String(right.scriptName || "")));
 		return filteredCandidates[0];
 	}
-	const uniqueScriptNames = [...new Set((Array.isArray(candidates) ? candidates : []).map((candidate) => String(candidate?.scriptName || "").trim()).filter(Boolean))];
-	if (uniqueScriptNames.length === 1) return (Array.isArray(candidates) ? candidates : []).find((candidate) => String(candidate?.scriptName || "").trim() === uniqueScriptNames[0]) || null;
 	return null;
 }
 async function listCloudflareWorkerPlacementRegions(accountId, apiToken) {
@@ -7809,8 +7691,7 @@ async function resolveCloudflareWorkerScriptContext({ cfAccountId, cfZoneId, cfA
 			zoneId: cfZoneId,
 			hostname: requestHost
 		},
-		{ hostname: requestHost },
-		{ zoneId: cfZoneId }
+		{ hostname: requestHost }
 	];
 	for (const query of domainQueries) {
 		const querySignature = JSON.stringify({
@@ -8220,13 +8101,10 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 		},
 		async getAdminBootstrap(data, { env, ctx, kv, db }) {
 			try {
-				const authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db, allowReadOnlyFallback: true });
-				const config = authority.config;
+				const config = await getRuntimeConfigStrict(env);
 				const initHealth = buildInitHealth(env);
-				const [nodes, configSnapshots, storedSnapshots, runtimeStatusPayload] = await Promise.all([
+				const [nodes, runtimeStatusPayload] = await Promise.all([
 					CacheManager.getNodesListStrict(env, ctx),
-					kernel.getConfigSnapshotsForRead(kv),
-					kernel.readStoredConfigSnapshotsStrict(kv),
 					kernel.getRuntimeStatusPayload(env, {
 						ctx,
 						kv,
@@ -8241,10 +8119,8 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				}, {
 					ctx,
 					config,
-					nodes,
-					snapshots: storedSnapshots
+					nodes
 				});
-				if (authority.version?.revision) revisions.configRevision = authority.version.revision;
 				return jsonResponse({
 					adminPath: getAdminPath(env),
 					loginPath: getAdminLoginPath(env),
@@ -8254,11 +8130,9 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 					legacyHost: resolveConfiguredLegacyHost(env),
 					contract: buildAdminUiContract(),
 					nodes,
-					configSnapshots,
 					shell: buildAdminShellState(env, initHealth, config),
 										runtimeStatus: runtimeStatusPayload?.status && typeof runtimeStatusPayload.status === "object" ? runtimeStatusPayload.status : withAdminShellRuntimeStatus({}, env, config, initHealth),
 					revisions,
-					configAuthority: { mode: authority.mode, readOnly: authority.readOnly === true, errorCode: authority.errorCode || "" },
 					generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 				});
 			} catch (error) {
@@ -8267,27 +8141,18 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 		},
 		async getSettingsBootstrap(data, { env, ctx, kv, db }) {
 			let config;
-			let authority;
 			try {
-				authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db, allowReadOnlyFallback: true });
-				config = authority.config;
+				config = await getRuntimeConfigStrict(env);
 			} catch (error) {
 				throw remapAdminReadKvError(error, "SETTINGS_BOOTSTRAP_READ_FAILED", "设置页加载失败：KV 读取异常", "admin.read.settings_bootstrap");
 			}
 			let nodes = [];
-			let configSnapshots = [];
-			let storedSnapshots = [];
 			let runtimeStatus = {};
 			let revisions = {};
 			try {
 				nodes = await CacheManager.getNodesListStrict(env, ctx);
 			} catch (error) {
 				console.warn("[settings_bootstrap.nodes_degraded]", getErrorMessage(error));
-			}
-			try {
-				[configSnapshots, storedSnapshots] = await Promise.all([kernel.getConfigSnapshotsForRead(kv), kernel.readStoredConfigSnapshotsStrict(kv)]);
-			} catch (error) {
-				console.warn("[settings_bootstrap.snapshots_degraded]", getErrorMessage(error));
 			}
 			try {
 				const runtimeStatusPayload = await kernel.getRuntimeStatusPayload(env, {
@@ -8308,23 +8173,19 @@ function defineDashboardActions(dependencies = {}, actions = {}) {
 				}, {
 					ctx,
 					config,
-					nodes,
-					snapshots: storedSnapshots
+					nodes
 				});
 			} catch (error) {
 				console.warn("[settings_bootstrap.revisions_degraded]", getErrorMessage(error));
 			}
-			if (authority?.version?.revision) revisions.configRevision = authority.version.revision;
 			return jsonResponse({
 				config: redactAdminRuntimeConfig(config),
 				hostDomain: resolveConfiguredHost(env),
 				legacyHost: resolveConfiguredLegacyHost(env),
 				contract: buildAdminUiContract(),
 				nodes,
-				configSnapshots,
 								runtimeStatus: withAdminShellRuntimeStatus(runtimeStatus, env, config, buildInitHealth(env)),
 				revisions,
-				configAuthority: { mode: authority?.mode || kernel.normalizeConfigAuthorityMode(env), readOnly: authority?.readOnly === true, errorCode: authority?.errorCode || "" },
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		},
@@ -8724,36 +8585,23 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				})
 			});
 		},
-		async saveConfig(data, { env, ctx, kv, db, meta }) {
+		async saveConfig(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
-			const authority = await kernel.getAuthoritativeRuntimeConfig(env, { kv, db });
-			const currentConfig = authority.config;
-			const resultState = {};
+			const currentConfig = await getRuntimeConfigStrict(env);
 			const savedConfig = data.config ? await kernel.persistRuntimeConfig(mergeAdminSettingsRuntimeConfig(data.config, currentConfig), {
 				env,
 				kv,
-				db,
 				ctx,
 				expectedConfigRevision: data?.expectedConfigRevision,
-				requireExpectedConfigRevision: authority.mode === "d1",
 				mutationId: data?.mutationId,
-				resultState,
-				snapshotMeta: {
-					reason: "save_config",
-					section: String(meta?.section || "all"),
-					source: String(meta?.source || "ui"),
-					actor: "admin"
-				}
+				forceKvCommit: true
 			}) : currentConfig;
 			const revisions = await kernel.getAdminRevisions(env, { ctx, config: savedConfig });
-			if (resultState.version?.revision) revisions.configRevision = resultState.version.revision;
 			return jsonResponse({
 				success: true,
 				committed: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-				revision: String(resultState.version?.revision || revisions.configRevision || ""),
-				projectionStatus: String(resultState.projection?.status || "submitted"),
-				configAuthority: { mode: authority.mode, readOnly: false },
+				revision: String(revisions.configRevision || ""),
 				revisions
 			});
 		},
@@ -8836,7 +8684,7 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				containsSecrets: includeSecrets === true
 			});
 		},
-		async importSettings(data, { env, ctx, kv, meta }) {
+		async importSettings(data, { env, ctx, kv }) {
 			if (!kv) return jsonError("KV_NOT_CONFIGURED", "请先绑定 ENI_KV / KV Namespace", 503);
 			const importedConfig = data?.config && typeof data.config === "object" && !Array.isArray(data.config) ? data.config : data?.settings && typeof data.settings === "object" && !Array.isArray(data.settings) ? data.settings : null;
 			if (!importedConfig) return jsonError("INVALID_SETTINGS_BACKUP", "设置备份文件无效，缺少 config/settings 对象");
@@ -8845,40 +8693,20 @@ function defineConfigActions(dependencies = {}, actions = {}) {
 				env,
 				kv,
 				ctx,
-				snapshotMeta: {
-					reason: "import_settings",
-					section: String(meta?.section || "settings"),
-					source: String(meta?.source || "settings_backup"),
-					actor: "admin"
-				}
+				forceKvCommit: true
 			});
-			const [configSnapshots, revisions] = await Promise.all([kernel.getConfigSnapshotsForRead(kv), kernel.getAdminRevisions(env, {
+			const revisions = await kernel.getAdminRevisions(env, {
 				ctx,
 				config: savedConfig
-			})]);
+			});
 			return jsonResponse({
 				success: true,
 				config: redactAdminRuntimeConfig(savedConfig),
-				configSnapshots,
 				revisions,
 				generatedAt: (/* @__PURE__ */ new Date()).toISOString()
 			});
 		},
-		async getConfigSnapshots(data, { env, kv, db, ctx }) {
-			const snapshots = await kernel.getConfigSnapshotsForRead(kv);
-			const storedSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			return jsonResponse({
-				snapshots,
-				revisions: await kernel.getAdminRevisionsForRead({
-					env,
-					kv,
-					db
-				}, {
-					ctx,
-					snapshots: storedSnapshots
-				})
-			});
-		}
+
 	};
 }
 //#endregion
@@ -8887,82 +8715,6 @@ function defineBackupActions(dependencies = {}, actions = {}) {
 	const { kernel } = dependencies;
 	const { CacheManager, Logger } = dependencies;
 	return {
-		async clearConfigSnapshots(data, { kv }) {
-			const snapshotsKey = kernel.CONFIG_SNAPSHOTS_KEY;
-			const snapshotsMetaKey = kernel.CONFIG_SNAPSHOTS_META_KEY;
-			try {
-				await kernel.clearConfigSnapshots(kv);
-			} catch (error) {
-				const structuredError = createConfigSnapshotsWriteError("CONFIG_SNAPSHOTS_CLEAR_FAILED", "设置快照清理失败：KV 写入异常", {
-					dependency: "KV",
-					phase: "clear",
-					clearApplied: false,
-					snapshotsKey,
-					snapshotsMetaKey,
-					reason: getErrorMessage(error)
-				});
-				logRuntimeFailure("admin.write.config_snapshots.clear_failed", structuredError, structuredError.details);
-				throw structuredError;
-			}
-			try {
-				return jsonResponse({
-					success: true,
-					snapshots: [],
-					revisions: await kernel.getAdminRevisions(kv, { snapshots: [] })
-				});
-			} catch (error) {
-				const structuredError = createConfigSnapshotsWriteError("CONFIG_SNAPSHOTS_REVISIONS_REFRESH_FAILED", "设置快照已清理，但版本信息刷新失败", {
-					...isStructuredKvReadError(error) && isPlainObject(error?.details) ? error.details : {},
-					phase: "refresh_revisions",
-					clearApplied: true,
-					reason: getErrorMessage(error)
-				});
-				logRuntimeFailure("admin.write.config_snapshots.revisions_refresh_failed", structuredError, structuredError.details);
-				throw structuredError;
-			}
-		},
-		async restoreConfigSnapshot(data, { env, ctx, kv }) {
-			const snapshotId = String(data?.id || "").trim();
-			if (!snapshotId) return jsonError("SNAPSHOT_ID_REQUIRED", "请提供要恢复的快照 ID");
-			const snapshot = await kernel.getConfigSnapshotById(kv, snapshotId);
-			if (!snapshot) return jsonError("SNAPSHOT_NOT_FOUND", "指定的配置快照不存在", 404);
-			const currentConfig = await getRuntimeConfigStrict(env);
-			const restoredSnapshotConfig = preserveRuntimeConfigSecrets(snapshot.config || {}, currentConfig);
-			const restoredIndexRevision = parseAdminLocalIndexSourceUrl(restoredSnapshotConfig.indexUrl || "");
-			const restoredIndexRecord = restoredIndexRevision ? await kernel.getAdminIndexUploadRecord(kv, restoredIndexRevision) : null;
-			if (restoredIndexRevision && !restoredIndexRecord) return jsonError("SNAPSHOT_ADMIN_INDEX_MISSING", "配置快照引用的 index.html 已不存在", 409, { revision: restoredIndexRevision });
-			const previousActiveIndexValue = await kv.get(kernel.ADMIN_ACTIVE_INDEX_KEY);
-			if (restoredIndexRecord) await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, JSON.stringify(restoredIndexRecord));
-			else await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
-			let savedConfig;
-			try {
-				savedConfig = await kernel.persistRuntimeConfig(restoredSnapshotConfig, {
-					env,
-					kv,
-					ctx,
-					snapshotMeta: {
-						reason: "restore_snapshot",
-						section: "all",
-						source: "snapshot",
-						actor: "admin",
-						note: snapshotId
-					}
-				});
-			} catch (error) {
-				if (previousActiveIndexValue === null) await kv.delete(kernel.ADMIN_ACTIVE_INDEX_KEY);
-				else await kv.put(kernel.ADMIN_ACTIVE_INDEX_KEY, previousActiveIndexValue);
-				throw error;
-			}
-			return jsonResponse({
-				success: true,
-				config: redactAdminRuntimeConfig(savedConfig),
-				restoredSnapshotId: snapshotId,
-				revisions: await kernel.getAdminRevisions(env, {
-					ctx,
-					config: savedConfig
-				})
-			});
-		},
 		async list(data, { env, ctx, kv, db }) {
 			try {
 				const nodes = await CacheManager.getNodesListStrict(env, ctx);
@@ -9313,14 +9065,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					}, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "sync_main_video_stream_shortcuts",
-							section: "proxy",
-							source: "ui_shortcut",
-							actor: "admin",
-							note: selectedNodeNames.join(",")
-						}
+						ctx
 					});
 				} catch (error) {
 					let configRollbackError = "";
@@ -9434,13 +9179,7 @@ function defineNodeActions(dependencies = {}, actions = {}) {
 					if (importedConfig) savedConfig = await kernel.commitRuntimeConfig(importedConfig, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "import_full",
-							section: "all",
-							source: "full_backup",
-							actor: "admin"
-						}
+						ctx
 					});
 					if (preparedMutations.length > 0) {
 						await kernel.applyPreparedNodeMutations(preparedMutations, {
@@ -10623,7 +10362,7 @@ async function probeDnsIpRoutingViaCloudflare(db, ip = "", entryColo = "UNKNOWN"
 			probedAt: finalizedAt,
 			expiresAt: nowMs() + Config.Defaults.DnsIpProbeCacheTtlSec * 1e3
 		};
-		if (db) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
+		if (db && options.skipCacheWrite !== true) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
 		return entry;
 	} catch (error) {
 		const entry = {
@@ -10639,7 +10378,7 @@ async function probeDnsIpRoutingViaCloudflare(db, ip = "", entryColo = "UNKNOWN"
 			probedAt: finalizedAt,
 			expiresAt: nowMs() + Config.Defaults.DnsIpProbeCacheTtlSec * 1e3
 		};
-		if (db) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
+		if (db && options.skipCacheWrite !== true) await probeRepository.upsertDnsIpProbeCacheEntry(db, entry);
 		return entry;
 	} finally {
 		clearTimeout(timeoutId);
@@ -10704,15 +10443,26 @@ async function buildDnsIpWorkspaceItems(rawItems = [], db, entryColo = "UNKNOWN"
 	let probeDataSource = "cache";
 	if (syncTargets.length > 0) probeDataSource = "live_sync";
 	if (deferredTargets.length > 0) probeDataSource = "live_deferred";
-	await runWithConcurrency(syncTargets, probeConcurrency, async (targetIp) => {
-		const result = await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, options);
+	const syncProbeResults = await runWithConcurrency(syncTargets, probeConcurrency, async (targetIp) => {
+		const result = await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, {
+			...options,
+			skipCacheRead: true,
+			skipCacheWrite: true
+		});
 		probeMap.set(String(targetIp || "").toLowerCase(), result);
+		return result;
 	});
+	if (db && syncProbeResults.length) await options.probeRepository.upsertDnsIpProbeCacheEntries(db, syncProbeResults);
 	if (deferredTargets.length) {
 		deferredTargets.forEach((targetIp) => deferredTargetKeys.add(String(targetIp || "").toLowerCase()));
-		options.ctx.waitUntil(runWithConcurrency(deferredTargets, probeConcurrency, async (targetIp) => {
-			await probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, options);
-		}).catch((error) => {
+		options.ctx.waitUntil((async () => {
+			const results = await runWithConcurrency(deferredTargets, probeConcurrency, (targetIp) => probeDnsIpRoutingViaCloudflare(db, targetIp, entryColo, {
+				...options,
+				skipCacheRead: true,
+				skipCacheWrite: true
+			}));
+			if (db && results.length) await options.probeRepository.upsertDnsIpProbeCacheEntries(db, results);
+		})().catch((error) => {
 			console.warn("[DNS IP Workspace] Deferred probe failed:", error?.message || error);
 		}));
 	}
@@ -11762,6 +11512,19 @@ function resetNodeCacheTokens(state = nodeBindingCacheStates.current()) {
 }
 function getUtf8ByteLength(value) {
 	return new TextEncoder().encode(String(value ?? "")).byteLength;
+}
+function createD1SerializedValueTooLargeError(field, value, options = {}) {
+	const actualBytes = getUtf8ByteLength(value);
+	const limitBytes = Math.max(1, Number(options.limitBytes) || D1_SAFE_SERIALIZED_VALUE_MAX_BYTES);
+	const error = /* @__PURE__ */ new Error(`D1 value exceeds the ${limitBytes}-byte compatibility budget`);
+	error.code = "D1_VALUE_TOO_LARGE";
+	error.status = 400;
+	error.details = { field: String(field || "value"), actualBytes, limitBytes, platformLimitBytes: D1_TEXT_VALUE_MAX_BYTES };
+	return error;
+}
+function assertD1SerializedValueFits(field, value, options = {}) {
+	if (getUtf8ByteLength(value) > Math.max(1, Number(options.limitBytes) || D1_SAFE_SERIALIZED_VALUE_MAX_BYTES)) throw createD1SerializedValueTooLargeError(field, value, options);
+	return value;
 }
 function getNodeResourceLimitViolation(nodeName, nodeData = {}) {
 	const name = String(nodeName || "").trim().toLowerCase();
@@ -13153,46 +12916,18 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				nextTidyConfig = normalizedTidyConfig;
 				migratedConfigKeys.push("sourceDirectNodes");
 			}
-			const rawSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			const [configMeta, snapshotsMeta] = await Promise.all([kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY), kernel.readRevisionMetaForRead(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 })]);
+			const configMeta = await kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY);
 			const revisions = {
 				configRevision: String(configMeta?.revision || ""),
-				configContentHash: hashStableText(serializeConfigValue(currentStoredConfig)),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
-				snapshotsContentHash: hashStableText(serializeConfigValue(rawSnapshots))
+				configContentHash: hashStableText(serializeConfigValue(currentStoredConfig))
 			};
-			const { rewrittenSnapshots, rewrittenSnapshotCount, deletedLegacySnapshotFieldCount, migratedConfigKeys: snapshotMigratedConfigKeys } = kernel.rewriteKvTidySnapshots(rawSnapshots);
-			migratedConfigKeys.push(...snapshotMigratedConfigKeys);
+			const hasLegacyConfigSnapshotData = allKeys.includes(kernel.CONFIG_SNAPSHOTS_KEY);
 			const configRewriteNeeded = repairedConfig.hadMalformedValue || serializeConfigValue(currentStoredConfig) !== serializeConfigValue(nextTidyConfig);
-			const tidySnapshotNoteParts = kernel.buildKvTidyNoteParts({
-				legacyKeysPresent: configMigration.legacyKeysPresent,
-				rewrittenSnapshotCount,
-				rewrittenNodeCount,
-				migratedTopLevelPortNodeCount,
-				migratedLinePortCount,
-				migratedDefaultPortNodeCount,
-				migratedDefaultPortLineCount
-			}, {
-				includeRepairSource: true,
-				repairLabel: "repair_source",
-				repairedConfig
-			});
 			const configDiffEntries = getConfigDiffEntries(repairedConfig.config, nextTidyConfig);
-			const nextSnapshots = [];
-			if (configDiffEntries.length > 0) nextSnapshots.push(kernel.createSyntheticConfigSnapshot(repairedConfig.config, {
-				reason: "tidy_kv_data",
-				section: "all",
-				source: "kv_tidy",
-				actor: "admin",
-				note: tidySnapshotNoteParts.join("; ") || (repairedConfig.hadMalformedValue ? "repair_malformed_sys_config" : "sanitize_runtime_config")
-			}, {
-				changedKeys: configDiffEntries.map((item) => item.key),
-				changeCount: configDiffEntries.length
-			}));
-			if (rewrittenSnapshots.length > 0) nextSnapshots.push(...rewrittenSnapshots);
-			const retainedSnapshots = nextSnapshots.length > 0 ? nextSnapshots : rawSnapshots;
-			const unreferencedAdminIndexUploadKeys = kernel.collectUnreferencedAdminIndexUploadKeys(nextTidyConfig, retainedSnapshots, adminIndexUploadKeys);
+			const unreferencedAdminIndexUploadKeys = kernel.collectUnreferencedAdminIndexUploadKeys(nextTidyConfig, [], adminIndexUploadKeys);
 			for (const key of unreferencedAdminIndexUploadKeys) removableKeys.add(key);
+			if (allKeys.includes(kernel.CONFIG_SNAPSHOTS_KEY)) removableKeys.add(kernel.CONFIG_SNAPSHOTS_KEY);
+			if (allKeys.includes(kernel.CONFIG_SNAPSHOTS_META_KEY)) removableKeys.add(kernel.CONFIG_SNAPSHOTS_META_KEY);
 			const rebuiltNodeSummaries = kernel.normalizeNodeSummaryIndex(fullEntityNodes).nodes;
 			const rebuiltNodeIndex = kernel.normalizeNodeIndex(rebuiltNodeSummaries.map((node) => node?.name));
 			const nextIndexText = JSON.stringify(rebuiltNodeIndex);
@@ -13203,11 +12938,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const removableKeyList = [...removableKeys].sort();
 			const plannedDeleteKeyList = [.../* @__PURE__ */ new Set([...cacheInvalidationKeys, ...removableKeyList])].filter(Boolean).sort();
 			const mutationPlan = [];
-			if (nextSnapshots.length > 0) mutationPlan.push({
-				type: "put",
-				key: kernel.CONFIG_SNAPSHOTS_KEY,
-				value: JSON.stringify(nextSnapshots)
-			});
 			if (configRewriteNeeded) mutationPlan.push({
 				type: "put",
 				key: kernel.CONFIG_KEY,
@@ -13246,11 +12976,9 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				configReadSource: repairedConfig.source,
 				configRewritten: configRewriteNeeded,
 				migratedConfigKeys: normalizeDistinctConfigKeyList(migratedConfigKeys),
-				rewrittenSnapshotCount,
-				deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + deletedLegacySnapshotFieldCount + deletedLegacyNodeFieldCount,
+				deletedLegacyFieldCount: configMigration.deletedLegacyFieldCount + deletedLegacyNodeFieldCount,
 				deletedLegacyConfigFieldCount: configMigration.deletedLegacyFieldCount,
 				deletedLegacyNodeFieldCount,
-				deletedLegacySnapshotFieldCount,
 				migratedTopLevelPortNodeCount,
 				migratedLinePortCount,
 				migratedDefaultPortNodeCount,
@@ -13265,14 +12993,12 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				deletedDnsFetchLockKeyCount: dnsFetchLockKeyCount,
 				deletedAdminIndexUploadCount: unreferencedAdminIndexUploadKeys.length,
 				untouchedOtherKeyCount,
-				rawSnapshotCount: rawSnapshots.length,
 				previousFullIndexBytes,
 				nextSummaryIndexBytes,
 				savedBytes
 			};
 			const fieldGroups = buildKvTidyFieldGroups({
 				configFieldTargets: summary.migratedConfigKeys,
-				rewrittenSnapshotCount,
 				sourceDirectNodesFromLegacyNodes,
 				migratedTopLevelPortNodeCount,
 				migratedLinePortCount,
@@ -13288,7 +13014,6 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			const scheduledLockKeys = removableKeyList.filter((key) => key === kernel.LEGACY_SCHEDULED_LOCK_KEY);
 			const dnsFetchLockKeys = removableKeyList.filter((key) => key.startsWith(LEGACY_DNS_IP_POOL_FETCH_LOCK_KV_KEY_PREFIX));
 			const staleAdminIndexUploadKeys = removableKeyList.filter((key) => key.startsWith(kernel.ADMIN_INDEX_UPLOAD_PREFIX));
-			const rewrittenSnapshotIds = rewrittenSnapshots.map((snapshot) => snapshot?.id);
 			const rewrittenNodeNames = rewrittenNodes.map((node) => node.name);
 			pushTidyPreviewGroup(deleteGroups, staleCfCacheKeys.length > 0, "cf_dash_cache", "Cloudflare 仪表盘缓存", staleCfCacheKeys, staleCfCacheKeys.length, "会删除遗留的 sys:cf_dash_cache 及其按日期 / Zone 生成的缓存键。");
 			pushTidyPreviewGroup(deleteGroups, loginFailureKeys.length > 0, "login_failures", "旧版登录失败计数", loginFailureKeys, loginFailureKeys.length, "会删除旧版 fail:* 登录失败计数键，后续仅保留 D1 auth_failures。");
@@ -13297,7 +13022,8 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			pushTidyPreviewGroup(deleteGroups, telegramAlertStateKeys.length > 0, "telegram_alert_state", "旧版 Telegram 告警冷却状态", telegramAlertStateKeys, telegramAlertStateKeys.length, "会删除 sys:telegram_alert_state:v1，后续只保留 D1 sys_status scope。");
 			pushTidyPreviewGroup(deleteGroups, scheduledLockKeys.length > 0, "scheduled_lock", "旧版定时租约键", scheduledLockKeys, scheduledLockKeys.length, "会删除 sys:scheduled_lock:v1，后续只保留 D1 sys_locks。");
 			pushTidyPreviewGroup(deleteGroups, dnsFetchLockKeys.length > 0, "dns_fetch_lock", "旧版 DNS 抓取锁键", dnsFetchLockKeys, dnsFetchLockKeys.length, "会删除 sys:dns_ip_pool_fetch_lock:v1:*，后续只保留 D1 sys_locks。");
-			pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只删除当前配置和保留快照都不再引用的内容寻址 index.html。");
+			pushTidyPreviewGroup(deleteGroups, hasLegacyConfigSnapshotData || snapshotMetaKeyCount > 0, "legacy_config_snapshot_keys", "停用的设置历史键", [kernel.CONFIG_SNAPSHOTS_KEY, kernel.CONFIG_SNAPSHOTS_META_KEY], Number(hasLegacyConfigSnapshotData) + Number(snapshotMetaKeyCount > 0), "会删除已停用的设置历史键及其元数据。");
+			pushTidyPreviewGroup(deleteGroups, staleAdminIndexUploadKeys.length > 0, "admin_index_uploads", "未引用的本地 HTML 版本", staleAdminIndexUploadKeys, staleAdminIndexUploadKeys.length, "只保留当前配置引用的内容寻址 index.html。");
 			const rewriteGroups = [];
 			if (configRewriteNeeded) pushTidyPreviewGroup(rewriteGroups, true, "runtime_config", "全局设置 sys:theme", [...configMigration.legacyKeysPresent, ...configDiffEntries.map((item) => item.key)], 1, "会把旧版设置字段吸收到当前 schema，并以后端 sanitizeRuntimeConfig() 结果回写。");
 			if (rewrittenNodeCount > 0) {
@@ -13314,10 +13040,9 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 				note: "不会整批删除 node:*，只会按需重写必要节点。"
 			})];
 			if (dnsRecordHistoryKeyCount > 0) pushTidyPreviewGroup(preserveGroups, true, "dns_record_history", "DNS 历史记录", allKeys.filter((key) => key.startsWith(kernel.DNS_RECORD_HISTORY_PREFIX)), dnsRecordHistoryKeyCount, "不会删除 sys:dns_record_history:v1:*。");
-			const preservedMetaCount = configMetaKeyCount + snapshotMetaKeyCount + nodeIndexMetaKeyCount;
-			if (preservedMetaCount > 0) pushTidyPreviewGroup(preserveGroups, true, "meta_keys", "配置 / 快照 / 索引元信息", [
+			const preservedMetaCount = configMetaKeyCount + nodeIndexMetaKeyCount;
+			if (preservedMetaCount > 0) pushTidyPreviewGroup(preserveGroups, true, "meta_keys", "配置 / 索引元信息", [
 				kernel.CONFIG_META_KEY,
-				kernel.CONFIG_SNAPSHOTS_META_KEY,
 				kernel.NODES_INDEX_META_KEY
 			], preservedMetaCount, "不会删除这些 revision / meta 键。");
 			const warnings = [];
@@ -13327,7 +13052,7 @@ function defineKvTidyMethods(dependencies = {}, kernel = {}) {
 			if (migratedDefaultPortNodeCount > 0 || migratedDefaultPortLineCount > 0) warnings.push(`检测到 ${migratedDefaultPortNodeCount} 个节点 / ${migratedDefaultPortLineCount} 条线路仍未显式写端口；整理后会按协议补齐为 :443 / :80。`);
 			if (storedSummaryIndexState?.legacyMirrorDetected === true) warnings.push(`检测到旧版 sys:nodes_index_full:v2 仍保存完整节点镜像；本次会按 node:* 重建并收敛为摘要索引（${previousFullIndexBytes} -> ${nextSummaryIndexBytes} bytes）。`);
 			if (untouchedOtherKeyCount > 0) warnings.push(`发现 ${untouchedOtherKeyCount} 个未列入整理白名单的 KV 键，本次不会自动删除。`);
-			if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenSnapshotCount === 0 && rewrittenNodeCount === 0) warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
+			if (deleteGroups.length === 0 && !configRewriteNeeded && rewrittenNodeCount === 0) warnings.push("当前没有检测到需要执行的 KV 清理动作；本次更多是一轮一致性巡检。");
 			warnings.push(buildKvTidyQuotaBudgetWarning(quotaBudget));
 			if (quotaBudget.blocked === true && quotaBudget.reason) warnings.push(quotaBudget.reason);
 			const plan = {
@@ -13520,7 +13245,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const db = options.db || kernel.getDB(env);
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
-			const schemaStatus = await kernel.getD1SchemaStatus(db);
+			const schemaStatus = options.schemaStatus?.schemaReady === true ? options.schemaStatus : await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 			if (schemaStatus.schemaReady !== true) {
 				const preview = kernel.createEmptyTidyPreview("d1");
 				preview.warnings.push("D1 结构尚未通过运行时兼容检查；本预览不授权删除，必须先完成统一“初始化 DB”并重新预览。");
@@ -13543,6 +13268,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const runtimeConfig = sanitizeRuntimeConfig(options.config || (env ? await getRuntimeConfig(env) : {}));
 			const baseContext = D1TidyPlanner.buildContext(runtimeConfig, options);
 			const context = D1TidyPlanner.attachPreviousState(kernel, baseContext, options.previousCleanupStatus);
+			context.schemaStatus = schemaStatus;
 			context.logQueuePendingCount = logBindingStates.get(db).LogQueue.length;
 			const facts = await D1TidyPlanner.readFacts(kernel, db, kv, context);
 			const sourcePolicy = D1TidyPlanner.buildSourcePolicy(facts.d1DnsIpPoolSources);
@@ -13587,7 +13313,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			const db = options.db || kernel.getDB(env);
 			const kv = options.kv || kernel.getKV(env) || null;
 			if (!db) throw new Error("D1 not configured");
-			const compatibilityStatus = await kernel.getD1SchemaStatus(db);
+			const compatibilityStatus = options.schemaStatus?.schemaReady === true ? options.schemaStatus : plan?.schemaStatus?.schemaReady === true ? plan.schemaStatus : await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 			if (compatibilityStatus.schemaReady !== true) {
 				const error = /* @__PURE__ */ new Error("D1 schema must pass runtime compatibility checks before tidy execution");
 				error.code = "D1_SCHEMA_INCOMPATIBLE";
@@ -13625,14 +13351,8 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				if (!continueOnStepFailure) throw error;
 				return false;
 			};
-			await beforeStep("bootstrapD1Schema");
-			await kernel.bootstrapD1Schema(db, "logs-core");
 			const logState = logBindingStates.get(db);
 			if (logState.LogFlushTask) await Promise.resolve(logState.LogFlushTask).catch(() => {});
-			if (env && logState.LogQueue.length > 0) {
-				await beforeStep("flushLogQueue");
-				await Logger.flush(env).catch(() => {});
-			}
 			const maintenanceStartedAt = nowMs();
 			const deleteScopes = D1TidyExecutor.buildDeleteScopes(kernel, executionPlan, flags, db);
 			const deleteResult = await D1TidyExecutor.runBudgetedDeleteScopes(deleteScopes, summary, beforeStep, { startedAt: maintenanceStartedAt });
@@ -13705,7 +13425,7 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 			if (!db) throw new Error("D1 not configured");
 			if (mode === "manual") {
 				const tokenPayload = await kernel.verifyD1TidyPlanToken(env, options.planToken);
-				const statusBefore = await kernel.getD1SchemaStatus(db);
+				const statusBefore = await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 				if (statusBefore.schemaReady !== true) {
 					const error = /* @__PURE__ */ new Error("D1 schema changed after preview; initialize and preview again");
 					error.code = "TIDY_PLAN_STALE";
@@ -13726,7 +13446,8 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 					statsBucketDate: String(tokenPayload.statsBucketDate || ""),
 					statsStartTs: Number(tokenPayload.statsStartTs) || 0,
 					statsEndTs: Number(tokenPayload.statsEndTs) || 0,
-					statsUtcOffsetMinutes: Number(tokenPayload.statsUtcOffsetMinutes) || 0
+					statsUtcOffsetMinutes: Number(tokenPayload.statsUtcOffsetMinutes) || 0,
+					schemaStatus: statusBefore
 				});
 				if (String(plan.planHash || "") !== String(tokenPayload.planHash || "")) {
 					const error = /* @__PURE__ */ new Error("D1 tidy data changed after preview");
@@ -13745,12 +13466,13 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 						db,
 						env,
 						mode,
-						maintenanceMode: plan.maintenanceMode
+						maintenanceMode: plan.maintenanceMode,
+						schemaStatus: statusBefore
 					}),
 					schema: statusBefore
 				};
 			}
-			const statusBefore = await kernel.getD1SchemaStatus(db);
+			const statusBefore = await kernel.getD1SchemaReadiness(db, { allowAttestedFastPath: true, env });
 			if (statusBefore.schemaReady !== true) {
 				const error = /* @__PURE__ */ new Error("D1 schema is not initialized");
 				error.code = "D1_SCHEMA_NOT_READY";
@@ -13762,13 +13484,15 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 				...options,
 				db,
 				mode,
-				maintenanceMode
+				maintenanceMode,
+				schemaStatus: statusBefore
 			});
 			return {
 				...await kernel.applyD1TidyPlan(plan, {
 					...options,
 					db,
-					env
+					env,
+					schemaStatus: statusBefore
 				}),
 				schema: statusBefore
 			};
@@ -13799,87 +13523,15 @@ function defineD1TidyMethods(dependencies = {}, kernel = {}) {
 function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
-		normalizeConfigSnapshotMeta(meta = {}) {
-			/** @type {ConfigSnapshotMeta} */
-			const input = meta && typeof meta === "object" ? meta : {};
-			return {
-				reason: String(input.reason || "save_config").trim() || "save_config",
-				section: String(input.section || "all").trim() || "all",
-				actor: String(input.actor || "admin").trim() || "admin",
-				source: String(input.source || "ui").trim() || "ui",
-				note: String(input.note || "").trim()
-			};
-		},
-		async readStoredConfigSnapshots(kv) {
-			if (!kv) return [];
-			try {
-				const stored = await kv.get(kernel.CONFIG_SNAPSHOTS_KEY, { type: "json" });
-				return Array.isArray(stored) ? stored : [];
-			} catch {
-				return [];
-			}
-		},
-		async readStoredConfigSnapshotsStrict(kv) {
+		async readLegacyConfigSnapshotRecordsStrict(kv) {
 			if (!kv) return [];
 			const stored = await kvGetStrict(kv, kernel.CONFIG_SNAPSHOTS_KEY, { type: "json" });
 			if (stored === null || stored === void 0) return [];
 			if (Array.isArray(stored)) return stored;
-			const error = /* @__PURE__ */ new Error("Stored config snapshots are invalid");
+			const error = /* @__PURE__ */ new Error("Stored legacy config snapshot records are invalid");
 			error.code = "CONFIG_SNAPSHOTS_INVALID";
 			error.status = 409;
 			throw error;
-		},
-		async writeStoredConfigSnapshots(kv, snapshots = [], options = {}) {
-			if (!kv) return [];
-			const nextSnapshots = Array.isArray(snapshots) ? snapshots.slice(0, Config.Defaults.ConfigSnapshotLimit) : [];
-			await kv.put(kernel.CONFIG_SNAPSHOTS_KEY, JSON.stringify(nextSnapshots));
-			await kernel.ensureConfigSnapshotsMeta(kv, nextSnapshots, options);
-			return nextSnapshots;
-		},
-		createSyntheticConfigSnapshot(config, meta = {}, options = {}) {
-			const snapshotMeta = kernel.normalizeConfigSnapshotMeta(meta);
-			const changedKeys = normalizeDistinctConfigKeyList(options.changedKeys || []);
-			const extraFields = isPlainObject(options.extraFields) ? options.extraFields : {};
-			return redactConfigSnapshotSecrets({
-				id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-				createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-				reason: snapshotMeta.reason,
-				section: snapshotMeta.section,
-				actor: snapshotMeta.actor,
-				source: snapshotMeta.source,
-				note: snapshotMeta.note,
-				changedKeys,
-				changeCount: Number(options.changeCount) || changedKeys.length,
-				config: redactRuntimeConfigSecrets(config),
-				...extraFields
-			});
-		},
-		async getConfigSnapshots(kv, options = {}) {
-			if (!kv) return [];
-			const rawSnapshots = await kernel.readStoredConfigSnapshots(kv);
-			return kernel.normalizeConfigSnapshotsForResponse(rawSnapshots, options);
-		},
-		normalizeConfigSnapshotsForResponse(rawSnapshots = [], options = {}) {
-			const includeConfig = options.withConfig === true;
-			return (Array.isArray(rawSnapshots) ? rawSnapshots : []).filter((item) => item && typeof item === "object" && Array.isArray(item.changedKeys) && item.createdAt).map((item) => includeConfig ? redactConfigSnapshotSecrets(item) : {
-				id: item.id,
-				createdAt: item.createdAt,
-				reason: item.reason,
-				section: item.section,
-				actor: item.actor,
-				source: item.source,
-				note: item.note || "",
-				changedKeys: [...item.changedKeys],
-				changeCount: Number(item.changeCount) || item.changedKeys.length || 0
-			});
-		},
-		async getConfigSnapshotsForRead(kv, options = {}) {
-			if (!kv) return [];
-			const rawSnapshots = await kernel.readStoredConfigSnapshotsStrict(kv);
-			return kernel.normalizeConfigSnapshotsForResponse(rawSnapshots, options);
-		},
-		async getConfigSnapshotById(kv, snapshotId) {
-			return (await kernel.getConfigSnapshotsForRead(kv, { withConfig: true })).find((item) => item.id === snapshotId) || null;
 		},
 		buildAdminIndexUploadKey(revision = "") {
 			const normalizedRevision = normalizeAdminLocalIndexRevision(revision);
@@ -13992,14 +13644,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 						}, {
 							env,
 							kv,
-							ctx,
-							snapshotMeta: {
-								reason: "upload_admin_index",
-								section: "static_assets_policy",
-								source: "admin_gate_local_upload",
-								actor: "admin",
-								note: persistedRecord.fileName
-							}
+							ctx
 						}),
 						previousConfig: currentConfig,
 						record: persistedRecord
@@ -14040,13 +13685,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 					}, {
 						env,
 						kv,
-						ctx,
-						snapshotMeta: {
-							reason: "rollback_worker_html_update",
-							section: "static_assets_policy",
-							source: "worker_html_upload",
-							actor: "system"
-						}
+						ctx
 					});
 					return {
 						config: restoredConfig,
@@ -14058,10 +13697,6 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 					throw error;
 				}
 			});
-		},
-		async clearConfigSnapshots(kv) {
-			if (!kv) return;
-			await kernel.writeStoredConfigSnapshots(kv, []);
 		},
 		async captureRuntimeConfigRollbackState(env, kv) {
 			if (!kv) return {
@@ -14110,13 +13745,7 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 				await kernel.commitRuntimeConfig(previousConfig, {
 					env: options.env,
 					kv: options.kv,
-					ctx: options.ctx,
-					snapshotMeta: {
-						reason: "rollback_config_dns",
-						section: "all",
-						source: "rollback",
-						actor: "system"
-					}
+					ctx: options.ctx
 				});
 			} catch (error) {
 				dnsRestoreError = error;
@@ -14145,200 +13774,14 @@ function defineSnapshotMethods(dependencies = {}, kernel = {}) {
 function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 	const { D1TidyExecutor, D1TidyPlanner, Logger, buildAdminReleaseVendorManifest, normalizeAdminReleaseVendorManifestRecord, validateAdminShellHtmlSource } = dependencies;
 	return {
-		normalizeConfigAuthorityMode(env = {}) {
-			const mode = String(env?.CONFIG_AUTHORITY_MODE || "kv").trim().toLowerCase();
-			return mode === "d1" || mode === "shadow" ? mode : "kv";
-		},
-		normalizeD1ConfigVersionRow(row = null) {
-			if (!isPlainObject(row)) return null;
-			const payload = String(row.payload || "{}");
-			let config;
-			try {
-				config = sanitizeRuntimeConfig(JSON.parse(payload));
-			} catch {
-				throw createStructuredConfigError("CONFIG_AUTHORITY_CORRUPT", "D1 配置版本内容无效", 503);
-			}
-			const contentHash = hashStableText(payload);
-			if (String(row.content_hash || "") !== contentHash) throw createStructuredConfigError("CONFIG_AUTHORITY_CORRUPT", "D1 配置版本校验失败", 503);
-			return {
-				revision: String(row.revision || ""),
-				sequence: Number(row.sequence) || 0,
-				contentHash,
-				config,
-				createdAt: Number(row.created_at) || 0,
-				projectedAt: row.projected_at == null ? null : Number(row.projected_at) || 0
-			};
-		},
-		async readD1CurrentConfigVersion(db) {
-			if (!db) return null;
-			return kernel.normalizeD1ConfigVersionRow(await db.prepare(`SELECT * FROM ${kernel.CONFIG_VERSIONS_TABLE} ORDER BY sequence DESC LIMIT 1`).first());
-		},
-		async readD1ConfigVersionByMutationId(db, mutationId = "") {
-			if (!db || !mutationId) return null;
-			return kernel.normalizeD1ConfigVersionRow(await db.prepare(`SELECT * FROM ${kernel.CONFIG_VERSIONS_TABLE} WHERE mutation_id = ? ORDER BY sequence DESC LIMIT 1`).bind(String(mutationId)).first());
-		},
-		async bootstrapD1ConfigVersion(db, config = {}, meta = {}) {
-			if (!db) throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
-			const normalizedConfig = sanitizeRuntimeConfig(config);
-			const payload = serializeConfigValue(normalizedConfig);
-			const contentHash = hashStableText(payload);
-			const createdAt = nowMs();
-			const revision = `${buildRevisionValue(contentHash)}.${Math.random().toString(36).slice(2, 10)}`;
-			try {
-				await db.prepare(`INSERT INTO ${kernel.CONFIG_VERSIONS_TABLE} (parent_revision, revision, sequence, content_hash, payload, mutation_id, source, section, actor, created_at, projection_attempts) SELECT '', ?, 1, ?, ?, ?, ?, ?, ?, ?, 0 WHERE NOT EXISTS (SELECT 1 FROM ${kernel.CONFIG_VERSIONS_TABLE})`).bind(revision, contentHash, payload, String(meta.mutationId || "bootstrap"), String(meta.source || "kv_bootstrap"), String(meta.section || "all"), String(meta.actor || "system"), createdAt).run();
-			} catch {}
-			return await kernel.readD1CurrentConfigVersion(db);
-		},
-		async appendD1ConfigVersion(db, rawConfig = {}, options = {}) {
-			if (!db) throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
-			const expectedRevision = String(options.expectedConfigRevision || "").trim();
-			if (!expectedRevision) throw createStructuredConfigError("CONFIG_REVISION_REQUIRED", "保存 D1 配置必须提供当前版本", 428);
-			const mutationId = String(options.mutationId || `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`).trim();
-			const nextConfig = sanitizeRuntimeConfig(rawConfig);
-			const payload = serializeConfigValue(nextConfig);
-			const contentHash = hashStableText(payload);
-			const priorMutation = await kernel.readD1ConfigVersionByMutationId(db, mutationId);
-			if (priorMutation) {
-				if (priorMutation.contentHash !== contentHash) throw createStructuredConfigError("CONFIG_MUTATION_ID_REUSED", "配置请求标识已用于其他内容", 409);
-				return { ...priorMutation, idempotent: true };
-			}
-			const createdAt = nowMs();
-			const revision = `${buildRevisionValue(contentHash)}.${Math.random().toString(36).slice(2, 10)}`;
-			try {
-				await db.prepare(`INSERT INTO ${kernel.CONFIG_VERSIONS_TABLE} (parent_revision, revision, sequence, content_hash, payload, mutation_id, source, section, actor, created_at, projection_attempts) SELECT current.revision, ?, current.sequence + 1, ?, ?, ?, ?, ?, ?, ?, 0 FROM ${kernel.CONFIG_VERSIONS_TABLE} AS current WHERE current.sequence = (SELECT MAX(sequence) FROM ${kernel.CONFIG_VERSIONS_TABLE}) AND current.revision = ?`).bind(revision, contentHash, payload, mutationId, String(options.source || "ui"), String(options.section || "all"), String(options.actor || "admin"), createdAt, expectedRevision).run();
-			} catch {}
-			const committed = await kernel.readD1ConfigVersionByMutationId(db, mutationId);
-			if (committed) return { ...committed, idempotent: false };
-			const current = await kernel.readD1CurrentConfigVersion(db);
-			throw createStructuredConfigError("CONFIG_REVISION_CONFLICT", "配置版本已变化，请刷新后重试", 409, { expectedRevision, currentRevision: current?.revision || "" });
-		},
-		async projectD1ConfigVersionToKv(version, options = {}) {
-			const kv = options.kv || getKvBinding(options.env);
-			if (!kv) throw createStructuredConfigError("KV_NOT_CONFIGURED", "KV 配置投影不可用", 503);
-			const envelope = {
-				schemaVersion: 2,
-				sequence: version.sequence,
-				revision: version.revision,
-				hash: version.contentHash,
-				config: version.config
-			};
-			try {
-				await kv.put(kernel.CONFIG_ENVELOPE_KEY, JSON.stringify(envelope));
-				await kv.put(kernel.CONFIG_KEY, JSON.stringify(version.config));
-				await kv.put(kernel.CONFIG_META_KEY, JSON.stringify({ hash: version.contentHash, revision: version.revision, updatedAt: new Date(version.createdAt).toISOString() }));
-				await options.db?.prepare(`UPDATE ${kernel.CONFIG_VERSIONS_TABLE} SET projected_at = ?, projection_attempts = projection_attempts + 1, projection_error = NULL WHERE revision = ?`).bind(nowMs(), version.revision).run();
-				if (options.env) primeRuntimeConfigCache(options.env, version.config);
-				else invalidateRuntimeConfigCache();
-				return { status: "submitted", revision: version.revision };
-			} catch (error) {
-				await options.db?.prepare(`UPDATE ${kernel.CONFIG_VERSIONS_TABLE} SET projection_attempts = projection_attempts + 1, projection_error = ? WHERE revision = ?`).bind(getErrorMessage(error, "projection_failed").slice(0, 300), version.revision).run().catch(() => {});
-				return { status: "pending", revision: version.revision };
-			}
-		},
-		async reconcileD1ConfigProjection(env, options = {}) {
-			if (kernel.normalizeConfigAuthorityMode(env) !== "d1") return { status: "skipped", reason: "authority_mode" };
-			const db = options.db || getD1Binding(env);
-			const kv = options.kv || getKvBinding(env);
-			if (!db || !kv) return { status: "skipped", reason: "binding_unavailable" };
-			const version = await kernel.readD1CurrentConfigVersion(db);
-			if (!version) return { status: "skipped", reason: "not_initialized" };
-			return await kernel.projectD1ConfigVersionToKv(version, { env, db, kv });
-		},
-		async getAuthoritativeRuntimeConfig(env, options = {}) {
-			const mode = kernel.normalizeConfigAuthorityMode(env);
-			if (mode !== "d1") return { mode, config: await getRuntimeConfigStrict(env), version: null, readOnly: false };
-			const db = options.db || getD1Binding(env);
-			const kv = options.kv || getKvBinding(env);
-			try {
-				let version = await kernel.readD1CurrentConfigVersion(db);
-				if (!version) version = await kernel.bootstrapD1ConfigVersion(db, await getRuntimeConfigStrict(env));
-				return { mode, config: version.config, version, readOnly: false };
-			} catch {
-				if (options.allowReadOnlyFallback === true && kv) return { mode, config: await getRuntimeConfigStrict(env), version: null, readOnly: true, errorCode: "CONFIG_AUTHORITY_UNAVAILABLE" };
-				throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503);
-			}
-		},
-		async commitD1RuntimeConfig(rawConfig, options = {}) {
-			const env = options.env || {};
-			const db = options.db || getD1Binding(env);
-			const kv = options.kv || getKvBinding(env);
-			let current = await kernel.readD1CurrentConfigVersion(db).catch(() => { throw createStructuredConfigError("CONFIG_AUTHORITY_UNAVAILABLE", "D1 配置服务不可用", 503); });
-			if (!current) current = await kernel.bootstrapD1ConfigVersion(db, kv ? await getRuntimeConfigStrict(env) : {});
-			let expectedConfigRevision = String(options.expectedConfigRevision || "").trim();
-			if (!expectedConfigRevision && options.requireExpectedConfigRevision === true) throw createStructuredConfigError("CONFIG_REVISION_REQUIRED", "保存 D1 配置必须提供当前版本", 428);
-			if (!expectedConfigRevision) expectedConfigRevision = current.revision;
-			const nextConfig = sanitizeRuntimeConfig(rawConfig);
-			assertHostPrefixCnameTargetValid(nextConfig?.defaultHostPrefixCnameTarget);
-			assertAdminIndexSourceConfigValid(rawConfig);
-			assertHostPrefixProxyConfigReady(nextConfig, env);
-			if (serializeConfigValue(current.config) === serializeConfigValue(nextConfig)) return {
-				config: current.config,
-				version: current,
-				projection: { status: current.projectedAt ? "submitted" : "pending", revision: current.revision }
-			};
-			const version = await kernel.appendD1ConfigVersion(db, nextConfig, {
-				expectedConfigRevision,
-				mutationId: options.mutationId,
-				...options.snapshotMeta
-			});
-			const projection = await kernel.projectD1ConfigVersionToKv(version, { env, kv, db });
-			await kernel.invalidateDashboardSnapshotCacheForConfigChange(env, { prevConfig: current.config, nextConfig }).catch(() => {});
-			return { config: nextConfig, version, projection };
-		},
-		async recordConfigSnapshot(kv, prevConfig, nextConfig, meta = {}) {
-			if (!kv) return null;
-			const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
-			if (!diffEntries.length) return null;
-			const snapshotMeta = kernel.normalizeConfigSnapshotMeta(meta);
-			const currentSnapshots = await kernel.getConfigSnapshots(kv, { withConfig: true });
-			const snapshot = {
-				id: `cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-				createdAt: (/* @__PURE__ */ new Date()).toISOString(),
-				reason: snapshotMeta.reason,
-				section: snapshotMeta.section,
-				actor: snapshotMeta.actor,
-				source: snapshotMeta.source,
-				note: snapshotMeta.note,
-				changedKeys: diffEntries.map((item) => item.key),
-				changeCount: diffEntries.length,
-				config: redactRuntimeConfigSecrets(prevConfig)
-			};
-			const nextSnapshots = [snapshot, ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit);
-			await kernel.writeStoredConfigSnapshots(kv, nextSnapshots);
-			return snapshot;
-		},
 		async persistRuntimeConfig(rawConfig, options = {}) {
-			const mode = kernel.normalizeConfigAuthorityMode(options.env);
-			if (mode === "d1") {
-				const result = await kernel.commitD1RuntimeConfig(rawConfig, options);
-				if (isPlainObject(options.resultState)) {
-					options.resultState.config = result.config;
-					options.resultState.version = result.version;
-					options.resultState.projection = result.projection;
-				}
-				return result.config;
-			}
-			const saved = await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, options));
-			if (mode === "shadow") {
-				const db = options.db || getD1Binding(options.env);
-				if (db) try {
-					let current = await kernel.readD1CurrentConfigVersion(db);
-					if (!current) current = await kernel.bootstrapD1ConfigVersion(db, saved, { source: "shadow_bootstrap" });
-					if (current.contentHash !== hashStableText(serializeConfigValue(saved))) await kernel.appendD1ConfigVersion(db, saved, {
-						expectedConfigRevision: current.revision,
-						mutationId: options.mutationId,
-						source: "shadow",
-						section: options.snapshotMeta?.section,
-						actor: options.snapshotMeta?.actor
-					});
-				} catch (error) {
-					console.warn("[config.shadow.failed]", String(error?.code || "CONFIG_SHADOW_FAILED"));
-				}
-			}
-			return saved;
+			return await runKvDataMutation(options.kv || getKvBinding(options.env))(() => kernel.commitRuntimeConfig(rawConfig, {
+				...options,
+				forceKvCommit: true
+			}));
 		},
 		async prepareRuntimeConfigPersistence(rawConfig, options = {}) {
-			const { env, kv, ctx, snapshotMeta } = options;
+			const { env, kv, ctx } = options;
 			if (!kv) {
 				const error = /* @__PURE__ */ new Error("KV namespace is required to persist runtime config");
 				error.code = "KV_NOT_CONFIGURED";
@@ -14361,34 +13804,24 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 					previousConfig: prevConfig,
 					nextConfig
 				})).filter((plan) => plan.changed === true),
-				snapshotMeta,
 				ctx,
 				kv,
 				env
 			};
 		},
-		async buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta = {}) {
-			const diffEntries = getConfigDiffEntries(prevConfig, nextConfig);
-			const currentSnapshots = (await kernel.readStoredConfigSnapshotsStrict(kv)).map((snapshot) => redactConfigSnapshotSecrets(snapshot));
-			const nextSnapshots = diffEntries.length > 0 ? [kernel.createSyntheticConfigSnapshot(prevConfig, snapshotMeta, {
-				changedKeys: diffEntries.map((item) => item.key),
-				changeCount: diffEntries.length
-			}), ...currentSnapshots].slice(0, Config.Defaults.ConfigSnapshotLimit) : currentSnapshots.slice(0, Config.Defaults.ConfigSnapshotLimit);
+		async buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig) {
+			const legacySnapshotRecords = await kernel.readLegacyConfigSnapshotRecordsStrict(kv);
 			const configMeta = kernel.normalizeRevisionMeta(buildHashedMetaPayload(nextConfig));
-			const snapshotsMeta = kernel.normalizeRevisionMeta({
-				...buildHashedMetaPayload(nextSnapshots),
-				count: nextSnapshots.length
-			}, { count: 0 });
 			const mutationPlan = [
 				{
-					type: "put",
+					type: "delete",
 					key: kernel.CONFIG_SNAPSHOTS_KEY,
-					value: JSON.stringify(nextSnapshots)
+					value: ""
 				},
 				{
-					type: "put",
+					type: "delete",
 					key: kernel.CONFIG_SNAPSHOTS_META_KEY,
-					value: JSON.stringify(snapshotsMeta)
+					value: ""
 				},
 				{
 					type: "put",
@@ -14406,8 +13839,8 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 				key,
 				value: ""
 			});
-			const previouslyReferencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(prevConfig, currentSnapshots);
-			const retainedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(nextConfig, nextSnapshots);
+			const previouslyReferencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(prevConfig, legacySnapshotRecords);
+			const retainedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(nextConfig, []);
 			for (const revision of previouslyReferencedRevisions) {
 				if (retainedRevisions.has(revision)) continue;
 				mutationPlan.push({
@@ -14419,16 +13852,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			return mutationPlan;
 		},
 		async commitRuntimeConfig(rawConfig, options = {}) {
-			if (kernel.normalizeConfigAuthorityMode(options.env) === "d1" && options.forceKvCommit !== true) {
-				const result = await kernel.commitD1RuntimeConfig(rawConfig, options);
-				if (isPlainObject(options.resultState)) {
-					options.resultState.config = result.config;
-					options.resultState.version = result.version;
-					options.resultState.projection = result.projection;
-				}
-				return result.config;
-			}
-			const { prevConfig, nextConfig, configuredHost, dnsPlans, snapshotMeta, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
+			const { prevConfig, nextConfig, configuredHost, dnsPlans, ctx, kv, env } = await kernel.prepareRuntimeConfigPersistence(rawConfig, options);
 			assertExpectedRuntimeConfigRevision(options.expectedConfigRevision, prevConfig);
 			if (serializeConfigValue(prevConfig) === serializeConfigValue(nextConfig)) {
 				await kernel.ensureConfigMeta(kv, nextConfig, { ctx });
@@ -14451,7 +13875,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 					activeDnsPlan = null;
 				}
 				configMutationStarted = true;
-				const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig, snapshotMeta);
+				const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(kv, prevConfig, nextConfig);
 				await kernel.applyKvMutationsWithRollback(kv, mutationPlan);
 				if (env) primeRuntimeConfigCache(env, nextConfig);
 				else invalidateRuntimeConfigCache();
@@ -14508,14 +13932,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			}, {
 				env,
 				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "sync_node_shortcut_selections",
-					section: "proxy",
-					source: String(options.source || "node_mutation"),
-					actor: "admin",
-					note: String(options.note || "").trim()
-				}
+				ctx
 			});
 		},
 		async commitSingleNodeMainVideoStreamShortcutShadowWithinMutation(env, kv, ctx, options = {}) {
@@ -14536,14 +13953,7 @@ function defineConfigPersistenceMethods(dependencies = {}, kernel = {}) {
 			}, {
 				env,
 				kv,
-				ctx,
-				snapshotMeta: {
-					reason: "sync_main_video_stream_shortcuts",
-					section: "proxy",
-					source: String(options.source || "node_save"),
-					actor: "admin",
-					note: String(options.note || nodeName || "").trim()
-				}
+				ctx
 			});
 		}
 	};
@@ -15090,14 +14500,12 @@ var ScheduledMaintenanceFacade = class {
 					d1Tidy: {},
 					cleanup: {},
 					kvTidy: {},
-					configProjection: {},
 					tgDailyReport: {},
 					alerts: {}
 				};
 				const nowIso = () => makeScheduledIso(/* @__PURE__ */ new Date());
 				try {
 					const config = runtimeConfig || {};
-					scheduledState.configProjection = await scheduledNonCritical(this.service.reconcileD1ConfigProjection(env, { db, kv }), "reconcile_config_projection", null, { status: "failed" });
 					const previousScheduledStatus = await scheduledNonCritical(this.service.getOpsStatusSection(env, "scheduled"), "read_previous_status", null, {});
 					if (db) try {
 						await ensureLeaseActive();
@@ -16485,6 +15893,7 @@ function buildLogQueryPlanner(dependencies = {}) {
 					useFtsKeyword = true;
 				} else {
 					const likeKeyword = `%${escapeSqlLike(keyword)}%`;
+					if (getUtf8ByteLength(likeKeyword) > D1_LIKE_PATTERN_MAX_BYTES) return { errorResponse: jsonError("LOG_QUERY_KEYWORD_TOO_LONG", "LIKE 搜索关键词过长", 400, { maxPatternBytes: D1_LIKE_PATTERN_MAX_BYTES }) };
 					const likeClauses = [
 						"proxy_logs.node_name LIKE ? ESCAPE '\\'",
 						"proxy_logs.request_path LIKE ? ESCAPE '\\'",
@@ -16635,7 +16044,6 @@ function buildLogger(dependencies = {}) {
 				if (logState.LogFlushTask === flushTask) logState.LogFlushTask = null;
 				logState.LogFlushPending = false;
 				logState.LogLastFlushAt = nowMs();
-				if (logState.LogQueue.length > 0) logger.scheduleFlush(env, ctx);
 			});
 			logState.LogFlushTask = flushTask;
 			ctx.waitUntil(flushTask);
@@ -16797,17 +16205,26 @@ function buildLogger(dependencies = {}) {
 					if (!chunk.length) continue;
 					activeBatchSize = chunk.length;
 					activeBatchWrittenCount = 0;
-					const statements = chunk.map((item) => db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, inbound_colo, outbound_colo, user_agent, referer, category, error_detail, detail_json, created_at)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-            WHERE ? > COALESCE((
-              SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
-              FROM ${SYS_STATUS_TABLE$1}
-              WHERE scope = ?
-              LIMIT 1
-            ), 0)`).bind(item.timestamp, item.nodeName, item.requestPath, item.requestMethod, item.statusCode, item.responseTime, item.clientIp, item.inboundColo, item.outboundColo, item.userAgent, item.referer, item.category, item.errorDetail, item.detailJson, item.createdAt, item.timestamp, logScope));
+					const payload = JSON.stringify(chunk);
+					if (getUtf8ByteLength(payload) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) throw createD1SerializedValueTooLargeError("proxy_logs.batch", payload);
+					const statement = db.prepare(`INSERT INTO proxy_logs (timestamp, node_name, request_path, request_method, status_code, response_time, client_ip, inbound_colo, outbound_colo, user_agent, referer, category, error_detail, detail_json, created_at)
+						SELECT
+							CAST(json_extract(entry.value, '$.timestamp') AS INTEGER),
+							json_extract(entry.value, '$.nodeName'), json_extract(entry.value, '$.requestPath'), json_extract(entry.value, '$.requestMethod'),
+							CAST(json_extract(entry.value, '$.statusCode') AS INTEGER), CAST(json_extract(entry.value, '$.responseTime') AS INTEGER),
+							json_extract(entry.value, '$.clientIp'), json_extract(entry.value, '$.inboundColo'), json_extract(entry.value, '$.outboundColo'),
+							json_extract(entry.value, '$.userAgent'), json_extract(entry.value, '$.referer'), json_extract(entry.value, '$.category'),
+							json_extract(entry.value, '$.errorDetail'), json_extract(entry.value, '$.detailJson'), json_extract(entry.value, '$.createdAt')
+						FROM json_each(?) AS entry
+						WHERE CAST(json_extract(entry.value, '$.timestamp') AS INTEGER) > COALESCE((
+							SELECT CAST(json_extract(payload, '$.clearEpochMs') AS INTEGER)
+							FROM ${SYS_STATUS_TABLE$1}
+							WHERE scope = ?
+							LIMIT 1
+						), 0)`).bind(payload, logScope);
 					let attempt = 0;
 					while (true) try {
-						await db.batch(statements);
+						await statement.run();
 						break;
 					} catch (error) {
 						if (attempt >= maxRetryCount) throw error;
@@ -16906,8 +16323,10 @@ function defineDatabaseStatusMethods(dependencies = {}) {
 		async putOpsStatusPayloadToDb(db, scope, payload, updatedAtMs) {
 			if (!db || !scope || !payload || typeof payload !== "object") return false;
 			if (!await statusPersistence.ensureSysStatusTable(db)) return false;
+			const payloadText = JSON.stringify(payload);
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return false;
 			await db.prepare(`INSERT INTO ${SYS_STATUS_TABLE} (scope, payload, updated_at) VALUES (?, ?, ?)
-        ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`).bind(scope, JSON.stringify(payload), Number(updatedAtMs) || nowMs()).run();
+		ON CONFLICT(scope) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at`).bind(scope, payloadText, Number(updatedAtMs) || nowMs()).run();
 			statusPersistence.cacheOpsStatusPayload(db, scope, payload);
 			return true;
 		},
@@ -21254,19 +20673,21 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 			})).filter((row) => row.bucketDate);
 			if (!rows.length) return true;
 			const updatedAt = (/* @__PURE__ */ new Date()).toISOString();
-			const statements = rows.map((row) => db.prepare(`INSERT INTO ${kernel.STATS_HOURLY_TABLE} (
-            bucket_date, bucket_hour, request_count, play_count, playback_info_count, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?)
-          ON CONFLICT(bucket_date, bucket_hour) DO UPDATE SET
-            request_count = ${kernel.STATS_HOURLY_TABLE}.request_count + excluded.request_count,
-            play_count = ${kernel.STATS_HOURLY_TABLE}.play_count + excluded.play_count,
-            playback_info_count = ${kernel.STATS_HOURLY_TABLE}.playback_info_count + excluded.playback_info_count,
-            updated_at = excluded.updated_at`).bind(row.bucketDate, row.bucketHour, row.requestCount, row.playCount, row.playbackInfoCount, updatedAt));
-			if (options.useBatch === false) for (const statement of statements) await statement.run();
-			else {
-				const batchSize = 50;
-				for (let index = 0; index < statements.length; index += batchSize) await db.batch(statements.slice(index, index + batchSize));
-			}
+			const payload = assertD1SerializedValueFits("proxy_stats_hourly.batch", JSON.stringify(rows));
+			const statement = db.prepare(`INSERT INTO ${kernel.STATS_HOURLY_TABLE} (
+				bucket_date, bucket_hour, request_count, play_count, playback_info_count, updated_at
+			)
+			SELECT json_extract(entry.value, '$.bucketDate'), CAST(json_extract(entry.value, '$.bucketHour') AS INTEGER),
+				CAST(json_extract(entry.value, '$.requestCount') AS INTEGER), CAST(json_extract(entry.value, '$.playCount') AS INTEGER),
+				CAST(json_extract(entry.value, '$.playbackInfoCount') AS INTEGER), ?
+			FROM json_each(?) AS entry
+			WHERE 1
+			ON CONFLICT(bucket_date, bucket_hour) DO UPDATE SET
+				request_count = ${kernel.STATS_HOURLY_TABLE}.request_count + excluded.request_count,
+				play_count = ${kernel.STATS_HOURLY_TABLE}.play_count + excluded.play_count,
+				playback_info_count = ${kernel.STATS_HOURLY_TABLE}.playback_info_count + excluded.playback_info_count,
+				updated_at = excluded.updated_at`).bind(updatedAt, payload);
+			await statement.run();
 			return true;
 		},
 		async clearStatsHourly(db) {
@@ -21386,7 +20807,7 @@ function defineAnalyticsStatsMethods(dependencies = {}, kernel = {}) {
 				recreated: false
 			};
 			const forceRecreate = options.forceRecreate === true;
-			await kernel.ensureLogsBaseSchema(db);
+			if (options.baseSchemaReady !== true) await kernel.ensureLogsBaseSchema(db);
 			const readiness = await kernel.getLogsFtsReadiness(db);
 			if (readiness.ready && !forceRecreate) return {
 				migratedRows: 0,
@@ -21553,17 +20974,41 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			}
 			const normalizedItems = [...deduped.values()];
 			if (!normalizedItems.length) return [];
-			const statements = normalizedItems.map((item) => db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_ITEMS_TABLE} (
+			const payload = JSON.stringify(normalizedItems.map((item) => ({
+				id: item.id,
+				ip: item.ip,
+				ipType: item.ipType,
+				sourceKind: item.sourceKind,
+				sourceLabel: item.sourceLabel,
+				lineLabel: item.lineLabel,
+				remark: item.remark,
+				createdAt: item.createdAt,
+				updatedAt: item.updatedAt
+			})));
+			assertD1SerializedValueFits("dns_ip_pool_items.batch", payload);
+			const statement = db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_ITEMS_TABLE} (
             id, ip, ip_type, source_kind, source_label, line_label, remark, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          )
+          SELECT
+            json_extract(entry.value, '$.id'),
+            json_extract(entry.value, '$.ip'),
+            json_extract(entry.value, '$.ipType'),
+            json_extract(entry.value, '$.sourceKind'),
+            json_extract(entry.value, '$.sourceLabel'),
+            json_extract(entry.value, '$.lineLabel'),
+            json_extract(entry.value, '$.remark'),
+            json_extract(entry.value, '$.createdAt'),
+            json_extract(entry.value, '$.updatedAt')
+          FROM json_each(?) AS entry
+          WHERE 1
           ON CONFLICT(ip) DO UPDATE SET
             ip_type = excluded.ip_type,
             source_kind = excluded.source_kind,
             source_label = excluded.source_label,
             line_label = CASE WHEN COALESCE(excluded.line_label, '') != '' THEN excluded.line_label ELSE ${kernel.DNS_IP_POOL_ITEMS_TABLE}.line_label END,
             remark = CASE WHEN COALESCE(excluded.remark, '') != '' THEN excluded.remark ELSE ${kernel.DNS_IP_POOL_ITEMS_TABLE}.remark END,
-            updated_at = excluded.updated_at`).bind(item.id, item.ip, item.ipType, item.sourceKind, item.sourceLabel, item.lineLabel, item.remark, item.createdAt, item.updatedAt));
-			await db.batch(statements);
+            updated_at = excluded.updated_at`).bind(payload);
+			await db.batch([statement]);
 			return normalizedItems;
 		},
 		async deleteDnsIpPoolItems(db, ips = []) {
@@ -21571,14 +21016,17 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			await kernel.ensureDnsIpWorkspaceSchema(db);
 			const normalizedIps = [...new Set((Array.isArray(ips) ? ips : []).map((item) => String(item || "").trim()).filter((ip) => detectIpType(ip)))];
 			if (!normalizedIps.length) return 0;
-			const statements = normalizedIps.flatMap((ip) => [db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_ITEMS_TABLE} WHERE ip = ?`).bind(ip), db.prepare(`DELETE FROM ${kernel.DNS_IP_PROBE_CACHE_TABLE} WHERE ip = ?`).bind(ip)]);
-			const batchSize = 50;
-			for (let index = 0; index < statements.length; index += batchSize) await db.batch(statements.slice(index, index + batchSize));
+			const payload = JSON.stringify(normalizedIps);
+			assertD1SerializedValueFits("dns_ip_pool_items.delete_batch", payload);
+			await db.batch([
+				db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_ITEMS_TABLE} WHERE ip IN (SELECT value FROM json_each(?))`).bind(payload),
+				db.prepare(`DELETE FROM ${kernel.DNS_IP_PROBE_CACHE_TABLE} WHERE ip IN (SELECT value FROM json_each(?))`).bind(payload)
+			]);
 			return normalizedIps.length;
 		},
-		async getDnsIpPoolSourcesFromDb(db) {
+		async getDnsIpPoolSourcesFromDb(db, options = {}) {
 			if (!db) return [];
-			await kernel.ensureDnsIpWorkspaceSchema(db);
+			if (options.schemaReady !== true) await kernel.ensureDnsIpWorkspaceSchema(db);
 			try {
 				const result = await db.prepare(`SELECT id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
               FROM ${kernel.DNS_IP_POOL_SOURCES_TABLE}
@@ -21610,9 +21058,47 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			if (!db) throw new Error("D1 not configured");
 			await kernel.ensureDnsIpWorkspaceSchema(db);
 			const statements = [db.prepare(`DELETE FROM ${kernel.DNS_IP_POOL_SOURCES_TABLE}`)];
-			statements.push(...normalizedSources.map((source) => db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_SOURCES_TABLE} (
+			if (normalizedSources.length) {
+				const payload = JSON.stringify(normalizedSources.map((source) => ({
+					id: source.id,
+					name: source.name,
+					url: source.url,
+					sourceType: source.sourceType,
+					domain: source.domain,
+					sourceKind: source.sourceKind,
+					presetId: source.presetId,
+					builtinId: source.builtinId,
+					enabled: source.enabled ? 1 : 0,
+					sortOrder: source.sortOrder,
+					ipLimit: source.ipLimit,
+					lastFetchAt: source.lastFetchAt,
+					lastFetchStatus: source.lastFetchStatus,
+					lastFetchCount: source.lastFetchCount,
+					createdAt: source.createdAt,
+					updatedAt: source.updatedAt
+				})));
+				assertD1SerializedValueFits("dns_ip_pool_sources.batch", payload);
+				statements.push(db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_SOURCES_TABLE} (
             id, name, url, source_type, domain, source_kind, preset_id, builtin_id, enabled, sort_order, ip_limit, last_fetch_at, last_fetch_status, last_fetch_count, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(source.id, source.name, source.url, source.sourceType, source.domain, source.sourceKind, source.presetId, source.builtinId, source.enabled ? 1 : 0, source.sortOrder, source.ipLimit, source.lastFetchAt, source.lastFetchStatus, source.lastFetchCount, source.createdAt, source.updatedAt)));
+          ) SELECT
+            json_extract(entry.value, '$.id'),
+            json_extract(entry.value, '$.name'),
+            json_extract(entry.value, '$.url'),
+            json_extract(entry.value, '$.sourceType'),
+            json_extract(entry.value, '$.domain'),
+            json_extract(entry.value, '$.sourceKind'),
+            json_extract(entry.value, '$.presetId'),
+            json_extract(entry.value, '$.builtinId'),
+            json_extract(entry.value, '$.enabled'),
+            json_extract(entry.value, '$.sortOrder'),
+            json_extract(entry.value, '$.ipLimit'),
+            json_extract(entry.value, '$.lastFetchAt'),
+            json_extract(entry.value, '$.lastFetchStatus'),
+            json_extract(entry.value, '$.lastFetchCount'),
+            json_extract(entry.value, '$.createdAt'),
+            json_extract(entry.value, '$.updatedAt')
+          FROM json_each(?) AS entry`).bind(payload));
+			}
 			await db.batch(statements);
 			return normalizedSources;
 		},
@@ -21666,6 +21152,9 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 			const updatedAt = String(entry?.updatedAt || entry?.updated_at || new Date(cachedAtMs).toISOString());
 			const importedCount = Math.max(0, Number(entry?.importedCount ?? entry?.imported_count) || items.length);
 			const enabledSourceCount = Math.max(0, Number(entry?.enabledSourceCount ?? entry?.enabled_source_count) || 0);
+			const itemsJson = JSON.stringify(items);
+			const sourceResultsJson = JSON.stringify(sourceResults);
+			if (getUtf8ByteLength(itemsJson) + getUtf8ByteLength(sourceResultsJson) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.DNS_IP_POOL_FETCH_CACHE_TABLE} (
             signature, items_json, source_results_json, imported_count, enabled_source_count, cached_at, expires_at, created_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -21676,7 +21165,7 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
             enabled_source_count = excluded.enabled_source_count,
             cached_at = excluded.cached_at,
             expires_at = excluded.expires_at,
-            updated_at = excluded.updated_at`).bind(signature, JSON.stringify(items), JSON.stringify(sourceResults), importedCount, enabledSourceCount, cachedAtMs, expiresAtMs, createdAt, updatedAt).run();
+				updated_at = excluded.updated_at`).bind(signature, itemsJson, sourceResultsJson, importedCount, enabledSourceCount, cachedAtMs, expiresAtMs, createdAt, updatedAt).run();
 			return {
 				signature,
 				items,
@@ -21749,19 +21238,42 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
 				expiresAt: Math.max(0, Number(row?.expires_at) || 0)
 			}));
 		},
-		async upsertDnsIpProbeCacheEntry(db, entry = {}) {
-			if (!db) return null;
+		async upsertDnsIpProbeCacheEntries(db, entries = []) {
+			if (!db) return [];
 			await kernel.ensureDnsIpWorkspaceSchema(db);
-			const ip = String(entry?.ip || "").trim();
-			const entryColo = String(entry?.entryColo || entry?.entry_colo || "").trim().toUpperCase();
-			const probeStatus = normalizeDnsIpProbeStatus(entry?.probeStatus || entry?.probe_status || "");
-			if (!ip || !entryColo) return null;
-			const expiresAt = Math.max(nowMs(), Number(entry?.expiresAt ?? entry?.expires_at) || 0);
-			const probedAt = String(entry?.probedAt || entry?.probed_at || (/* @__PURE__ */ new Date()).toISOString());
+			const normalizedEntries = (Array.isArray(entries) ? entries : []).map((entry) => ({
+				ip: String(entry?.ip || "").trim(),
+				entryColo: String(entry?.entryColo || entry?.entry_colo || "").trim().toUpperCase(),
+				probeStatus: normalizeDnsIpProbeStatus(entry?.probeStatus || entry?.probe_status || ""),
+				latencyMs: Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null,
+				cfRay: String(entry?.cfRay || entry?.cf_ray || ""),
+				coloCode: String(entry?.coloCode || entry?.colo_code || "").toUpperCase(),
+				cityName: String(entry?.cityName || entry?.city_name || ""),
+				countryCode: String(entry?.countryCode || entry?.country_code || "").toUpperCase(),
+				countryName: String(entry?.countryName || entry?.country_name || ""),
+				probedAt: String(entry?.probedAt || entry?.probed_at || (/* @__PURE__ */ new Date()).toISOString()),
+				expiresAt: Math.max(nowMs(), Number(entry?.expiresAt ?? entry?.expires_at) || 0)
+			})).filter((entry) => detectIpType(entry.ip) && entry.entryColo);
+			if (!normalizedEntries.length) return [];
+			const payload = JSON.stringify(normalizedEntries);
+			if (getUtf8ByteLength(payload) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return [];
 			await db.prepare(`INSERT INTO ${kernel.DNS_IP_PROBE_CACHE_TABLE} (
-            ip, entry_colo, probe_status, latency_ms, cf_ray, colo_code, city_name, country_code, country_name, probed_at, expires_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(ip, entry_colo) DO UPDATE SET
+				ip, entry_colo, probe_status, latency_ms, cf_ray, colo_code, city_name, country_code, country_name, probed_at, expires_at
+			) SELECT
+				json_extract(entry.value, '$.ip'),
+				json_extract(entry.value, '$.entryColo'),
+				json_extract(entry.value, '$.probeStatus'),
+				json_extract(entry.value, '$.latencyMs'),
+				json_extract(entry.value, '$.cfRay'),
+				json_extract(entry.value, '$.coloCode'),
+				json_extract(entry.value, '$.cityName'),
+				json_extract(entry.value, '$.countryCode'),
+				json_extract(entry.value, '$.countryName'),
+				json_extract(entry.value, '$.probedAt'),
+				json_extract(entry.value, '$.expiresAt')
+			FROM json_each(?) AS entry
+			WHERE 1
+			ON CONFLICT(ip, entry_colo) DO UPDATE SET
             probe_status = excluded.probe_status,
             latency_ms = excluded.latency_ms,
             cf_ray = excluded.cf_ray,
@@ -21770,20 +21282,12 @@ function defineAnalyticsDnsMethods(dependencies = {}, kernel = {}) {
             country_code = excluded.country_code,
             country_name = excluded.country_name,
             probed_at = excluded.probed_at,
-            expires_at = excluded.expires_at`).bind(ip, entryColo, probeStatus, Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null, String(entry?.cfRay || entry?.cf_ray || ""), String(entry?.coloCode || entry?.colo_code || "").toUpperCase(), String(entry?.cityName || entry?.city_name || ""), String(entry?.countryCode || entry?.country_code || "").toUpperCase(), String(entry?.countryName || entry?.country_name || ""), probedAt, expiresAt).run();
-			return {
-				ip,
-				entryColo,
-				probeStatus,
-				latencyMs: Number.isFinite(Number(entry?.latencyMs ?? entry?.latency_ms)) ? Math.round(Number(entry?.latencyMs ?? entry?.latency_ms)) : null,
-				cfRay: String(entry?.cfRay || entry?.cf_ray || ""),
-				coloCode: String(entry?.coloCode || entry?.colo_code || "").toUpperCase(),
-				cityName: String(entry?.cityName || entry?.city_name || ""),
-				countryCode: String(entry?.countryCode || entry?.country_code || "").toUpperCase(),
-				countryName: String(entry?.countryName || entry?.country_name || ""),
-				probedAt,
-				expiresAt
-			};
+				expires_at = excluded.expires_at`).bind(payload).run();
+			return normalizedEntries;
+		},
+		async upsertDnsIpProbeCacheEntry(db, entry = {}) {
+			const entries = await kernel.upsertDnsIpProbeCacheEntries(db, [entry]);
+			return entries[0] || null;
 		}
 	};
 }
@@ -22090,6 +21594,7 @@ function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 			const expiresAt = Math.max(cachedAt, Number(entry?.expiresAt) || cachedAt);
 			const updatedAt = Math.max(cachedAt, Number(entry?.updatedAt) || cachedAt);
 			const payloadText = JSON.stringify(sanitizeDashboardSnapshotPayload(entry?.payload || {}));
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.CF_DASH_CACHE_TABLE} (
             cache_key, zone_id, bucket_date, payload, version, cached_at, expires_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -22219,6 +21724,7 @@ function defineAnalyticsCacheMethods(dependencies = {}, kernel = {}) {
 			const expiresAt = Math.max(cachedAt, Number(entry?.expiresAt) || cachedAt);
 			const updatedAt = Math.max(cachedAt, Number(entry?.updatedAt) || cachedAt);
 			const payloadText = JSON.stringify(entry?.payload ?? {});
+			if (getUtf8ByteLength(payloadText) > D1_SAFE_SERIALIZED_VALUE_MAX_BYTES) return null;
 			await db.prepare(`INSERT INTO ${kernel.CF_RUNTIME_CACHE_TABLE} (
             cache_key, cache_group, resource_id, payload, cached_at, expires_at, updated_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -23205,7 +22711,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				[kernel.D1_SCHEMA_META_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, contract_version INTEGER NOT NULL, contract_hash TEXT NOT NULL, schema_fingerprint TEXT NOT NULL, schema_cookie INTEGER NOT NULL, last_plan_hash TEXT NOT NULL, verified_at TEXT NOT NULL, attestation TEXT NOT NULL, migration_owner TEXT, lease_expires_at INTEGER)`,
 				[kernel.SYS_STATUS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.SCHEDULED_LOCKS_TABLE]: `${createTable} ${target} (scope TEXT PRIMARY KEY, token TEXT NOT NULL, owner TEXT NOT NULL, acquired_at INTEGER NOT NULL, renewed_at INTEGER, expires_at INTEGER NOT NULL)`,
-				[kernel.CONFIG_VERSIONS_TABLE]: `${createTable} ${target} (parent_revision TEXT PRIMARY KEY, revision TEXT NOT NULL, sequence INTEGER NOT NULL, content_hash TEXT NOT NULL, payload TEXT NOT NULL, mutation_id TEXT NOT NULL, source TEXT NOT NULL, section TEXT NOT NULL, actor TEXT NOT NULL, created_at INTEGER NOT NULL, projected_at INTEGER, projection_attempts INTEGER NOT NULL DEFAULT 0, projection_error TEXT)`,
 				[kernel.AUTH_FAILURES_TABLE]: `${createTable} ${target} (ip TEXT PRIMARY KEY, fail_count INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.CF_DASH_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, zone_id TEXT NOT NULL, bucket_date TEXT NOT NULL, payload TEXT NOT NULL, version INTEGER NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
 				[kernel.CF_RUNTIME_CACHE_TABLE]: `${createTable} ${target} (cache_key TEXT PRIMARY KEY, cache_group TEXT NOT NULL, resource_id TEXT NOT NULL, payload TEXT NOT NULL, cached_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)`,
@@ -23245,8 +22750,9 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			}));
 		},
 		async getD1SchemaCookie(db) {
-			const row = await db.prepare("PRAGMA schema_version").first();
-			return Math.max(0, Number(row?.schema_version) || 0);
+			// D1 rejects PRAGMA schema_version with SQLITE_AUTH. Keep the legacy
+			// response field stable while schema changes are detected by fingerprint.
+			return 0;
 		},
 		buildD1SchemaAttestationPayload(meta = {}) {
 			return serializeConfigValue({
@@ -23280,13 +22786,15 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			if (String(meta.contract_hash || "") !== kernel.getD1ContractHash()) return { valid: false, reason: "contract_hash_mismatch", meta };
 			const schemaCookie = await kernel.getD1SchemaCookie(db);
 			if (Math.max(0, Number(meta.schema_cookie) || 0) !== schemaCookie) return { valid: false, reason: "schema_cookie_changed", meta, schemaCookie };
+			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			if (String(meta.schema_fingerprint || "") !== schemaFingerprint) return { valid: false, reason: "schema_fingerprint_changed", meta, schemaCookie, schemaFingerprint };
 			const expected = await kernel.signD1SchemaAttestation(env, meta);
 			if (!expected || expected !== String(meta.attestation || "")) return { valid: false, reason: "invalid_attestation", meta, schemaCookie };
-			return { valid: true, meta, schemaCookie };
+			return { valid: true, meta, schemaCookie, schemaFingerprint };
 		},
 		async writeVerifiedD1SchemaMeta(db, env, plan = {}) {
 			const contractHash = kernel.getD1ContractHash();
-			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			const schemaFingerprint = String(plan?.schemaFingerprint || "") || await kernel.getD1SchemaFingerprint(db);
 			const schemaCookie = await kernel.getD1SchemaCookie(db);
 			const verifiedAt = (/* @__PURE__ */ new Date()).toISOString();
 			const values = {
@@ -23331,21 +22839,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 		},
 		getD1RuntimeIndexContract() {
 			return {
-				idx_runtime_config_versions_sequence: {
-					table: kernel.CONFIG_VERSIONS_TABLE,
-					columns: ["sequence"],
-					createSql: `CREATE INDEX idx_runtime_config_versions_sequence ON ${kernel.CONFIG_VERSIONS_TABLE} (sequence DESC)`
-				},
-				idx_runtime_config_versions_revision: {
-					table: kernel.CONFIG_VERSIONS_TABLE,
-					columns: ["revision"],
-					createSql: `CREATE INDEX idx_runtime_config_versions_revision ON ${kernel.CONFIG_VERSIONS_TABLE} (revision)`
-				},
-				idx_runtime_config_versions_mutation: {
-					table: kernel.CONFIG_VERSIONS_TABLE,
-					columns: ["mutation_id"],
-					createSql: `CREATE INDEX idx_runtime_config_versions_mutation ON ${kernel.CONFIG_VERSIONS_TABLE} (mutation_id)`
-				},
 				idx_sys_locks_expires_at: {
 					table: kernel.SCHEDULED_LOCKS_TABLE,
 					columns: ["expires_at"],
@@ -23440,20 +22933,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 					acquired_at: "INTEGER NOT NULL DEFAULT 0",
 					renewed_at: "INTEGER",
 					expires_at: "INTEGER NOT NULL DEFAULT 0"
-				},
-				[kernel.CONFIG_VERSIONS_TABLE]: {
-					revision: "TEXT NOT NULL DEFAULT ''",
-					sequence: "INTEGER NOT NULL DEFAULT 0",
-					content_hash: "TEXT NOT NULL DEFAULT ''",
-					payload: "TEXT NOT NULL DEFAULT '{}'",
-					mutation_id: "TEXT NOT NULL DEFAULT ''",
-					source: "TEXT NOT NULL DEFAULT ''",
-					section: "TEXT NOT NULL DEFAULT ''",
-					actor: "TEXT NOT NULL DEFAULT ''",
-					created_at: "INTEGER NOT NULL DEFAULT 0",
-					projected_at: "INTEGER",
-					projection_attempts: "INTEGER NOT NULL DEFAULT 0",
-					projection_error: "TEXT"
 				},
 				[kernel.AUTH_FAILURES_TABLE]: {
 					fail_count: "INTEGER NOT NULL DEFAULT 0",
@@ -23557,7 +23036,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				[kernel.D1_SCHEMA_META_TABLE]: ["scope"],
 				[kernel.SYS_STATUS_TABLE]: ["scope"],
 				[kernel.SCHEDULED_LOCKS_TABLE]: ["scope"],
-				[kernel.CONFIG_VERSIONS_TABLE]: ["parent_revision"],
 				[kernel.AUTH_FAILURES_TABLE]: ["ip"],
 				[kernel.CF_DASH_CACHE_TABLE]: ["cache_key"],
 				[kernel.CF_RUNTIME_CACHE_TABLE]: ["cache_key"],
@@ -23641,16 +23119,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			if (currentMeta.hash === nextMeta.hash && currentMeta.revision) return currentMeta;
 			return await kernel.writeRevisionMeta(kv, kernel.CONFIG_META_KEY, nextMeta, options.ctx);
 		},
-		async ensureConfigSnapshotsMeta(kv, snapshots = null, options = {}) {
-			const nextSnapshots = Array.isArray(snapshots) ? snapshots : await kernel.readStoredConfigSnapshots(kv);
-			const nextMeta = kernel.normalizeRevisionMeta({
-				...buildHashedMetaPayload(nextSnapshots),
-				count: nextSnapshots.length
-			}, { count: 0 });
-			const currentMeta = await kernel.readRevisionMeta(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 });
-			if (currentMeta.hash === nextMeta.hash && Number(currentMeta.count) === Number(nextMeta.count) && currentMeta.revision) return currentMeta;
-			return await kernel.writeRevisionMeta(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, nextMeta, options.ctx);
-		},
 		buildNodesIndexMeta(index = [], nodes = [], options = {}) {
 			const normalizedIndex = kernel.normalizeNodeIndex(index);
 			const normalizedNodes = kernel.normalizeNodeSummaryIndex(nodes).nodes;
@@ -23733,14 +23201,13 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			const resolvedStores = kernel.resolveOpsStatusStores(stores);
 			const kv = resolvedStores.kv;
 			const db = resolvedStores.db;
-			const [configMeta, nodesMeta, snapshotsMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
+			const [configMeta, nodesMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
 				kernel.ensureConfigMeta(kv, options.config, { ctx: options.ctx }),
 				kernel.ensureNodesIndexMeta(kv, {
 					ctx: options.ctx,
 					index: options.nodes?.map?.((node) => node?.name),
 					nodes: options.nodes
 				}),
-				kernel.ensureConfigSnapshotsMeta(kv, options.snapshots, { ctx: options.ctx }),
 				kernel.getOpsStatusSection({
 					kv,
 					db
@@ -23753,7 +23220,6 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			return {
 				configRevision: String(configMeta?.revision || ""),
 				nodesRevision: String(nodesMeta?.revision || ""),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
 				logsRevision: kernel.getLogsRevisionFromStatus(logStatus),
 				dnsIpPoolRevision: kernel.getDnsIpPoolRevisionFromStatus(dnsIpPoolStatus)
 			};
@@ -23762,14 +23228,13 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 			const resolvedStores = kernel.resolveOpsStatusStores(stores);
 			const kv = resolvedStores.kv;
 			const db = resolvedStores.db;
-			const [storedConfigMeta, storedNodesMeta, storedSnapshotsMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
+			const [storedConfigMeta, storedNodesMeta, logStatus, dnsIpPoolStatus] = await Promise.all([
 				kernel.readRevisionMetaForRead(kv, kernel.CONFIG_META_KEY),
 				kernel.readRevisionMetaForRead(kv, kernel.NODES_INDEX_META_KEY, {
 					count: 0,
 					indexHash: "",
 					fullIndexHash: ""
 				}),
-				kernel.readRevisionMetaForRead(kv, kernel.CONFIG_SNAPSHOTS_META_KEY, { count: 0 }),
 				kernel.getOpsStatusSection({
 					kv,
 					db
@@ -23790,18 +23255,9 @@ function defineSchemaRevisionMethods(dependencies = {}, kernel = {}) {
 				const nodes = Array.isArray(options.nodes) ? options.nodes : await kernel.getNodesSummaryIndexStrict(kv, { ctx: options.ctx });
 				nodesMeta = kernel.buildNodesIndexMeta((Array.isArray(nodes) ? nodes : []).map((node) => node?.name), Array.isArray(nodes) ? nodes : []);
 			}
-			let snapshotsMeta = storedSnapshotsMeta;
-			if (!snapshotsMeta) {
-				const snapshots = Array.isArray(options.snapshots) ? options.snapshots : await kernel.readStoredConfigSnapshotsStrict(kv);
-				snapshotsMeta = kernel.normalizeRevisionMeta({
-					...buildHashedMetaPayload(Array.isArray(snapshots) ? snapshots : []),
-					count: Array.isArray(snapshots) ? snapshots.length : 0
-				}, { count: 0 });
-			}
 			return {
 				configRevision: String(configMeta?.revision || ""),
 				nodesRevision: String(nodesMeta?.revision || ""),
-				snapshotsRevision: String(snapshotsMeta?.revision || ""),
 				logsRevision: kernel.getLogsRevisionFromStatus(logStatus),
 				dnsIpPoolRevision: kernel.getDnsIpPoolRevisionFromStatus(dnsIpPoolStatus)
 			};
@@ -23956,13 +23412,40 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 			const rows = await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all();
 			return new Set((rows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
 		},
+		async getD1SchemaSnapshot(db) {
+			if (!db) return { objects: [], columns: [], indexes: [] };
+			const contractTables = Object.keys(kernel.getD1CurrentSchemaContract().columns);
+			const inspectedTables = [...contractTables, kernel.LOGS_FTS_TABLE];
+			const placeholders = inspectedTables.map(() => "?").join(", ");
+			const indexPlaceholders = contractTables.map(() => "?").join(", ");
+			const [objects, columns, indexes] = await Promise.all([
+				db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").all(),
+				db.prepare(`SELECT schema_table.name AS table_name, column_info.name, column_info.type, column_info."notnull" AS is_not_null,
+					column_info.dflt_value, column_info.pk, column_info.hidden
+					FROM sqlite_master AS schema_table
+					JOIN pragma_table_xinfo(schema_table.name) AS column_info
+					WHERE schema_table.type = 'table' AND schema_table.name IN (${placeholders})
+					ORDER BY schema_table.name, column_info.cid`).bind(...inspectedTables).all(),
+				db.prepare(`SELECT schema_index.tbl_name AS table_name, index_list.name AS index_name, index_list."unique" AS is_unique,
+					index_list.partial, index_list.origin, index_column.seqno, index_column.cid, index_column.name AS column_name, index_column."key" AS is_key
+					FROM sqlite_master AS schema_index
+					JOIN pragma_index_list(schema_index.tbl_name) AS index_list ON index_list.name = schema_index.name
+					JOIN pragma_index_xinfo(index_list.name) AS index_column
+					WHERE schema_index.type = 'index' AND schema_index.tbl_name IN (${indexPlaceholders})
+					ORDER BY schema_index.tbl_name, index_list.name, index_column.seqno`).bind(...contractTables).all()
+			]);
+			return {
+				objects: objects?.results || [],
+				columns: columns?.results || [],
+				indexes: indexes?.results || []
+			};
+		},
 		getD1CurrentSchemaContract() {
 			const primaryKeys = kernel.getD1RequiredPrimaryKeyContract();
 			const primaryKeyTypes = {
 				[kernel.D1_SCHEMA_META_TABLE]: { scope: "TEXT" },
 				[kernel.SYS_STATUS_TABLE]: { scope: "TEXT" },
 				[kernel.SCHEDULED_LOCKS_TABLE]: { scope: "TEXT" },
-				[kernel.CONFIG_VERSIONS_TABLE]: { parent_revision: "TEXT" },
 				[kernel.AUTH_FAILURES_TABLE]: { ip: "TEXT" },
 				[kernel.CF_DASH_CACHE_TABLE]: { cache_key: "TEXT" },
 				[kernel.CF_RUNTIME_CACHE_TABLE]: { cache_key: "TEXT" },
@@ -23993,28 +23476,41 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 		},
 		async getD1SchemaFingerprint(db) {
 			if (!db) return "";
-			const contract = kernel.getD1CurrentSchemaContract();
 			const schemaRows = (await db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name").all())?.results || [];
-			const columnState = {};
-			for (const tableName of Object.keys(contract.columns)) {
-				columnState[tableName] = (await kernel.getTableColumnDefinitions(db, tableName)).map((column) => ({
-					name: column.name,
-					type: column.type,
-					primaryKeyOrder: column.primaryKeyOrder,
-					hidden: column.hidden
-				}));
-			}
-			return hashStableText(serializeConfigValue({ schemaRows, columnState }));
+			return hashStableText(serializeConfigValue(schemaRows));
 		},
-		async getD1SchemaStatus(db) {
+		async getD1SchemaStatus(db, options = {}) {
 			if (!db) return { tables: {}, columns: {}, indexes: {}, constraints: { primaryKeys: {}, uniqueKeys: {} }, ftsReady: false, fts: {}, schemaReady: false, issues: ["db_not_configured"] };
 			const contract = kernel.getD1CurrentSchemaContract();
-			const [tableRows, indexRows] = await Promise.all([
-				db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(),
-				db.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all()
-			]);
-			const tableNames = new Set((tableRows?.results || []).map((row) => String(row?.name || "")).filter(Boolean));
-			const indexOwners = new Map((indexRows?.results || []).map((row) => [String(row?.name || ""), String(row?.tbl_name || "")]).filter(([name]) => name));
+			const snapshot = options.snapshot || await kernel.getD1SchemaSnapshot(db);
+			const objectRows = snapshot.objects || [];
+			const tableNames = new Set(objectRows.filter((row) => row?.type === "table").map((row) => String(row?.name || "")).filter(Boolean));
+			const indexRowsByName = new Map();
+			for (const row of snapshot.indexes || []) {
+				const indexName = String(row?.index_name || "");
+				if (!indexName) continue;
+				let entry = indexRowsByName.get(indexName);
+				if (!entry) {
+					entry = { name: indexName, table: String(row?.table_name || ""), unique: Number(row?.is_unique) === 1, partial: Number(row?.partial) === 1, origin: String(row?.origin || ""), columns: [] };
+					indexRowsByName.set(indexName, entry);
+				}
+				if (row?.is_key === void 0 || Number(row.is_key) === 1) entry.columns.push({ order: Math.max(0, Number(row?.seqno) || 0), name: Number(row?.cid) === -2 || !String(row?.column_name || "").trim() ? "<expression>" : String(row.column_name).toLowerCase() });
+			}
+			for (const entry of indexRowsByName.values()) entry.columns = entry.columns.sort((left, right) => left.order - right.order).map((column) => column.name);
+			const columnRowsByTable = new Map();
+			for (const row of snapshot.columns || []) {
+				const tableName = String(row?.table_name || "");
+				if (!columnRowsByTable.has(tableName)) columnRowsByTable.set(tableName, []);
+				columnRowsByTable.get(tableName).push({
+					name: String(row?.name || "").toLowerCase(),
+					type: String(row?.type || "").trim().toUpperCase(),
+					affinity: normalizeSqliteTypeAffinity(row?.type),
+					primaryKeyOrder: Math.max(0, Number(row?.pk) || 0),
+					notNull: Number(row?.is_not_null) === 1,
+					defaultValue: row?.dflt_value ?? null,
+					hidden: Math.max(0, Number(row?.hidden) || 0)
+				});
+			}
 			const tables = Object.fromEntries(Object.keys(contract.columns).map((name) => [name, tableNames.has(name)]));
 			const columns = {};
 			const primaryKeys = {};
@@ -24026,7 +23522,7 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 					issues.push(`missing_table:${tableName}`);
 					continue;
 				}
-				const definitions = await kernel.getTableColumnDefinitions(db, tableName);
+				const definitions = columnRowsByTable.get(tableName) || [];
 				const actualColumns = new Map(definitions.map((column) => [column.name, column]));
 				columns[tableName] = Object.fromEntries(requiredColumns.map((name) => {
 					const actual = actualColumns.get(name);
@@ -24042,25 +23538,49 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				const idColumn = tableName === kernel.LOGS_TABLE ? definitions.find((column) => column.name === "id") : null;
 				primaryKeys[tableName] = serializeConfigValue(actualPrimaryKey) === serializeConfigValue(contract.primaryKeys[tableName] || []) && (!idColumn || idColumn.type === "INTEGER");
 				if (!primaryKeys[tableName]) issues.push(`invalid_primary_key:${tableName}`);
+				const unsupportedRequiredColumns = definitions.filter((column) => !requiredColumns.includes(column.name) && column.notNull && column.defaultValue === null && column.primaryKeyOrder === 0).map((column) => column.name);
+				if (unsupportedRequiredColumns.length) issues.push(`unsupported_required_columns:${tableName}:${unsupportedRequiredColumns.join(",")}`);
 			}
 			let dnsIpUniqueReady = false;
 			if (tableNames.has(kernel.DNS_IP_POOL_ITEMS_TABLE)) {
-				for (const index of (await kernel.getTableIndexDefinitions(db, kernel.DNS_IP_POOL_ITEMS_TABLE)).filter((item) => item.unique && !item.partial)) {
-					if (serializeConfigValue(await kernel.getIndexKeyColumns(db, index.name)) === serializeConfigValue(["ip"])) { dnsIpUniqueReady = true; break; }
+				for (const index of [...indexRowsByName.values()].filter((item) => item.table === kernel.DNS_IP_POOL_ITEMS_TABLE && item.unique && !item.partial)) {
+					if (serializeConfigValue(index.columns) === serializeConfigValue(["ip"])) { dnsIpUniqueReady = true; break; }
 				}
 				if (!dnsIpUniqueReady) issues.push(`missing_unique_key:${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`);
 			}
 			const indexes = {};
 			for (const [indexName, definition] of Object.entries(contract.indexes)) {
-				const owner = indexOwners.get(indexName);
-				if (!owner) { indexes[indexName] = false; issues.push(`missing_index:${indexName}`); continue; }
-				const listed = (await kernel.getTableIndexDefinitions(db, definition.table)).find((item) => item.name === indexName);
-				indexes[indexName] = owner === definition.table && listed?.unique === false && listed?.partial === false && serializeConfigValue(await kernel.getIndexKeyColumns(db, indexName)) === serializeConfigValue(definition.columns);
+				const listed = indexRowsByName.get(indexName);
+				if (!listed) { indexes[indexName] = false; issues.push(`missing_index:${indexName}`); continue; }
+				indexes[indexName] = listed.table === definition.table && listed.unique === false && listed.partial === false && serializeConfigValue(listed.columns) === serializeConfigValue(definition.columns);
 				if (!indexes[indexName]) issues.push(`invalid_index:${indexName}`);
 			}
-			const fts = await kernel.getLogsFtsReadiness(db);
+			for (const tableName of Object.keys(contract.columns)) {
+				const allowedUniqueKeys = [contract.primaryKeys?.[tableName] || [], ...Object.values(contract.uniqueIndexes || {}).filter((definition) => definition.table === tableName).map((definition) => definition.columns)];
+				const unsupportedUniqueIndexes = [...indexRowsByName.values()].filter((index) => index.table === tableName && index.unique && !index.partial && !allowedUniqueKeys.some((columns) => serializeConfigValue(columns) === serializeConfigValue(index.columns))).map((index) => index.name);
+				if (unsupportedUniqueIndexes.length) issues.push(`unsupported_unique_indexes:${tableName}:${unsupportedUniqueIndexes.join(",")}`);
+			}
+			const knownTriggerNames = new Set([String(kernel.LOGS_FTS_INSERT_TRIGGER).toLowerCase()]);
+			for (const tableName of Object.keys(contract.columns)) {
+				const unsupportedTriggers = objectRows.filter((row) => row?.type === "trigger" && String(row?.tbl_name || "") === tableName && !knownTriggerNames.has(String(row?.name || "").toLowerCase())).map((row) => String(row?.name || "")).filter(Boolean);
+				if (unsupportedTriggers.length) issues.push(`unsupported_triggers:${tableName}:${unsupportedTriggers.join(",")}`);
+			}
+			const ftsTable = objectRows.find((row) => row?.type === "table" && String(row?.name || "") === kernel.LOGS_FTS_TABLE);
+			const ftsTrigger = objectRows.find((row) => row?.type === "trigger" && String(row?.name || "") === kernel.LOGS_FTS_INSERT_TRIGGER);
+			const ftsColumns = new Set((columnRowsByTable.get(kernel.LOGS_FTS_TABLE) || []).map((column) => column.name));
+			const tableSql = normalizeSqlIdentifierSearchText(ftsTable?.sql || "").replace(/'/g, "");
+			const triggerSql = normalizeSqlIdentifierSearchText(ftsTrigger?.sql || "");
+			const compactTriggerSql = triggerSql.replace(/\s+/g, "");
+			const expectedTriggerInsert = `insertinto${kernel.LOGS_FTS_TABLE}(rowid,node_name,request_path,user_agent,error_detail,detail_json)values(new.id,new.node_name,new.request_path,coalesce(new.user_agent,''),coalesce(new.error_detail,''),coalesce(new.detail_json,''))`;
+			const fts = {
+				tableReady: !!ftsTable,
+				virtualTableReady: !!ftsTable && /^create\s+virtual\s+table\b/.test(tableSql) && /\busing\s+fts5\s*\(/.test(tableSql) && new RegExp(`\\bcontent\\s*=\\s*${kernel.LOGS_TABLE}\\b`).test(tableSql) && /\bcontent_rowid\s*=\s*id\b/.test(tableSql),
+				columnsReady: ["node_name", "request_path", "user_agent", "error_detail", "detail_json"].every((name) => ftsColumns.has(name)),
+				triggerReady: String(ftsTrigger?.tbl_name || "") === kernel.LOGS_TABLE && new RegExp(`\\bafter\\s+insert\\s+on\\s+${kernel.LOGS_TABLE}\\b`).test(triggerSql) && compactTriggerSql.includes(expectedTriggerInsert)
+			};
+			fts.ready = fts.virtualTableReady && fts.columnsReady && fts.triggerReady;
 			if (!fts.ready) issues.push(fts.tableReady ? "fts_contract_invalid" : `missing_table:${kernel.LOGS_FTS_TABLE}`);
-			const schemaReady = Object.values(tables).every(Boolean) && Object.values(columns).every((entry) => Object.values(entry).every(Boolean)) && Object.values(primaryKeys).every(Boolean) && dnsIpUniqueReady && Object.values(indexes).every(Boolean) && fts.ready;
+			const schemaReady = issues.length === 0 && Object.values(tables).every(Boolean) && Object.values(columns).every((entry) => Object.values(entry).every(Boolean)) && Object.values(primaryKeys).every(Boolean) && dnsIpUniqueReady && Object.values(indexes).every(Boolean) && fts.ready;
 			return {
 				tables,
 				columns,
@@ -24149,9 +23669,10 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 			};
 		},
 		async buildD1SchemaRepairPlan(db) {
-			const status = await kernel.getD1SchemaStatus(db);
+			const snapshot = await kernel.getD1SchemaSnapshot(db);
+			const status = await kernel.getD1SchemaStatus(db, { snapshot });
 			const contract = kernel.getD1CurrentSchemaContract();
-			const schemaFingerprint = await kernel.getD1SchemaFingerprint(db);
+			const schemaFingerprint = hashStableText(serializeConfigValue(snapshot.objects || []));
 			const schemaCookie = await kernel.getD1SchemaCookie(db);
 			const contractHash = kernel.getD1ContractHash();
 			const storedMeta = await kernel.readD1SchemaMeta(db);
@@ -24193,6 +23714,11 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 						});
 					} else blockingIssues.push(issue, ...probe.blockers);
 				}
+			}
+			for (const issue of status.issues || []) if (/^unsupported_(?:required_columns|unique_indexes|triggers):/.test(String(issue))) {
+				const tableName = String(issue).split(":", 2)[1];
+				if (tableName === kernel.LOGS_TABLE && status.constraints?.primaryKeys?.[tableName] !== true) continue;
+				blockingIssues.push(issue);
 			}
 			const uniqueKey = `${kernel.DNS_IP_POOL_ITEMS_TABLE}.ip`;
 			if (status.tables?.[kernel.DNS_IP_POOL_ITEMS_TABLE] && status.constraints?.uniqueKeys?.[uniqueKey] !== true && status.columns?.[kernel.DNS_IP_POOL_ITEMS_TABLE]?.ip === true) {
@@ -24463,8 +23989,9 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 			const profile = options.profile || (options.includeFts === false ? "logs-core" : "logs-fts");
 			const repairMode = String(options.repairMode || (String(options.repairToken || "").trim() ? "confirmed-destructive" : "safe"));
 			kernel.invalidateD1SchemaReadiness(db, "all");
-			const tablesBefore = await kernel.getD1TableNameSet(db);
 			const plan = await kernel.buildD1SchemaRepairPlan(db);
+			const tablesBefore = new Set(Object.entries(plan.status?.tables || {}).filter(([, ready]) => ready === true).map(([name]) => name));
+			if (plan.status?.fts?.tableReady === true) tablesBefore.add(kernel.LOGS_FTS_TABLE);
 			if (plan.blockingIssues.length) { const error = new Error("D1 schema repair is blocked by incompatible data or table shape"); error.code = "D1_SCHEMA_REPAIR_BLOCKED"; error.status = 409; error.details = { phase: "preflight", blockingIssues: plan.blockingIssues, repairPlan: plan }; throw error; }
 			let bookmarkState = null;
 			if (plan.phase === "safe" && repairMode === "confirmed-destructive") {
@@ -24512,10 +24039,15 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				const rebuildSteps = executableSteps.filter((step) => step.kind === "rebuild_table");
 				const rebuildTargets = rebuildSteps.map((step) => step.target);
 				const destructiveLogStep = executableSteps.find((step) => step.kind === "recreate_log_table" && step.target === kernel.LOGS_TABLE);
-				const plannedHighRiskTargets = plan.steps.filter((step) => step.risk === "high" && (step.kind === "rebuild_table" || step.kind === "recreate_log_table")).map((step) => step.target);
-				const skippedTables = [...new Set([...rebuildTargets, ...plannedHighRiskTargets])];
-				const addedColumns = plan.phase === "safe" ? await kernel.ensureD1KnownColumns(db, { skipTables: skippedTables }) : [];
-				for (const target of addedColumns) executedSteps.push({ kind: "add_column", target });
+				const addedColumns = [];
+				for (const step of executableSteps.filter((item) => item.kind === "add_column")) {
+					const [tableName, columnName] = String(step.target || "").split(".", 2);
+					const definition = kernel.getD1RuntimeColumnAdditions()?.[tableName]?.[columnName];
+					if (!definition) throw new Error(`Unknown D1 column addition: ${step.target}`);
+					await db.prepare(`ALTER TABLE ${quoteSqlIdentifier(tableName)} ADD COLUMN ${quoteSqlIdentifier(columnName)} ${definition}`).run();
+					addedColumns.push(step.target);
+					executedSteps.push({ kind: "add_column", target: step.target });
+				}
 				for (const tableName of rebuildTargets) {
 					rebuiltTables.push(await kernel.rebuildD1TableWithShadow(db, tableName, plan));
 					executedSteps.push({ kind: "rebuild_table", target: tableName });
@@ -24525,17 +24057,31 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 					executedSteps.push({ kind: "recreate_log_table", target: kernel.LOGS_TABLE });
 				}
 				const destructivelyCreatedIndexes = destructiveLogStep ? Object.entries(kernel.getD1RuntimeIndexContract()).filter(([, definition]) => definition.table === kernel.LOGS_TABLE).map(([name]) => name) : [];
-				const indexChanges = plan.phase === "safe" ? await kernel.repairD1RuntimeIndexes(db, { skipTables: skippedTables }) : { createdIndexes: [], repairedIndexes: [] };
-				for (const target of indexChanges.createdIndexes) executedSteps.push({ kind: "create_index", target });
-				for (const target of indexChanges.repairedIndexes) executedSteps.push({ kind: "repair_index", target });
-				const uniqueIndexesCreated = plan.phase === "safe" ? await kernel.ensureD1UniqueIndexes(db) : [];
-				for (const target of uniqueIndexesCreated) executedSteps.push({ kind: "create_unique_index", target });
+				const indexChanges = { createdIndexes: [], repairedIndexes: [] };
+				for (const step of executableSteps.filter((item) => item.kind === "create_index" || item.kind === "repair_index")) {
+					const definition = kernel.getD1RuntimeIndexContract()?.[step.target];
+					if (!definition) throw new Error(`Unknown D1 runtime index: ${step.target}`);
+					if (step.kind === "repair_index") await db.prepare(`DROP INDEX IF EXISTS ${quoteSqlIdentifier(step.target)}`).run();
+					await db.prepare(definition.createSql).run();
+					indexChanges[step.kind === "repair_index" ? "repairedIndexes" : "createdIndexes"].push(step.target);
+					executedSteps.push({ kind: step.kind, target: step.target });
+				}
+				const uniqueIndexesCreated = [];
+				for (const step of executableSteps.filter((item) => item.kind === "create_unique_index")) {
+					const definition = kernel.getD1UniqueIndexContract()?.[step.target];
+					if (!definition) throw new Error(`Unknown D1 unique index: ${step.target}`);
+					await db.prepare(definition.createSql).run();
+					uniqueIndexesCreated.push(step.target);
+					executedSteps.push({ kind: step.kind, target: step.target });
+				}
 				let ftsResult = { rebuilt: false, recreated: false };
 				const ftsStep = executableSteps.find((step) => step.target === kernel.LOGS_FTS_TABLE);
-				if (ftsStep && options.includeFts !== false && !await kernel.isLogsFtsReady(db)) ftsResult = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true });
+				if (ftsStep && options.includeFts !== false) ftsResult = await kernel.ensureLogsFtsSchema(db, { forceRecreate: true, baseSchemaReady: true });
 				if (ftsResult?.rebuilt === true) executedSteps.push({ kind: String(ftsStep?.kind || "create_fts"), target: kernel.LOGS_FTS_TABLE });
 				kernel.invalidateD1SchemaReadiness(db, "all");
-				const status = await kernel.getD1SchemaStatus(db);
+				const finalSnapshot = await kernel.getD1SchemaSnapshot(db);
+				const status = await kernel.getD1SchemaStatus(db, { snapshot: finalSnapshot });
+				const finalSchemaFingerprint = hashStableText(serializeConfigValue(finalSnapshot.objects || []));
 				const nextPlan = status.schemaReady ? null : await kernel.buildD1SchemaRepairPlan(db);
 				const pendingHighRisk = nextPlan?.phase === "destructive";
 				if (!status.schemaReady && !pendingHighRisk) {
@@ -24549,11 +24095,13 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 				if (backupTables.length) await db.batch(backupTables.map((rebuilt) => db.prepare(`DROP TABLE IF EXISTS ${quoteSqlIdentifier(rebuilt.backupTable)}`)));
 				let schemaMeta = { written: false, reason: "pending_high_risk" };
 				if (status.schemaReady) {
-					const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
-					schemaMeta = attested.valid ? { written: false, reused: true, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash: plan.contractHash } : await kernel.writeVerifiedD1SchemaMeta(db, options.env, plan);
+					if (plan.phase === "ready") {
+						const attested = await kernel.verifyD1SchemaAttestation(db, options.env);
+						schemaMeta = attested.valid ? { written: false, reused: true, contractVersion: D1_SCHEMA_CONTRACT_VERSION, contractHash: plan.contractHash } : await kernel.writeVerifiedD1SchemaMeta(db, options.env, { ...plan, schemaFingerprint: finalSchemaFingerprint });
+					} else schemaMeta = await kernel.writeVerifiedD1SchemaMeta(db, options.env, { ...plan, schemaFingerprint: finalSchemaFingerprint });
 				}
 				const reportableTables = new Set([...Object.keys(kernel.getD1CurrentSchemaContract().columns), kernel.LOGS_FTS_TABLE]);
-				const createdTables = [...await kernel.getD1TableNameSet(db)].filter((name) => reportableTables.has(name) && !tablesBefore.has(name));
+				const createdTables = finalSnapshot.objects.filter((row) => row?.type === "table").map((row) => String(row?.name || "")).filter((name) => reportableTables.has(name) && !tablesBefore.has(name));
 				return {
 					profile,
 					phase: plan.phase,
@@ -24663,16 +24211,6 @@ function defineSchemaInspectionMethods(dependencies = {}, kernel = {}) {
 //#region worker/features/storage/d1/schema-records-methods.js
 function defineSchemaRecordMethods(dependencies = {}, kernel = {}) {
 	return {
-		async ensureRuntimeConfigVersionsSchema(db) {
-			if (!db) return false;
-			if (kernel.isD1SchemaReadyCached(db, "runtimeConfigVersionsSchema")) return true;
-			await db.prepare(kernel.buildD1CreateTableSql(kernel.CONFIG_VERSIONS_TABLE, kernel.CONFIG_VERSIONS_TABLE, { ifNotExists: true })).run();
-			for (const definition of Object.values(kernel.getD1RuntimeIndexContract()).filter((item) => item.table === kernel.CONFIG_VERSIONS_TABLE)) {
-				await db.prepare(String(definition.createSql).replace(/^CREATE INDEX\s+/i, "CREATE INDEX IF NOT EXISTS ")).run();
-			}
-			kernel.markD1SchemaReady(db, "runtimeConfigVersionsSchema");
-			return true;
-		},
 		async ensureLogsBaseSchema(db) {
 			if (!db) return false;
 			if (kernel.isD1SchemaReadyCached(db, "logsBaseSchema")) return true;
@@ -24785,10 +24323,6 @@ function defineSchemaBootstrapMethods(dependencies = {}, kernel = {}) {
 				steps: []
 			};
 			const runtimeSteps = [
-				{
-					name: "ensureRuntimeConfigVersionsSchema",
-					run: () => kernel.ensureRuntimeConfigVersionsSchema(db)
-				},
 				{
 					name: "ensureSysStatusTable",
 					run: () => kernel.ensureSysStatusTable(db)
@@ -24969,13 +24503,10 @@ function buildD1TidyExecutor() {
 		async patchLogStatus(database, db, stores, executionPlan, summary, flags, options = {}) {
 			const nowIso = (/* @__PURE__ */ new Date()).toISOString();
 			const mode = String(executionPlan?.mode || options.mode || "manual").trim().toLowerCase() === "scheduled" ? "scheduled" : "manual";
-			const ftsReady = await database.isLogsFtsReady(db);
-			const statsReady = await database.hasStatsHourlyTable(db);
-			const schemaStatus = await database.getD1SchemaStatus(db);
 			const logPatch = {
 				schemaReady: true,
-				ftsReady,
-				statsReady,
+				ftsReady: true,
+				statsReady: true,
 				categoryEnabled: true
 			};
 			if (flags.rebuildStatsHourly !== true || summary.alignedStatsWindow === true) logPatch.statsUtcOffsetMinutes = executionPlan.statsUtcOffsetMinutes ?? executionPlan.utcOffsetMinutes;
@@ -25093,8 +24624,10 @@ function buildD1TidyPlanner() {
 					dns_ip_pool_items: dnsIpPoolItems.countIsLowerBound,
 					sys_status: sysStatus.countIsLowerBound
 				},
-				ftsReady: await database.isLogsFtsReady(db),
-				d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db),
+				ftsReady: context.schemaStatus?.schemaReady === true || await database.isLogsFtsReady(db),
+				d1DnsIpPoolSources: await database.getDnsIpPoolSourcesFromDb(db, {
+					schemaReady: context.schemaStatus?.schemaReady === true
+				}),
 				kvDnsIpPoolSources: []
 			};
 		},
@@ -25238,8 +24771,6 @@ var DATA_SERVICE_CONSTANTS = Object.freeze({
 	WORKER_PLACEMENT_REGION_OVERRIDE_PREFIX: "sys:worker_placement_region:v1:",
 	CONFIG_SNAPSHOTS_KEY: "sys:config_snapshots:v1",
 	CONFIG_META_KEY: "sys:config_meta:v1",
-	CONFIG_ENVELOPE_KEY: "sys:theme:v2",
-	CONFIG_VERSIONS_TABLE: "runtime_config_versions",
 	CONFIG_SNAPSHOTS_META_KEY: "sys:config_snapshots_meta:v1",
 	NODES_INDEX_META_KEY: "sys:nodes_index_meta:v1",
 	LEGACY_DNS_IP_POOL_SOURCES_KEY: "sys:dns_ip_pool_sources:v1",
@@ -26538,29 +26069,9 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 				rollbackKvEntries: [...rollbackKvEntries, ...nodeRollbackEntries]
 			};
 		},
-		rewriteKvTidySnapshots(rawSnapshots = []) {
-			const rewrittenSnapshots = [];
-			let rewrittenSnapshotCount = 0;
-			let deletedLegacySnapshotFieldCount = 0;
-			const migratedConfigKeys = [];
-			for (const snapshot of rawSnapshots) {
-				const rewriteResult = rewriteConfigSnapshotToCurrentSchema(snapshot);
-				rewrittenSnapshots.push(redactConfigSnapshotSecrets(rewriteResult.snapshot));
-				if (rewriteResult.rewritten) rewrittenSnapshotCount += 1;
-				deletedLegacySnapshotFieldCount += Number(rewriteResult.deletedLegacyFieldCount) || 0;
-				migratedConfigKeys.push(...rewriteResult.migratedConfigKeys || []);
-			}
-			return {
-				rewrittenSnapshots,
-				rewrittenSnapshotCount,
-				deletedLegacySnapshotFieldCount,
-				migratedConfigKeys
-			};
-		},
 		buildKvTidyNoteParts(payload = {}, options = {}) {
 			const noteParts = [];
 			if (Array.isArray(payload.legacyKeysPresent) && payload.legacyKeysPresent.length) noteParts.push(`legacy_keys=${payload.legacyKeysPresent.join(",")}`);
-			if (Number(payload.rewrittenSnapshotCount) > 0) noteParts.push(`rewritten_snapshots=${payload.rewrittenSnapshotCount}`);
 			if (Number(payload.rewrittenNodeCount) > 0) noteParts.push(`rewritten_nodes=${payload.rewrittenNodeCount}`);
 			if (Number(payload.migratedTopLevelPortNodeCount) > 0) noteParts.push(`top_level_port_nodes=${payload.migratedTopLevelPortNodeCount}`);
 			if (Number(payload.migratedLinePortCount) > 0) noteParts.push(`line_ports=${payload.migratedLinePortCount}`);
@@ -26569,29 +26080,11 @@ function defineNodeKvTidyMethods(dependencies = {}, kernel = {}) {
 			if (options.includeRepairSource === true && options.repairedConfig?.hadMalformedValue) noteParts.push(`${options.repairLabel || "config_source"}=${options.repairedConfig.source}`);
 			return noteParts;
 		},
-		normalizeKvTidyMutationValueForHash(mutation = {}) {
-			const key = String(mutation?.key || "").trim();
-			const value = String(mutation?.value ?? "");
-			if (key !== kernel.CONFIG_SNAPSHOTS_KEY || !value) return value;
-			try {
-				const snapshots = JSON.parse(value);
-				if (!Array.isArray(snapshots)) return value;
-				return JSON.stringify(snapshots.map((snapshot) => {
-					if (!isPlainObject(snapshot)) return snapshot;
-					const normalized = { ...snapshot };
-					delete normalized.id;
-					delete normalized.createdAt;
-					return normalized;
-				}));
-			} catch {
-				return value;
-			}
-		},
 		buildKvTidyPlanHash(plan = {}) {
 			const mutationPlan = (Array.isArray(plan?.mutationPlan) ? plan.mutationPlan : []).map((mutation) => ({
 				type: String(mutation?.type || "put").trim().toLowerCase() === "delete" ? "delete" : "put",
 				key: String(mutation?.key || "").trim(),
-				value: kernel.normalizeKvTidyMutationValueForHash(mutation)
+				value: String(mutation?.value ?? "")
 			}));
 			return hashStableText(serializeConfigValue({
 				scope: "kv",

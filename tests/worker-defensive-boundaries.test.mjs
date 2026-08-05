@@ -4651,6 +4651,116 @@ test("Worker and HTML update requires both uploaded files", async () => {
   }
 });
 
+test("Worker and HTML update refuses a zone-level script that is not bound to the current host", async () => {
+  const { kv, putKeys } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {
+      cfAccountId: "account-id",
+      cfZoneId: "zone-id",
+      cfApiToken: "api-token"
+    }
+  });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-current-host-required" };
+  const requestedUrls = [];
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({
+      fetch: async (input) => {
+        const url = String(input);
+        requestedUrls.push(url);
+        if (url.includes("/workers/domains")) {
+          return Response.json({
+            success: true,
+            result: [{ hostname: "sibling.example", service: "sibling-worker" }]
+          });
+        }
+        if (url.includes("/workers/routes")) {
+          return Response.json({
+            success: true,
+            result: [{ pattern: "sibling.example/*", script: "sibling-worker" }],
+            result_info: { total_pages: 1 }
+          });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url}`);
+      }
+    }, () => adminActions.updateWorkerAndAdminIndex({
+      workerFileName: "worker.js",
+      workerScriptContent: "export default { fetch() { return new Response('current'); } }",
+      indexFileName: "index.html",
+      indexHtml: '<!doctype html><html><body><div id="app"></div></body></html>'
+    }, {
+      env,
+      kv,
+      ctx: null,
+      request: new Request("https://current.example/admin")
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(payload.error.code, "WORKER_PLACEMENT_SCRIPT_UNRESOLVED");
+    assert.equal(requestedUrls.some((url) => /workers\/domains\?(?:[^#]*&)?zone_id=zone-id(?:&|$)/.test(url) && !url.includes("hostname=current.example")), false);
+    assert.equal(requestedUrls.some((url) => url.includes("/workers/scripts/")), false);
+    assert.deepEqual(putKeys, []);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("Worker and HTML update uploads only the script bound to the current host", async () => {
+  const { kv } = createInMemoryKvStore({
+    [kernel.CONFIG_KEY]: {
+      cfAccountId: "account-id",
+      cfZoneId: "zone-id",
+      cfApiToken: "api-token"
+    }
+  });
+  const env = { ENI_KV: kv, __CONFIG_CACHE_NAMESPACE: "worker-html-current-host-only" };
+  const scriptUploads = [];
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await withWorkerGlobals({
+      fetch: async (input, init = {}) => {
+        const url = String(input);
+        if (url.includes("/workers/domains")) {
+          return Response.json({
+            success: true,
+            result: [
+              { hostname: "sibling.example", service: "sibling-worker" },
+              { hostname: "current.example", service: "current-worker" }
+            ]
+          });
+        }
+        if (url.includes("/workers/scripts/")) {
+          scriptUploads.push({ url, method: init.method });
+          return Response.json({ success: true, result: {} });
+        }
+        throw new Error(`unexpected Cloudflare request: ${url}`);
+      }
+    }, () => adminActions.updateWorkerAndAdminIndex({
+      workerFileName: "worker.js",
+      workerScriptContent: "export default { fetch() { return new Response('current'); } }",
+      indexFileName: "index.html",
+      indexHtml: '<!doctype html><html><body><div id="app"></div></body></html>'
+    }, {
+      env,
+      kv,
+      ctx: null,
+      request: new Request("https://current.example/admin")
+    }));
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.scriptName, "current-worker");
+    assert.deepEqual(scriptUploads, [{
+      url: "https://api.cloudflare.com/client/v4/accounts/account-id/workers/scripts/current-worker/content",
+      method: "PUT"
+    }]);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
 test("local index source persists in KV and renders through the same-origin vendor path", async () => {
   const { kv } = createInMemoryKvStore({ "sys:theme": {} });
   const env = { ADMIN_PATH: "/admin", ENI_KV: kv };
@@ -5797,6 +5907,29 @@ test("D1 DNS writes keep stable ids and replace sources atomically", async () =>
   assert.equal(sourceBatch.length, 2);
   assert.match(sourceBatch[0].sql, /^DELETE FROM dns_ip_pool_sources$/);
   assert.match(sourceBatch[1].sql, /^INSERT INTO dns_ip_pool_sources/);
+
+  const bulkItems = Array.from({ length: 250 }, (_, index) => ({
+    id: `item-${index}`,
+    ip: `10.0.0.${index % 250 + 1}`,
+    sourceKind: "manual"
+  }));
+  await kernel.upsertDnsIpPoolItems(recorder.db, bulkItems);
+  assert.equal(recorder.batches.at(-1).length, 1);
+  assert.equal(recorder.batches.at(-1)[0].bindings.length, 1);
+
+  const bulkSources = Array.from({ length: 250 }, (_, index) => ({
+    id: `source-${index}`,
+    name: `Source ${index}`,
+    url: `https://example.test/${index}.txt`,
+    sourceType: "url",
+    sourceKind: "custom",
+    enabled: true,
+    sortOrder: index,
+    ipLimit: 5
+  }));
+  await kernel.persistDnsIpPoolSources({ db: recorder.db }, bulkSources);
+  assert.equal(recorder.batches.at(-1).length, 2);
+  assert.equal(recorder.batches.at(-1)[1].bindings.length, 1);
 });
 
 test("D1 probe cache bulk reads stay within the 100 binding limit", async () => {

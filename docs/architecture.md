@@ -91,13 +91,11 @@ frontend/admin-runtime.template.html
 
 ### KV
 
-KV 用于运行时配置、节点实体与索引、配置快照、DNS 历史、远端/本地管理端 HTML 记录，以及与缓存/整理相关的元数据。KV 写入通过 mutation chain、revision 和回滚逻辑保护；管理端配置保存和导入不能绕过这些服务。
+KV 用于运行时配置、节点实体与索引、DNS 历史、远端/本地管理端 HTML 记录，以及与缓存/整理相关的元数据。全局设置以 `sys:theme` 为唯一事实来源，保存和 settings-only 导入始终写入 KV；D1 不参与设置读写，也不会让设置进入只读状态。KV 写入通过 mutation chain、revision 和回滚逻辑保护。
 
 ### D1
 
-D1 保存日志、统计聚合、DNS/IP 工作区数据、运行状态、缓存/锁、认证失败和 FTS 结构。D1 Schema v2 还包含追加式 `runtime_config_versions` 配置版本链，以 `parent_revision` 主键完成跨 Worker 实例的 CAS；KV 的 `sys:theme:v2` 是代理运行时读取投影，不是管理端写入权威源。`initLogsDb` 是当前统一 schema 初始化动作；D1 整理必须先通过 schema readiness，再使用签名的预览 plan token 执行。
-
-配置权威迁移由 `CONFIG_AUTHORITY_MODE=kv|shadow|d1` 控制，默认 `kv`。`shadow` 保持 KV 写入并向 D1 镜像，用于上线前观察；`d1` 在 D1 提交失败时拒绝管理写入，KV 投影失败则保留已提交版本并由定时任务重试，代理继续读取最后一个有效投影。切换到 `d1` 前必须先执行 D1 Schema v2 初始化。
+D1 保存日志、统计聚合、DNS/IP 工作区数据、运行状态、缓存/锁、认证失败和 FTS 结构，不保存或投影全局设置。`initLogsDb` 是当前统一 schema 初始化动作；D1 整理必须先通过 schema readiness，再使用签名的预览 plan token 执行。
 
 ### Isolate 内存
 

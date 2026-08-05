@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createTestApplication } from "../worker/testing/hooks.js";
+import { hashStableText } from "../worker/core/hashing.js";
 import {
   defineKvTidyMethods,
   defineSnapshotMethods,
@@ -171,26 +172,20 @@ test("KV tidy plan tokens verify signatures and reject tampering and expiry", as
   );
 });
 
-test("KV tidy plan hashes bind config and snapshot revisions", () => {
+test("KV tidy plan hashes bind the current config revision", () => {
   const basePlan = {
-    scannedKeys: [kernel.CONFIG_KEY, kernel.CONFIG_SNAPSHOTS_KEY],
+    scannedKeys: [kernel.CONFIG_KEY],
     mutationPlan: [],
     rebuiltNodeSummaries: [],
     revisions: {
       configRevision: "config-r1",
-      configContentHash: "config-h1",
-      snapshotsRevision: "snapshots-r1",
-      snapshotsContentHash: "snapshots-h1"
+      configContentHash: "config-h1"
     }
   };
   const previewHash = kernel.buildKvTidyPlanHash(basePlan);
   assert.notEqual(kernel.buildKvTidyPlanHash({
     ...basePlan,
     revisions: { ...basePlan.revisions, configRevision: "config-r2" }
-  }), previewHash);
-  assert.notEqual(kernel.buildKvTidyPlanHash({
-    ...basePlan,
-    revisions: { ...basePlan.revisions, snapshotsContentHash: "snapshots-h2" }
   }), previewHash);
 });
 
@@ -227,7 +222,7 @@ test("KV tidy quota includes puts, deletes, rollback writes, and rollback delete
   assert.equal(budget.estimatedWorstCaseWriteCount, 4);
 });
 
-test("config snapshots redact secrets and restoration preserves current secrets", async () => {
+test("config persistence removes legacy snapshots and snapshot actions are unavailable", async () => {
   const previousConfig = {
     rateLimitRpm: 10,
     cfApiToken: "previous-cf-secret",
@@ -245,14 +240,12 @@ test("config snapshots redact secrets and restoration preserves current secrets"
   const mutationPlan = await kernel.buildRuntimeConfigMutationPlan(
     kv,
     previousConfig,
-    currentConfig,
-    { reason: "test_snapshot" }
+    currentConfig
   );
   const snapshotsMutation = mutationPlan.find(mutation => mutation.key === kernel.CONFIG_SNAPSHOTS_KEY);
-  const [snapshot] = JSON.parse(snapshotsMutation.value);
-  assert.equal(snapshot.config.cfApiToken, undefined);
-  assert.equal(snapshot.config.tgBotToken, undefined);
-  await kv.put(kernel.CONFIG_SNAPSHOTS_KEY, snapshotsMutation.value);
+  const snapshotsMetaMutation = mutationPlan.find(mutation => mutation.key === kernel.CONFIG_SNAPSHOTS_META_KEY);
+  assert.equal(snapshotsMutation.type, "delete");
+  assert.equal(snapshotsMetaMutation.type, "delete");
 
   const env = {
     ENI_KV: kv,
@@ -260,10 +253,11 @@ test("config snapshots redact secrets and restoration preserves current secrets"
   };
   invalidateRuntimeConfigCache();
   try {
-    const response = await adminActions.restoreConfigSnapshot({ id: snapshot.id }, { env, ctx: null, kv });
-    assert.equal(response.status, 200);
+    assert.equal(adminActions.getConfigSnapshots, undefined);
+    assert.equal(adminActions.clearConfigSnapshots, undefined);
+    assert.equal(adminActions.restoreConfigSnapshot, undefined);
     const restored = await kv.get(kernel.CONFIG_KEY, { type: "json" });
-    assert.equal(restored.rateLimitRpm, 10);
+    assert.equal(restored.rateLimitRpm, 20);
     assert.equal(restored.cfApiToken, "current-cf-secret");
     assert.equal(restored.tgBotToken, "current-tg-secret");
   } finally {
@@ -371,7 +365,7 @@ test("Worker HTML rollback preserves settings saved after activation", async () 
   }
 });
 
-test("local HTML activation retains only versions referenced by config and snapshots", async () => {
+test("local HTML activation retains only the version referenced by current config", async () => {
   const { kv, values } = createKv({ [kernel.CONFIG_KEY]: {} });
   const env = {
     ENI_KV: kv,
@@ -389,13 +383,11 @@ test("local HTML activation retains only versions referenced by config and snaps
     }
 
     const config = await kv.get(kernel.CONFIG_KEY, { type: "json" });
-    const snapshots = await kernel.getConfigSnapshotsForRead(kv, { withConfig: true });
-    const referencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(config, snapshots);
+    const referencedRevisions = kernel.collectReferencedAdminIndexUploadRevisions(config, []);
     const storedUploadKeys = [...values.keys()]
       .filter(key => key.startsWith(kernel.ADMIN_INDEX_UPLOAD_PREFIX));
-    assert.equal(snapshots.length, 5);
-    assert.equal(referencedRevisions.size, 6);
-    assert.equal(storedUploadKeys.length, 6);
+    assert.equal(referencedRevisions.size, 1);
+    assert.equal(storedUploadKeys.length, 1);
     assert.deepEqual(
       new Set(storedUploadKeys),
       new Set([...referencedRevisions].map(revision => kernel.buildAdminIndexUploadKey(revision)))
@@ -462,6 +454,48 @@ test("stale config revisions are rejected before settings persistence", async ()
       error => error?.code === "CONFIG_REVISION_CONFLICT" && error?.status === 409
     );
     assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 20);
+  } finally {
+    invalidateRuntimeConfigCache();
+  }
+});
+
+test("admin settings always use KV and ignore stale projection data", async () => {
+  const staleProjectionConfig = { rateLimitRpm: 999, cfApiToken: "stale-d1-secret" };
+  const { kv } = createKv({
+    [kernel.CONFIG_KEY]: { rateLimitRpm: 20, cfApiToken: "kv-secret" },
+    ["sys:theme:v2"]: {
+      schemaVersion: 2,
+      revision: "stale-d1-projection",
+      hash: hashStableText(JSON.stringify(staleProjectionConfig)),
+      config: staleProjectionConfig
+    },
+    [kernel.CONFIG_SNAPSHOTS_KEY]: [{ id: "legacy-snapshot" }]
+  });
+  const env = {
+    ENI_KV: kv,
+    __CONFIG_CACHE_NAMESPACE: "d1-admin-kv-fallback"
+  };
+  invalidateRuntimeConfigCache();
+
+  try {
+    const response = await adminActions.saveConfig({
+      config: { rateLimitRpm: 30 }
+    }, { env, kv, db: null, ctx: null, meta: { section: "security", source: "ui" } });
+    const payload = await response.json();
+
+    assert.equal(response.status, 200);
+    assert.equal(payload.configAuthority, undefined);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 30);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).cfApiToken, "kv-secret");
+    assert.equal(await kv.get(kernel.CONFIG_SNAPSHOTS_KEY, { type: "json" }), null);
+
+    const importResponse = await adminActions.importSettings({
+      config: { rateLimitRpm: 40 }
+    }, { env, kv, db: null, ctx: null, meta: { section: "settings", source: "settings_backup" } });
+    const importPayload = await importResponse.json();
+    assert.equal(importResponse.status, 200);
+    assert.equal(importPayload.configAuthority, undefined);
+    assert.equal((await kv.get(kernel.CONFIG_KEY, { type: "json" })).rateLimitRpm, 40);
   } finally {
     invalidateRuntimeConfigCache();
   }

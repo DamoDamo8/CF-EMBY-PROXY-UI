@@ -47,7 +47,7 @@ const statTiles = computed(() => [
   {
     title: '节点数',
     value: String(props.adminConsole?.nodeCount ?? 0),
-    note: `配置快照 ${props.adminConsole?.configSnapshotCount ?? 0} 份`
+    note: '来自当前 KV 节点索引'
   },
   {
     title: '播放 / PlaybackInfo',

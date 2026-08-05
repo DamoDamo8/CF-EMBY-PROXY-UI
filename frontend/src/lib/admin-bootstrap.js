@@ -36,7 +36,6 @@ export function readInlineAdminBootstrap() {
     runtimeStatus: isPlainObject(payload?.runtimeStatus) ? payload.runtimeStatus : {},
     revisions: isPlainObject(payload?.revisions) ? payload.revisions : {},
     config: isPlainObject(payload?.config) ? payload.config : {},
-    nodes: Array.isArray(payload?.nodes) ? payload.nodes : [],
-    configSnapshots: Array.isArray(payload?.configSnapshots) ? payload.configSnapshots : []
+    nodes: Array.isArray(payload?.nodes) ? payload.nodes : []
   };
 }

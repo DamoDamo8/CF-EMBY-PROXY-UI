@@ -91,7 +91,7 @@ const importText = computed(() => String(importDraft.value.text || ''));
 const importSourceLabel = computed(() => String(importDraft.value.sourceLabel || '').trim());
 const importTextPlaceholder = computed(() => (
   String(importDraft.value.placeholder || '').trim()
-  || '支持上传旧版导出的 JSON，也支持直接粘贴配置快照文本。解析、兼容检查和最终导入动作都由上层 action 决定。'
+  || '支持上传旧版导出的 JSON，也支持直接粘贴配置备份文本。解析、兼容检查和最终导入动作都由上层 action 决定。'
 ));
 
 const previewTone = computed(() => {
@@ -247,7 +247,7 @@ const exportButtons = computed(() => {
 
   return [{
     key: 'export-config',
-    label: String(exportState.value.buttonLabel || '').trim() || '导出配置快照',
+    label: String(exportState.value.buttonLabel || '').trim() || '导出配置备份',
     hint: String(exportState.value.buttonHint || '').trim() || '支持让上层决定是下载 JSON、复制到剪贴板，还是生成脱敏备份。',
     tone: 'primary',
     actionName: 'exportConfig',
@@ -722,7 +722,7 @@ function buildImportDraftSummary(draft, text) {
           <Download class="mt-0.5 h-5 w-5 shrink-0 text-brand-300" />
           <div>
             <h3 class="text-sm font-medium text-white">
-              {{ exportState.title || '导出配置快照' }}
+              {{ exportState.title || '导出配置备份' }}
             </h3>
             <p class="mt-2 text-sm leading-6 text-slate-300">
               {{ exportState.description || '这里不直接实现下载协议，只提供导出入口与上下文展示，方便上层接 Worker、文件系统或剪贴板动作。' }}

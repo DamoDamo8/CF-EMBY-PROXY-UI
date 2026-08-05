@@ -24,42 +24,9 @@ function normalizeAdminBootstrap(rawPayload = {}, seedBootstrap = {}) {
     shell: isPlainObject(payload.shell) ? payload.shell : (isPlainObject(seed.shell) ? seed.shell : null),
     config: isPlainObject(payload.config) ? payload.config : {},
     nodes: Array.isArray(payload.nodes) ? payload.nodes : [],
-    configSnapshots: Array.isArray(payload.configSnapshots) ? payload.configSnapshots : [],
     revisions: isPlainObject(payload.revisions) ? payload.revisions : {},
     runtimeStatus: isPlainObject(payload.runtimeStatus) ? payload.runtimeStatus : {}
   };
-}
-
-function normalizeConfigSnapshot(rawSnapshot = {}, index = 0) {
-  if (!isPlainObject(rawSnapshot)) return null;
-
-  const snapshotId = String(rawSnapshot.id || `config-snapshot-${index + 1}`).trim();
-  const createdAt = String(rawSnapshot.createdAt || '').trim();
-  if (!snapshotId || !createdAt) return null;
-
-  const changedKeys = [...new Set(
-    (Array.isArray(rawSnapshot.changedKeys) ? rawSnapshot.changedKeys : [])
-      .map((entry) => String(entry || '').trim())
-      .filter(Boolean)
-  )];
-
-  return {
-    id: snapshotId,
-    createdAt,
-    reason: String(rawSnapshot.reason || '').trim(),
-    section: String(rawSnapshot.section || '').trim(),
-    actor: String(rawSnapshot.actor || '').trim(),
-    source: String(rawSnapshot.source || '').trim(),
-    note: String(rawSnapshot.note || '').trim(),
-    changedKeys,
-    changeCount: Math.max(0, parseInt(rawSnapshot.changeCount, 10) || changedKeys.length || 0)
-  };
-}
-
-function normalizeConfigSnapshots(rawSnapshots = []) {
-  return (Array.isArray(rawSnapshots) ? rawSnapshots : [])
-    .map((snapshot, index) => normalizeConfigSnapshot(snapshot, index))
-    .filter(Boolean);
 }
 
 function normalizeDashboardSnapshot(rawPayload = {}) {
@@ -1261,36 +1228,6 @@ export function useAdminConsole() {
     return config;
   }
 
-  function patchBootstrapConfigSnapshots(snapshots = [], revisions = {}) {
-    const normalizedSnapshots = normalizeConfigSnapshots(snapshots);
-    const normalizedRevisions = isPlainObject(revisions) ? revisions : {};
-
-    if (isPlainObject(state.bootstrap)) {
-      state.bootstrap = mergeRevisionsPatch({
-        ...state.bootstrap,
-        configSnapshots: normalizedSnapshots
-      }, normalizedRevisions);
-    }
-
-    if (isPlainObject(state.settingsBootstrap)) {
-      state.settingsBootstrap = mergeRevisionsPatch({
-        ...state.settingsBootstrap,
-        configSnapshots: normalizedSnapshots
-      }, normalizedRevisions);
-    }
-
-    const nextSeedBootstrap = {
-      ...(isPlainObject(state.seedBootstrap) ? state.seedBootstrap : {}),
-      configSnapshots: normalizedSnapshots
-    };
-    state.seedBootstrap = normalizeAdminBootstrap(
-      mergeRevisionsPatch(nextSeedBootstrap, normalizedRevisions),
-      state.seedBootstrap
-    );
-
-    return normalizedSnapshots;
-  }
-
   function patchBootstrapGeneratedAt(generatedAt = '') {
     const normalizedGeneratedAt = String(generatedAt || '').trim();
     if (!normalizedGeneratedAt) return '';
@@ -1370,9 +1307,6 @@ export function useAdminConsole() {
       exportSettings: false,
       importFull: false,
       importSettings: false,
-      configSnapshots: false,
-      clearConfigSnapshots: false,
-      restoreConfigSnapshot: false,
       nodes: false,
       nodeDetail: false,
       saveNode: false,
@@ -1411,9 +1345,6 @@ export function useAdminConsole() {
       exportSettings: '',
       importFull: '',
       importSettings: '',
-      configSnapshots: '',
-      clearConfigSnapshots: '',
-      restoreConfigSnapshot: '',
       nodes: '',
       pingNode: '',
       deleteNode: '',
@@ -1505,9 +1436,6 @@ export function useAdminConsole() {
       }
       const snapshotNodeCount = Number(this.stats.nodeCount);
       return Number.isFinite(snapshotNodeCount) ? snapshotNodeCount : 0;
-    },
-    get configSnapshotCount() {
-      return Array.isArray(this.adminBootstrap.configSnapshots) ? this.adminBootstrap.configSnapshots.length : 0;
     },
     get revisions() {
       return isPlainObject(this.adminBootstrap.revisions) ? this.adminBootstrap.revisions : {};
@@ -1786,13 +1714,10 @@ export function useAdminConsole() {
 
         const seedSource = state.settingsBootstrap || state.bootstrap || state.seedBootstrap;
         state.seedBootstrap = normalizeAdminBootstrap(seedSource, state.seedBootstrap);
-        const snapshotState = await this.getConfigSnapshots();
-
-        return {
-          config: nextConfig,
-          revisions: nextRevisions,
-          configSnapshots: snapshotState?.snapshots || normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots),
-          savedAt
+		return {
+			config: nextConfig,
+			revisions: nextRevisions,
+			savedAt
         };
       } catch (error) {
         if (isAuthError(error)) {
@@ -1879,15 +1804,13 @@ export function useAdminConsole() {
 
         patchBootstrapConfig(nextConfig, nextRevisions);
         commitNodesState(nextNodes, nextRevisions);
-        const snapshotState = await this.getConfigSnapshots();
-        state.authRequired = false;
+		state.authRequired = false;
 
         return {
           success: response?.success === true,
-          config: nextConfig,
-          nodes: normalizeNodeCollection(nextNodes),
-          revisions: nextRevisions,
-          configSnapshots: snapshotState?.snapshots || normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots)
+			config: nextConfig,
+			nodes: normalizeNodeCollection(nextNodes),
+			revisions: nextRevisions
         };
       } catch (error) {
         if (isAuthError(error)) {
@@ -1920,29 +1843,23 @@ export function useAdminConsole() {
 
         const nextConfig = isPlainObject(response?.config) ? response.config : {};
         const nextRevisions = isPlainObject(response?.revisions) ? response.revisions : {};
-        const nextSnapshots = Array.isArray(response?.configSnapshots) ? response.configSnapshots : null;
-        const savedAt = patchBootstrapGeneratedAt(
+		const savedAt = patchBootstrapGeneratedAt(
           String(response?.generatedAt || new Date().toISOString()).trim() || new Date().toISOString()
         );
 
-        patchBootstrapConfig(nextConfig, nextRevisions);
-        let appliedSnapshots = normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots);
-        if (nextSnapshots) {
-          appliedSnapshots = patchBootstrapConfigSnapshots(nextSnapshots, nextRevisions);
-        } else if (Object.keys(nextRevisions).length > 0) {
-          patchBootstrapRevisions(nextRevisions);
-          appliedSnapshots = normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots);
-        }
+		patchBootstrapConfig(nextConfig, nextRevisions);
+		if (Object.keys(nextRevisions).length > 0) {
+			patchBootstrapRevisions(nextRevisions);
+		}
 
         state.lastConfigSavedAt = savedAt;
         state.authRequired = false;
 
         return {
-          success: response?.success === true,
-          config: nextConfig,
-          revisions: nextRevisions,
-          configSnapshots: appliedSnapshots,
-          savedAt
+			success: response?.success === true,
+			config: nextConfig,
+			revisions: nextRevisions,
+			savedAt
         };
       } catch (error) {
         if (isAuthError(error)) {
@@ -1954,120 +1871,6 @@ export function useAdminConsole() {
         return null;
       } finally {
         state.loading.importSettings = false;
-      }
-    },
-    async getConfigSnapshots() {
-      if (state.loading.configSnapshots) {
-        return {
-          snapshots: normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots),
-          revisions: isPlainObject(this.settingsBootstrap.revisions) ? this.settingsBootstrap.revisions : {}
-        };
-      }
-
-      state.loading.configSnapshots = true;
-      state.errors.configSnapshots = '';
-
-      try {
-        const payload = await callAdminAction('getConfigSnapshots', {}, {
-          seedBootstrap: state.seedBootstrap
-        });
-
-        const nextSnapshots = patchBootstrapConfigSnapshots(
-          Array.isArray(payload?.snapshots) ? payload.snapshots : this.settingsBootstrap.configSnapshots,
-          payload?.revisions
-        );
-        const nextRevisions = isPlainObject(payload?.revisions) ? payload.revisions : {};
-
-        state.authRequired = false;
-        return {
-          snapshots: nextSnapshots,
-          revisions: nextRevisions
-        };
-      } catch (error) {
-        if (isAuthError(error)) {
-          state.authRequired = true;
-          state.errors.configSnapshots = '';
-        } else {
-          state.errors.configSnapshots = getErrorMessage(error, '配置快照读取失败');
-        }
-        return null;
-      } finally {
-        state.loading.configSnapshots = false;
-      }
-    },
-    async clearConfigSnapshots() {
-      if (state.loading.clearConfigSnapshots) return null;
-
-      state.loading.clearConfigSnapshots = true;
-      state.errors.clearConfigSnapshots = '';
-
-      try {
-        const payload = await callAdminAction('clearConfigSnapshots', {}, {
-          seedBootstrap: state.seedBootstrap
-        });
-
-        const nextSnapshots = patchBootstrapConfigSnapshots(
-          Array.isArray(payload?.snapshots) ? payload.snapshots : [],
-          payload?.revisions
-        );
-        const nextRevisions = isPlainObject(payload?.revisions) ? payload.revisions : {};
-
-        state.authRequired = false;
-        return {
-          success: payload?.success === true,
-          snapshots: nextSnapshots,
-          revisions: nextRevisions
-        };
-      } catch (error) {
-        if (isAuthError(error)) {
-          state.authRequired = true;
-          state.errors.clearConfigSnapshots = '';
-        } else {
-          state.errors.clearConfigSnapshots = getErrorMessage(error, '配置快照清理失败');
-        }
-        return null;
-      } finally {
-        state.loading.clearConfigSnapshots = false;
-      }
-    },
-    async restoreConfigSnapshot(snapshotId = '') {
-      const normalizedSnapshotId = String(snapshotId || '').trim();
-      if (!normalizedSnapshotId || state.loading.restoreConfigSnapshot) return null;
-
-      state.loading.restoreConfigSnapshot = true;
-      state.errors.restoreConfigSnapshot = '';
-
-      try {
-        const payload = await callAdminAction('restoreConfigSnapshot', {
-          id: normalizedSnapshotId
-        }, {
-          seedBootstrap: state.seedBootstrap
-        });
-
-        const nextConfig = isPlainObject(payload?.config) ? payload.config : {};
-        const nextRevisions = isPlainObject(payload?.revisions) ? payload.revisions : {};
-
-        patchBootstrapConfig(nextConfig, nextRevisions);
-        const snapshotState = await this.getConfigSnapshots();
-        state.authRequired = false;
-
-        return {
-          success: payload?.success === true,
-          restoredSnapshotId: String(payload?.restoredSnapshotId || normalizedSnapshotId).trim() || normalizedSnapshotId,
-          config: nextConfig,
-          revisions: snapshotState?.revisions || nextRevisions,
-          snapshots: snapshotState?.snapshots || normalizeConfigSnapshots(this.settingsBootstrap.configSnapshots)
-        };
-      } catch (error) {
-        if (isAuthError(error)) {
-          state.authRequired = true;
-          state.errors.restoreConfigSnapshot = '';
-        } else {
-          state.errors.restoreConfigSnapshot = getErrorMessage(error, '配置快照恢复失败');
-        }
-        return null;
-      } finally {
-        state.loading.restoreConfigSnapshot = false;
       }
     },
     async refreshSnapshot(options = {}) {

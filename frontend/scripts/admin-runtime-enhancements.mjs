@@ -1223,11 +1223,6 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 		const normalizedAction = String(action || '');
 		let requestPayload = payload && typeof payload === 'object' ? payload : {};
 		if (normalizedAction === 'saveConfig') {
-			if (this.configAuthority?.readOnly === true) {
-				const unavailable = new Error('D1 配置服务不可用，当前只读');
-				unavailable.code = 'CONFIG_AUTHORITY_UNAVAILABLE';
-				throw unavailable;
-			}
 			requestPayload = {
 				...requestPayload,
 				mutationId: String(requestPayload.mutationId || ('cfg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10)))
@@ -1240,18 +1235,7 @@ const ADMIN_RUNTIME_ENHANCEMENT_SCRIPT = `<script data-admin-runtime-enhancement
 			if (normalizedAction === 'saveConfig' && String(error?.code || '').toUpperCase() === 'CONFIG_REVISION_CONFLICT') {
 				error.message = '配置版本已变化，请刷新设置确认差异后重新提交；当前编辑内容已保留。';
 			}
-			if (normalizedAction === 'saveConfig' && String(error?.code || '').toUpperCase() === 'CONFIG_AUTHORITY_UNAVAILABLE') {
-				error.message = 'D1 配置服务不可用，当前只读';
-			}
 			throw error;
-		}
-		if ((normalizedAction === 'getAdminBootstrap' || normalizedAction === 'getSettingsBootstrap') && result?.configAuthority) {
-			this.configAuthority = { ...result.configAuthority };
-			if (result.configAuthority.readOnly === true) this.showMessage?.('D1 配置服务不可用，当前只读', { tone: 'warning' });
-		}
-		if (normalizedAction === 'saveConfig') {
-			if (result?.configAuthority) this.configAuthority = { ...result.configAuthority };
-			if (String(result?.projectionStatus || '') === 'pending') this.showMessage?.('配置已保存，边缘同步中', { tone: 'warning' });
 		}
         if (String(action || '') === 'getNode' && Array.isArray(result?.warnings) && result.warnings.length > 0) {
           const warning = result.warnings.find((item) => item?.code === 'NODE_RESOURCE_LIMIT_EXCEEDED') || result.warnings[0];

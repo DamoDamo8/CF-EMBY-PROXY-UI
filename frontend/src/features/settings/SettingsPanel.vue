@@ -9,8 +9,7 @@ import {
   Save,
   Server,
   ShieldAlert,
-  SlidersHorizontal,
-  Trash2
+  SlidersHorizontal
 } from 'lucide-vue-next';
 
 import SectionCard from '@/components/SectionCard.vue';
@@ -33,7 +32,6 @@ const configBackupDraft = reactive(createEmptyConfigBackupDraft());
 const configBackupPreview = reactive(createEmptyConfigBackupPreviewState());
 const configBackupExportState = reactive(createEmptyConfigBackupExportState());
 const configBackupFeedback = reactive(createEmptyPanelFeedback());
-const snapshotFeedback = reactive(createEmptyPanelFeedback());
 const uiPreferences = useUiPreferences();
 const experienceModeSeed = uiPreferences.readSettingsExperienceMode();
 
@@ -54,9 +52,6 @@ const exportConfigLoading = computed(() => Boolean(props.adminConsole?.state?.lo
 const exportSettingsLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.exportSettings));
 const importFullLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.importFull));
 const importSettingsLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.importSettings));
-const configSnapshotsLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.configSnapshots));
-const clearConfigSnapshotsLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.clearConfigSnapshots));
-const restoreConfigSnapshotLoading = computed(() => Boolean(props.adminConsole?.state?.loading?.restoreConfigSnapshot));
 const authRequired = computed(() => props.adminConsole?.state?.authRequired === true);
 const settingsError = computed(() => String(props.adminConsole?.state?.errors?.settings || '').trim());
 const loadConfigError = computed(() => String(props.adminConsole?.state?.errors?.loadConfig || '').trim());
@@ -66,9 +61,6 @@ const exportConfigError = computed(() => String(props.adminConsole?.state?.error
 const exportSettingsError = computed(() => String(props.adminConsole?.state?.errors?.exportSettings || '').trim());
 const importFullError = computed(() => String(props.adminConsole?.state?.errors?.importFull || '').trim());
 const importSettingsError = computed(() => String(props.adminConsole?.state?.errors?.importSettings || '').trim());
-const configSnapshotsError = computed(() => String(props.adminConsole?.state?.errors?.configSnapshots || '').trim());
-const clearConfigSnapshotsError = computed(() => String(props.adminConsole?.state?.errors?.clearConfigSnapshots || '').trim());
-const restoreConfigSnapshotError = computed(() => String(props.adminConsole?.state?.errors?.restoreConfigSnapshot || '').trim());
 
 const baseFormState = computed(() => buildFormFromConfig(config.value));
 const baseComparableFormState = computed(() => buildComparableFormState(baseFormState.value));
@@ -86,21 +78,9 @@ const anySettingsBusy = computed(() => (
   || importFullLoading.value
   || exportSettingsLoading.value
   || importSettingsLoading.value
-  || configSnapshotsLoading.value
-  || clearConfigSnapshotsLoading.value
-  || restoreConfigSnapshotLoading.value
 ));
 const currentNodeCount = computed(() => (
   Array.isArray(settingsBootstrap.value.nodes) ? settingsBootstrap.value.nodes.length : 0
-));
-const currentSnapshotCount = computed(() => (
-  Array.isArray(settingsBootstrap.value.configSnapshots) ? settingsBootstrap.value.configSnapshots.length : 0
-));
-const configSnapshots = computed(() => (
-  Array.isArray(settingsBootstrap.value.configSnapshots) ? settingsBootstrap.value.configSnapshots : []
-));
-const latestConfigSnapshot = computed(() => (
-  configSnapshots.value.length > 0 && isPlainObject(configSnapshots.value[0]) ? configSnapshots.value[0] : null
 ));
 const configBackupPanelData = computed(() => ({
   summary: {
@@ -108,7 +88,6 @@ const configBackupPanelData = computed(() => ({
     generatedAt: settingsBootstrap.value.generatedAt,
     tags: [
       `当前节点 ${currentNodeCount.value} 个`,
-      `配置快照 ${currentSnapshotCount.value} 份`,
       '通过 Worker /admin action'
     ]
   },
@@ -163,9 +142,9 @@ const summaryTiles = computed(() => [
     note: String(settingsBootstrap.value.legacyHost || '无 legacy host').trim() || '无 legacy host'
   },
   {
-    title: '节点与快照',
-    value: `${Array.isArray(settingsBootstrap.value.nodes) ? settingsBootstrap.value.nodes.length : 0} / ${Array.isArray(settingsBootstrap.value.configSnapshots) ? settingsBootstrap.value.configSnapshots.length : 0}`,
-    note: '节点数 / 配置快照数'
+    title: '节点数量',
+    value: String(Array.isArray(settingsBootstrap.value.nodes) ? settingsBootstrap.value.nodes.length : 0),
+    note: '当前已加载节点'
   },
   {
     title: '当前模式',
@@ -291,7 +270,7 @@ function createEmptyConfigBackupDraft() {
     fileName: '',
     fileSize: null,
     accept: '.json,application/json',
-    placeholder: '支持上传旧版导出的 JSON，也支持直接粘贴配置快照文本。正式导入前会先走 Worker 预检。'
+    placeholder: '支持上传旧版导出的 JSON，也支持直接粘贴配置备份文本。正式导入前会先走 Worker 预检。'
   };
 }
 
@@ -336,18 +315,6 @@ function clearConfigBackupFeedback() {
   Object.assign(configBackupFeedback, createEmptyPanelFeedback());
 }
 
-function setSnapshotFeedback(tone = '', title = '', text = '') {
-  Object.assign(snapshotFeedback, {
-    tone,
-    title,
-    text
-  });
-}
-
-function clearSnapshotFeedback() {
-  Object.assign(snapshotFeedback, createEmptyPanelFeedback());
-}
-
 function applyConfigBackupDraftUpdate(patch = {}, options = {}) {
   const nextPatch = isPlainObject(patch) ? patch : {};
   Object.assign(configBackupDraft, nextPatch);
@@ -390,12 +357,7 @@ async function handleConfigBackupRefresh() {
   if (!props.adminConsole?.loadConfig) return null;
 
   clearConfigBackupFeedback();
-  const [configResult, snapshotsResult] = await Promise.all([
-    props.adminConsole.loadConfig(),
-    typeof props.adminConsole?.getConfigSnapshots === 'function'
-      ? props.adminConsole.getConfigSnapshots()
-      : Promise.resolve(null)
-  ]);
+  const configResult = await props.adminConsole.loadConfig();
   if (!configResult) {
     if (loadConfigError.value) {
       setConfigBackupFeedback('error', '刷新失败', loadConfigError.value);
@@ -406,12 +368,9 @@ async function handleConfigBackupRefresh() {
   setConfigBackupFeedback(
     'success',
     '配置摘要已刷新',
-    `已从 Worker 重新读取配置，Revision ${compactRevision(configResult.revisions?.configRevision)}，快照 ${snapshotsResult?.snapshots?.length ?? currentSnapshotCount.value} 份。`
+    `已从 Worker 重新读取 KV 配置，Revision ${compactRevision(configResult.revisions?.configRevision)}。`
   );
-  return {
-    config: configResult,
-    snapshots: snapshotsResult
-  };
+  return configResult;
 }
 
 async function handleConfigBackupExport(payload = {}) {
@@ -520,7 +479,7 @@ async function handleConfigBackupPreview() {
     title: warnings.length > 0 ? '预检完成，请确认警告' : '预检通过，可以导入',
     description: prepared.meta.nodeCount > 0
       ? '配置部分已经通过 Worker 预检，节点会在正式导入时继续校验并在必要时触发回滚。'
-      : '这份配置快照已经通过 Worker 预检，可以继续执行正式导入。',
+      : '这份配置备份已经通过 Worker 预检，可以继续执行正式导入。',
     warnings,
     errors: [],
     items: buildConfigBackupPreviewItems(prepared.meta, {
@@ -606,14 +565,13 @@ async function handleConfigBackupConfirm() {
 
   const resultConfig = isPlainObject(result.config) ? result.config : {};
   const resultRevision = result.revisions?.configRevision || revisions.value.configRevision;
-  const resultSnapshotCount = Array.isArray(result.configSnapshots) ? result.configSnapshots.length : currentSnapshotCount.value;
   const generatedAt = result.savedAt || new Date().toISOString();
 
   if (settingsOnlyImport) {
     resetConfigBackupPreview({
       tone: 'success',
       title: '设置导入完成',
-      description: 'Worker 已更新配置，并把新的 revision 与快照历史同步回当前设置页。',
+      description: 'Worker 已把设置写入 KV，并将新的 revision 同步回当前设置页。',
       warnings: [],
       errors: [],
       items: [
@@ -628,18 +586,11 @@ async function handleConfigBackupConfirm() {
           title: 'Config Revision',
           value: compactRevision(resultRevision),
           note: '新的配置 revision 已写回前端桥接层'
-        },
-        {
-          key: 'import-snapshots',
-          title: '快照历史',
-          value: String(resultSnapshotCount),
-          note: '设置快照历史已经同步刷新'
         }
       ],
       stats: [
         { label: '配置键', value: String(Object.keys(resultConfig).length) },
-        { label: 'Revision', value: compactRevision(resultRevision) },
-        { label: '快照', value: String(resultSnapshotCount) }
+        { label: 'Revision', value: compactRevision(resultRevision) }
       ],
       ready: true,
       canConfirm: false,
@@ -699,73 +650,6 @@ async function handleConfigBackupConfirm() {
     'success',
     '导入成功',
     `完整配置与节点已导入，当前节点 ${Array.isArray(result.nodes) ? result.nodes.length : prepared.meta.nodeCount} 个。`
-  );
-  return result;
-}
-
-async function handleRefreshConfigSnapshots() {
-  if (!props.adminConsole?.getConfigSnapshots) return null;
-
-  clearSnapshotFeedback();
-  const result = await props.adminConsole.getConfigSnapshots();
-  if (!result) {
-    if (configSnapshotsError.value) {
-      setSnapshotFeedback('error', '刷新失败', configSnapshotsError.value);
-    }
-    return null;
-  }
-
-  setSnapshotFeedback('success', '快照已刷新', `当前共 ${result.snapshots.length} 份配置快照。`);
-  return result;
-}
-
-async function handleClearConfigSnapshots() {
-  if (!props.adminConsole?.clearConfigSnapshots || clearConfigSnapshotsLoading.value) return null;
-  if (typeof window !== 'undefined') {
-    const confirmed = window.confirm('确认清空所有配置快照吗？当前生效配置不会被删除。');
-    if (!confirmed) return null;
-  }
-
-  clearSnapshotFeedback();
-  const result = await props.adminConsole.clearConfigSnapshots();
-  if (!result) {
-    if (clearConfigSnapshotsError.value) {
-      setSnapshotFeedback('error', '清空失败', clearConfigSnapshotsError.value);
-    }
-    return null;
-  }
-
-  setSnapshotFeedback('success', '快照已清空', 'Worker 中记录的配置快照已清空，当前生效配置保持不变。');
-  return result;
-}
-
-async function handleRestoreConfigSnapshot(snapshot = {}) {
-  if (!props.adminConsole?.restoreConfigSnapshot || restoreConfigSnapshotLoading.value) return null;
-
-  const snapshotId = String(snapshot?.id || '').trim();
-  if (!snapshotId) return null;
-  if (typeof window !== 'undefined') {
-    const confirmed = window.confirm(
-      `确认恢复 ${formatDateTime(snapshot.createdAt)} 的配置快照吗？这会覆盖当前生效配置。`
-    );
-    if (!confirmed) return null;
-  }
-
-  clearSnapshotFeedback();
-  const result = await props.adminConsole.restoreConfigSnapshot(snapshotId);
-  if (!result) {
-    if (restoreConfigSnapshotError.value) {
-      setSnapshotFeedback('error', '恢复失败', restoreConfigSnapshotError.value);
-    }
-    return null;
-  }
-
-  feedback.tone = 'success';
-  feedback.text = `已从配置快照恢复，时间 ${formatDateTime(snapshot.createdAt)}。`;
-  setSnapshotFeedback(
-    'success',
-    '恢复完成',
-    `已恢复到历史快照，当前 Revision ${compactRevision(result.revisions?.configRevision)}。`
   );
   return result;
 }
@@ -884,7 +768,7 @@ function buildConfigBackupPreviewItems(meta = {}, extras = {}) {
         ? '设置备份'
         : Number(meta.nodeCount) > 0
           ? '完整备份'
-          : '配置快照',
+          : '配置备份',
       note: String(meta.sourceLabel || '未标记来源').trim() || '未标记来源'
     },
     {
@@ -1487,11 +1371,8 @@ function resolveStatusTone() {
     || exportSettingsError.value
     || importFullError.value
     || importSettingsError.value
-    || configSnapshotsError.value
-    || clearConfigSnapshotsError.value
-    || restoreConfigSnapshotError.value
   ) return 'border-rose-400/30 bg-rose-500/12 text-rose-200';
-  if (savingConfig.value || importFullLoading.value || importSettingsLoading.value || restoreConfigSnapshotLoading.value) {
+  if (savingConfig.value || importFullLoading.value || importSettingsLoading.value) {
     return 'border-brand-400/30 bg-brand-500/12 text-brand-200';
   }
   if (
@@ -1500,8 +1381,6 @@ function resolveStatusTone() {
     || previewConfigLoading.value
     || exportConfigLoading.value
     || exportSettingsLoading.value
-    || configSnapshotsLoading.value
-    || clearConfigSnapshotsLoading.value
   ) {
     return 'border-ocean-500/30 bg-ocean-500/12 text-ocean-300';
   }
@@ -1519,44 +1398,15 @@ function resolveStatusLabel() {
     || exportSettingsError.value
     || importFullError.value
     || importSettingsError.value
-    || configSnapshotsError.value
-    || clearConfigSnapshotsError.value
-    || restoreConfigSnapshotError.value
   ) return '设置异常';
-  if (restoreConfigSnapshotLoading.value) return '正在恢复快照';
   if (importFullLoading.value || importSettingsLoading.value) return '正在导入';
   if (exportConfigLoading.value || exportSettingsLoading.value) return '正在导出';
-  if (clearConfigSnapshotsLoading.value) return '正在清空快照';
-  if (configSnapshotsLoading.value) return '正在同步快照';
   if (previewConfigLoading.value) return '正在预检';
   if (savingConfig.value) return '正在保存';
   if (loadingSettings.value || loadConfigLoading.value) return '正在加载';
   return '设置已接通';
 }
 
-function formatConfigSnapshotReason(value = '') {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'save_config') return '保存配置';
-  if (normalized === 'restore_snapshot') return '恢复快照';
-  if (normalized === 'import_settings') return '导入设置';
-  if (normalized === 'import_full') return '完整导入';
-  if (normalized === 'tidy_kv_data_pre_migration') return 'KV 整理前快照';
-  return String(value || '未标记').trim() || '未标记';
-}
-
-function formatConfigSnapshotSection(value = '') {
-  const normalized = String(value || '').trim().toLowerCase();
-  if (normalized === 'settings') return 'settings';
-  if (normalized === 'all') return 'all';
-  return String(value || 'unknown').trim() || 'unknown';
-}
-
-function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
-  const normalized = parseLooseTextList(changedKeys);
-  if (!normalized.length) return '未记录字段差异';
-  const preview = normalized.slice(0, 6).join(', ');
-  return normalized.length > 6 ? `${preview} 等 ${normalized.length} 项` : preview;
-}
 </script>
 
 <template>
@@ -2220,159 +2070,8 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
         :data="configBackupPanelData"
         :loading="configBackupPanelLoading"
         :actions="configBackupPanelActions"
-        description="这里已经直接接到 Worker 的 `loadConfig / getConfigSnapshots / previewConfig / exportConfig / exportSettings / importFull / importSettings`。导入会先做预检，再决定走完整备份还是 settings-only。"
+        description="这里直接接到 Worker 的 `loadConfig / previewConfig / exportConfig / exportSettings / importFull / importSettings`。导入会先做预检，再决定走完整备份还是 settings-only。"
       />
-
-      <article class="form-card">
-        <div class="flex flex-wrap items-start justify-between gap-4">
-          <div class="max-w-3xl">
-            <div class="flex items-center gap-3">
-              <Boxes class="h-5 w-5 text-ocean-300" />
-              <h3 class="text-sm font-medium text-white">配置快照历史</h3>
-            </div>
-            <p class="mt-3 text-sm leading-6 text-slate-300">
-              这里直接消费 Worker 返回的 `configSnapshots` 摘要列表，并接通刷新、恢复、清空三条真实链路。恢复时只覆盖配置，不会删除当前节点列表。
-            </p>
-          </div>
-
-          <div class="flex flex-wrap items-center gap-3">
-            <button
-              type="button"
-              class="secondary-btn"
-              :disabled="authRequired || anySettingsBusy"
-              @click="handleRefreshConfigSnapshots"
-            >
-              <RefreshCw class="h-4 w-4" :class="{ 'animate-spin': configSnapshotsLoading }" />
-              {{ configSnapshotsLoading ? '刷新中' : '刷新历史' }}
-            </button>
-            <button
-              type="button"
-              class="secondary-btn"
-              :disabled="authRequired || anySettingsBusy || !configSnapshots.length"
-              @click="handleClearConfigSnapshots"
-            >
-              <Trash2 class="h-4 w-4" />
-              {{ clearConfigSnapshotsLoading ? '清空中' : '清空历史' }}
-            </button>
-          </div>
-        </div>
-
-        <div class="mt-5 grid gap-4 md:grid-cols-3">
-          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
-            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">快照数量</p>
-            <p class="mt-2 text-2xl font-semibold text-white">{{ currentSnapshotCount }}</p>
-            <p class="mt-2 text-sm leading-6 text-slate-400">当前 settings bootstrap 中已经同步到的快照总数。</p>
-          </div>
-          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
-            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">最近快照</p>
-            <p class="mt-2 text-base font-semibold text-white">{{ formatDateTime(latestConfigSnapshot?.createdAt) }}</p>
-            <p class="mt-2 text-sm leading-6 text-slate-400">
-              {{ latestConfigSnapshot ? formatConfigSnapshotReason(latestConfigSnapshot.reason) : '还没有历史快照。' }}
-            </p>
-          </div>
-          <div class="rounded-2xl border border-white/10 bg-slate-950/45 px-4 py-3">
-            <p class="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">最近差异</p>
-            <p class="mt-2 text-base font-semibold text-white">
-              {{ latestConfigSnapshot ? `${latestConfigSnapshot.changeCount || latestConfigSnapshot.changedKeys?.length || 0} 项` : '0 项' }}
-            </p>
-            <p class="mt-2 text-sm leading-6 text-slate-400">
-              {{ latestConfigSnapshot ? summarizeConfigSnapshotChangedKeys(latestConfigSnapshot.changedKeys) : '等待首次保存或导入后生成。' }}
-            </p>
-          </div>
-        </div>
-
-        <article
-          v-if="snapshotFeedback.text"
-          class="mt-5 rounded-3xl border p-5"
-          :class="snapshotFeedback.tone === 'success'
-            ? 'border-mint-400/25 bg-mint-400/10 text-mint-100'
-            : 'border-rose-400/25 bg-rose-500/10 text-rose-100'"
-        >
-          <p v-if="snapshotFeedback.title" class="text-sm font-semibold">{{ snapshotFeedback.title }}</p>
-          <p class="text-sm leading-6" :class="{ 'mt-2': snapshotFeedback.title }">{{ snapshotFeedback.text }}</p>
-        </article>
-
-        <div
-          v-if="configSnapshots.length"
-          class="mt-5 space-y-3"
-        >
-          <article
-            v-for="snapshot in configSnapshots"
-            :key="snapshot.id"
-            class="rounded-3xl border border-white/10 bg-slate-950/45 px-5 py-4"
-          >
-            <div class="flex flex-wrap items-start justify-between gap-4">
-              <div class="min-w-0 flex-1">
-                <div class="flex flex-wrap items-center gap-2">
-                  <span class="inline-flex rounded-full border border-ocean-500/25 bg-ocean-500/10 px-3 py-1 text-xs text-ocean-100">
-                    {{ formatConfigSnapshotReason(snapshot.reason) }}
-                  </span>
-                  <span class="inline-flex rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-200">
-                    {{ formatConfigSnapshotSection(snapshot.section) }}
-                  </span>
-                  <span class="inline-flex rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-300">
-                    {{ snapshot.source || 'unknown source' }}
-                  </span>
-                </div>
-                <p class="mt-3 text-sm font-medium text-white">
-                  {{ formatDateTime(snapshot.createdAt) }}
-                </p>
-                <p class="mt-2 text-sm leading-6 text-slate-300">
-                  {{ snapshot.note || '这份快照没有附加说明。' }}
-                </p>
-              </div>
-
-              <button
-                type="button"
-                class="secondary-btn"
-                :disabled="authRequired || anySettingsBusy"
-                @click="handleRestoreConfigSnapshot(snapshot)"
-              >
-                <RotateCcw class="h-4 w-4" />
-                {{ restoreConfigSnapshotLoading ? '恢复中' : '恢复此快照' }}
-              </button>
-            </div>
-
-            <div class="mt-4 grid gap-3 md:grid-cols-3">
-              <div class="rounded-2xl border border-white/8 bg-white/5 px-4 py-3">
-                <p class="text-xs uppercase tracking-[0.12em] text-slate-400">变更项数</p>
-                <p class="mt-2 text-lg font-semibold text-white">{{ snapshot.changeCount || snapshot.changedKeys?.length || 0 }}</p>
-              </div>
-              <div class="rounded-2xl border border-white/8 bg-white/5 px-4 py-3">
-                <p class="text-xs uppercase tracking-[0.12em] text-slate-400">Actor</p>
-                <p class="mt-2 text-lg font-semibold text-white">{{ snapshot.actor || 'admin' }}</p>
-              </div>
-              <div class="rounded-2xl border border-white/8 bg-white/5 px-4 py-3">
-                <p class="text-xs uppercase tracking-[0.12em] text-slate-400">Snapshot ID</p>
-                <p class="mt-2 truncate text-sm font-medium text-slate-200">{{ snapshot.id }}</p>
-              </div>
-            </div>
-
-            <div class="mt-4 flex flex-wrap gap-2">
-              <span
-                v-for="changedKey in (Array.isArray(snapshot.changedKeys) ? snapshot.changedKeys.slice(0, 8) : [])"
-                :key="`${snapshot.id}-${changedKey}`"
-                class="inline-flex rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-200"
-              >
-                {{ changedKey }}
-              </span>
-              <span
-                v-if="Array.isArray(snapshot.changedKeys) && snapshot.changedKeys.length > 8"
-                class="inline-flex rounded-full border border-white/10 bg-white/6 px-3 py-1 text-xs text-slate-400"
-              >
-                +{{ snapshot.changedKeys.length - 8 }} 项
-              </span>
-            </div>
-          </article>
-        </div>
-
-        <div
-          v-else
-          class="mt-5 rounded-3xl border border-dashed border-white/12 bg-slate-950/30 px-5 py-6 text-sm leading-6 text-slate-400"
-        >
-          当前还没有配置快照历史。首次保存设置、导入设置备份或执行完整导入后，Worker 会在这里返回新的快照摘要。
-        </div>
-      </article>
     </div>
 
     <article class="form-card mt-4">
@@ -2383,10 +2082,10 @@ function summarizeConfigSnapshotChangedKeys(changedKeys = []) {
 
       <div class="mt-5 space-y-3 text-sm leading-6 text-slate-300">
         <p class="rounded-2xl border border-white/8 bg-slate-950/50 px-4 py-3">
-          当前设置页已经不再只是说明文案，而是直接读取 Worker 返回的 `config / revisions / nodes / configSnapshots`。
+          当前设置页已经不再只是说明文案，而是直接读取 Worker 返回的 `config / revisions / nodes`。
         </p>
         <p class="rounded-2xl border border-white/8 bg-slate-950/50 px-4 py-3">
-          保存时仍然走原有 `saveConfig`，并把 `meta.section=settings` 带回 Worker，便于后端沿用既有快照与审计语义。
+          保存时仍然走原有 `saveConfig`，配置以 KV 中的 `sys:theme` 为唯一事实来源。
         </p>
         <p class="rounded-2xl border border-white/8 bg-slate-950/50 px-4 py-3">
           这一轮已经把预热、Playback/进度转发、Hedge/Failover、日志写入细粒度、批处理阈值、调度时区和 Telegram 告警阈值搬进独立前端；日志检索工作台、节点治理和 DNS 工具台仍可继续从旧版 Worker UI 逐块拆出。
